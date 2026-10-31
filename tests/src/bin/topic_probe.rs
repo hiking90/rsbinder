@@ -126,7 +126,7 @@ fn relay(
         }
         "notify" => {
             let callback: Strong<dyn hub::IServiceCallback> = token.into_interface()?;
-            let got = timed(&mut || Ok(hub::register_for_notifications(target, &callback)?));
+            let got = timed(&mut || hub::register_for_notifications(target, &callback));
             let _ = hub::unregister_for_notifications(target, &callback);
             Ok(got)
         }
@@ -136,7 +136,7 @@ fn relay(
             kept.push(Box::new(own.clone()));
             let callback: Strong<dyn hub::IClientCallback> = token.into_interface()?;
             Ok(timed(&mut || {
-                Ok(hub::register_client_callback(target, &own, &callback)?)
+                hub::register_client_callback(target, &own, &callback)
             }))
         }
         "advertise" => {

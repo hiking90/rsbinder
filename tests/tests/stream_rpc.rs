@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 
 use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
 use rsbinder::stream::{
-    PingPolicy, Receiver, ReceiverPolicy, RingUse, Sink, SinkPolicy, StreamEndpoint, Token,
+    PingPolicy, Receiver, ReceiverPolicy, RecvTimeoutError, RingUse, Sink, SinkPolicy,
+    StreamEndpoint, Token, TryRecvError,
 };
 use rsbinder::{
     BinderResult, ExceptionCode, FromIBinder, Interface, SIBinder, Status, Strong, TransportCaps,
@@ -78,11 +79,9 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fn sink_policy(max_batch_bytes: i32, initial_credits: i32) -> SinkPolicy {
-    SinkPolicy {
-        max_batch_bytes: max_batch_bytes as usize,
-        initial_credits: initial_credits as u32,
-        ..SinkPolicy::default()
-    }
+    SinkPolicy::default()
+        .with_max_batch_bytes(max_batch_bytes as usize)
+        .with_initial_credits(initial_credits as u32)
 }
 
 impl DemoSvc {
@@ -95,10 +94,7 @@ impl DemoSvc {
         delay: Duration,
         ending: Option<Status>,
     ) -> BinderResult<()> {
-        let policy = SinkPolicy {
-            ping: self.ping,
-            ..policy.clone()
-        };
+        let policy = policy.clone().with_ping(self.ping);
         let mut producer = Sink::open_with(endpoint, &policy)?;
         let sent = self.sent.clone();
         let finished = self.finished.clone();
@@ -156,10 +152,7 @@ impl IStreamDemo for DemoSvc {
         max_batch_bytes: i32,
         initial_credits: i32,
     ) -> BinderResult<()> {
-        let policy = SinkPolicy {
-            ping: self.ping,
-            ..sink_policy(max_batch_bytes, initial_credits)
-        };
+        let policy = sink_policy(max_batch_bytes, initial_credits).with_ping(self.ping);
         let mut producer = Sink::open_with(endpoint, &policy)?;
         let sent = self.sent.clone();
         let finished = self.finished.clone();
@@ -215,11 +208,9 @@ impl IStreamDemo for DemoSvc {
     fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint<i32>> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
-            &ReceiverPolicy {
-                ring_bytes: ring_bytes.max(0) as usize,
-                ring_use: self.upload_ring_use,
-                ..ReceiverPolicy::default()
-            },
+            &ReceiverPolicy::default()
+                .with_ring_bytes(ring_bytes.max(0) as usize)
+                .with_ring_use(self.upload_ring_use),
         )?;
         let uploaded = self.uploaded.clone();
         let ordered = self.upload_ordered.clone();
@@ -267,7 +258,7 @@ impl IStreamDemo for DemoSvc {
 
 /// A server on its own socket and a client session with `incoming` callback connections.
 struct Fixture {
-    _server: thread::JoinHandle<()>,
+    _server: rsbinder::rpc::RpcServerHandle,
     client: RpcSession,
     demo: Strong<dyn IStreamDemo>,
     path: std::path::PathBuf,
@@ -411,11 +402,9 @@ impl Fixture {
     ) -> (Receiver<i32>, StreamEndpoint<i32>) {
         Receiver::<i32>::with_policy(
             &self.demo.as_binder(),
-            &ReceiverPolicy {
-                credit_window,
-                max_opening,
-                ..ReceiverPolicy::default()
-            },
+            &ReceiverPolicy::default()
+                .with_credit_window(credit_window)
+                .with_max_opening(max_opening),
         )
         .expect("a receiver against a live session")
     }
@@ -447,15 +436,19 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
     };
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
-    server.set_reply_timeout(setup.server_reply_timeout);
-    server.set_idle_timeout(setup.server_idle);
+    server
+        .set_reply_timeout(setup.server_reply_timeout)
+        .expect("reply timeout");
+    server
+        .set_idle_timeout(setup.server_idle)
+        .expect("idle timeout");
     if setup.fd_unix {
         server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
     }
     server
         .set_root(BnStreamDemo::new_binder(svc.clone()).as_binder())
         .expect("set_root");
-    let server = server.run_background();
+    let server = server.run_background().expect("run_background");
 
     let relay = setup.relay.then(|| Relay::start(&path, tag));
     let dial = relay
@@ -467,7 +460,9 @@ fn fixture_with(tag: &str, incoming: u32, setup: Setup) -> Fixture {
         config = config.fd_mode(FileDescriptorTransportMode::Unix);
     }
     let client = RpcSession::setup_client_android13plus_with_config(config).expect("connect");
-    client.set_timeout(setup.client_timeout);
+    client
+        .set_reply_timeout(setup.client_timeout)
+        .expect("reply timeout");
     let demo = <dyn IStreamDemo as FromIBinder>::try_from(client.get_root().expect("get_root"))
         .expect("cast the root to IStreamDemo");
 
@@ -524,14 +519,13 @@ fn twenty_thousand_items_cross_each_way_without_a_stall() {
         .expect("subscribe");
     for want in 0..N {
         match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Some(item)) => assert_eq!(item, want),
+            Ok(item) => assert_eq!(item, want),
             other => panic!("download stalled after {want} items: {other:?}"),
         }
     }
-    assert!(
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("a clean end")
-            .is_none(),
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)),
+        Err(RecvTimeoutError::Ended),
         "the terminator follows the last batch"
     );
 
@@ -541,10 +535,7 @@ fn twenty_thousand_items_cross_each_way_without_a_stall() {
         .demo
         .r#upload(&token.binder(), ring_bytes)
         .expect("upload");
-    let policy = SinkPolicy {
-        send_timeout: Some(Duration::from_secs(10)),
-        ..sink_policy(4, default_credits())
-    };
+    let policy = sink_policy(4, default_credits()).with_send_timeout(Some(Duration::from_secs(10)));
     let mut tx = Sink::<i32>::open_with(&endpoint, &policy).expect("open");
     for item in 0..N {
         tx.send(&item)
@@ -574,9 +565,10 @@ fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {
         .r#subscribe(&endpoint, 1000, 64, default_credits() + 1, 0)
         .expect("`onStart` is oneway, so the service cannot hear the refusal");
 
-    let refusal = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect_err("the stream must end before any item");
+    let refusal = match rx.recv_timeout(Duration::from_secs(10)) {
+        Err(RecvTimeoutError::Failed(status)) => status,
+        other => panic!("the stream must end before any item: {other:?}"),
+    };
     assert_eq!(refusal.exception_code(), ExceptionCode::IllegalArgument);
 
     // The same service, a consumer made for that window: every item.
@@ -589,7 +581,7 @@ fn a_window_wider_than_the_consumer_accepts_is_refused_across_a_session() {
     let mut got = 0;
     while got < 1000 {
         match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Some(_)) => got += 1,
+            Ok(_) => got += 1,
             other => panic!("stalled after {got} items: {other:?}"),
         }
     }
@@ -608,16 +600,14 @@ fn an_async_producer_streams_across_a_session() {
     let mut got = Vec::new();
     while got.len() < 300 {
         match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Some(item)) => got.push(item),
+            Ok(item) => got.push(item),
             other => panic!("stalled after {} items: {other:?}", got.len()),
         }
     }
     assert_eq!(got, (0..300).collect::<Vec<_>>());
-    assert!(
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("a clean end")
-            .is_none()
-            && rx.is_finished(),
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)),
+        Err(RecvTimeoutError::Ended),
         "the terminator follows the last batch"
     );
     assert_eq!(f.demo.r#lastError().expect("lastError"), 0);
@@ -704,7 +694,7 @@ fn a_session_that_ends_releases_a_blocked_consumer() {
         .expect("subscribe");
     assert!(rx.next().expect("item 0").is_ok());
     // Pays the owed credit, so the dead session is seen by the death link, not a grant.
-    assert!(rx.try_recv().expect("still running").is_none());
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "still running");
 
     f.client.close_session();
 
@@ -712,12 +702,12 @@ fn a_session_that_ends_releases_a_blocked_consumer() {
     let failure = loop {
         match rx.recv_timeout(Duration::from_secs(10)) {
             // Batches already queued come out first.
-            Ok(Some(_)) => continue,
-            Ok(None) if rx.is_finished() => {
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Ended) => {
                 panic!("the stream ended clean, which the producer never did")
             }
-            Ok(None) => panic!("the lost session left the consumer waiting"),
-            Err(status) => break status,
+            Err(RecvTimeoutError::Timeout) => panic!("the lost session left the consumer waiting"),
+            Err(RecvTimeoutError::Failed(status)) => break status,
         }
     };
     assert_eq!(
@@ -795,11 +785,9 @@ fn frozen_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>) {
     );
     let (mut rx, endpoint) = Receiver::<i32>::with_policy(
         &f.demo.as_binder(),
-        &ReceiverPolicy {
-            max_opening: 1_000_000,
-            ping,
-            ..ReceiverPolicy::default()
-        },
+        &ReceiverPolicy::default()
+            .with_max_opening(1_000_000)
+            .with_ping(ping),
     )
     .expect("a receiver");
     // 30 s per item and spare credit: after item 0 neither end sends anything on its own.
@@ -808,7 +796,7 @@ fn frozen_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>) {
         .expect("subscribe");
     assert!(rx.next().expect("item 0").is_ok());
     // Pays the owed credit, so the wait below has no grant to send.
-    assert!(rx.try_recv().expect("still running").is_none());
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "still running");
     f.freeze();
     (f, rx)
 }
@@ -819,9 +807,10 @@ fn a_waiting_consumer_notices_a_producer_gone_silent_behind_a_relay() {
     let (_f, mut rx) = frozen_download("ping_rx", PingPolicy::Inherit);
 
     let started = Instant::now();
-    let failure = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect_err("the ping goes unanswered and the session ends");
+    let failure = match rx.recv_timeout(Duration::from_secs(10)) {
+        Err(RecvTimeoutError::Failed(status)) => status,
+        other => panic!("the ping goes unanswered and the session ends: {other:?}"),
+    };
     assert_eq!(
         failure.transaction_error(),
         rsbinder::StatusCode::DeadObject
@@ -838,11 +827,10 @@ fn a_waiting_consumer_notices_a_producer_gone_silent_behind_a_relay() {
 fn without_a_ping_a_producer_gone_silent_behind_a_relay_goes_unnoticed() {
     let (_f, mut rx) = frozen_download("noping_rx", PingPolicy::Off);
 
-    assert!(
-        rx.recv_timeout(NOTICED_WITHIN)
-            .expect("nothing ends the stream")
-            .is_none(),
-        "no item crosses a frozen relay"
+    assert_eq!(
+        rx.recv_timeout(NOTICED_WITHIN),
+        Err(RecvTimeoutError::Timeout),
+        "no item crosses a frozen relay, and nothing ends the stream"
     );
     assert!(!rx.is_finished());
 }
@@ -888,7 +876,7 @@ fn a_dropped_recv_async_gives_back_the_thread_its_wait_held() {
         .expect("subscribe");
     assert!(rx.next().expect("item 0").is_ok());
     // Pays the owed credit, so `recv_async` goes straight to its pooled wait.
-    assert!(rx.try_recv().expect("still running").is_none());
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "still running");
 
     let (tx, done) = mpsc::channel();
     thread::spawn(move || {
@@ -1003,10 +991,7 @@ fn ring_fixture(tag: &str, upload_ring_use: RingUse) -> Fixture {
 }
 
 fn opted_in() -> ReceiverPolicy {
-    ReceiverPolicy {
-        ring_use: RingUse::AlsoUnixRpc,
-        ..ReceiverPolicy::default()
-    }
+    ReceiverPolicy::default().with_ring_use(RingUse::AlsoUnixRpc)
 }
 
 /// Every item to a clean end, each within 10 s: a stall fails rather than hangs.
@@ -1014,8 +999,8 @@ fn collect_within(rx: &mut Receiver<i32>) -> Vec<i32> {
     let mut got = Vec::new();
     loop {
         match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Some(item)) => got.push(item),
-            Ok(None) if rx.is_finished() => return got,
+            Ok(item) => got.push(item),
+            Err(RecvTimeoutError::Ended) => return got,
             other => panic!("stalled after {} items: {other:?}", got.len()),
         }
     }
@@ -1023,10 +1008,7 @@ fn collect_within(rx: &mut Receiver<i32>) -> Vec<i32> {
 
 /// A send that waits for room or credit fails after 10 s rather than hangs.
 fn bounded_sink() -> SinkPolicy {
-    SinkPolicy {
-        send_timeout: Some(Duration::from_secs(10)),
-        ..SinkPolicy::default()
-    }
+    SinkPolicy::default().with_send_timeout(Some(Duration::from_secs(10)))
 }
 
 /// Poll `done` for up to 5 s.
@@ -1149,12 +1131,10 @@ fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>)
     );
     let (mut rx, endpoint) = Receiver::<i32>::with_policy(
         &f.demo.as_binder(),
-        &ReceiverPolicy {
-            ring_use: RingUse::AlsoUnixRpc,
-            max_opening: 1_000_000,
-            ping,
-            ..ReceiverPolicy::default()
-        },
+        &ReceiverPolicy::default()
+            .with_ring_use(RingUse::AlsoUnixRpc)
+            .with_max_opening(1_000_000)
+            .with_ping(ping),
     )
     .expect("a receiver");
     assert_eq!(rx.uses_ring(), RING, "the memfd crossed the relay");
@@ -1164,7 +1144,7 @@ fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>)
         .expect("subscribe");
     assert!(rx.next().expect("item 0").is_ok());
     // Off a ring this pays the owed credit, so the wait below has no grant to send.
-    assert!(rx.try_recv().expect("still running").is_none());
+    assert_eq!(rx.try_recv(), Err(TryRecvError::Empty), "still running");
     f.freeze();
     (f, rx)
 }
@@ -1174,9 +1154,10 @@ fn frozen_ring_download(tag: &str, ping: PingPolicy) -> (Fixture, Receiver<i32>)
 fn a_waiting_ring_consumer_notices_a_producer_gone_silent_behind_a_relay() {
     let (_f, mut rx) = frozen_ring_download("ring_ping_rx", PingPolicy::Inherit);
     let started = Instant::now();
-    let failure = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect_err("the ping goes unanswered and the session ends");
+    let failure = match rx.recv_timeout(Duration::from_secs(10)) {
+        Err(RecvTimeoutError::Failed(status)) => status,
+        other => panic!("the ping goes unanswered and the session ends: {other:?}"),
+    };
     assert_eq!(
         failure.transaction_error(),
         rsbinder::StatusCode::DeadObject
@@ -1192,7 +1173,10 @@ fn a_waiting_ring_consumer_notices_a_producer_gone_silent_behind_a_relay() {
 #[test]
 fn without_a_ping_a_ring_consumer_waits_on_a_producer_gone_silent() {
     let (_f, mut rx) = frozen_ring_download("ring_noping_rx", PingPolicy::Off);
-    assert_eq!(rx.recv_timeout(NOTICED_WITHIN).expect("no error"), None);
+    assert_eq!(
+        rx.recv_timeout(NOTICED_WITHIN),
+        Err(RecvTimeoutError::Timeout)
+    );
     assert!(!rx.is_finished());
 }
 
@@ -1211,12 +1195,10 @@ fn parked_ring_producer(tag: &str, ping: PingPolicy) -> Fixture {
     );
     let (rx, endpoint) = Receiver::<i32>::with_policy(
         &f.demo.as_binder(),
-        &ReceiverPolicy {
-            ring_use: RingUse::AlsoUnixRpc,
-            ring_bytes: 4096,
-            credit_window: 1,
-            ..ReceiverPolicy::default()
-        },
+        &ReceiverPolicy::default()
+            .with_ring_use(RingUse::AlsoUnixRpc)
+            .with_ring_bytes(4096)
+            .with_credit_window(1),
     )
     .expect("a receiver");
     assert_eq!(rx.uses_ring(), RING);
@@ -1262,19 +1244,16 @@ fn a_closed_session_ends_an_rpc_ring_stream_on_both_sides() {
     f.demo
         .r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 20_000)
         .expect("subscribe");
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).expect("ok"),
-        Some(0)
-    );
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(0));
 
     f.client.close_session();
 
     let failure = loop {
         match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Some(_)) => continue,
-            Ok(None) if rx.is_finished() => panic!("a clean end the producer never sent"),
-            Ok(None) => panic!("the lost session left the consumer waiting"),
-            Err(status) => break status,
+            Ok(_) => continue,
+            Err(RecvTimeoutError::Ended) => panic!("a clean end the producer never sent"),
+            Err(RecvTimeoutError::Timeout) => panic!("the lost session left the consumer waiting"),
+            Err(RecvTimeoutError::Failed(status)) => break status,
         }
     };
     assert_eq!(
@@ -1328,10 +1307,10 @@ mod idle {
         let mut got = Vec::new();
         loop {
             match rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(Some(item)) => got.push(item),
-                Ok(None) if rx.is_finished() => return Ok(got),
-                Ok(None) => panic!("no item for 10 s after {}", got.len()),
-                Err(status) => return Err(status),
+                Ok(item) => got.push(item),
+                Err(RecvTimeoutError::Ended) => return Ok(got),
+                Err(RecvTimeoutError::Timeout) => panic!("no item for 10 s after {}", got.len()),
+                Err(RecvTimeoutError::Failed(status)) => return Err(status),
             }
         }
     }
@@ -1392,12 +1371,10 @@ mod idle {
         let f = idle_fixture("idle_stall_dl", IDLE, None);
         let (rx, endpoint) = Receiver::<i32>::with_policy(
             &f.demo.as_binder(),
-            &ReceiverPolicy {
-                ring_use: RingUse::AlsoUnixRpc,
-                ring_bytes: 4096,
-                credit_window: 1,
-                ..ReceiverPolicy::default()
-            },
+            &ReceiverPolicy::default()
+                .with_ring_use(RingUse::AlsoUnixRpc)
+                .with_ring_bytes(4096)
+                .with_credit_window(1),
         )
         .expect("a receiver");
         assert_eq!(rx.uses_ring(), RING);
@@ -1429,12 +1406,10 @@ mod idle {
         let f = idle_fixture("idle_ping_dl", IDLE, reply);
         let (rx, endpoint) = Receiver::<i32>::with_policy(
             &f.demo.as_binder(),
-            &ReceiverPolicy {
-                ring_use: RingUse::AlsoUnixRpc,
-                ring_bytes: 4096,
-                credit_window: 1,
-                ..ReceiverPolicy::default()
-            },
+            &ReceiverPolicy::default()
+                .with_ring_use(RingUse::AlsoUnixRpc)
+                .with_ring_bytes(4096)
+                .with_credit_window(1),
         )
         .expect("a receiver");
         assert_eq!(rx.uses_ring(), RING);
@@ -1567,22 +1542,21 @@ mod two_process {
         demo.r#subscribe(&endpoint, i32::MAX, 64, default_credits(), 1000)
             .expect("subscribe");
         for expected in 0..10 {
-            assert_eq!(
-                rx.recv_timeout(Duration::from_secs(10)).expect("ok"),
-                Some(expected)
-            );
+            assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(expected));
         }
         server.kill();
         let mut expected = 10;
         let failure = loop {
             match rx.recv_timeout(Duration::from_secs(10)) {
-                Ok(Some(item)) => {
+                Ok(item) => {
                     assert_eq!(item, expected, "records before the death come in order");
                     expected += 1;
                 }
-                Ok(None) if rx.is_finished() => panic!("a clean end the producer never sent"),
-                Ok(None) => panic!("the dead producer left the consumer waiting"),
-                Err(status) => break status,
+                Err(RecvTimeoutError::Ended) => panic!("a clean end the producer never sent"),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("the dead producer left the consumer waiting")
+                }
+                Err(RecvTimeoutError::Failed(status)) => break status,
             }
         };
         assert_eq!(

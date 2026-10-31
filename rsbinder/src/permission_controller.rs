@@ -28,8 +28,10 @@
 //! nothing is registered under that name**: a check inside an RPC
 //! transaction and a check outside any transaction are denied before the
 //! lookup is reached, and a lookup that yields `Ok(None)` or `Err` denies
-//! as well. The lookup is reached only inside a kernel transaction, so
-//! kernel binder is initialized whenever it runs. The Linux
+//! as well. The lookup is reached only inside a kernel transaction or an
+//! in-process call through a generated proxy (`Caller::InProcess`, which
+//! needs kernel binder too), so kernel binder is initialized whenever it
+//! runs. The Linux
 //! `hub` is a general-purpose service manager: a process allowed to
 //! register can [`crate::hub::add_service`] a binder under the name
 //! `"permission"`, and if its descriptor matches, the lookup
@@ -43,15 +45,18 @@
 //! which process answers, and the kept strong reference counts as a client
 //! of the registered service, so its `tryUnregisterService` is refused.
 
-include!(concat!(env!("OUT_DIR"), "/permission_controller.rs"));
+// Private: the re-exports below are the one public path to the generated items.
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/permission_controller.rs"));
+}
 
-pub use android::os::IPermissionController::{
+pub use generated::android::os::IPermissionController::{
     BnPermissionController, BpPermissionController, IPermissionController,
-    IPermissionControllerDefault, IPermissionControllerDefaultRef,
+    IPermissionControllerDefault, IPermissionControllerDefaultRef, IPermissionControllerDelegate,
 };
 
 #[cfg(feature = "async")]
-pub use android::os::IPermissionController::{
+pub use generated::android::os::IPermissionController::{
     IPermissionControllerAsync, IPermissionControllerAsyncService,
 };
 
@@ -73,8 +78,11 @@ pub const SERVICE_NAME: &str = "permission";
 /// [`Caller::Kernel`]; a uid ACL, TLS-certificate allowlist, or token
 /// scope for `Caller::Rpc`). With no transaction in flight
 /// ([`crate::calling_caller`] returns `None`) the check fails closed
-/// without consulting it, so an authority never sees an in-process call
-/// and cannot log or allow one.
+/// without consulting it. An in-process call through a generated proxy
+/// over a local binder made outside any transaction reaches it as
+/// [`Caller::InProcess`] (see [`crate::Strong::into_async`]); a direct call
+/// on a local service's sync handle never reaches `on_transact`, so no
+/// check runs for it at all.
 ///
 /// The core crate ships only this **slot**, never a policy: token/JWT
 /// formats, certificate→permission tables, and uid→permission maps are
@@ -92,15 +100,44 @@ static AUTHORITY: RwLock<Option<Arc<dyn PermissionAuthority>>> = RwLock::new(Non
 
 /// Install the process-wide [`PermissionAuthority`]; subsequent
 /// [`check_permission`] calls delegate the whole decision to it. Replaces
-/// any previously installed authority.
+/// any previously installed authority, which is dropped here after the
+/// slot's lock is released.
+///
+/// Code that installs an authority into a process it does not own (a
+/// library) should use [`replace_permission_authority`] and keep what it
+/// replaced.
 pub fn set_permission_authority(authority: Arc<dyn PermissionAuthority>) {
-    *AUTHORITY.write().expect("permission authority poisoned") = Some(authority);
+    drop(replace_permission_authority(Some(authority)));
 }
 
 /// Remove any installed [`PermissionAuthority`], restoring the built-in
-/// default (kernel → PMS, RPC → deny).
+/// default (kernel → PMS, RPC → deny). The removed authority is dropped
+/// after the slot's lock is released.
 pub fn clear_permission_authority() {
-    *AUTHORITY.write().expect("permission authority poisoned") = None;
+    drop(replace_permission_authority(None));
+}
+
+/// Install `authority` as the process-wide [`PermissionAuthority`], or
+/// restore the built-in default with `None`, and return the authority it
+/// replaced, `None` if the default was in effect.
+///
+/// A check already running in another thread finishes with the authority
+/// it started with.
+pub fn replace_permission_authority(
+    authority: Option<Arc<dyn PermissionAuthority>>,
+) -> Option<Arc<dyn PermissionAuthority>> {
+    let mut slot = AUTHORITY.write().unwrap_or_else(PoisonError::into_inner);
+    // Returned after the guard drops, so the old authority's user `Drop` never runs under the lock.
+    std::mem::replace(&mut *slot, authority)
+}
+
+/// The process-wide [`PermissionAuthority`] installed now, `None` while
+/// the built-in default (kernel → PMS, RPC → deny) is in effect.
+pub fn permission_authority() -> Option<Arc<dyn PermissionAuthority>> {
+    AUTHORITY
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// Acquire a `BpPermissionController` proxy for the system-wide
@@ -181,12 +218,21 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
 /// via [`crate::get_calling_uid`] over Unix RPC).
 ///
+/// # In-process calls
+///
+/// A local binder called through a generated proxy while no transaction
+/// is in flight on the thread ([`Caller::InProcess`], the async view of a
+/// sync-only service on a pool thread) is decided for this process's own
+/// uid and pid, as AOSP Java's `checkCallingOrSelfPermission` checks a
+/// call made outside a transaction. Inside a kernel or RPC handler the
+/// same call is decided for that handler's caller, by the rules above.
+///
 /// # Fail-closed semantics
 ///
 /// **With no [`PermissionAuthority`] installed**, returns `false` when:
 /// - The innermost transaction on this thread is an RPC one (see above).
-/// - The current thread is not handling a binder transaction (explicit
-///   deny before PMS is consulted).
+/// - The current thread is neither handling a binder transaction nor
+///   running an in-process call (explicit deny before PMS is consulted).
 /// - The `permission` service is unreachable (`system_server` absent) —
 ///   the lookup error denies.
 /// - The remote `checkPermission` call returns an error.
@@ -213,25 +259,24 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// If a [`PermissionAuthority`] is installed via
 /// [`set_permission_authority`], it **replaces** the default decision for
 /// every transport and receives the transport-tagged [`Caller`] — but
-/// only while a transaction is in flight; with none
-/// ([`crate::calling_caller`] returns `None`) the check fails closed
-/// without consulting it. With no authority installed (the default), the
-/// kernel→PMS / RPC→deny behavior applies unchanged.
+/// only while a transaction or an in-process call is in flight; with
+/// neither ([`crate::calling_caller`] returns `None`) the check fails
+/// closed without consulting it. With no authority installed (the
+/// default), the kernel→PMS / RPC→deny behavior applies unchanged.
 pub fn check_permission(_reader: &Parcel, permission_name: &str) -> bool {
     // Clone the Arc out so the read lock is released before the (re-entrant) policy runs.
-    let authority = AUTHORITY
-        .read()
-        .expect("permission authority poisoned")
-        .clone();
+    let authority = permission_authority();
     // No caller (not in a transaction) ⇒ fail closed on either path.
     let caller = crate::calling_caller();
     if let Some(authority) = authority {
         return caller.is_some_and(|caller| authority.check(permission_name, &caller));
     }
     match caller {
-        Some(Caller::Kernel { uid, pid, .. }) => ask_controller(&CONTROLLER, default, |pc| {
-            pc.checkPermission(permission_name, pid, uid as i32)
-        }),
+        Some(Caller::Kernel { uid, pid, .. } | Caller::InProcess { uid, pid }) => {
+            ask_controller(&CONTROLLER, default, |pc| {
+                pc.checkPermission(permission_name, pid, uid as i32)
+            })
+        }
         // An RPC uid is not a PMS uid (see rustdoc).
         #[cfg(feature = "rpc")]
         Some(Caller::Rpc(_)) => {
@@ -434,6 +479,72 @@ mod tests {
             !check_permission(&kernel_parcel, "android.permission.INTERNET"),
             "outside a transaction the kernel path denies before PMS"
         );
+    }
+
+    /// Plan 17 K-23: the getter sees each install; a replaced authority's `Drop` panic is harmless.
+    #[serial_test::serial(authority)]
+    #[test]
+    fn authority_getter_and_a_panicking_drop_of_the_replaced_one() {
+        struct Fixed {
+            grant: bool,
+            panic_on_drop: bool,
+        }
+        impl PermissionAuthority for Fixed {
+            fn check(&self, _: &str, _: &Caller) -> bool {
+                self.grant
+            }
+        }
+        impl Drop for Fixed {
+            fn drop(&mut self) {
+                if self.panic_on_drop {
+                    panic!("injected authority Drop panic");
+                }
+            }
+        }
+
+        assert!(permission_authority().is_none());
+        let first: Arc<dyn PermissionAuthority> = Arc::new(Fixed {
+            grant: false,
+            panic_on_drop: true,
+        });
+        assert!(replace_permission_authority(Some(first.clone())).is_none());
+        let seen = permission_authority().expect("the getter sees the installed authority");
+        assert!(Arc::ptr_eq(&seen, &first));
+        // The slot now holds the last reference, so replacing it runs the panicking `Drop`.
+        drop((seen, first));
+
+        let second: Arc<dyn PermissionAuthority> = Arc::new(Fixed {
+            grant: true,
+            panic_on_drop: false,
+        });
+        let replaced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set_permission_authority(second.clone())
+        }));
+        assert!(replaced.is_err(), "the replaced authority's Drop panicked");
+        assert!(
+            !AUTHORITY.is_poisoned(),
+            "the Drop ran after the write lock was released"
+        );
+        let seen = permission_authority().expect("the new authority is installed");
+        assert!(Arc::ptr_eq(&seen, &second));
+
+        // Not in a transaction: denies without consulting the authority, and without panicking.
+        assert!(!check_permission(&Parcel::new(), "p"));
+        #[cfg(feature = "rpc")]
+        {
+            let _g = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 1000, pid: 7 }),
+                UNIX_CAPS,
+            );
+            assert!(
+                check_permission(&Parcel::new(), "p"),
+                "the new authority decides"
+            );
+        }
+
+        let last = replace_permission_authority(None).expect("the second authority");
+        assert!(Arc::ptr_eq(&last, &second));
+        assert!(permission_authority().is_none());
     }
 
     /// Plan 2-16 Phase C: an installed authority grants a Unix-RPC uid what the default denies.

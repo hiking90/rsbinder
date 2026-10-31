@@ -25,7 +25,10 @@ fn waiting(timeout: Duration) -> Publisher<Bytes> {
 fn within(timeout: Duration, window: Option<NonZeroUsize>) -> Publisher<Bytes> {
     Publisher::new(&PublisherPolicy {
         ring_bytes: MIN_RING,
-        backpressure: Some(Backpressure { timeout, window }),
+        backpressure: Some(Backpressure {
+            publish_timeout: timeout,
+            window,
+        }),
         ..PublisherPolicy::default()
     })
     .unwrap()
@@ -294,7 +297,10 @@ fn pooled_within(
             max_loans: 1,
             huge_pages: false,
         }),
-        backpressure: Some(Backpressure { timeout, window }),
+        backpressure: Some(Backpressure {
+            publish_timeout: timeout,
+            window,
+        }),
         ..PublisherPolicy::default()
     })
     .unwrap()

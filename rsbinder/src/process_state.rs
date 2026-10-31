@@ -200,10 +200,8 @@
 //! (`BINDER_TYPE_BINDER`), held while parcel-side (`publish_count`) or
 //! kernel-side (`kernel_refs`) refs are outstanding, and removed when both are
 //! zero and `pending_reservations` is zero. While it exists, `binder_pin` keeps
-//! `Inner<T>` alive and holds `RefCounter.strong` / `RefCounter.weak` at the
-//! "alive" level (>= 1) so `attempt_inc_*` succeeds: `SIBinder::from_arc`'s
-//! `inc_strong` sets that at creation and `SIBinder::Drop`'s
-//! `dec_strong(None)` releases it at removal. `publish_count` follows
+//! `Inner<T>` alive; the `Arc` count is the only count that decides when
+//! `Inner<T>` is destroyed. `publish_count` follows
 //! `FlatBinderObject::acquire` / `release`, called from
 //! `Parcel::write_object`, `Parcel::append_from` and `Parcel::release_objects`.
 //! `kernel_refs` rises on `BR_INCREFS` / `BR_ACQUIRE` and falls on
@@ -230,10 +228,7 @@
 //! `Arc::ptr_eq` against `binder_pin`, so publishing one `Arc` twice returns
 //! the same id, as Android allocates one `binder_node` per `weakref_type*`
 //! however often it is sent. A dedup hit only bumps `pending_reservations`. A
-//! fresh insert drives `RefCounter.strong` 0→1 through `SIBinder::from_arc`
-//! and `RefCounter.weak` 0→1 through an explicit `inc_weak`; that table-held
-//! +1 keeps both counts above zero, so user-side increments and decrements
-//! never reach the count→0 closure path. `publish_count` starts at 0 and the
+//! fresh insert stores a clone of the `Arc` as `binder_pin`. `publish_count` starts at 0 and the
 //! `Parcel::write_object` → `FlatBinderObject::acquire` right after brings
 //! it to 1. The only leak path is a `Parcel::write_aligned_data` failure between
 //! `From<&SIBinder>` returning and that `acquire()`: a panic (typically OOM),
@@ -252,8 +247,8 @@
 //! counters under the write lock and release it; `remove_entry_if_zero` then
 //! re-takes the lock, re-checks that `publish_count`, `kernel_refs` and
 //! `pending_reservations` are all zero, removes the entry, and drops
-//! `binder_pin` after releasing the lock. The drop calls `dec_strong(None)`,
-//! which may run user destructor code (`Inner<T>::drop`) that calls back into
+//! `binder_pin` after releasing the lock. The drop may release the last `Arc`
+//! and run user destructor code (`Inner<T>::drop`) that calls back into
 //! `ProcessState`, so holding the write lock there would deadlock. If a
 //! concurrent `BR_INCREFS` / `From<&SIBinder>` raised a counter between the
 //! phases, the re-check aborts the removal.
@@ -331,7 +326,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -630,7 +625,7 @@ pub struct ProcessFreezeInfo {
 
 /// Sidecar entry for a published native, keyed by a u64 id; see module doc "Published natives".
 pub(crate) struct PublishedNative {
-    /// Holds `RefCounter.strong` >= 1 and keeps `Inner<T>` alive while the entry exists.
+    /// Keeps `Inner<T>` alive while the entry exists.
     pub(crate) binder_pin: SIBinder,
     /// Live `BINDER_TYPE_BINDER` objects for this id across this process's parcel buffers.
     pub(crate) publish_count: u32,
@@ -688,7 +683,10 @@ unsafe impl Sync for MemoryMap {}
 unsafe impl Send for MemoryMap {}
 
 pub struct ProcessState {
-    max_threads: u32,
+    /// The ceiling last given to `BINDER_SET_MAX_THREADS`; written only under `max_threads_set`.
+    max_threads: AtomicU32,
+    /// Serializes `set_max_threads`, so the driver and `max_threads` agree after racing calls.
+    max_threads_set: Mutex<()>,
     driver_name: PathBuf,
     driver: Arc<File>,
     mmap: MemoryMap,
@@ -802,11 +800,7 @@ impl ProcessState {
         Ok(mmap_size.next_multiple_of(page))
     }
 
-    fn inner_init(
-        driver_name: &str,
-        max_threads: u32,
-        mmap_size: usize,
-    ) -> std::result::Result<ProcessState, Box<dyn std::error::Error>> {
+    fn inner_init(driver_name: &str, max_threads: u32, mmap_size: usize) -> Result<ProcessState> {
         Self::log_max_threads(max_threads);
 
         let vm_size = Self::normalized_mmap_size(mmap_size)?;
@@ -826,10 +820,15 @@ impl ProcessState {
                 &driver,
                 0,
             )
-        }?;
+        }
+        .map_err(|e| {
+            log::error!("mmap of the binder receive buffer ({vm_size} bytes) failed: {e}");
+            errno_status(e)
+        })?;
 
         Ok(ProcessState {
-            max_threads,
+            max_threads: AtomicU32::new(max_threads),
+            max_threads_set: Mutex::new(()),
             driver_name,
             driver: driver.into(),
             mmap: MemoryMap {
@@ -874,12 +873,30 @@ impl ProcessState {
     /// was called, whatever `max_threads` says: the flag it sets gates
     /// kernel-driven spawning too.
     ///
-    /// First call wins — a later call with different arguments returns the
-    /// existing state unchanged.
-    pub fn init(
-        driver_name: &str,
-        max_threads: u32,
-    ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
+    /// The state is process-wide and set once. A later call with the same
+    /// driver path, `max_threads` and receive-mapping size returns the
+    /// existing state; a call with any of them different returns
+    /// [`StatusCode::BadValue`] and leaves the state as it is (AOSP
+    /// `ProcessState::initWithDriver` aborts on a different driver).
+    /// [`driver_name`](Self::driver_name) and [`mmap_size`](Self::mmap_size)
+    /// read what the first call set; [`max_threads`](Self::max_threads)
+    /// reads the ceiling in force, which only
+    /// [`set_max_threads`](Self::set_max_threads) changes after init, and a
+    /// later `init` is compared against that.
+    ///
+    /// # Errors
+    ///
+    /// - [`StatusCode::BadValue`]: settings that differ from the existing
+    ///   state's, or a receive-mapping size outside the range
+    ///   [`init_with_mmap_size`](Self::init_with_mmap_size) accepts.
+    /// - The status of the failed system call when the driver cannot be
+    ///   opened (a missing node is [`StatusCode::NameNotFound`]), queried,
+    ///   configured or mapped; the call is logged.
+    /// - [`StatusCode::NoInit`]: the driver speaks another binder protocol
+    ///   version.
+    ///
+    /// A failed call leaves the process uninitialized; a later call may try again.
+    pub fn init(driver_name: &str, max_threads: u32) -> Result<&'static ProcessState> {
         Self::init_with_mmap_size(driver_name, max_threads, Self::default_mmap_size())
     }
 
@@ -914,11 +931,10 @@ impl ProcessState {
     ///   in as transactions use them, so a 4 MB mapping does not cost
     ///   4 MB of memory.
     ///
-    /// Process-wide and set once, like every other `init` argument: the
-    /// first call wins and a later one with a different size returns the
-    /// existing state unchanged (the entry layer,
-    /// [`serve`](crate::serve) / [`Client`](crate::Client), reports that
-    /// mismatch as [`StatusCode::BadValue`] rather than passing it over).
+    /// Process-wide and set once, like every other `init` argument: a
+    /// later call with a different size is [`StatusCode::BadValue`], and
+    /// the same (page-rounded) size again returns the existing state; see
+    /// [`init`](Self::init) for the rule and the errors.
     /// Call it before [`start_thread_pool`](Self::start_thread_pool) —
     /// once a pooled thread is serving, the mapping it serves out of is
     /// already fixed.
@@ -926,7 +942,33 @@ impl ProcessState {
         driver_name: &str,
         max_threads: u32,
         mmap_size: usize,
-    ) -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>> {
+    ) -> Result<&'static ProcessState> {
+        let vm_size = Self::normalized_mmap_size(mmap_size)?;
+        let ps = Self::init_or_existing(driver_name, max_threads, vm_size)?;
+        // Compared after the cell is set: a racing first call with other settings is caught too.
+        if ps.driver_name() != Path::new(driver_name)
+            || ps.max_threads() != max_threads
+            || ps.mmap_size() != vm_size
+        {
+            log::error!(
+                "ProcessState is already initialized with driver={:?} max_threads={} \
+                 mmap_size={}; init(driver={driver_name:?}, max_threads={max_threads}, \
+                 mmap_size={vm_size}) cannot be applied",
+                ps.driver_name(),
+                ps.max_threads(),
+                ps.mmap_size()
+            );
+            return Err(StatusCode::BadValue);
+        }
+        Ok(ps)
+    }
+
+    /// The existing state whatever it was built with, or a new one; callers compare the settings.
+    pub(crate) fn init_or_existing(
+        driver_name: &str,
+        max_threads: u32,
+        mmap_size: usize,
+    ) -> Result<&'static ProcessState> {
         let cell = Self::instance();
         if let Some(existing) = cell.get() {
             return Ok(existing);
@@ -949,9 +991,9 @@ impl ProcessState {
     /// [`DEFAULT_MAX_BINDER_THREADS`].
     ///
     /// The path is `DEFAULT_BINDER_PATH` (`/dev/binderfs/binder`), falling
-    /// back to `LEGACY_BINDER_PATH` when that does not exist.
-    pub fn init_default() -> std::result::Result<&'static ProcessState, Box<dyn std::error::Error>>
-    {
+    /// back to `LEGACY_BINDER_PATH` when that does not exist. Errors and
+    /// the repeated-call rule are [`init`](Self::init)'s.
+    pub fn init_default() -> Result<&'static ProcessState> {
         Self::init(Self::default_driver_path(), DEFAULT_MAX_BINDER_THREADS)
     }
 
@@ -1407,22 +1449,23 @@ impl ProcessState {
         }
     }
 
-    /// Freeze or thaw the binder state of process `pid`. AOSP `IPCThreadState::freeze`.
+    /// Freeze the binder state of process `pid`. AOSP
+    /// `IPCThreadState::freeze(pid, true, timeout_ms)`.
     ///
     /// This sets the kernel binder driver's per-process freeze state; it does
     /// not stop the process's threads, which is the cgroup freezer's job
     /// (Android's cached-app freezer does both). While frozen, the driver
     /// fails synchronous calls into the process with
     /// [`StatusCode::FailedTransaction`] (`BR_FROZEN_REPLY`), queues oneway
-    /// calls until it is thawed, and notifies every
+    /// calls until it is thawed with [`thaw`](Self::thaw), and notifies every
     /// [`FrozenStateChangeCallback`] registered on its binders.
     ///
-    /// Freezing waits up to `timeout` for the process's in-flight
+    /// The call waits up to `timeout` for the process's in-flight
     /// transactions to finish. If synchronous ones are still pending, the
     /// freeze is rolled back and [`StatusCode::WouldBlock`] (`EAGAIN`) is
     /// returned; call again to retry, as AOSP documents. A zero `timeout`
-    /// checks once without waiting. Thawing never waits. `timeout` is
-    /// rounded down to milliseconds and capped at `u32::MAX` of them.
+    /// checks once without waiting. `timeout` is rounded down to
+    /// milliseconds and capped at `u32::MAX` of them.
     ///
     /// The driver makes no permission check of its own and applies the
     /// call to every binder context the process opened. On Android, SELinux
@@ -1437,7 +1480,40 @@ impl ProcessState {
     ///   no binder state (it never opened a binder device).
     /// - [`StatusCode::WouldBlock`] as described above.
     /// - `StatusCode::Errno(-EACCES)` on Android outside `system_server`.
+    pub fn freeze(&self, pid: i32, timeout: Duration) -> Result<()> {
+        self.set_frozen(pid, true, timeout)
+    }
+
+    /// Thaw the binder state of process `pid`, undoing [`freeze`](Self::freeze).
+    /// AOSP `IPCThreadState::freeze(pid, false, 0)`.
+    ///
+    /// The driver delivers the oneway calls it queued while the process was
+    /// frozen and notifies every [`FrozenStateChangeCallback`] registered on
+    /// its binders. Thawing never waits, so it takes no timeout. Thawing a
+    /// process that is not frozen succeeds.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`freeze`](Self::freeze), except that it never returns
+    /// [`StatusCode::WouldBlock`].
+    pub fn thaw(&self, pid: i32) -> Result<()> {
+        self.set_frozen(pid, false, Duration::ZERO)
+    }
+
+    /// Freeze (`enable`) or thaw the binder state of process `pid`. AOSP
+    /// `IPCThreadState::freeze`.
+    ///
+    /// `timeout` applies to a freeze only; see [`freeze`](Self::freeze) and
+    /// [`thaw`](Self::thaw), which this forwards to.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `freeze(pid, timeout)` or `thaw(pid)`, which name the direction"
+    )]
     pub fn freeze_process(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
+        self.set_frozen(pid, enable, timeout)
+    }
+
+    fn set_frozen(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
         let pid = u32::try_from(pid)
             .ok()
             .filter(|pid| *pid > 0)
@@ -1447,7 +1523,7 @@ impl ProcessState {
             enable: enable.into(),
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
         };
-        binder::freeze(&*self.driver, info).map_err(StatusCode::from)
+        binder::freeze(&*self.driver, info).map_err(errno_status)
     }
 
     /// What the binder driver recorded for process `pid` since its last
@@ -1459,7 +1535,7 @@ impl ProcessState {
     ///   binder state.
     /// - `StatusCode::Errno(-EACCES)` on Android outside `system_server`,
     ///   which SELinux grants this ioctl alone, as for
-    ///   [`freeze_process`](Self::freeze_process).
+    ///   [`freeze`](Self::freeze).
     pub fn process_freeze_info(&self, pid: i32) -> Result<ProcessFreezeInfo> {
         let pid = u32::try_from(pid)
             .ok()
@@ -1470,7 +1546,7 @@ impl ProcessState {
             sync_recv: 0,
             async_recv: 0,
         };
-        binder::get_frozen_info(&*self.driver, &mut info).map_err(StatusCode::from)?;
+        binder::get_frozen_info(&*self.driver, &mut info).map_err(errno_status)?;
         Ok(ProcessFreezeInfo {
             sync_received: info.sync_recv & 1 != 0,
             transactions_pending: info.sync_recv & 2 != 0,
@@ -1492,17 +1568,11 @@ impl ProcessState {
                 return *existing_id;
             }
         }
-        // Drive RefCounter.strong 0→1 via SIBinder::from_arc → inc_strong.
-        let binder_pin = SIBinder::from_arc(Arc::clone(&arc));
-        // native::inc_weak ignores dummy_wi; dropping it never touches RefCounter.weak.
-        let dummy_wi = SIBinder::downgrade(&binder_pin);
-        arc.inc_weak(&dummy_wi)
-            .expect("inc_weak on Arc<dyn IBinder> must not fail");
         let id = self.next_native_id.fetch_add(1, Ordering::Relaxed);
         map.insert(
             id,
             PublishedNative {
-                binder_pin,
+                binder_pin: SIBinder::from_arc(arc),
                 publish_count: 0,
                 kernel_refs: 0,
                 pending_reservations: 0,
@@ -1616,13 +1686,7 @@ impl ProcessState {
             }
             slot.remove()
         };
-        // dec_weak (no side effect) before the drop that may run `Inner<T>::drop`; no BR_* left.
-        let arc_for_weak = Arc::clone(entry.binder_pin.as_arc());
-        if let Err(e) = arc_for_weak.dec_weak() {
-            // Loud like `publish_native`'s `inc_weak`: silence hides a RefCounter.weak underflow.
-            log::error!("unpublish_native: dec_weak failed for id {id}: {e:?}");
-        }
-        drop(entry.binder_pin);
+        drop(entry);
     }
 
     pub fn disable_background_scheduling(&self, disable: bool) {
@@ -1638,14 +1702,62 @@ impl ProcessState {
         self.driver.clone()
     }
 
-    /// Init-time driver path; `serve`/`Client` compare it to detect a conflicting re-init.
-    pub(crate) fn driver_name(&self) -> &std::path::Path {
+    /// The binder driver path the process was initialized with, as passed to
+    /// [`init`](Self::init) (or the one [`init_default`](Self::init_default)
+    /// chose).
+    pub fn driver_name(&self) -> &Path {
         &self.driver_name
     }
 
-    /// Init-time `max_threads` (`0` = no kernel-driven spawns); see [`Self::driver_name`].
-    pub(crate) fn max_threads(&self) -> u32 {
-        self.max_threads
+    /// The kernel thread-pool ceiling in force: the `max_threads` the
+    /// process was initialized with, or the last value
+    /// [`set_max_threads`](Self::set_max_threads) applied. `0` means the
+    /// kernel never asks for a pooled thread. See [`init`](Self::init).
+    pub fn max_threads(&self) -> u32 {
+        self.max_threads.load(Ordering::Acquire)
+    }
+
+    /// Change the kernel thread-pool ceiling: `BINDER_SET_MAX_THREADS`
+    /// with `max_threads` as written, as AOSP
+    /// `ProcessState::setThreadPoolMaxThreadCount` does. On success
+    /// [`max_threads`](Self::max_threads) returns the new value.
+    ///
+    /// Before [`start_thread_pool`](Self::start_thread_pool) any value is
+    /// accepted. After it, the ceiling may stay or grow but not shrink:
+    /// threads the kernel already asked for are running and are not taken
+    /// back. AOSP aborts the process on a shrink after the pool started;
+    /// here it is [`StatusCode::InvalidOperation`], logged, with the
+    /// ceiling unchanged.
+    ///
+    /// Unlike the receive mapping ([`mmap_size`](Self::mmap_size)), which
+    /// is mapped once at init and cannot be resized, the ceiling is a
+    /// driver setting and may change while the process runs.
+    ///
+    /// # Errors
+    ///
+    /// - [`StatusCode::InvalidOperation`]: a value below the ceiling in
+    ///   force after the pool started.
+    /// - The status of the failed `ioctl`; the ceiling is unchanged.
+    pub fn set_max_threads(&self, max_threads: u32) -> Result<()> {
+        let _serial = self
+            .max_threads_set
+            .lock()
+            .expect("max_threads_set poisoned");
+        let in_force = self.max_threads();
+        if self.thread_pool_started() && max_threads < in_force {
+            log::error!(
+                "ProcessState::set_max_threads({max_threads}): the binder thread pool has \
+                 started with a ceiling of {in_force} and cannot be shrunk"
+            );
+            return Err(StatusCode::InvalidOperation);
+        }
+        binder::set_max_threads(&self.driver, max_threads).map_err(|e| {
+            log::error!("Binder ioctl to set max threads failed: {e}");
+            errno_status(e)
+        })?;
+        self.max_threads.store(max_threads, Ordering::Release);
+        Self::log_max_threads(max_threads);
+        Ok(())
     }
 
     /// Whether [`start_thread_pool`](Self::start_thread_pool) ran (AOSP `mThreadPoolStarted`).
@@ -1740,7 +1852,7 @@ impl ProcessState {
             return Ok(());
         }
         // Mirror of AOSP `checkExpectingThreadPoolStart` (pool sized but never started).
-        if this.max_threads == 0 {
+        if this.max_threads() == 0 {
             log::warn!(
                 "start_thread_pool() with max_threads = 0: one worker is spawned, but the \
                  kernel will never ask for another, so the pool cannot grow under load. \
@@ -1804,9 +1916,11 @@ impl ProcessState {
             reserved3: 0,
         };
 
-        binder::get_node_info_for_ref(&self.driver, &mut info).inspect_err(|&e| {
-            log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {e:?}");
-        })?;
+        binder::get_node_info_for_ref(&self.driver, &mut info)
+            .inspect_err(|&e| {
+                log::error!("Binder ioctl(BINDER_GET_NODE_INFO_FOR_REF) failed: {e:?}");
+            })
+            .map_err(errno_status)?;
         Ok(info.strong_count as usize)
     }
 
@@ -1815,35 +1929,39 @@ impl ProcessState {
     }
 }
 
-fn open_driver(
-    driver: &Path,
-    max_threads: u32,
-) -> std::result::Result<File, Box<dyn std::error::Error>> {
+fn open_driver(driver: &Path, max_threads: u32) -> Result<File> {
     let fd = File::options()
         .read(true)
         .write(true)
         .open(driver)
-        .map_err(|e| format!("Opening '{}' failed: {}\n", driver.to_string_lossy(), e))?;
+        .map_err(|e| {
+            log::error!("Opening '{}' failed: {e}", driver.to_string_lossy());
+            StatusCode::from(e)
+        })?;
 
     let mut vers = binder::binder_version {
         protocol_version: 0,
     };
 
-    binder::version(&fd, &mut vers)
-        .map_err(|e| format!("Binder ioctl to obtain version failed: {e}"))?;
+    binder::version(&fd, &mut vers).map_err(|e| {
+        log::error!("Binder ioctl to obtain version failed: {e}");
+        errno_status(e)
+    })?;
     log::info!("Binder driver protocol version: {}", vers.protocol_version);
 
     if vers.protocol_version != binder::BINDER_CURRENT_PROTOCOL_VERSION as i32 {
-        return Err(format!(
+        log::error!(
             "Binder driver protocol({}) does not match user space protocol({})!",
             vers.protocol_version,
             binder::BINDER_CURRENT_PROTOCOL_VERSION
-        )
-        .into());
+        );
+        return Err(StatusCode::NoInit);
     }
 
-    binder::set_max_threads(&fd, max_threads)
-        .map_err(|e| format!("Binder ioctl to set max threads failed: {e}"))?;
+    binder::set_max_threads(&fd, max_threads).map_err(|e| {
+        log::error!("Binder ioctl to set max threads failed: {e}");
+        errno_status(e)
+    })?;
     log::info!("Binder driver max threads set to {max_threads}");
 
     let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
@@ -1868,6 +1986,17 @@ impl Drop for ProcessState {
         if let Err(e) = unsafe { rustix::mm::munmap(self.mmap.ptr, self.mmap.size) } {
             log::error!("ProcessState::drop: munmap failed: {e}");
         }
+    }
+}
+
+impl std::fmt::Debug for ProcessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessState")
+            .field("driver", &self.driver_name)
+            .field("max_threads", &self.max_threads())
+            .field("mmap_size", &self.mmap.size)
+            .field("thread_pool_started", &self.thread_pool_started())
+            .finish_non_exhaustive()
     }
 }
 
@@ -2037,7 +2166,7 @@ mod tests {
     fn assert_process_state_initialized() {
         let process = ProcessState::init_default().expect("init_default");
         // `init_default` passes the default explicitly; no sentinel is rewritten into it.
-        assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
+        assert_eq!(process.max_threads(), DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
             process.driver_name,
             PathBuf::from(ProcessState::default_driver_path())
@@ -2347,7 +2476,7 @@ mod tests {
         }
     }
 
-    /// Driver-free native `IBinder` with no-op ref counts, for the `published_natives` tests.
+    /// Driver-free native `IBinder`, for the `published_natives` tests.
     struct MockNative;
 
     impl IBinder for MockNative {
@@ -2371,21 +2500,6 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             false
-        }
-        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> Result<()> {
-            Ok(())
         }
     }
 

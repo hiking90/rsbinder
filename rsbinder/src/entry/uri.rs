@@ -197,7 +197,11 @@ impl From<KernelEndpoint> for Endpoint {
 /// Every setting left unset means the default. The settings apply to the
 /// process-wide [`ProcessState`](crate::ProcessState), so
 /// [`serve`](super::serve) / [`Client::open`](super::Client::open) refuse
-/// one that disagrees with a `ProcessState` already initialized.
+/// a driver or mmap size that disagrees with a `ProcessState` already
+/// initialized. The thread ceiling is the exception on the server side: a
+/// server's `run` / `spawn` applies a different one to the running process
+/// ([`ProcessState::set_max_threads`](crate::ProcessState::set_max_threads)),
+/// while a client still refuses it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct KernelEndpoint {
@@ -250,7 +254,12 @@ impl KernelEndpoint {
 
 /// Which RPC wire a session speaks. A kernel binder [`Uri`] takes only
 /// [`WireProfile::R34`]; any other is `BadValue` at `serve` / `connect`.
+///
+/// `#[non_exhaustive]`: a later AOSP wire that is not a version of the
+/// android-13+ one would be a variant of its own, so a `match` keeps a
+/// wildcard arm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum WireProfile {
     /// The AOSP android-12 r34 wire, without a handshake.
     #[default]

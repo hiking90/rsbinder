@@ -1,68 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Concrete shared-memory heaps (Plan 4-7a Phase A).
-//!
-//! * [`MemoryHeapBase`] — the *owner* side. Allocates an anonymous
-//!   shared region and (by default) maps it into this process.
-//! * [`MappedHeap`] — the *receiver* side. Wraps an fd that arrived
-//!   through a parcel plus the wire geometry (`size`, `offset`,
-//!   `flags`) and maps it.
-//!
-//! Backing store by target:
-//!
-//! | target | create | size guard |
-//! |---|---|---|
-//! | linux / android | `memfd_create(MFD_CLOEXEC \| MFD_ALLOW_SEALING)` | `F_SEAL_GROW \| F_SEAL_SHRINK` (+`F_SEAL_FUTURE_WRITE` for read-only, +`F_SEAL_SEAL` unless [`FLAG_MEMFD_ALLOW_SEALING`]) — the AOSP `MemoryHeapBase::FORCE_MEMFD` path |
-//! | macos | `shm_open` + immediate `shm_unlink` (two fds: `O_RDWR` for the owner, `O_RDONLY` to export) | kernel-inherent: a POSIX shm object accepts exactly **one** `ftruncate` (≡ `F_SEAL_GROW \| F_SEAL_SHRINK`), and an `O_RDONLY` fd refuses `PROT_WRITE` mappings and `mprotect` upgrades (≡ `F_SEAL_FUTURE_WRITE`). See `plan/4-7b-macos-shared-memory.md` |
-//! | other | no backing store — every [`MemoryHeapBase`] constructor returns `InvalidOperation`, and [`is_supported`] is `false`. The receiver side is not all gone: see [`MappedHeap::from_fd`] | — |
-//!
-//! The owner mapping is always created *before* seals are applied so
-//! that `F_SEAL_FUTURE_WRITE` leaves the owner's own mapping writable,
-//! exactly like AOSP `MemoryHeapBase.cpp`. Receivers map `PROT_READ`
-//! only when [`FLAG_READ_ONLY`] is set — and on every backend the
-//! kernel refuses a writable mapping to a peer that ignores the flag
-//! (Linux 5.1+; an older kernel lacks `F_SEAL_FUTURE_WRITE`, which
-//! `seals()` reports).
-//!
-//! `seals()` reports the **effective protections** of the fd a heap
-//! exports as `SEAL_*` bits: `F_GET_SEALS` on Linux/Android, synthesized
-//! from the kernel semantics above on macOS (`SEAL_SHRINK | SEAL_GROW`,
-//! plus `SEAL_FUTURE_WRITE` when the exported fd is read-only; never
-//! `SEAL_SEAL`). On macOS only a POSIX shm object qualifies: it has no
-//! vnode, so `st_mode` carries no `S_IFMT` bits. A regular file (resizable
-//! by any holder) yields `None`, matching `F_GET_SEALS` failing on
-//! non-memfd fds on Linux.
-//!
-//! **Aliasing.** A shared mapping is, by definition, writable by other
-//! processes at any time, so no safe accessor ever exposes it as `&[u8]`:
-//! [`read_at`](MemoryHeapBase::read_at) / [`write_at`](MemoryHeapBase::write_at)
-//! copy through atomics, and [`IMemoryHeap::base`] returns the read-only
-//! [`SharedBytes`] view built on the same copies. Only the raw
-//! [`as_ptr`](MemoryHeapBase::as_ptr) carries AOSP's `unsecurePointer()`
-//! caveat, and it is the caller's `unsafe` to dereference.
-//!
-//! The heaps' shared state is `Send + Sync` on the same basis. The mapping
-//! is a `rsbinder_fmq::shm::Mapping`, an address range with no thread
-//! affinity that is `Send + Sync` itself, and every safe access goes through
-//! `Mapping::region` — atomic loads and stores, uniformly word-sized on the
-//! word part — so concurrent `read_at`/`write_at`/`base` from several
-//! threads (or another process) are data races only in the hardware sense,
-//! never in Rust's model. That is the contract `shm::Mapping` sets for the
-//! code that turns its address into references: atomic access only, no byte
-//! at two sizes through one mapping, and `Relaxed` loads no wider than a
-//! `usize` through a read-only one. Stores are gated on the heap being
-//! writable, so a `PROT_READ` mapping is never written. The atomic view
-//! relies on the mapping starting on a page boundary (the heap's offset is
-//! page-aligned, so the word part is `usize`-aligned), `AtomicUsize` having
-//! `usize`'s size and alignment, and `AtomicU8` being `repr(transparent)`
-//! over `u8`.
-//!
-//! `shm::Mapping` adds two refusals to the `mmap` it makes, both
-//! `BadValue`: a range of more than `isize::MAX` bytes, which no Rust slice
-//! may span (a 32-bit target only), and on Linux and Android an fd the
-//! kernel reports as a hugetlbfs file, whose mapping could not be released
-//! on drop.
+//! The heaps; documented in the parent module, section "Heaps".
 
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "macos")]
@@ -264,8 +203,9 @@ mod backend {
         match shm::add_seals(fd.as_fd(), seals) {
             Ok(()) => Ok(()),
             // Pre-5.1 kernel lacks FUTURE_WRITE (EINVAL): apply the rest; `seals()` shows the gap.
-            Err(rsbinder_fmq::Error::Os(rustix::io::Errno::INVAL))
-                if seals.contains(Seals::FUTURE_WRITE) =>
+            Err(rsbinder_fmq::Error::Os(errno))
+                if errno.raw() == rustix::io::Errno::INVAL.raw_os_error()
+                    && seals.contains(Seals::FUTURE_WRITE) =>
             {
                 log::warn!("memfd F_SEAL_FUTURE_WRITE unsupported by this kernel; read-only heap is not write-sealed");
                 shm::add_seals(fd.as_fd(), seals.difference(Seals::FUTURE_WRITE))?;
@@ -306,14 +246,14 @@ mod backend {
                     last = StatusCode::AlreadyExists;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(crate::error::errno_status(e)),
             };
             // RO re-open before unlink; EXCL above keeps the name ours for that window.
             let ro = rustix::shm::open(shm_name.as_str(), OFlags::RDONLY, Mode::empty());
             let _ = rustix::shm::unlink(shm_name.as_str());
-            let ro = ro?;
+            let ro = ro.map_err(crate::error::errno_status)?;
             // The one and only size set the kernel allows on this object.
-            rustix::fs::ftruncate(&fd, size as u64)?;
+            rustix::fs::ftruncate(&fd, size as u64).map_err(crate::error::errno_status)?;
             return Ok(Created {
                 fd,
                 ro_fd: Some(ro),
@@ -399,8 +339,8 @@ pub const fn is_supported() -> bool {
 // --- MemoryHeapBase: owner side --------------------------------------
 
 /// Owner-side heap: AOSP `MemoryHeapBase` (anonymous / `FORCE_MEMFD`
-/// constructor). See the [module doc](self) for the per-target backing
-/// store and the aliasing contract.
+/// constructor). See the [module doc](crate::shared_memory#heaps) for the
+/// per-target backing store and the aliasing contract.
 ///
 /// `size` is rounded up to a whole number of pages, as in AOSP. The
 /// owner's own mapping is always writable, even with [`FLAG_READ_ONLY`]
@@ -478,7 +418,7 @@ impl MemoryHeapBase {
 
     /// Effective protections (`SEAL_*` bits) of the fd this heap
     /// exports; `None` only if the query fails. Linux/Android read
-    /// `F_GET_SEALS`; macOS synthesizes them (see the module doc).
+    /// `F_GET_SEALS`; macOS synthesizes them (see the module doc, "Heaps").
     pub fn seals(&self) -> Option<u32> {
         self.0.seals()
     }
@@ -598,7 +538,9 @@ impl MappedHeap {
             return Err(StatusCode::BadValue);
         }
         let end = offset.checked_add(size).ok_or(StatusCode::BadValue)?;
-        let st_size = rustix::fs::fstat(&fd)?.st_size;
+        let st_size = rustix::fs::fstat(&fd)
+            .map_err(crate::error::errno_status)?
+            .st_size;
         if st_size <= 0 {
             if !super::shared::is_ashmem_fd(fd.as_fd()) {
                 log::error!("shared memory fd has no backing size and is not ashmem");

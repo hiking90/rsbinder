@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::{hub, ExceptionCode, Status};
+use rsbinder::hub;
 use rsbinder_topic::{Backpressure, Bytes, PoolPolicy, Publisher, PublisherPolicy, PublisherStats};
 use tests::topic_fleet::event::{Kind, Subscribed};
 use tests::topic_fleet::payload::{FleetPayload, FleetRecord};
@@ -36,7 +36,7 @@ pub fn policy(spec: &PubSpec) -> PublisherPolicy {
     }
     if let Some(ms) = spec.backpressure_ms {
         policy.backpressure = Some(Backpressure {
-            timeout: Duration::from_millis(ms),
+            publish_timeout: Duration::from_millis(ms),
             window: spec.window.and_then(NonZeroUsize::new),
         });
     }
@@ -56,6 +56,7 @@ pub fn pub_stats(topic: &str, stats: PublisherStats) -> Kind {
                 pid: info.pid,
                 lost: info.lost,
                 evicted: info.evicted,
+                pinned: info.pinned,
             })
             .collect(),
         bytes: stats.bytes,
@@ -132,7 +133,7 @@ pub fn finish<T: FleetPayload>(
     incarnation: Incarnation,
     next: u64,
 ) {
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     drop(publisher);
     published(out, topic, incarnation, next);
 }
@@ -206,7 +207,7 @@ fn run<T: FleetPayload>(
                 }
                 Ok(Request::Command(Command::Close, _)) if state == State::Publishing => {
                     if let Some(publisher) = &publisher {
-                        publisher.close(&Status::from(ExceptionCode::None));
+                        publisher.close();
                     }
                     published(&out, &spec.topic, incarnation, seq);
                     state = State::Done;
@@ -227,7 +228,7 @@ fn run<T: FleetPayload>(
                     if through_registry && state != State::Done =>
                 {
                     if let Some(old) = publisher.take() {
-                        old.close(&Status::from(ExceptionCode::None));
+                        old.close();
                     }
                     match transport::advertise(&spec.topic, &policy(&spec), &spec.via) {
                         Ok(new) => {

@@ -119,11 +119,11 @@
 //!   the extra `GET_SESSION_ID` round trip it adds is not observed.
 //! - `attach_with_a_bogus_session_id_is_refused_at_attach_time`: the
 //!   outgoing attach wire has no server→client acknowledgement (the server
-//!   refuses by closing), so `add_outgoing_connection_with_config` confirms
+//!   refuses by closing), so `add_outgoing_connection` confirms
 //!   with one `GET_SESSION_ID` round trip. A single-threaded client always
 //!   draws slot 1 first, so the test drives 4 threads to reach the attached
-//!   slot. The client-local id and an unknown id are both refused before
-//!   connecting (`BadValue`), leaving the session up; the echo loop is the
+//!   slot. An unknown id, which only the deprecated manual attach can name, is
+//!   refused before connecting (`BadValue`), leaving the session up; the echo loop is the
 //!   control that a confirmed pool has no dead slot. The `confirm_attach`
 //!   mutant is caught by
 //!   `attach_past_the_server_slot_cap_is_refused_at_attach_time`.
@@ -210,8 +210,8 @@
 //!   Phase B). The test pins that safety property; no assertion depends on
 //!   the DEC going out.
 //! - `preconnected_inet_fd_handshakes_over_tcp_debug`: the android-13+
-//!   handshake starts with a raw write; a transport without
-//!   `send_raw`/`recv_raw` gets the trait default's `Protocol` refusal.
+//!   handshake starts with a raw write, so the adopted `AF_INET` fd must be
+//!   wrapped by a transport whose `send_raw`/`recv_raw` reach the socket.
 //! - `terminate_ends_every_session_and_joins_workers`: only the android-13+
 //!   session has an id (the r34 one was never in the id registry), and it is
 //!   `Live(2)`; the test checks that `terminate` still returns and that
@@ -234,10 +234,10 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcSession};
+use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcServerHandle, RpcSession};
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION,
+    Binder, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status, StatusCode,
+    TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IEcho2";
@@ -299,10 +299,10 @@ impl IEcho2 for EchoSvc {
             .as_any()
             .downcast_ref::<RpcProxy>()
             .ok_or(StatusCode::BadType)?;
-        let mut d = rp.build_request(DESC)?;
+        let mut d = rp.prepare_request(DESC)?;
         d.write(&"ping")?;
         let mut r = rp
-            .transact(TX_ECHO, &d, 0)?
+            .submit_transact(TX_ECHO, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         let got: String = r.read()?;
@@ -446,55 +446,55 @@ impl EchoProxy {
             .expect("RpcProxy")
     }
     fn echo(&self, s: &str) -> Result<String> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(&s)?;
         let mut r = self
             .rp()
-            .transact(TX_ECHO, &d, 0)?
+            .submit_transact(TX_ECHO, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
     }
     fn bump(&self) -> Result<()> {
-        let d = self.rp().build_request(DESC)?;
+        let d = self.rp().prepare_request(DESC)?;
         self.rp()
-            .transact(TX_BUMP, &d, rsbinder::FLAG_ONEWAY)
+            .submit_transact(TX_BUMP, &d, rsbinder::FLAG_ONEWAY)
             .map(|_| ())
     }
     fn count(&self) -> Result<i64> {
-        let d = self.rp().build_request(DESC)?;
+        let d = self.rp().prepare_request(DESC)?;
         let mut r = self
             .rp()
-            .transact(TX_COUNT, &d, 0)?
+            .submit_transact(TX_COUNT, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<i64>()
     }
     fn slow(&self, ms: i32) -> Result<()> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(&ms)?;
         let mut r = self
             .rp()
-            .transact(TX_SLOW, &d, 0)?
+            .submit_transact(TX_SLOW, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)
     }
     fn roundtrip(&self, cb: &SIBinder) -> Result<String> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(cb)?;
         let mut r = self
             .rp()
-            .transact(TX_ROUNDTRIP, &d, 0)?
+            .submit_transact(TX_ROUNDTRIP, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
     }
     fn hold(&self, cb: &SIBinder) -> Result<()> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(cb)?;
         let mut r = self
             .rp()
-            .transact(TX_HOLD_CB, &d, 0)?
+            .submit_transact(TX_HOLD_CB, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)
     }
@@ -535,21 +535,19 @@ fn raw_attach_is_refused(path: &std::path::Path, id: &[u8]) -> bool {
     }
 }
 
-/// An attach config whose connection's socket is also kept in `kept`, so a test can sever it.
-fn attach_keeping_socket<'a>(
-    path: &'a std::path::Path,
+/// A config whose every connection's socket is also kept in `kept`, so a test can sever one.
+fn keeping_sockets(
+    path: &std::path::Path,
     max_version: u32,
-    session_id: &'a [u8],
-    kept: &'a Mutex<Vec<std::os::unix::net::UnixStream>>,
-) -> RpcClientConfig<'a> {
+    kept: &Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+) -> RpcClientConfig {
+    let (path, kept) = (path.to_path_buf(), Arc::clone(kept));
     RpcClientConfig::new(max_version, move || {
-        let stream = std::os::unix::net::UnixStream::connect(path)?;
+        let stream = std::os::unix::net::UnixStream::connect(&path)?;
         kept.lock().unwrap().push(stream.try_clone()?);
-        let t = rsbinder::rpc::transport::UnixTransport::from_owned_fd(stream.into())
-            .map_err(StatusCode::from)?;
+        let t = rsbinder::rpc::transport::UnixTransport::from_owned_fd(stream.into())?;
         Ok(Box::new(t) as Box<dyn rsbinder::rpc::RpcTransport>)
     })
-    .session_id(session_id)
 }
 
 /// Wait until a server socket file exists (bounded).
@@ -586,15 +584,11 @@ impl Drop for KillOnDrop {
 /// Stops, joins, terminates and unlinks on any drop, a panic included; one per test.
 struct ServeCleanup {
     server: Arc<RpcServer>,
-    bg: Option<std::thread::JoinHandle<()>>,
+    bg: Option<RpcServerHandle>,
     path: Option<std::path::PathBuf>,
 }
 impl ServeCleanup {
-    fn new(
-        server: Arc<RpcServer>,
-        bg: std::thread::JoinHandle<()>,
-        path: std::path::PathBuf,
-    ) -> Self {
+    fn new(server: Arc<RpcServer>, bg: RpcServerHandle, path: std::path::PathBuf) -> Self {
         Self {
             server,
             bg: Some(bg),
@@ -604,22 +598,16 @@ impl ServeCleanup {
 }
 impl Drop for ServeCleanup {
     fn drop(&mut self) {
-        self.server.stop_accepting();
+        // `stop_and_join` terminates, not `join_workers`: a client left connected would hang.
         if let Some(h) = self.bg.take() {
-            // Print, not `resume_unwind`: the test may already be unwinding its own panic.
-            if let Err(p) = h.join() {
-                let msg = p
-                    .downcast_ref::<&'static str>()
-                    .copied()
-                    .or_else(|| p.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("<non-string panic payload>");
+            // Print, not panic: the test may already be unwinding its own panic.
+            if let Err(e) = h.stop_and_join() {
                 eprintln!(
                     "WARNING: ServeCleanup observed a background accept-loop \
-                     panic during teardown: {msg}"
+                     failure or panic during teardown: {e:?}"
                 );
             }
         }
-        // Not `join_workers`: a client a test left connected would hang the whole binary.
         self.server.terminate();
         if let Some(path) = &self.path {
             let _ = std::fs::remove_file(path);
@@ -634,7 +622,7 @@ fn real_process_e2e_and_negotiation() {
     // Child role: become the server and block.
     if let Ok(path) = std::env::var("RSB_RPC_SERVER") {
         let server = RpcServer::setup_unix_server(&path).expect("bind");
-        server.set_max_threads(2);
+        server.set_max_threads(2).expect("set_max_threads");
         server
             .set_root(make_service(Arc::new(AtomicI64::new(0))))
             .expect("set_root");
@@ -655,13 +643,11 @@ fn real_process_e2e_and_negotiation() {
 
     {
         let client = RpcSession::setup_unix_client(&path).expect("connect");
-        let r34bad = tmp_sock("r34bad");
-        assert!(matches!(
-            client.add_outgoing_connection_with_config(
-                RpcClientConfig::unix(&r34bad, 1).session_id(&[0u8; 32])
-            ),
-            Err(StatusCode::BadType)
-        ));
+        // An r34 session keeps no connector to attach with.
+        assert_eq!(
+            client.add_outgoing_connection(),
+            Err(StatusCode::InvalidOperation)
+        );
         // Explicit negotiation, local=8, server advertises 2.
         assert_eq!(client.negotiate(8).expect("negotiate"), 2);
         assert_eq!(client.negotiated_max_threads(), 2);
@@ -690,7 +676,7 @@ fn real_process_abstract_unix_socket_e2e() {
     if let Ok(name) = std::env::var("RSB_RPC_ABSTRACT_SERVER") {
         let server = RpcServer::setup_unix_server_abstract(name.as_bytes()).expect("bind abstract");
         server.set_android13plus(2);
-        server.set_max_threads(3);
+        server.set_max_threads(3).expect("set_max_threads");
         server
             .set_root(make_service(Arc::new(AtomicI64::new(0))))
             .expect("set_root");
@@ -726,12 +712,9 @@ fn real_process_abstract_unix_socket_e2e() {
 
     assert_eq!(client.wire_protocol_version(), Some(2));
     assert_eq!(client.negotiate(8).expect("negotiate"), 3);
-    let sid = client.get_session_id().expect("get_session_id");
     assert_eq!(
         client
-            .add_outgoing_connection_with_config(
-                RpcClientConfig::unix_abstract(name.as_bytes(), 2).session_id(&sid),
-            )
+            .add_outgoing_connection()
             .expect("attach to the abstract child session"),
         2
     );
@@ -772,7 +755,7 @@ fn concurrent_calls_single_shared_session() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -825,7 +808,7 @@ fn concurrent_clients_isolated_sessions() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -859,7 +842,7 @@ fn max_connections_admission_bound() {
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
     server.set_max_connections(2);
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -881,7 +864,8 @@ fn max_connections_admission_bound() {
 
     // c3 lands in the kernel backlog; accept is gated at 2, so its `get_root` must time out.
     let c3 = RpcSession::setup_unix_client(&path).expect("connect c3 (backlog)");
-    c3.set_timeout(Some(Duration::from_millis(600)));
+    c3.set_reply_timeout(Some(Duration::from_millis(600)))
+        .expect("timeout");
     assert!(
         c3.get_root().is_err(),
         "3rd connection must be admission-blocked while 2 workers are live"
@@ -891,7 +875,8 @@ fn max_connections_admission_bound() {
     // Dropping c1 ends its worker; the next accept tick reaps it and accept resumes.
     drop(c1);
     let c4 = RpcSession::setup_unix_client(&path).expect("connect c4");
-    c4.set_timeout(Some(Duration::from_secs(5)));
+    c4.set_reply_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
     assert_eq!(
         EchoProxy(c4.get_root().expect("c4 get_root after a slot freed"))
             .echo("c4")
@@ -915,8 +900,10 @@ fn silent_r34_peer_released_by_handshake_deadline() {
         .expect("set_root");
     // One slot makes a pinned silent peer observable; a short deadline keeps it fast.
     server.set_max_connections(1);
-    server.set_handshake_timeout(Some(Duration::from_millis(300)));
-    let bg = server.run_background();
+    server
+        .set_handshake_timeout(Some(Duration::from_millis(300)))
+        .expect("handshake timeout");
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -926,7 +913,8 @@ fn silent_r34_peer_released_by_handshake_deadline() {
 
     // c2 waits in the backlog until c1's worker hits the first-frame deadline.
     let c2 = RpcSession::setup_unix_client(&path).expect("connect c2");
-    c2.set_timeout(Some(Duration::from_secs(5)));
+    c2.set_reply_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
     assert_eq!(
         EchoProxy(c2.get_root().expect("c2 get_root after c1 deadline"))
             .echo("c2")
@@ -950,7 +938,7 @@ fn oneway_fifo_and_nonblocking() {
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -991,7 +979,7 @@ fn nested_callback_no_deadlock() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1019,12 +1007,14 @@ fn client_timeout_on_hung_server() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
-    client.set_timeout(Some(Duration::from_millis(150)));
+    client
+        .set_reply_timeout(Some(Duration::from_millis(150)))
+        .expect("timeout");
     let root = EchoProxy(client.get_root().expect("get_root"));
 
     // Server sleeps 5s; client deadline is 150ms → deterministic Timeout.
@@ -1046,12 +1036,14 @@ fn a_session_with_one_busy_connection_is_not_idle() {
     let path = tmp_sock("idlefan");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(2);
-    server.set_idle_timeout(Some(Duration::from_millis(400)));
+    server.set_max_threads(2).expect("set_max_threads");
+    server
+        .set_idle_timeout(Some(Duration::from_millis(400)))
+        .expect("idle timeout");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1079,12 +1071,14 @@ fn a_dispatch_longer_than_the_idle_period_is_not_idle() {
     let path = tmp_sock("idledisp");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(2);
-    server.set_idle_timeout(Some(Duration::from_millis(300)));
+    server.set_max_threads(2).expect("set_max_threads");
+    server
+        .set_idle_timeout(Some(Duration::from_millis(300)))
+        .expect("idle timeout");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1124,13 +1118,17 @@ fn a_handler_waiting_on_its_own_callback_is_not_idle() {
     let path = tmp_sock("idlehcb");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(2);
-    server.set_idle_timeout(Some(Duration::from_millis(300)));
-    server.set_reply_timeout(Some(Duration::from_secs(10)));
+    server.set_max_threads(2).expect("set_max_threads");
+    server
+        .set_idle_timeout(Some(Duration::from_millis(300)))
+        .expect("idle timeout");
+    server
+        .set_reply_timeout(Some(Duration::from_secs(10)))
+        .expect("reply timeout");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1153,7 +1151,7 @@ fn a_reply_timeout_on_one_connection_ends_the_fan_out_session() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Two outgoing connections and one callback connection from the client.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     let slow_entered = Arc::new(AtomicBool::new(false));
     server
         .set_root(make_service_with_slow_signal(
@@ -1161,7 +1159,7 @@ fn a_reply_timeout_on_one_connection_ends_the_fan_out_session() {
             Arc::clone(&slow_entered),
         ))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1191,7 +1189,9 @@ fn a_reply_timeout_on_one_connection_ends_the_fan_out_session() {
     // Well past the send, so that call has read the session's (absent) deadline already.
     std::thread::sleep(Duration::from_millis(100));
 
-    client.set_timeout(Some(Duration::from_millis(200)));
+    client
+        .set_reply_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
     assert_eq!(root.slow(3_000), Err(StatusCode::TimedOut));
     assert_eq!(
         other.join().expect("other call"),
@@ -1230,11 +1230,11 @@ fn android13plus_profile_e2e() {
         let counter = Arc::new(AtomicI64::new(0));
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(smax); // opt in to the versioned wire
-        server.set_max_threads(2);
+        server.set_max_threads(2).expect("set_max_threads");
         server
             .set_root(make_service(counter.clone()))
             .expect("set_root");
-        let bg = server.run_background();
+        let bg = server.run_background().expect("run_background");
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
         wait_for_sock(&path);
 
@@ -1300,7 +1300,7 @@ fn abstract_unix_socket_e2e() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu_r34 = ServeCleanup {
         server: Arc::clone(&server),
         bg: Some(bg),
@@ -1315,19 +1315,21 @@ fn abstract_unix_socket_e2e() {
     let server = RpcServer::setup_unix_server_abstract(&a13_name).expect("bind abstract a13");
     assert!(server.path().is_none());
     server.set_android13plus(2);
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu_a13 = ServeCleanup {
         server: Arc::clone(&server),
         bg: Some(bg),
         path: None,
     };
 
-    let client = RpcSession::setup_unix_client_android13plus_abstract(&a13_name, 2)
-        .expect("connect abstract android13plus");
+    let client = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix_abstract(&a13_name, 2),
+    )
+    .expect("connect abstract android13plus");
     assert_eq!(client.wire_protocol_version(), Some(2));
     assert_eq!(client.negotiate(8).expect("negotiate"), 2);
     let root = EchoProxy(client.get_root().expect("get_root"));
@@ -1336,9 +1338,7 @@ fn abstract_unix_socket_e2e() {
     let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
     client
-        .add_outgoing_connection_with_config(
-            RpcClientConfig::unix_abstract(&a13_name, 2).session_id(&sid),
-        )
+        .add_outgoing_connection()
         .expect("attach abstract android13plus");
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
@@ -1348,11 +1348,11 @@ fn abstract_unix_socket_e2e() {
     let fan_name = format!("rsb_rpc_abs_fan_{}", std::process::id()).into_bytes();
     let fan_server = RpcServer::setup_unix_server_abstract(&fan_name).expect("bind fan-out");
     fan_server.set_android13plus(2);
-    fan_server.set_max_threads(3);
+    fan_server.set_max_threads(3).expect("set_max_threads");
     fan_server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let fan_bg = fan_server.run_background();
+    let fan_bg = fan_server.run_background().expect("run_background");
     let _cu_fan = ServeCleanup {
         server: Arc::clone(&fan_server),
         bg: Some(fan_bg),
@@ -1497,7 +1497,7 @@ fn r34_profile_reports_no_wire_version() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1522,16 +1522,18 @@ fn multi_connection_shared_session() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Founding + one attach need 2 slots (AOSP `setMaxIncomingThreads(2)`); the default is 1.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // --- client #1: empty id ⇒ new session (default, byte-identical).
-    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ connect #1");
+    // --- client #1: empty id ⇒ new session (default, byte-identical); its sockets kept.
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let c1 = RpcSession::setup_client_android13plus_with_config(keeping_sockets(&path, 1, &kept))
+        .expect("a13+ connect #1");
     let root1 = EchoProxy(c1.get_root().expect("get_root #1"));
     assert_eq!(root1.echo("a0b-1").unwrap(), "a0b-1");
     assert!(
@@ -1545,8 +1547,7 @@ fn multi_connection_shared_session() {
     assert_eq!(sid1.len(), 32, "AOSP kSessionIdBytes");
 
     // --- connection #2: echoes #1's id ⇒ ATTACHED to #1's SharedSession; see module doc.
-    let kept = Mutex::new(Vec::new());
-    c1.add_outgoing_connection_with_config(attach_keeping_socket(&path, 1, &sid1, &kept))
+    c1.add_outgoing_connection()
         .expect("a13+ connection #2 (attach)");
     assert!(
         poll_until(|| server.attached_count() == 1),
@@ -1568,8 +1569,8 @@ fn multi_connection_shared_session() {
     );
     assert_eq!(server.attached_count(), 1, "attach count stable");
 
-    // Sever only #2.
-    kept.lock().unwrap()[0]
+    // Sever only #2 (`kept[0]` is the founding connection).
+    kept.lock().unwrap()[1]
         .shutdown(std::net::Shutdown::Both)
         .expect("sever connection #2");
     // One connection's loss ends the shared session (plan 2-24 D1, AOSP `handleRpcError`).
@@ -1601,16 +1602,18 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Opt into 2 incoming slots (default 1 ⇒ founding-only).
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     // Founding connection (#1): empty id ⇒ new session, one slot.
-    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ #1");
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let c1 = RpcSession::setup_client_android13plus_with_config(keeping_sockets(&path, 1, &kept))
+        .expect("a13+ #1");
     let _root1 = EchoProxy(c1.get_root().expect("get_root #1"));
     let sid = c1.get_session_id().expect("get_session_id #1");
     let sid_arr: [u8; 32] = sid
@@ -1624,9 +1627,7 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     );
 
     // Attached connection (#2): echoing #1's id adds a *slot* to the founding inner.
-    let kept = Mutex::new(Vec::new());
-    c1.add_outgoing_connection_with_config(attach_keeping_socket(&path, 1, &sid, &kept))
-        .expect("a13+ #2 (attach)");
+    c1.add_outgoing_connection().expect("a13+ #2 (attach)");
     assert!(
         poll_until(|| server.attached_count() == 1),
         "echo-id connection took the id-demux ATTACH path"
@@ -1639,7 +1640,7 @@ fn ac_12_f8_attach_unifies_to_single_inner() {
     );
 
     // One connection's end ends the one inner: its pool empties, the founding slot with it.
-    kept.lock().unwrap()[0]
+    kept.lock().unwrap()[1]
         .shutdown(std::net::Shutdown::Both)
         .expect("sever connection #2");
     assert!(
@@ -1656,23 +1657,24 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     // Founding (#1) + attached (#2): both under the cap.
-    let c1 = RpcSession::setup_unix_client_android13plus(&path, 1).expect("a13+ #1");
+    let c1 = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("a13+ #1");
     let _r1 = EchoProxy(c1.get_root().expect("get_root #1"));
     let sid = c1.get_session_id().expect("get_session_id #1");
     let sid_arr: [u8; 32] = sid
         .as_slice()
         .try_into()
         .expect("32-byte session id (AOSP kSessionIdBytes)");
-    c1.add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+    c1.add_outgoing_connection()
         .expect("a13+ #2 (attach within cap)");
     assert!(
         poll_until(|| server.session_slot_count(&sid_arr) == Some(2)),
@@ -1711,17 +1713,18 @@ fn ac_12_4_set_max_threads_caps_incoming_slots() {
 
 /// `outgoing_connections(N)` (AOSP `setupClient` fan-out) mints N-1 extra slots; see module doc.
 #[test]
+#[expect(deprecated, reason = "checks the manual attach's refusals")]
 fn fan_out_creates_n_outgoing_slots_when_local_max_outgoing_is_n() {
     let path = tmp_sock("b2fan");
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // N = 3; the helper learns the cap via `negotiate` and mints exactly N - 1 extras.
-    server.set_max_threads(3);
+    server.set_max_threads(3).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1790,11 +1793,11 @@ fn local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // The server allows multi-conn, but the client opts out: fan-out must NOT run.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1828,11 +1831,11 @@ fn local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
     let path2 = tmp_sock("b2zero");
     let server2 = RpcServer::setup_unix_server(&path2).expect("bind");
     server2.set_android13plus(1);
-    server2.set_max_threads(2);
+    server2.set_max_threads(2).expect("set_max_threads");
     server2
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg2 = server2.run_background();
+    let bg2 = server2.run_background().expect("run_background");
     let _cu2 = ServeCleanup::new(Arc::clone(&server2), bg2, path2.clone());
     wait_for_sock(&path2);
     let client_zero = RpcSession::setup_client_android13plus_with_config(
@@ -1848,45 +1851,44 @@ fn local_max_outgoing_one_skips_fan_out_byte_identical_to_founding_only() {
 
 /// A refused outgoing attach is an error at attach time, not a kept slot; see module doc.
 #[test]
+#[expect(deprecated, reason = "only the manual attach takes a foreign id")]
 fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
     let path = tmp_sock("badattach");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(4);
+    server.set_max_threads(4).expect("set_max_threads");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let client = Arc::new(RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect"));
+    let client = Arc::new(
+        RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+            .expect("connect"),
+    );
     let sid = client.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
 
-    // (a) The client-local `session_id()` is NOT the server-minted id.
-    assert_ne!(
-        client.session_id().as_slice(),
-        sid.as_slice(),
-        "a client session's `session_id()` is a local value, never the peer's"
-    );
-    // Refused before connecting: the session goes on and the server never sees it.
-    assert!(matches!(
+    // (a) Garbage is not this session's id: refused before connecting, the session goes on.
+    assert_eq!(
         client.add_outgoing_connection_with_config(
-            RpcClientConfig::unix(&path, 1).session_id(&client.session_id())
+            RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
         ),
-        Err(StatusCode::BadValue)
-    ));
+        Err(StatusCode::BadValue),
+        "attaching with an unknown id must fail here, not later"
+    );
     assert_eq!(
         server.session_slot_count(&sid_arr),
         Some(1),
         "the refused attach left the server session at its founding slot"
     );
 
-    // (b) Control: the server-minted id attaches; 200 calls on 4 threads, zero failures.
+    // (b) Control: the session's own attach succeeds; 200 calls on 4 threads, zero failures.
     assert_eq!(
         client
-            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+            .add_outgoing_connection()
             .expect("attach with the server-minted id"),
         2
     );
@@ -1905,7 +1907,7 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
         h.join().expect("client thread");
     }
 
-    // (c) Plain garbage is not this session's id either: refused before connecting.
+    // (c) The same refusal on a pool of two leaves both slots.
     assert_eq!(
         client.add_outgoing_connection_with_config(
             RpcClientConfig::unix(&path, 1).session_id(&[0xABu8; 32])
@@ -1927,16 +1929,17 @@ fn attach_with_a_bogus_session_id_is_refused_at_attach_time() {
 
 /// An attach naming another session's server id is `BadValue` before connecting; see module doc.
 #[test]
+#[expect(deprecated, reason = "only the manual attach takes a foreign id")]
 fn an_attach_with_another_sessions_id_is_refused_before_connecting() {
     let path = tmp_sock("foreignid");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Room for the attach, so only the client-side check can refuse it.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -1973,27 +1976,26 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Founding + exactly one attach.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let client = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    let sid = client.get_session_id().expect("get_session_id");
+    let client =
+        RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+            .expect("connect");
 
     assert_eq!(
         client
-            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+            .add_outgoing_connection()
             .expect("first attach is under the cap"),
         2
     );
     assert!(
-        client
-            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
-            .is_err(),
+        client.add_outgoing_connection().is_err(),
         "an attach past max_threads=2 must be refused at attach time"
     );
     // A monotonic counter: the slot count races the server's teardown of the ended session.
@@ -2011,15 +2013,16 @@ fn attach_past_the_server_slot_cap_is_refused_at_attach_time() {
 
 /// An attach cannot negotiate: `max_version` below the session's is `BadType`; its own works.
 #[test]
+#[expect(deprecated, reason = "only the manual attach takes a `max_version`")]
 fn attach_max_version_below_the_session_version_is_bad_type() {
     let path = tmp_sock("attachver");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(2);
-    server.set_max_threads(3);
+    server.set_max_threads(3).expect("set_max_threads");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2052,7 +2055,7 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2091,7 +2094,7 @@ fn r34_server_answers_an_aosp12_shaped_client() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2127,7 +2130,7 @@ fn r34_server_refuses_a_length_prefixed_client() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2159,7 +2162,9 @@ fn a_length_prefixed_server_refuses_the_r34_preamble() {
     use rsbinder::rpc::{AddressSpace, RpcError, RpcTransport};
     let (a, old_server) = UnixTransport::pair().expect("socketpair");
     let client = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("client");
-    client.set_timeout(Some(Duration::from_secs(5)));
+    client
+        .set_reply_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
     let caller = std::thread::spawn(move || client.get_root().map(|_| ()));
     assert!(matches!(
         old_server.recv_frame(),
@@ -2281,9 +2286,11 @@ fn r34_server(
 ) -> (Arc<RpcServer>, ServeCleanup, std::path::PathBuf) {
     let path = tmp_sock(tag);
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_max_threads(max_threads);
+    server
+        .set_max_threads(max_threads)
+        .expect("set_max_threads");
     server.set_root(make_service(counter)).expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
     (server, cu, path)
@@ -2357,12 +2364,14 @@ fn r34_joined_connections_serve_concurrently() {
 fn r34_joined_connection_outlives_the_handshake_deadline() {
     let path = tmp_sock("aosp12idle");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    server.set_max_threads(2);
-    server.set_handshake_timeout(Some(Duration::from_millis(200)));
+    server.set_max_threads(2).expect("set_max_threads");
+    server
+        .set_handshake_timeout(Some(Duration::from_millis(200)))
+        .expect("handshake timeout");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2417,7 +2426,7 @@ impl rsbinder::rpc::RpcTransport for PeerUid {
     fn peer_identity(&self) -> rsbinder::rpc::PeerIdentity {
         match self.0.peer_identity() {
             rsbinder::rpc::PeerIdentity::Local { pid, .. } => {
-                rsbinder::rpc::PeerIdentity::Local { uid: self.1, pid }
+                rsbinder::rpc::PeerIdentity::local(self.1, pid)
             }
             other => other,
         }
@@ -2512,15 +2521,17 @@ fn a_new_session_setup_refuses_a_session_id() {
     let path = tmp_sock("newid");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(3);
+    server.set_max_threads(3).expect("set_max_threads");
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let founding = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
+    let founding =
+        RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+            .expect("connect");
     let sid = founding.get_session_id().expect("get_session_id");
     let sid_arr: [u8; 32] = sid.as_slice().try_into().expect("32-byte session id");
     assert_eq!(
@@ -2555,7 +2566,7 @@ fn a_new_session_setup_refuses_a_session_id() {
     // Control: a connection is added to a session through that session.
     assert_eq!(
         founding
-            .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
+            .add_outgoing_connection()
             .expect("attach with the server-minted id"),
         2
     );
@@ -2571,11 +2582,11 @@ fn shutdown_gate_e2e_rejects_attach_during_handshake_stall() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Within the cap, so the only `rejected_unknown_id` increment is the shutdown arm's.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2648,7 +2659,7 @@ fn excess_receipt_no_leak_single_client() {
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
@@ -2686,20 +2697,18 @@ fn pool_distributes_concurrent_calls_across_outgoing_slots() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // Founding + one attach = 2 incoming slots; the default cap of 1 would reject the attach.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     let overlap: Arc<[AtomicUsize; 2]> = Arc::default();
     server
         .set_root(make_service_with_slow_overlap(Arc::clone(&overlap)))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    let sid = c.get_session_id().expect("get_session_id");
-    let slot2 = c
-        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
-        .expect("add outgoing slot");
+    let c = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("connect");
+    let slot2 = c.add_outgoing_connection().expect("add outgoing slot");
     assert_ne!(slot2, 1, "second slot has a fresh id (founding == 1)");
 
     // With the pool, `find_conn` gives each thread its own slot, so both sleeps overlap.
@@ -2741,20 +2750,18 @@ fn pool_exhausted_third_caller_waits_for_a_free_slot() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // 2 incoming slots (founding + attached); 3 client threads observe the cv-wait band.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     let overlap: Arc<[AtomicUsize; 2]> = Arc::default();
     server
         .set_root(make_service_with_slow_overlap(Arc::clone(&overlap)))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    let sid = c.get_session_id().expect("get_session_id");
-    let slot2 = c
-        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
-        .expect("slot 2");
+    let c = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("connect");
+    let slot2 = c.add_outgoing_connection().expect("slot 2");
     assert_ne!(slot2, 1, "second slot has a fresh id (founding == 1)");
 
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
@@ -2803,13 +2810,13 @@ fn pool_exhausted_wait_with_unrepresentable_deadline_waits_for_the_slot() {
             Arc::clone(&slow_entered),
         ))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
     // One `Outgoing` slot: while the parker drives it, the next caller reaches the (4) wait.
     let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    c.set_timeout(Some(Duration::MAX));
+    c.set_reply_timeout(Some(Duration::MAX)).expect("timeout");
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
 
     let parked = Arc::clone(&root);
@@ -2840,22 +2847,20 @@ fn pool_nested_callback_pins_to_forced_slot_single_thread() {
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
     // 2 incoming slots (founding + forced slot-2 echo).
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service_with_slow_signal(
             Arc::new(AtomicI64::new(0)),
             Arc::clone(&slow_entered),
         ))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    let sid = c.get_session_id().expect("get_session_id");
-    let slot2 = c
-        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
-        .expect("slot 2");
+    let c = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("connect");
+    let slot2 = c.add_outgoing_connection().expect("slot 2");
     assert_ne!(
         slot2, 1,
         "second slot has a fresh id (founding == 1) — otherwise the \
@@ -2896,20 +2901,19 @@ fn ac_12_2_extended_cross_slot_nested_callback_multi_thread() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    c.set_timeout(Some(Duration::from_secs(3)));
-    let sid = c.get_session_id().expect("get_session_id");
-    let slot2 = c
-        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
-        .expect("slot 2");
+    let c = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("connect");
+    c.set_reply_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    let slot2 = c.add_outgoing_connection().expect("slot 2");
     assert_ne!(slot2, 1, "second slot has a fresh id");
 
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
@@ -2937,19 +2941,17 @@ fn pool_oneway_fifo_under_concurrent_twoway_multi_outgoing() {
     let counter = Arc::new(AtomicI64::new(0));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
     server.set_android13plus(1);
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(make_service(counter.clone()))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    let c = RpcSession::setup_unix_client_android13plus(&path, 1).expect("connect");
-    let sid = c.get_session_id().expect("get_session_id");
-    let slot2 = c
-        .add_outgoing_connection_with_config(RpcClientConfig::unix(&path, 1).session_id(&sid))
-        .expect("slot 2");
+    let c = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path, 1))
+        .expect("connect");
+    let slot2 = c.add_outgoing_connection().expect("slot 2");
     assert_ne!(slot2, 1, "second slot has a fresh id");
 
     let root = Arc::new(EchoProxy(c.get_root().expect("get_root")));
@@ -3288,11 +3290,13 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
             .set_root(make_service(Arc::new(AtomicI64::new(0))))
             .expect("set_root");
         server.set_authorizer(|_peer| false);
-        let bg = server.run_background();
+        let bg = server.run_background().expect("run_background");
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
         wait_for_sock(&path);
         let client = RpcSession::setup_unix_client(&path).expect("connect");
-        client.set_timeout(Some(Duration::from_secs(3)));
+        client
+            .set_reply_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
         assert!(
             client.get_root().is_err(),
             "a rejecting authorizer must close the connection (zero RPC bytes)"
@@ -3308,7 +3312,7 @@ fn authorizer_gate_rejects_before_any_rpc_byte() {
             .set_root(make_service(Arc::new(AtomicI64::new(0))))
             .expect("set_root");
         server.set_authorizer(|peer| matches!(peer, PeerIdentity::Local { .. }));
-        let bg = server.run_background();
+        let bg = server.run_background().expect("run_background");
         let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
         wait_for_sock(&path);
         let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -3377,11 +3381,13 @@ fn boot_held_cfg(tag: &str, cfg: HeldCfg) -> HeldSetup {
     if cfg.a13 {
         server.set_android13plus(2);
     }
-    server.set_max_threads(cfg.max_threads);
-    server.set_idle_timeout(cfg.idle);
+    server
+        .set_max_threads(cfg.max_threads)
+        .expect("set_max_threads");
+    server.set_idle_timeout(cfg.idle).expect("set_idle_timeout");
     let root_local = make_service_with_hold(Arc::new(AtomicI64::new(0)), Arc::clone(&held));
     server.set_root(root_local.clone()).expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
     let client = if cfg.a13 {
@@ -3441,20 +3447,20 @@ fn rpc_of(b: &SIBinder) -> &RpcProxy {
 /// `TX_SLOW` on a proxy.
 fn drive_slow(cb: &SIBinder, ms: i32) -> Result<()> {
     let rp = rpc_of(cb);
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.prepare_request(DESC)?;
     d.write(&ms)?;
     let mut r = rp
-        .transact(TX_SLOW, &d, 0)?
+        .submit_transact(TX_SLOW, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     read_status(&mut r)
 }
 /// `TX_ROUNDTRIP` on `cb` with `target`: the callee calls `target.echo("ping")` back.
 fn drive_roundtrip(cb: &SIBinder, target: &SIBinder) -> Result<String> {
     let rp = rpc_of(cb);
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.prepare_request(DESC)?;
     d.write(target)?;
     let mut r = rp
-        .transact(TX_ROUNDTRIP, &d, 0)?
+        .submit_transact(TX_ROUNDTRIP, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     read_status(&mut r)?;
     r.read::<String>()
@@ -3465,13 +3471,14 @@ fn drive(cb: &SIBinder, oneway: bool) -> Result<()> {
         .as_any()
         .downcast_ref::<RpcProxy>()
         .expect("RpcProxy");
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.prepare_request(DESC)?;
     if oneway {
-        rp.transact(TX_BUMP, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+        rp.submit_transact(TX_BUMP, &d, rsbinder::FLAG_ONEWAY)
+            .map(|_| ())
     } else {
         d.write(&"x")?;
         let mut r = rp
-            .transact(TX_ECHO, &d, 0)?
+            .submit_transact(TX_ECHO, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         let got: String = r.read()?;
@@ -3578,9 +3585,9 @@ fn handshake_timeout_bounds_a_silent_peer() {
     };
     wait_for_sock(&path);
 
-    let via_timeout: fn(&std::path::Path) -> RpcClientConfig<'_> =
+    let via_timeout: fn(&std::path::Path) -> RpcClientConfig =
         |p| RpcClientConfig::unix(p, 2).timeout(Duration::from_millis(300));
-    let via_handshake_timeout: fn(&std::path::Path) -> RpcClientConfig<'_> =
+    let via_handshake_timeout: fn(&std::path::Path) -> RpcClientConfig =
         |p| RpcClientConfig::unix(p, 2).handshake_timeout(Duration::from_millis(300));
     for (name, config) in [
         ("timeout", via_timeout),
@@ -3610,7 +3617,7 @@ fn handshake_timeout_bounds_a_silent_peer() {
     server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path2.clone());
     wait_for_sock(&path2);
     let client = RpcSession::setup_client_android13plus_with_config(
@@ -3626,7 +3633,9 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let founded =
         RpcSession::setup_client_android13plus_with_config(RpcClientConfig::unix(&path2, 2))
             .expect("connect");
-    founded.set_timeout(Some(Duration::from_millis(300)));
+    founded
+        .set_reply_timeout(Some(Duration::from_millis(300)))
+        .expect("timeout");
     let sid = founded.get_session_id().expect("session id");
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let p = path.clone();
@@ -3995,6 +4004,7 @@ fn nested_call_from_oneway_callback_handler() {
 
 /// r34 + session id ⇒ `BadType`; attach + fan-out or incoming ⇒ `BadValue`, helpers included.
 #[test]
+#[expect(deprecated, reason = "validates the manual attach's config")]
 fn incoming_config_validation() {
     let h = boot_held_cfg(
         "b_cfg",
@@ -4029,10 +4039,8 @@ fn incoming_config_validation() {
         ),
         Err(StatusCode::BadValue)
     ));
-    // Manual attach works and is served.
-    h.client
-        .add_incoming_connection_with_config(RpcClientConfig::unix(&path, 2).session_id(&sid))
-        .expect("manual incoming attach");
+    // An incoming attach from the founding config works and is served.
+    h.client.add_incoming_connection().expect("incoming attach");
     // 1 is the founding slot; the attach must mint a fresh one.
     assert!(
         h.client.__slot_count() >= 2,
@@ -4266,10 +4274,10 @@ fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
         let caller = dispatching.then(|| {
             let root = EchoProxy(root.0.clone());
             std::thread::spawn(move || {
-                let mut d = root.rp().build_request(DESC).expect("request");
+                let mut d = root.rp().prepare_request(DESC).expect("request");
                 d.write(&300i32).expect("arg");
                 // Ends in an error once the session is shut down under it.
-                let _ = root.rp().transact(TX_SLOW, &d, 0);
+                let _ = root.rp().submit_transact(TX_SLOW, &d, 0);
             })
         });
         if dispatching {
@@ -4332,7 +4340,7 @@ fn terminate_ends_every_session_and_joins_workers() {
     r34_server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let r34_bg = r34_server.run_background();
+    let r34_bg = r34_server.run_background().expect("run_background");
     wait_for_sock(&r34_path);
     let r34 = RpcSession::setup_unix_client(&r34_path).expect("r34 connect");
     let r34_root = EchoProxy(r34.get_root().expect("root"));
@@ -4342,11 +4350,11 @@ fn terminate_ends_every_session_and_joins_workers() {
     let a13_path = tmp_sock("term13");
     let a13_server = RpcServer::setup_unix_server(&a13_path).expect("bind a13");
     a13_server.set_android13plus(2);
-    a13_server.set_max_threads(2);
+    a13_server.set_max_threads(2).expect("set_max_threads");
     a13_server
         .set_root(make_service(Arc::new(AtomicI64::new(0))))
         .expect("set_root");
-    let a13_bg = a13_server.run_background();
+    let a13_bg = a13_server.run_background().expect("run_background");
     wait_for_sock(&a13_path);
     let a13 = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&a13_path, 2).outgoing_connections(2),
@@ -4382,8 +4390,8 @@ fn terminate_ends_every_session_and_joins_workers() {
         }
         t.join().expect("terminate thread");
     }
-    r34_bg.join().expect("r34 accept loop");
-    a13_bg.join().expect("android-13+ accept loop");
+    r34_bg.stop_and_join().expect("r34 accept loop");
+    a13_bg.stop_and_join().expect("android-13+ accept loop");
     // Every worker exited (its `Arc<RpcServer>` clone is gone); the a13 session is dead.
     for (name, server) in [("r34", &r34_server), ("android-13+", &a13_server)] {
         assert!(
@@ -4441,7 +4449,7 @@ fn terminate_from_a_handler_does_not_join_itself() {
             Some(Arc::clone(&server)),
         )))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     wait_for_sock(&path);
     let client = RpcSession::setup_unix_client(&path).expect("connect");
     let root = client.get_root().expect("root");
@@ -4452,9 +4460,9 @@ fn terminate_from_a_handler_does_not_join_itself() {
             .as_any()
             .downcast_ref::<RpcProxy>()
             .expect("RpcProxy");
-        let d = rp.build_request(STOP_DESC).expect("request");
+        let d = rp.prepare_request(STOP_DESC).expect("request");
         // Errors (the transport is down before the reply); what matters is that it ends.
-        let _ = rp.transact(FIRST_CALL_TRANSACTION, &d, 0);
+        let _ = rp.submit_transact(FIRST_CALL_TRANSACTION, &d, 0);
         let _ = tx.send(());
     });
     match rx.recv_timeout(Duration::from_secs(5)) {
@@ -4462,7 +4470,7 @@ fn terminate_from_a_handler_does_not_join_itself() {
         Err(RecvTimeoutError::Timeout) => panic!("terminate from a handler deadlocked"),
     }
     caller.join().expect("caller thread");
-    bg.join().expect("accept loop");
+    bg.stop_and_join().expect("accept loop");
     assert!(
         poll_until(|| Arc::strong_count(&server) == 1),
         "the handler's own worker must exit on its own ({} refs)",
@@ -4682,7 +4690,9 @@ fn a_reply_timeout_ends_a_session_with_a_callback_slot() {
     );
     assert_eq!(h.client.__slot_count(), 2, "founding outgoing + callback");
     // The reply deadline ends the session, the callback slot with it.
-    h.client.set_timeout(Some(Duration::from_millis(50)));
+    h.client
+        .set_reply_timeout(Some(Duration::from_millis(50)))
+        .expect("timeout");
     assert_eq!(h.root.slow(400), Err(StatusCode::TimedOut));
     // Death, not a live session with only callback slots left.
     assert_eq!(
@@ -4843,8 +4853,6 @@ fn resend_after_would_block_delivers_a_live_node() {
             ..Default::default()
         },
     );
-    let path = h.server.path().expect("unix path").to_path_buf();
-    let sid = h.client.get_session_id().expect("session id");
     // The root the client holds is the server's only node so far.
     let base = h.server.live_session_node_count();
 
@@ -4852,7 +4860,7 @@ fn resend_after_would_block_delivers_a_live_node() {
     let svc = make_service(Arc::clone(&ctr));
     let cb = h.cb_proxy();
     let rp = rpc_of(&cb);
-    let mut d = rp.build_request(DESC).expect("build_request");
+    let mut d = rp.prepare_request(DESC).expect("build_request");
     d.write(&svc).expect("write the server's local binder");
     assert_eq!(
         h.server.live_session_node_count(),
@@ -4861,7 +4869,11 @@ fn resend_after_would_block_delivers_a_live_node() {
     );
 
     // No outgoing slot on the server yet: `WouldBlock`, from outside any handler.
-    let first = std::thread::scope(|s| s.spawn(|| rp.transact(TX_HOLD_CB, &d, 0)).join().unwrap());
+    let first = std::thread::scope(|s| {
+        s.spawn(|| rp.submit_transact(TX_HOLD_CB, &d, 0))
+            .join()
+            .unwrap()
+    });
     assert_eq!(first.err(), Some(StatusCode::WouldBlock));
     assert_eq!(
         h.server.live_session_node_count(),
@@ -4869,16 +4881,18 @@ fn resend_after_would_block_delivers_a_live_node() {
         "a request never sent keeps its bump; the same parcel is going out again"
     );
 
-    h.client
-        .add_incoming_connection_with_config(RpcClientConfig::unix(&path, 2).session_id(&sid))
-        .expect("manual incoming attach");
-    let second = std::thread::scope(|s| s.spawn(|| rp.transact(TX_HOLD_CB, &d, 0)).join().unwrap());
+    h.client.add_incoming_connection().expect("incoming attach");
+    let second = std::thread::scope(|s| {
+        s.spawn(|| rp.submit_transact(TX_HOLD_CB, &d, 0))
+            .join()
+            .unwrap()
+    });
     assert!(
         second.is_ok(),
         "the same parcel is sent once the slot exists: {second:?}"
     );
     assert_eq!(
-        rp.transact(TX_HOLD_CB, &d, 0).err(),
+        rp.submit_transact(TX_HOLD_CB, &d, 0).err(),
         Some(StatusCode::InvalidOperation),
         "sent: a third attempt is refused"
     );

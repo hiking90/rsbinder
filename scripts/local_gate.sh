@@ -403,6 +403,8 @@ tier_kernel() {
         --test death_reorder_kernel -- --ignored --test-threads=1
     run "lazy_descriptor_kernel" tpass cargo test -p tests \
         --test lazy_descriptor_kernel -- --ignored --test-threads=1
+    run "local_async_kernel" tpass cargo test -p tests \
+        --test local_async_kernel -- --ignored --test-threads=1
     local t
     for t in test_death_recipient test_wibinder_upgrade_after_obituary \
         test_death_recipient_panic_does_not_starve_others \

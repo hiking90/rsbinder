@@ -7,25 +7,39 @@ depend on binder — `rsbinder` adds the AIDL `MQDescriptor` parcelable and the
 conversion to this crate's `Descriptor`.
 
 ```rust
-use rsbinder_fmq::{AttachPolicy, MessageQueue, NOT_EMPTY, NOT_FULL};
+use rsbinder_fmq::{AttachPolicy, MessageQueue, Transfer};
 
 // The side that allocates: a ring of 1024 bytes with an EventFlag word.
 let mut producer = MessageQueue::<u8>::create(1024, true)?;
 let descriptor = producer.descriptor()?;          // fds + grantors; send it to the peer
 
 // The side that receives the descriptor.
-let policy = AttachPolicy { max_capacity: 1 << 20, require_seal: true, require_event_flag: true };
+let policy = AttachPolicy::new(1 << 20).require_event_flag(true);
 let mut consumer = MessageQueue::<u8>::attach(&descriptor, &policy)?;
 
-producer.write_blocking(b"hello", NOT_FULL, NOT_EMPTY, None)?;
+producer.write_blocking(b"hello", None)?;         // waits on NOT_FULL, wakes NOT_EMPTY
 let mut buf = [0u8; 5];
-consumer.read_blocking(&mut buf, NOT_EMPTY, NOT_FULL, None)?;
+consumer.read_blocking(&mut buf, None)?;          // waits on NOT_EMPTY, wakes NOT_FULL
 assert_eq!(&buf, b"hello");
+
+// Without waiting: `WouldBlock` leaves the items with the caller.
+if producer.write(b"again")? == Transfer::WouldBlock {
+    // the ring is full; retry later
+}
+
+// In place: reserve, copy in, commit. A transaction dropped without a commit publishes nothing.
+if let Some(mut txn) = producer.begin_write(3)? {
+    txn.write_at(0, b"abc")?;
+    txn.commit()?;
+}
 # Ok::<(), rsbinder_fmq::Error>(())
 ```
 
 That is libfmq's synchronized flavor: one writer, one reader, and a full ring
-refuses the write. The unsynchronized flavor — one writer, any number of
+refuses the write. `write_blocking_with` and `read_blocking_with` take other
+EventFlag bits as a `Notify { wait, wake }`, named so that libfmq's
+`readBlocking(data, count, readNotification, writeNotification, ..)` order
+cannot be carried over by position. The unsynchronized flavor — one writer, any number of
 readers, a full ring overwrites its oldest elements — is `UnsyncWriter` and
 `UnsyncReader`, with the counter discipline of `android-17.0.0_r1`:
 
@@ -36,7 +50,7 @@ use rsbinder_fmq::{AttachPolicy, UnsyncCreate, UnsyncRead, UnsyncReader, UnsyncS
 let mut writer = UnsyncWriter::<u32>::create(64, &UnsyncCreate::new().read_only_readers(true))?;
 let descriptor = writer.descriptor()?;            // send it to each reader
 
-let policy = AttachPolicy { max_capacity: 1 << 16, require_seal: true, require_event_flag: false };
+let policy = AttachPolicy::new(1 << 16);           // requires the seal by default
 let mut reader = UnsyncReader::<u32>::attach(&descriptor, &policy, UnsyncStart::Now)?;
 
 writer.write(&[1, 2, 3])?;                        // never waits for a reader
@@ -64,7 +78,8 @@ returns `Unsupported` on a target without that type (32-bit x86 without
 SSE2), and `UnsyncWriter::create` with `read_only_readers` returns it on a
 kernel without `F_SEAL_FUTURE_WRITE` (mainline Linux before 5.1). A
 descriptor from a peer is checked against an
-`AttachPolicy` before anything is mapped, and the counters are checked on
+`AttachPolicy` before anything is mapped (a refusal is
+`Error::InvalidDescriptor`), and the counters are checked on
 every operation. Every access to the shared memory is a Rust atomic, so
 breaking a flavor's rule — a second writer, or a second reader of a
 synchronized queue; the peer, another handle, C code — makes the

@@ -2,21 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Plan 10-0 §3.4 — a kernel option the process cannot honor is
-//! [`StatusCode::BadValue`], not a warning.
+//! [`StatusCode::BadValue`], not a warning; plan 17 K-12 — one it can
+//! honor is applied.
 //!
-//! The kernel thread pool is fixed by whoever initializes the
-//! process-wide `ProcessState` first and cannot be changed afterwards.
-//! A second `serve` naming a *different* size used to be warned about and
-//! then ignored, which left the caller believing a setting it never got.
-//! Every other inapplicable option in this layer is refused, and this one
-//! now is too.
+//! The driver and the receive mapping are fixed by whoever initializes the
+//! process-wide `ProcessState` first; a later *different* value is refused.
+//! The thread-pool ceiling is a driver setting that can change: a server's
+//! `?threads=` or `ServeOptions::threads` that differs from the ceiling in
+//! force is applied at `run` / `spawn` (`ProcessState::set_max_threads`),
+//! and once the pool has started it may grow but not shrink.
 //!
 //! Order matters and the process is the fixture: the first `serve` here
-//! decides the pool for the whole binary, so every case — the value
-//! already in force, a different one, the option omitted, and the same
-//! rule through `ServeOptions::threads` and `ClientOptions::driver` — must
-//! run in one test, in this order. A second test touching `ProcessState`
-//! would see whatever this one left behind.
+//! decides the initial pool and the mapping for the whole binary, so every
+//! case — the value already in force, a different one, the option omitted,
+//! the pool started, and `ClientOptions::driver` — must run in one test, in
+//! this order. A second test touching `ProcessState` would see whatever this
+//! one left behind.
 //!
 //! Needs a real binder device (`/dev/binder`, Linux + binderfs or
 //! Android). The first test needs no service manager, since nothing is
@@ -40,35 +41,67 @@ fn a_kernel_option_the_process_cannot_honor_is_refused() {
     let _ = rsbinder::serve(KernelEndpoint::default().with_threads(4))
         .expect("the first serve initializes ProcessState");
 
+    let ps = rsbinder::ProcessState::as_self();
+    assert_eq!(ps.max_threads(), 4, "the first serve sized the pool");
+
     // Asking again for what is already true is not an error — the caller
     // gets exactly what it asked for.
     let _ = rsbinder::serve(KernelEndpoint::default().with_threads(4))
         .expect("the same value must be accepted");
 
-    // A different value cannot be applied, and saying so is the point:
-    // the pool stays at 4 either way, but now the caller is told.
-    assert_eq!(
-        rsbinder::serve(KernelEndpoint::default().with_threads(8)).err(),
-        Some(StatusCode::BadValue),
-        "a different thread count must be refused, not warned about"
-    );
+    // A different value is applied where the server starts, not where it is assembled.
+    let pending = rsbinder::serve(KernelEndpoint::default().with_threads(6))
+        .expect("a different thread count is no longer refused at serve");
+    assert_eq!(ps.max_threads(), 4, "serve alone changes nothing");
+    drop(pending);
 
     // Omitting the option asks for nothing, so it always succeeds — this
     // is what keeps a second server in the same process working.
     let _ = rsbinder::serve(Uri::kernel()).expect("no thread count asks for nothing");
 
-    // The same rule through `ServeOptions`, which is applied later (at
-    // `spawn`) than the endpoint's setting (at `serve`).
-    let err = rsbinder::serve(Uri::kernel())
+    // The URI and `ServeOptions` name one setting: two different values are refused.
+    assert_eq!(
+        rsbinder::serve(KernelEndpoint::default().with_threads(6))
+            .expect("serve")
+            .with(|o| o.threads = Some(8))
+            .spawn()
+            .err(),
+        Some(StatusCode::BadValue),
+        "`?threads=` and ServeOptions::threads must not disagree"
+    );
+    assert_eq!(ps.max_threads(), 4, "a refused start applies nothing");
+
+    // `ServeOptions::threads` at `spawn`: applied, and this spawn starts the pool.
+    let _kernel = rsbinder::serve(Uri::kernel())
         .expect("serve")
         .with(|o| o.threads = Some(8))
         .spawn()
-        .err();
+        .expect("a different thread count is applied at spawn");
     assert_eq!(
-        err,
-        Some(StatusCode::BadValue),
-        "ServeOptions::threads must follow the same rule as `?threads=`"
+        ps.max_threads(),
+        8,
+        "ServeOptions::threads reached the driver"
     );
+
+    // The pool is running now: it may grow, through `?threads=` as well ...
+    let _kernel = rsbinder::serve(KernelEndpoint::default().with_threads(10))
+        .expect("serve")
+        .spawn()
+        .expect("growing a started pool is allowed");
+    assert_eq!(ps.max_threads(), 10, "`?threads=` is applied at spawn too");
+
+    // ... but not shrink (AOSP `setThreadPoolMaxThreadCount` aborts on that).
+    assert_eq!(
+        rsbinder::serve(Uri::kernel())
+            .expect("serve")
+            .with(|o| o.threads = Some(2))
+            .spawn()
+            .err(),
+        Some(StatusCode::InvalidOperation),
+        "a started pool cannot be shrunk"
+    );
+    assert_eq!(ps.max_threads(), 10, "a refused shrink leaves the ceiling");
+    assert_eq!(ps.set_max_threads(2), Err(StatusCode::InvalidOperation));
 
     // And the client half shares the one check.
     assert_eq!(

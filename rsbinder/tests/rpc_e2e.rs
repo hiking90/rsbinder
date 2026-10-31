@@ -40,8 +40,8 @@ use std::thread;
 use rsbinder::rpc::transport::{MemTransport, UnixTransport};
 use rsbinder::rpc::{AddressSpace, RpcProxy, RpcSession, RpcTransport};
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION,
+    Binder, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status, StatusCode,
+    TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 // ---- interface definitions (hand-written minimal fixture) -----------
@@ -227,40 +227,40 @@ struct SmokeProxy(SIBinder);
 impl SmokeProxy {
     fn echo(&self, s: &str) -> Result<String> {
         let rp = rpc_of(&self.0);
-        let mut d = rp.build_request(ISMOKE_DESC)?;
+        let mut d = rp.prepare_request(ISMOKE_DESC)?;
         d.write(&s)?;
         let mut r = rp
-            .transact(TX_ECHO, &d, 0)?
+            .submit_transact(TX_ECHO, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
     }
     fn add(&self, a: i32, b: i32) -> Result<i32> {
         let rp = rpc_of(&self.0);
-        let mut d = rp.build_request(ISMOKE_DESC)?;
+        let mut d = rp.prepare_request(ISMOKE_DESC)?;
         d.write(&a)?;
         d.write(&b)?;
         let mut r = rp
-            .transact(TX_ADD, &d, 0)?
+            .submit_transact(TX_ADD, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<i32>()
     }
     fn get_child(&self) -> Result<SIBinder> {
         let rp = rpc_of(&self.0);
-        let d = rp.build_request(ISMOKE_DESC)?;
+        let d = rp.prepare_request(ISMOKE_DESC)?;
         let mut r = rp
-            .transact(TX_GET_CHILD, &d, 0)?
+            .submit_transact(TX_GET_CHILD, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<SIBinder>()
     }
     fn pass_binder(&self, b: &SIBinder) -> Result<String> {
         let rp = rpc_of(&self.0);
-        let mut d = rp.build_request(ISMOKE_DESC)?;
+        let mut d = rp.prepare_request(ISMOKE_DESC)?;
         d.write(b)?;
         let mut r = rp
-            .transact(TX_PASS_BINDER, &d, 0)?
+            .submit_transact(TX_PASS_BINDER, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
@@ -271,9 +271,9 @@ struct ChildProxy(SIBinder);
 impl ChildProxy {
     fn name(&self) -> Result<String> {
         let rp = rpc_of(&self.0);
-        let d = rp.build_request(ICHILD_DESC)?;
+        let d = rp.prepare_request(ICHILD_DESC)?;
         let mut r = rp
-            .transact(TX_CHILD_NAME, &d, 0)?
+            .submit_transact(TX_CHILD_NAME, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
@@ -373,8 +373,6 @@ fn rpc_e2e_android13plus_over_mem() {
 /// An RPC binder's `as_remote()` drives a full call via `RemoteProxy`; see module doc "Notes".
 #[test]
 fn rpc_call_via_generalized_remote_proxy_trait() {
-    use rsbinder::RemoteProxy;
-
     let (a, b) = MemTransport::pair();
     let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).expect("RpcSession::new");
     server.set_root(make_root()).expect("set_root");
@@ -417,9 +415,9 @@ fn binder_read_after_session_close_is_dead_object() {
     let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).expect("RpcSession::new");
     let root = client.get_root().expect("get_root");
     let rp = rpc_of(&root);
-    let d = rp.build_request(ISMOKE_DESC).unwrap();
+    let d = rp.prepare_request(ISMOKE_DESC).unwrap();
     let mut reply = rp
-        .transact(TX_GET_CHILD, &d, 0)
+        .submit_transact(TX_GET_CHILD, &d, 0)
         .expect("get_child")
         .expect("reply");
     read_status(&mut reply).unwrap();
@@ -491,8 +489,8 @@ fn is_ended_follows_the_session_not_the_peer() {
     assert!(p.server.is_ended());
     assert!(!p.client.is_ended(), "no I/O since the peer closed");
     let rp = rpc_of(&p.root);
-    let d = rp.build_request(ISMOKE_DESC).unwrap();
-    assert!(rp.transact(TX_ECHO, &d, 0).is_err());
+    let d = rp.prepare_request(ISMOKE_DESC).unwrap();
+    assert!(rp.submit_transact(TX_ECHO, &d, 0).is_err());
     assert!(
         p.client.is_ended(),
         "the failed call ended the client's session"
@@ -515,7 +513,7 @@ fn write_after_close_session_is_refused() {
     let root = client.get_root().expect("get_root");
     client.close_session();
     let rp = rpc_of(&root);
-    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    let mut d = rp.prepare_request(ISMOKE_DESC).unwrap();
     assert_eq!(
         d.write(&make_root()),
         Err(StatusCode::DeadObject),
@@ -526,7 +524,7 @@ fn write_after_close_session_is_refused() {
         0,
         "the refused write inserted a node that no `clear_local` will ever drain"
     );
-    assert!(rp.transact(TX_PASS_BINDER, &d, 0).is_err());
+    assert!(rp.submit_transact(TX_PASS_BINDER, &d, 0).is_err());
     assert_eq!(client.local_node_count(), 0);
 
     drop(d);
@@ -541,7 +539,7 @@ fn write_after_close_session_is_refused() {
 fn an_unsent_request_releases_its_node_on_drop() {
     let p = MemPair::new();
     let rp = rpc_of(&p.root);
-    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    let mut d = rp.prepare_request(ISMOKE_DESC).unwrap();
     d.write(&make_root()).unwrap();
     assert_eq!(p.client.local_node_count(), 1, "the argument took its bump");
     drop(d);
@@ -558,14 +556,14 @@ fn an_unsent_request_releases_its_node_on_drop() {
 fn a_sent_parcel_is_refused_on_resend() {
     let p = MemPair::new();
     let rp = rpc_of(&p.root);
-    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    let mut d = rp.prepare_request(ISMOKE_DESC).unwrap();
     d.write(&make_root()).unwrap();
-    let mut r = rp.transact(TX_PASS_BINDER, &d, 0).unwrap().unwrap();
+    let mut r = rp.submit_transact(TX_PASS_BINDER, &d, 0).unwrap().unwrap();
     read_status(&mut r).unwrap();
     // A fresh server-side proxy has no descriptor yet; the reply's shape is what matters here.
     let _ = r.read::<String>().unwrap();
     assert_eq!(
-        rp.transact(TX_PASS_BINDER, &d, 0).err(),
+        rp.submit_transact(TX_PASS_BINDER, &d, 0).err(),
         Some(StatusCode::InvalidOperation),
         "a sent parcel is refused on resend"
     );
@@ -583,10 +581,10 @@ fn a_sent_parcel_is_refused_on_resend() {
 fn a_parcel_of_another_session_is_refused() {
     let a = MemPair::new();
     let b = MemPair::new();
-    let mut d = rpc_of(&a.root).build_request(ISMOKE_DESC).unwrap();
+    let mut d = rpc_of(&a.root).prepare_request(ISMOKE_DESC).unwrap();
     d.write(&make_root()).unwrap();
     assert_eq!(
-        rpc_of(&b.root).transact(TX_PASS_BINDER, &d, 0).err(),
+        rpc_of(&b.root).submit_transact(TX_PASS_BINDER, &d, 0).err(),
         Some(StatusCode::BadType),
         "B's peer never learns A's address, so no DEC_STRONG would ever settle A's bump"
     );
@@ -606,9 +604,9 @@ fn a_parcel_of_another_session_is_refused() {
 fn a_local_binder_written_after_the_send_is_refused() {
     let p = MemPair::new();
     let rp = rpc_of(&p.root);
-    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    let mut d = rp.prepare_request(ISMOKE_DESC).unwrap();
     d.write(&"x").unwrap();
-    rp.transact(TX_ECHO, &d, 0).unwrap();
+    rp.submit_transact(TX_ECHO, &d, 0).unwrap();
     assert_eq!(d.write(&make_root()), Err(StatusCode::BadType));
     assert_eq!(
         p.client.local_node_count(),
@@ -623,11 +621,11 @@ fn a_local_binder_written_after_the_send_is_refused() {
 fn a_received_reply_is_not_sent_again() {
     let p = MemPair::new();
     let rp = rpc_of(&p.root);
-    let mut d = rp.build_request(ISMOKE_DESC).unwrap();
+    let mut d = rp.prepare_request(ISMOKE_DESC).unwrap();
     d.write(&"x").unwrap();
-    let r = rp.transact(TX_ECHO, &d, 0).unwrap().unwrap();
+    let r = rp.submit_transact(TX_ECHO, &d, 0).unwrap().unwrap();
     assert_eq!(
-        rp.transact(TX_ECHO, &r, 0).err(),
+        rp.submit_transact(TX_ECHO, &r, 0).err(),
         Some(StatusCode::InvalidOperation)
     );
     p.finish();
@@ -661,9 +659,9 @@ fn a_returned_binder_survives_the_reply_parcel_drop() {
 fn a_oneway_handler_reply_binder_is_released() {
     let p = MemPair::new();
     let rp = rpc_of(&p.root);
-    let d = rp.build_request(ISMOKE_DESC).unwrap();
+    let d = rp.prepare_request(ISMOKE_DESC).unwrap();
     assert!(rp
-        .transact(TX_ONEWAY_CHILD, &d, rsbinder::FLAG_ONEWAY)
+        .submit_transact(TX_ONEWAY_CHILD, &d, rsbinder::FLAG_ONEWAY)
         .unwrap()
         .is_none());
     // Same slot, in order: once the echo returns, the oneway handler has run and its reply dropped.
@@ -711,7 +709,10 @@ fn rpc_transact_refuses_a_parcel_built_for_no_session() {
     for mut d in [Parcel::new(), data_only] {
         d.write(&ISMOKE_DESC).unwrap();
         d.write(&"x").unwrap();
-        assert_eq!(rp.transact(TX_ECHO, &d, 0).err(), Some(StatusCode::BadType));
+        assert_eq!(
+            rp.submit_transact(TX_ECHO, &d, 0).err(),
+            Some(StatusCode::BadType)
+        );
     }
     assert_eq!(SmokeProxy(p.root.clone()).echo("ok").unwrap(), "ok");
     p.finish();
@@ -935,8 +936,8 @@ impl RelayPair {
 
     fn child(&self) -> SIBinder {
         let rp = rpc_of(&self.root);
-        let d = rp.build_request(IRELAY_DESC).unwrap();
-        let mut r = rp.transact(TX_RELAY_CHILD, &d, 0).unwrap().unwrap();
+        let d = rp.prepare_request(IRELAY_DESC).unwrap();
+        let mut r = rp.submit_transact(TX_RELAY_CHILD, &d, 0).unwrap().unwrap();
         read_status(&mut r).unwrap();
         r.read().unwrap()
     }
@@ -944,10 +945,10 @@ impl RelayPair {
     /// Sends `holder` to `code`; the reply after its status.
     fn call(&self, code: TransactionCode, holder: &ParcelableHolder) -> Result<Parcel> {
         let rp = rpc_of(&self.root);
-        let mut d = rp.build_request(IRELAY_DESC)?;
+        let mut d = rp.prepare_request(IRELAY_DESC)?;
         d.write(holder)?;
         let mut r = rp
-            .transact(code, &d, 0)?
+            .submit_transact(code, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         Ok(r)
@@ -1117,9 +1118,9 @@ fn a_v2_holder_relays_data_and_fds() {
 fn a_reply_the_send_refuses_goes_back_as_a_status() {
     let p = RelayPair::new(Wire::R34);
     let rp = rpc_of(&p.root);
-    let d = rp.build_request(IRELAY_DESC).unwrap();
+    let d = rp.prepare_request(IRELAY_DESC).unwrap();
     assert_eq!(
-        rp.transact(TX_RELAY_REPLY_WITH_REQUEST, &d, 0).err(),
+        rp.submit_transact(TX_RELAY_REPLY_WITH_REQUEST, &d, 0).err(),
         Some(StatusCode::InvalidOperation),
         "a received parcel is not sent back as the reply"
     );
@@ -1156,8 +1157,8 @@ fn a_reply_refused_before_its_first_byte_goes_back_as_a_status() {
     for (wire, code, want) in cases {
         let p = RelayPair::new(wire);
         let rp = rpc_of(&p.root);
-        let d = rp.build_request(IRELAY_DESC).unwrap();
-        let got = (rp.transact(code, &d, 0).err(), p.root.ping_binder());
+        let d = rp.prepare_request(IRELAY_DESC).unwrap();
+        let got = (rp.submit_transact(code, &d, 0).err(), p.root.ping_binder());
         if got != (Some(want), Ok(())) {
             wrong.push((wire, code, got));
         }
@@ -1231,9 +1232,9 @@ fn oneway_flood_past_the_hold(name: &str, ends: Ends, wire: Wire, fd: FdMode) {
         thread::spawn(move || {
             let rp = rpc_of(&root);
             let sent = (0..n).try_for_each(|_| {
-                let mut d = rp.build_request(ISMOKE_DESC)?;
+                let mut d = rp.prepare_request(ISMOKE_DESC)?;
                 d.write(&new_child())?;
-                rp.transact(TX_PASS_BINDER, &d, rsbinder::FLAG_ONEWAY)
+                rp.submit_transact(TX_PASS_BINDER, &d, rsbinder::FLAG_ONEWAY)
                     .map(drop)
             });
             let _ = tx.send(sent);

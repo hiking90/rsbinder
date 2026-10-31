@@ -337,7 +337,9 @@ impl RawAccepted {
                 RawAccepted::Vsock(s) => Box::new(s),
                 RawAccepted::Tcp(s) => Box::new(s),
             };
-            return Ok(Box::new(TlsTransport::accept_stream(stream, cfg)?));
+            return Ok(Box::new(TlsTransport::accept_stream_within(
+                stream, cfg, None,
+            )?));
         }
         self.into_native_transport()
     }
@@ -351,9 +353,9 @@ impl RawAccepted {
     /// Native (plain) wrap — common to both feature build modes.
     fn into_native_transport(self) -> RpcResult<Box<dyn RpcTransport>> {
         match self {
-            RawAccepted::Unix(s) => Ok(Box::new(UnixTransport::from_stream(s)?)),
+            RawAccepted::Unix(s) => Ok(Box::new(UnixTransport::wrap(s)?)),
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
-            RawAccepted::Vsock(s) => Ok(Box::new(VsockTransport::from_stream(s)?)),
+            RawAccepted::Vsock(s) => Ok(Box::new(VsockTransport::wrap(s)?)),
             #[cfg(feature = "rpc-tls")]
             RawAccepted::Tcp(_) => Err(super::RpcError::Protocol(
                 "plain-text TCP server is not exposed (TLS-only on TCP)",
@@ -462,6 +464,8 @@ pub struct RpcServer {
     attached_count: AtomicUsize,
     rejected_unknown_id: AtomicUsize,
     shutdown: Arc<AtomicBool>,
+    /// Raised by `run`/`run_background`, never lowered; freezes root, directory and max threads.
+    started: AtomicBool,
     /// Raised only by `terminate`, before its `live_sessions` take; see module doc "Termination".
     terminating: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -494,7 +498,7 @@ fn remove_if_stale(path: &Path) -> Result<()> {
         "RpcServer::setup_unix_server: a socket exists at {path:?}; Apple platforms never \
          remove it (delete it once no server listens on it)"
     );
-    Err(StatusCode::from(rustix::io::Errno::ADDRINUSE))
+    Err(crate::error::errno_status(rustix::io::Errno::ADDRINUSE))
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -511,7 +515,7 @@ fn remove_if_stale(path: &Path) -> Result<()> {
         // `EAGAIN`: a listener whose backlog is full (Linux `unix_stream_connect`).
         Ok(()) | Err(Errno::AGAIN) | Err(Errno::INPROGRESS) => {
             log::error!("RpcServer::setup_unix_server: another server is listening on {path:?}");
-            Err(StatusCode::from(Errno::ADDRINUSE))
+            Err(crate::error::errno_status(Errno::ADDRINUSE))
         }
         Err(Errno::CONNREFUSED) => std::fs::remove_file(path).or_else(|e| match e.kind() {
             ErrorKind::NotFound => Ok(()),
@@ -653,6 +657,7 @@ impl RpcServer {
             attached_count: AtomicUsize::new(0),
             rejected_unknown_id: AtomicUsize::new(0),
             shutdown: Arc::new(AtomicBool::new(false)),
+            started: AtomicBool::new(false),
             terminating: Arc::new(AtomicBool::new(false)),
             workers: Mutex::new(Vec::new()),
             live_sessions: Mutex::new(Vec::new()),
@@ -727,29 +732,63 @@ impl RpcServer {
         self.tls_config.lock().expect("tls_config poisoned").clone()
     }
 
+    /// Raise `started` under the `root` lock, so a setter's check and its store are not split.
+    fn mark_started(&self) {
+        let _root = self.root.lock().expect("root poisoned");
+        self.started.store(true, Ordering::SeqCst);
+    }
+
+    /// `InvalidOperation` once started (AOSP aborts: "Cannot set ... while running"); hold `root`.
+    fn refuse_after_start(&self, what: &str) -> Result<()> {
+        if self.started.load(Ordering::SeqCst) {
+            log::error!("{what}: the server is already running; configure it before `run`");
+            return Err(StatusCode::InvalidOperation);
+        }
+        Ok(())
+    }
+
     /// Publish the single root object (android `setRootObject`).
     ///
     /// The root is copied into each session once, when it is accepted; AOSP
     /// instead reads `getRootObject()` on every `GET_ROOT` (`RpcState.cpp`).
-    /// A session accepted before this call keeps the root it was given, so
-    /// call it before [`run`](Self::run) / [`run_background`](Self::run_background).
-    /// A later [`add_service`](Self::add_service) replaces it with the service directory.
+    /// So the root is fixed once the server runs: a call after
+    /// [`run`](Self::run) / [`run_background`](Self::run_background) has
+    /// started is [`StatusCode::InvalidOperation`], where AOSP
+    /// `RpcServer::setRootObject` aborts. Before that, a second call
+    /// replaces the first.
+    ///
+    /// A server has either a root set here or the service directory of
+    /// [`add_service`](Self::add_service), not both: on a server that
+    /// already has a service this is [`StatusCode::InvalidOperation`].
     ///
     /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`] — see
     /// [`add_service`](Self::add_service) for why.
     pub fn set_root(&self, binder: SIBinder) -> Result<()> {
         super::refuse_remote(&binder, "RpcServer::set_root")?;
-        *self.root.lock().expect("root poisoned") = Some(binder);
+        let mut root = self.root.lock().expect("root poisoned");
+        self.refuse_after_start("RpcServer::set_root")?;
+        if !self.named.lock().expect("named poisoned").is_empty() {
+            log::error!(
+                "RpcServer::set_root: this server publishes services with `add_service`, whose \
+                 directory is its root; use one or the other"
+            );
+            return Err(StatusCode::InvalidOperation);
+        }
+        *root = Some(binder);
         Ok(())
     }
 
-    /// Register a named service. Every call installs the built-in
-    /// `ServiceDirectory` as the root, replacing a root set by
-    /// [`set_root`](Self::set_root); the directory shares this server's
-    /// service map, so the insert itself needs no rebuild. Clients reach it via
-    /// [`RpcSession::get_service`]. The *first* call installs a root, which,
-    /// as with [`set_root`](Self::set_root), a session accepted before it
-    /// does not see: make that first call before `run` / `run_background`.
+    /// Register a named service. The first call installs the built-in
+    /// `ServiceDirectory` as the root; the directory shares this server's
+    /// service map, so later inserts need no rebuild. Clients reach it via
+    /// [`RpcSession::get_service`].
+    ///
+    /// The directory is fixed once the server runs, as a root is (see
+    /// [`set_root`](Self::set_root)): a call after
+    /// [`run`](Self::run) / [`run_background`](Self::run_background) has
+    /// started is [`StatusCode::InvalidOperation`]. So is a call on a
+    /// server whose root [`set_root`](Self::set_root) set: the directory
+    /// would replace that root.
     ///
     /// Refuses a **remote** binder with [`StatusCode::InvalidOperation`]:
     /// publishing a proxy here can never work. A proxy of *this* session would
@@ -759,12 +798,20 @@ impl RpcServer {
     /// `BnFoo::new_binder(proxy)` — which is the gateway pattern.
     pub fn add_service(&self, name: &str, binder: SIBinder) -> Result<()> {
         super::refuse_remote(&binder, "RpcServer::add_service")?;
-        self.named
-            .lock()
-            .expect("named poisoned")
-            .insert(name.to_string(), binder);
-        // Reinstall the shared directory as root, so `add_service` wins over any prior `set_root`.
-        *self.root.lock().expect("root poisoned") = Some(self.directory.clone());
+        let mut root = self.root.lock().expect("root poisoned");
+        self.refuse_after_start("RpcServer::add_service")?;
+        let mut named = self.named.lock().expect("named poisoned");
+        // A root with no service behind it came from `set_root`.
+        if root.is_some() && named.is_empty() {
+            log::error!(
+                "RpcServer::add_service: this server's root was set with `set_root`; the \
+                 service directory would replace it — use one or the other"
+            );
+            return Err(StatusCode::InvalidOperation);
+        }
+        named.insert(name.to_string(), binder);
+        drop(named);
+        *root = Some(self.directory.clone());
         Ok(())
     }
 
@@ -805,9 +852,19 @@ impl RpcServer {
     ///
     /// `N == 1` (default, single-connection) and `N >= 2` (multi-
     /// connection-per-session) are both validated against real
-    /// android-13/14/15/16 libbinder peers.
-    pub fn set_max_threads(&self, n: u32) {
+    /// android-13/14/15/16 libbinder peers. `0` is taken as `1`.
+    ///
+    /// Fixed once the server runs: a call after [`run`](Self::run) /
+    /// [`run_background`](Self::run_background) has started is
+    /// [`StatusCode::InvalidOperation`], where AOSP
+    /// `RpcServer::setMaxThreads` aborts ("Cannot set max threads while
+    /// running"). Sessions read it when they are accepted, so a later
+    /// value would split the server's sessions between two caps.
+    pub fn set_max_threads(&self, n: u32) -> Result<()> {
+        let _root = self.root.lock().expect("root poisoned");
+        self.refuse_after_start("RpcServer::set_max_threads")?;
         self.max_threads.store(n.max(1), Ordering::SeqCst);
+        Ok(())
     }
 
     /// Opt-in **server-side admission bound** on concurrent
@@ -872,29 +929,19 @@ impl RpcServer {
     /// session is admitted with its preamble. Either
     /// way an established two-way session may then sit idle between requests
     /// unbounded (the per-call reply deadline is managed separately via
-    /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)).
+    /// [`set_reply_timeout`](Self::set_reply_timeout)).
     ///
-    /// `Some(Duration::ZERO)` is not a valid deadline (`SO_RCVTIMEO`
-    /// rejects it, and every arming site would silently fail, leaving the
-    /// admission phase *unbounded* — worse than never calling this) and is
-    /// refused: it is logged and the default is kept. Pass `None` to
-    /// disable the deadline deliberately.
-    pub fn set_handshake_timeout(&self, timeout: Option<std::time::Duration>) {
-        // Zero keeps the 10s default: here `None` (unbounded) is as wrong as zero.
-        let timeout = match timeout {
-            Some(d) if d.is_zero() => {
-                log::error!(
-                    "RpcServer::set_handshake_timeout: a zero duration is not a \
-                     valid deadline; keeping the default"
-                );
-                Some(DEFAULT_HANDSHAKE_TIMEOUT)
-            }
-            other => other,
-        };
+    /// `Some(Duration::ZERO)` is not a deadline and is refused with
+    /// [`StatusCode::BadValue`], leaving the value in force: no handshake
+    /// completes in no time, and `SO_RCVTIMEO` rejects a zero duration.
+    /// Pass `None` to disable the deadline deliberately.
+    pub fn set_handshake_timeout(&self, timeout: Option<std::time::Duration>) -> Result<()> {
+        super::session::reject_zero_deadline(timeout, "RpcServer::set_handshake_timeout")?;
         *self
             .handshake_timeout
             .lock()
             .expect("handshake_timeout poisoned") = timeout;
+        Ok(())
     }
 
     /// Set (or disable) the **idle timeout** of the android-13+ serve
@@ -1015,19 +1062,19 @@ impl RpcServer {
     /// multi-connection session is live leaves that session restoring the
     /// newest value on connections whose socket carries an older one.
     ///
-    /// `Some(Duration::ZERO)` is not a valid deadline (`SO_RCVTIMEO`
-    /// rejects it) and is refused — logged and treated as `None`.
-    pub fn set_idle_timeout(&self, timeout: Option<std::time::Duration>) {
-        *self.idle_timeout.lock().expect("idle_timeout poisoned") =
-            super::session::reject_zero_deadline(
-                timeout,
-                "RpcServer::set_idle_timeout: a zero duration is not a valid deadline; ignoring",
-            );
+    /// `Some(Duration::ZERO)` is not a deadline and is refused with
+    /// [`StatusCode::BadValue`], leaving the value in force: a session
+    /// idle for no time at all would be evicted at once. `None` is no idle
+    /// deadline.
+    pub fn set_idle_timeout(&self, timeout: Option<std::time::Duration>) -> Result<()> {
+        super::session::reject_zero_deadline(timeout, "RpcServer::set_idle_timeout")?;
+        *self.idle_timeout.lock().expect("idle_timeout poisoned") = timeout;
+        Ok(())
     }
 
     /// Bound how long this server waits for a **reply to a callback** it
-    /// issued to a client (`RpcSession::set_timeout` on every session this
-    /// server builds). `None` (default) blocks forever on a callback
+    /// issued to a client (`RpcSession::set_reply_timeout` on every session
+    /// this server builds). `None` (default) blocks forever on a callback
     /// issued *outside* a handler of that client's session (below says
     /// exactly which) — the case this setter exists for — which is
     /// byte-identical to not calling this at all.
@@ -1066,14 +1113,14 @@ impl RpcServer {
     /// control. Size it against the slowest legitimate handler, not the
     /// round-trip: it bounds the peer's *think time*, and its expiry ends
     /// the whole session with that client, as
-    /// [`RpcSession::set_timeout`](super::RpcSession::set_timeout)
+    /// [`RpcSession::set_reply_timeout`](super::RpcSession::set_reply_timeout)
     /// describes. It also bounds the
     /// wait for a free connection slot on the same session
-    /// ([`RpcSession::set_timeout`](super::RpcSession::set_timeout)), so a
+    /// ([`RpcSession::set_reply_timeout`](super::RpcSession::set_reply_timeout)), so a
     /// callback behind a busy pool can take up to twice this value
     /// end-to-end.
     ///
-    /// Being the session's `set_timeout`, it also bounds how long a send on
+    /// Being the session's `set_reply_timeout`, it also bounds how long a send on
     /// any connection of the session may go without the client's progress
     /// and, on TCP,
     /// sizes the kernel's check that the client's host still answers
@@ -1084,14 +1131,14 @@ impl RpcServer {
     /// [`run_background`](Self::run_background). Sessions already
     /// established keep the value that was in force when they were built.
     ///
-    /// `Some(Duration::ZERO)` is not a valid deadline (`SO_RCVTIMEO`
-    /// rejects it) and is refused — logged and treated as `None`.
-    pub fn set_reply_timeout(&self, timeout: Option<std::time::Duration>) {
-        *self.reply_timeout.lock().expect("reply_timeout poisoned") =
-            super::session::reject_zero_deadline(
-                timeout,
-                "RpcServer::set_reply_timeout: a zero duration is not a valid deadline; ignoring",
-            );
+    /// `Some(Duration::ZERO)` is not a deadline and is refused with
+    /// [`StatusCode::BadValue`], leaving the value in force: every
+    /// callback would fail before its reply could arrive. `None` is no
+    /// reply deadline.
+    pub fn set_reply_timeout(&self, timeout: Option<std::time::Duration>) -> Result<()> {
+        super::session::reject_zero_deadline(timeout, "RpcServer::set_reply_timeout")?;
+        *self.reply_timeout.lock().expect("reply_timeout poisoned") = timeout;
+        Ok(())
     }
 
     /// Reap finished worker handles and return the live count, for the accept-loop admission gate.
@@ -1236,7 +1283,7 @@ impl RpcServer {
         let max_threads = self.max_threads.load(Ordering::SeqCst);
         session.set_max_threads(max_threads);
         let reply_timeout = *self.reply_timeout.lock().expect("reply_timeout poisoned");
-        session.set_timeout(reply_timeout);
+        session.store_reply_timeout(reply_timeout);
         if self.fd_unix_supported.load(Ordering::SeqCst) {
             session.set_supported_fd_modes(&[crate::rpc::FileDescriptorTransportMode::Unix]);
         }
@@ -1379,6 +1426,8 @@ impl RpcServer {
     /// delegate). Avoids the nested-lock pattern (`sessions` → `state`), so
     /// a poisoned `state` lock in one session does not poison `sessions`
     /// as a side-effect.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
     pub fn live_session_node_count(&self) -> usize {
         let mut sessions: Vec<_> = self
             .sessions
@@ -1404,6 +1453,8 @@ impl RpcServer {
     /// (the typed `SessionLifecycle` goes `Live(n) → Dying` whatever
     /// `n`), without a `sleep(N ms)`
     /// heuristic that races scheduler jitter.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
     pub fn session_live_conns(&self, id: &[u8; 32]) -> Option<usize> {
         // The public API keeps raw bytes; the id newtype is internal-only.
         let key = RpcSessionId::new(*id);
@@ -1429,6 +1480,8 @@ impl RpcServer {
     /// [`live_session_node_count`](Self::live_session_node_count) does — a
     /// poisoned `conn_state` in one session must not poison `sessions` as a
     /// side-effect and take every attach down with it.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
     pub fn session_slot_count(&self, id: &[u8; 32]) -> Option<usize> {
         let key = RpcSessionId::new(*id);
         let inner = self
@@ -1912,7 +1965,15 @@ impl RpcServer {
     /// longer than for `EINTR` and keeps serving rather than turn an
     /// overload into a permanent outage. Any other error (e.g. the listener
     /// was closed) ends the loop with `Err`, logged at `error`.
+    ///
+    /// From the call on, the root, the service directory and the max
+    /// threads are fixed ([`set_root`](Self::set_root)).
     pub fn run(self: &Arc<Self>) -> Result<()> {
+        self.mark_started();
+        self.accept_loop()
+    }
+
+    fn accept_loop(self: &Arc<Self>) -> Result<()> {
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 break;
@@ -1981,14 +2042,40 @@ impl RpcServer {
         Ok(())
     }
 
-    /// Spawn the accept loop on a background thread; returns its handle.
-    pub fn run_background(self: &Arc<Self>) -> JoinHandle<()> {
+    /// Run the accept loop ([`run`](Self::run)) on a thread of its own and
+    /// return the handle that ends it.
+    ///
+    /// **Dropping the handle stops the server**, as
+    /// [`RpcServerHandle::stop_and_join`] does: the accept loop stops and is
+    /// joined, then [`terminate`](Self::terminate) ends every session and
+    /// joins the workers. Keep the handle for as long as the server should
+    /// serve. `let _ = server.run_background()?;` drops it on the same line,
+    /// so the server stops before it has accepted anyone.
+    ///
+    /// A thread the OS refuses to create is the `Err` (`EAGAIN` and the
+    /// like, as [`StatusCode::Errno`]); nothing is left running then. The
+    /// root, the service directory and the max threads are fixed from this
+    /// call on ([`set_root`](Self::set_root)).
+    pub fn run_background(self: &Arc<Self>) -> Result<RpcServerHandle> {
+        self.mark_started();
         let me = Arc::clone(self);
-        std::thread::spawn(move || {
-            // Log a fatal accept-loop error; otherwise the server dies with no trace.
-            if let Err(e) = me.run() {
-                log::error!("RPC accept loop terminated with error: {e:?}");
-            }
+        let accept = std::thread::Builder::new()
+            .name("rpc-accept".into())
+            .spawn(move || {
+                let ended = me.accept_loop();
+                // Logged here too: a handle that is only dropped never reads the result.
+                if let Err(e) = &ended {
+                    log::error!("RPC accept loop terminated with error: {e:?}");
+                }
+                ended
+            })
+            .map_err(|e| {
+                log::error!("RpcServer::run_background: cannot start the accept thread: {e}");
+                StatusCode::from(e)
+            })?;
+        Ok(RpcServerHandle {
+            server: Arc::clone(self),
+            accept: Some(accept),
         })
     }
 
@@ -1997,7 +2084,8 @@ impl RpcServer {
     /// nothing is joined. This reaches nothing a peer keeps open: a
     /// worker parked in `recv` never reads the flag, so a client that
     /// stays connected keeps its worker alive. To end those too, use
-    /// [`terminate`](Self::terminate).
+    /// [`terminate`](Self::terminate). The accept loop polls the flag, so
+    /// [`run`](Self::run) returns within a few milliseconds.
     ///
     /// **The android-13+ attach gate closes with it.** From this point a
     /// connection echoing a live session's id is refused — both the
@@ -2012,8 +2100,9 @@ impl RpcServer {
     }
 
     /// End the server now: stop accepting, end every session it serves,
-    /// and join the workers. This is what a dropped
-    /// [`ServerGuard`](crate::ServerGuard) does. Where
+    /// and join the workers. This is what a dropped [`RpcServerHandle`]
+    /// (and so a dropped [`ServerGuard`](crate::ServerGuard)) does after it
+    /// joined the accept loop. Where
     /// [`stop_accepting`](Self::stop_accepting) waits for peers to leave,
     /// this ends each session as [`RpcSession::close_session`] would — whatever its
     /// connection count — so every slot's transport is shut down, the
@@ -2037,10 +2126,10 @@ impl RpcServer {
     /// on is skipped rather than self-joined and exits when the handler
     /// returns. Idempotent.
     ///
-    /// **The join is guaranteed only against a stopped accept loop.** Its
-    /// thread is the caller's to join
-    /// ([`run_background`](Self::run_background) returned it), and joining
-    /// it *before* this call is the precondition, as `ServerGuard` does:
+    /// **The join is guaranteed only against a stopped accept loop.**
+    /// Stopping it *before* this call is the precondition, as
+    /// [`RpcServerHandle`] does (a [`run`](Self::run) on a thread of the
+    /// caller's has returned):
     /// a still-running accept loop spawns a worker before it registers the
     /// handle, so a connection accepted mid-pass can leave a worker behind
     /// that no pass ever sees. Such a worker is not joined, so the
@@ -2213,6 +2302,96 @@ impl Drop for RpcServer {
     }
 }
 
+impl std::fmt::Debug for RpcServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("RpcServer");
+        match &self.bind {
+            BindAddress::Unix { path, .. } => d.field("bind", path),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            BindAddress::UnixAbstract => d.field("bind", &"unix-abstract"),
+            #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+            BindAddress::Vsock { cid, port } => {
+                d.field("bind", &format_args!("vsock {cid}:{port}"))
+            }
+            #[cfg(feature = "rpc-tls")]
+            BindAddress::Tcp(addr) => d.field("bind", addr),
+        };
+        d.field("max_threads", &self.max_threads.load(Ordering::Relaxed))
+            .field("shutdown", &self.shutdown.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The accept loop [`RpcServer::run_background`] started, and the end of
+/// the server it serves.
+///
+/// Dropping it ends the server, as [`stop_and_join`](Self::stop_and_join)
+/// does: [`RpcServer::stop_accepting`], a join of the accept thread, then
+/// [`RpcServer::terminate`], which ends every session (connected clients
+/// see their connection go) and joins the workers. So the drop returns
+/// whether or not clients are still connected, bounded as `terminate` is
+/// by the handshake deadline of a connection still in its handshake.
+///
+/// The `RpcServer` itself lives on while another `Arc` holds it, but it
+/// accepts nothing again: the accept flag stays down.
+#[must_use = "dropping the handle stops the server at once; bind it to a named variable"]
+pub struct RpcServerHandle {
+    server: Arc<RpcServer>,
+    accept: Option<JoinHandle<Result<()>>>,
+}
+
+impl RpcServerHandle {
+    /// The server this handle runs.
+    pub fn server(&self) -> &Arc<RpcServer> {
+        &self.server
+    }
+
+    /// Whether the accept loop has ended — after [`RpcServer::stop_accepting`],
+    /// or on a fatal accept error, which [`stop_and_join`](Self::stop_and_join)
+    /// then returns. Sessions already accepted are served either way.
+    pub fn is_finished(&self) -> bool {
+        self.accept.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// End the server now, as dropping the handle does, and return how the
+    /// accept loop ended: `Ok(())` when it stopped on the flag, the error
+    /// [`RpcServer::run`] returns when a fatal accept error had ended it,
+    /// and [`StatusCode::Unknown`] when the accept thread panicked.
+    pub fn stop_and_join(mut self) -> Result<()> {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        let Some(accept) = self.accept.take() else {
+            return Ok(());
+        };
+        // Flag, then join, so nothing is accepted after this; then end what is connected.
+        self.server.stop_accepting();
+        let ended = accept.join().unwrap_or_else(|_| {
+            log::error!("RPC: accept loop thread panicked");
+            Err(StatusCode::Unknown)
+        });
+        self.server.terminate();
+        ended
+    }
+}
+
+impl Drop for RpcServerHandle {
+    fn drop(&mut self) {
+        // The accept thread already logged a fatal error; a drop has no caller to give it to.
+        let _ = self.stop();
+    }
+}
+
+impl std::fmt::Debug for RpcServerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcServerHandle")
+            .field("server", &self.server)
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
+
 impl RpcSession {
     /// Client: resolve a named service published via
     /// [`RpcServer::add_service`].
@@ -2222,10 +2401,10 @@ impl RpcSession {
             .as_any()
             .downcast_ref::<super::proxy::RpcProxy>()
             .ok_or(StatusCode::BadType)?;
-        let mut data = rp.build_request(DIRECTORY_DESC)?;
+        let mut data = rp.request_parcel(DIRECTORY_DESC)?;
         data.write(&name)?;
         let mut reply = rp
-            .transact(TX_GET_SERVICE, &data, 0)?
+            .send(TX_GET_SERVICE, &data, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         let st: crate::Status = reply.read()?;
         if !st.is_ok() {

@@ -103,12 +103,15 @@ Key points:
   without a service manager.
 - **`server.run()`** runs the accept loop until
   [`RpcServer::stop_accepting`] is called from another thread. Use
-  [`RpcServer::run_background`] to spawn it on a dedicated thread
-  instead. `stop_accepting` only raises the flag — sessions already
-  connected drain as their peers leave. [`RpcServer::terminate`] ends
-  those too (every session closed, every worker joined); it is what
-  dropping a `ServerGuard` does. See [How a connection
-  ends](#how-a-connection-ends).
+  [`RpcServer::run_background`] to run it on a thread of its own
+  instead: it returns an `RpcServerHandle`, and **dropping the handle
+  stops the server** — the accept loop is stopped and joined, then
+  [`RpcServer::terminate`] ends every session and joins every worker.
+  Keep the handle in a named variable for as long as the server should
+  serve; `let _ = server.run_background()?;` drops it on that line.
+  `stop_accepting` alone only raises the flag — sessions already
+  connected drain as their peers leave. A `ServerGuard` wraps the same
+  handle. See [How a connection ends](#how-a-connection-ends).
 
 ### Client
 
@@ -282,9 +285,11 @@ Each backend implements the
 [`RpcTransport`](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/trait.RpcTransport.html)
 trait — you can implement your own if you need a custom carrier. A
 session moves its bytes through `send_raw` / `recv_raw` on both wire
-profiles, so a transport of your own implements those; the trait's
-`send_frame` / `recv_frame` are a separate length-prefixed API no session
-calls.
+profiles, so those are required methods, together with `shutdown`,
+`peer_identity` and `describe`; the trait's `send_frame` / `recv_frame`
+are a separate length-prefixed API no session calls, with default
+implementations framed on top of the raw calls. The bundled
+transports' constructors return `rsbinder::Result`.
 
 ### Abstract Unix-domain sockets (Linux/Android)
 
@@ -329,10 +334,20 @@ The Unix-only predecessor `RpcUnixClientConfig`, and the
 `setup_unix_client_android13plus_{with_config,with_id,fan_out}` helpers,
 are deprecated since 0.12.0 and will be removed in the release after it.
 
-The builder's `session_id` knob is for the manual attach calls,
-`add_outgoing_connection_with_config` and
-`add_incoming_connection_with_config`, which add one connection to a
-session you already hold. Every entry that builds a new `RpcSession` —
+The builder owns what it connects with, and the session it founds keeps
+its connector: `RpcSession::add_outgoing_connection()` and
+`add_incoming_connection()` open one more connection the way the
+founding one was opened — same address, same handshake deadline, the
+session's own id, wire version and fd mode — with nothing to restate. A
+session built from a transport (`connect_android13plus`,
+`from_preconnected_fd`, an r34 session) has no connector, and those two
+calls return `InvalidOperation` on it. So a connect function given to
+`RpcClientConfig::new` must be `'static`.
+
+The deprecated manual attach calls, `add_outgoing_connection_with_config`
+and `add_incoming_connection_with_config`, take a config of their own
+whose deprecated `session_id` knob names the session. Every entry that
+builds a new `RpcSession` —
 `setup_client_android13plus_with_config`, the deprecated
 `setup_unix_client_android13plus_with_id` and
 `connect_android13plus_fd_with_id`, and the entry API's deprecated
@@ -348,16 +363,14 @@ manual attach accepts only the id of the session it is called on: any
 other id, such as one read from another `RpcSession`, is `BadValue`
 before connecting.
 
-> **The id you echo must come from `RpcSession::get_session_id()`** on the
-> session you attach to — one round trip that asks the server for it, kept
-> by the session. `RpcSession::session_id()` is a *different* method: on a
-> client session it returns a client-local value that the server has never
-> seen. Both return 32 opaque bytes, so nothing but the method name
-> distinguishes them; the attach calls refuse every id but the session's
-> own with `BadValue` before connecting. An attach the server refuses (for
-> example, more connections than its `set_max_threads` allows) fails at the
-> attach call, and on `add_outgoing_connection_with_config` that failure
-> also ends the session it was attaching to (see
+> **With the deprecated manual attach, the id you echo must come from
+> `RpcSession::get_session_id()`** on the session you attach to — one
+> round trip that asks the server for it, kept by the session. The attach
+> calls refuse every id but the session's own with `BadValue` before
+> connecting. `add_outgoing_connection()` reads the id itself. An attach
+> the server refuses (for example, more connections than its
+> `set_max_threads` allows) fails at the attach call, and on an outgoing
+> attach that failure also ends the session it was attaching to (see
 > [How a connection ends](#how-a-connection-ends)); stay within
 > `negotiate()` connections.
 
@@ -434,7 +447,7 @@ let config = Arc::new(
 // TCP is TLS-only by design: there is no plaintext-TCP server constructor.
 let server = RpcServer::setup_tcp_server_tls("0.0.0.0:9999", config)?;
 server.set_root(my_root_binder)?;
-server.run()?;                              // or server.run_background()
+server.run()?;                              // or keep `server.run_background()?`
 ```
 
 `RpcServer::setup_unix_server_tls` and (with `rpc-vsock`)
@@ -470,6 +483,39 @@ an untrusted, missing, or expired certificate fails the connection
 before a single RPC byte is exchanged. rsbinder never invents crypto —
 all key / cert / root management and verification are your `rustls`
 config and rustls itself.
+
+### What a refused certificate returns
+
+On Linux and Android a refused certificate comes back as an errno of the
+kernel's key-management family, so it is not mistaken for a lost
+connection or for an `EPERM` denial:
+
+| Cause | `StatusCode` |
+|-------|--------------|
+| untrusted issuer, bad signature, wrong host name, no certificate presented; or the peer's `unknown_ca` / `access_denied` / `certificate_required` / `unsupported_certificate` alert | `Errno(-EKEYREJECTED)` |
+| revoked; or the peer's `certificate_revoked` alert | `Errno(-EKEYREVOKED)` |
+| expired or not yet valid (an expired CRL too); or the peer's `certificate_expired` alert | `Errno(-EKEYEXPIRED)` |
+
+Anything else rustls reports — a malformed certificate, the
+`bad_certificate` alert, a non-certificate failure — stays
+`StatusCode::Unknown`, which is also what AOSP libbinder returns for every
+TLS failure. The `rustls::Error` itself is the payload of the
+`RpcError::Io` behind the status. Apple platforms have no `EKEY*` errnos and
+get `Unknown` for all of these.
+
+When the client learns of a refused **client** certificate depends on the TLS
+version. In TLS 1.2 its handshake fails. In TLS 1.3 the client has finished
+its handshake before the server judges its certificate, so the server's
+alert arrives on the client's first read — the connect on the android-13+
+profile, the first call on r34. An rsbinder server keeps the connection
+half-open after a failed handshake (up to 500 ms or 64 KiB of client data)
+so that alert reaches the client; a server that closes at once, as AOSP
+libbinder does, resets the connection and the client sees `DeadObject`.
+
+[`Reconnecting`](./reconnecting.md) treats `EKEYREJECTED` and `EKEYREVOKED`
+as permanent at `build` and keeps retrying them once it runs (a server can be
+redeployed with a new certificate); `EKEYEXPIRED` is never permanent, since a
+device that has just booted may still have its clock at the epoch.
 
 ## Security
 
@@ -566,7 +612,10 @@ per session, the mode every example in the book uses) and `N >= 2`
 libbinder peers. On the r34 wire `N` is how many connections an
 Android 12 client opens ([The Android 12 (r34) profile](#the-android-12-r34-profile)). See the rustdoc on
 [`RpcServer::set_max_threads`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_max_threads)
-for the per-mode details.
+for the per-mode details. Set it, and the root (`set_root`) or the
+service directory (`add_service`, one or the other), before `run` /
+`run_background`: once the server runs, each of those calls returns
+`InvalidOperation` (AOSP `RpcServer` aborts there).
 
 `set_max_threads` caps *incoming slots per session*. To cap
 *server-wide concurrent connections* — for example to bound the
@@ -615,7 +664,9 @@ name — TLS over a Unix socket, say — build the connections yourself with
 `RpcClientConfig::new(version, connect)`, whose `connect` is called once
 per connection. The server budgets them at
 `2 × set_max_threads` per session (two on a default server) and
-refuses the rest, which the client sees as a setup error.
+refuses the rest, which the client sees as a setup error. One more
+can be added later, one at a time, with
+`RpcSession::add_incoming_connection()`.
 
 Two consequences worth knowing:
 
@@ -659,11 +710,11 @@ no frame rode it and the client's attach fails with it. A client's
 attach, in either direction, ends the session once the server may hold
 the connection: any failure after its header went out, except, for a
 callback attach, a close (a reset included) before the first byte of
-the server's `"cci"`; see `add_incoming_connection_with_config`. An
+the server's `"cci"`; see `add_incoming_connection`. An
 outgoing attach has no such exception, because libbinder
 `android-16.0.0_r3` and later end their session when they refuse one
 at the `setMaxThreads` cap, and the close that refusal produces looks
-the same as any other; see `add_outgoing_connection_with_config`. A client's callback connection
+the same as any other; see `add_outgoing_connection`. A client's callback connection
 whose serving thread cannot be started ends the session too, since the
 server already holds it as a callback connection.
 
@@ -706,10 +757,14 @@ on a later write).
 AOSP libbinder's RPC path has no timeouts: every socket wait is a
 `poll` without a bound, and only a session shutdown ends it. Every
 deadline below is an rsbinder addition, and each measures one thing.
+For every one of them `None` is no deadline and `Duration::ZERO` is
+refused with `BadValue` — by the setter, or, for a config or options
+field, by the call that connects or serves — since no reply, idle period
+or handshake fits in no time.
 
 | Setting | What it bounds | On expiry |
 |---|---|---|
-| `RpcSession::set_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every bundled socket transport; a transport of your own only if it implements `RpcTransport::set_write_timeout`; on Linux and Android progress is the peer taking this end's bytes, `SIOCOUTQ`, which a reply wait counts too, and Apple counts the bytes a send accepted: [`transport` module doc "A slow peer"](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/index.html#a-slow-peer)); the peer's host not answering (the kernel's keepalive check, TCP and TLS over TCP); on a client, each connect and handshake step (`connect(2)` itself only for `tcp_debug` and `tls`, where it is one step across every address the host resolves to: a `unix` connect waits while the listener's accept queue is full, and the kernel bounds a `vsock` one by its own connect timeout) | The session ends; the call that waited returns `TimedOut`. A connect or handshake step: the setup or attach call returns `TimedOut`, and an attach whose step expires after its header went out ends the session ([How a connection ends](#how-a-connection-ends)) |
+| `RpcSession::set_reply_timeout(d)`; `RpcClientConfig::timeout`, `ClientOptions::timeout`; on a server `RpcServer::set_reply_timeout`, `ServeOptions::reply_timeout`, applied to every session it makes | How long the peer may leave this end without an answer: a reply wait; a send that makes no progress (`SO_SNDTIMEO`, every bundled socket transport; a transport of your own only if it implements `RpcTransport::set_write_timeout`; on Linux and Android progress is the peer taking this end's bytes, `SIOCOUTQ`, which a reply wait counts too, and Apple counts the bytes a send accepted: [`transport` module doc "A slow peer"](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/index.html#a-slow-peer)); the peer's host not answering (the kernel's keepalive check, TCP and TLS over TCP); on a client, each connect and handshake step (`connect(2)` itself only for `tcp_debug` and `tls`, where it is one step across every address the host resolves to: a `unix` connect waits while the listener's accept queue is full, and the kernel bounds a `vsock` one by its own connect timeout) | The session ends; the call that waited returns `TimedOut`. A connect or handshake step: the setup or attach call returns `TimedOut`, and an attach whose step expires after its header went out ends the session ([How a connection ends](#how-a-connection-ends)) |
 | The same `d`, for a free connection in the session's pool | A wait for a connection to send on; nothing has been sent yet | That call returns `WouldBlock`; the session goes on |
 | `RpcServer::set_handshake_timeout`, `ServeOptions::handshake_timeout` (default 10 s) | An accepted connection from its accept to admission, its TLS handshake and first contact included, as a whole: a peer that sends its handshake a byte at a time does not stretch it. The `set_authorizer` hook's run is not counted. A transport whose `RpcTransport::shutdown_handle` is `None`, the default for one of your own, is bounded per wait only, by the `set_read_timeout` and `set_write_timeout` it implements (neither: no bound) | The connection is dropped |
 | `RpcServer::set_idle_timeout`, `ServeOptions::idle_timeout` | A session in which no byte crossed any connection and no call was open, judged per session ([`set_idle_timeout`](https://docs.rs/rsbinder/latest/rsbinder/rpc/struct.RpcServer.html#method.set_idle_timeout) states the timing and what counts) | The session ends |
@@ -727,7 +782,7 @@ neither kernel binder nor libbinder bounds it.
 **Keepalive is on for every TCP connection, TLS over TCP included.**
 Without a session timeout it runs at the system's intervals, so a session whose peer host
 vanished ends, and fires its death recipients, after hours instead of
-never; `set_timeout(d)` sizes the check to `d`. The values, and what
+never; `set_reply_timeout(d)` sizes the check to `d`. The values, and what
 Linux, Android and macOS each do with them, are stated once, in
 [`RpcTransport::set_liveness`](https://docs.rs/rsbinder/latest/rsbinder/rpc/transport/trait.RpcTransport.html#method.set_liveness).
 The probes are between the two kernels and change no byte on the wire,
@@ -781,6 +836,16 @@ rsbinder implements **both sides** of this pattern:
   you back the RPC root. Your client code looks identical to a
   regular `hub::check_service` call.
 
+  The accessor, not your process, picks the socket. A Unix or vsock fd
+  is always accepted; an `AF_INET`/`AF_INET6` fd would run the plaintext
+  `rpc-tcp-debug` transport (no encryption, anonymous peer), so it is
+  refused with `BadType` unless the process calls
+  `rsbinder::rpc::set_accessor_plaintext_inet(true)` first. The feature
+  alone is not the switch because Cargo unifies features: any crate in
+  the dependency graph that enables `rpc-tcp-debug` enables it for the
+  whole build, release builds included. Without the feature an inet fd is
+  always `BadType`. AOSP accepts any family here.
+
 - **Register side** — `hub::android_16::create_accessor(instance,
   addr_provider)` builds a `LocalAccessor` `BnAccessor` you can
   publish via `hub::add_service`. The service manager hands it to
@@ -815,7 +880,7 @@ rsbinder implements **both sides** of this pattern:
   let server = RpcServer::setup_unix_server(&sock)?;
   server.set_android13plus(2);
   server.set_root(my_root)?;
-  let _bg = server.run_background();
+  let _serving = server.run_background()?; // dropping it stops the server
 
   // 2. Vend an IAccessor that hands clients of `my.IService/default` an
   //    fd connected to `sock`, and publish it through the kernel service

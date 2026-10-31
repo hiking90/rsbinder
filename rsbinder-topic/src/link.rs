@@ -214,7 +214,15 @@ impl Link {
             lost: self.control.lost(),
             waiting: self.control.state().load() & WAITING != 0,
             evicted: self.evicted(),
+            pinned: self.pinned(),
         }
+    }
+
+    /// The slot this subscription's pin word names: what [`Pins::load_pins`] counts for it.
+    fn pinned(&self) -> Option<u32> {
+        let pins = self.control.pins() > 0;
+        pins.then(|| self.control.pin(0))
+            .and_then(|pin| pin.checked_sub(1))
     }
 }
 
@@ -358,7 +366,6 @@ impl Readers for Links {
 impl Pins for Links {
     fn load_pins(&self, pinned: &mut Vec<u32>) {
         pinned.clear();
-        let words = self.links.iter().filter(|link| link.control.pins() > 0);
-        pinned.extend(words.filter_map(|link| link.control.pin(0).checked_sub(1)));
+        pinned.extend(self.links.iter().filter_map(|link| link.pinned()));
     }
 }

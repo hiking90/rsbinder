@@ -145,7 +145,7 @@ impl Remotable for Interop {
                 reply.write(&Interface::as_binder(&Binder::new(Interop)))
             }
             TX_ECHO_HOLDER => {
-                let mut holder = ParcelableHolder::new(Stability::Local);
+                let mut holder = ParcelableHolder::local();
                 holder.read_from_parcel(reader)?;
                 let relayed = holder.write_to_parcel(reply);
                 eprintln!("[rsbinder-server] echo_holder: undecoded relay -> {relayed:?}");
@@ -165,7 +165,7 @@ impl Remotable for Interop {
                 reply.write(&i32::from(home))
             }
             TX_HOLDER_RETRY => {
-                let mut holder = ParcelableHolder::new(Stability::Local);
+                let mut holder = ParcelableHolder::local();
                 holder.read_from_parcel(reader)?;
                 let first = holder.get_parcelable::<RetryProbe>();
                 let second = holder.get_parcelable::<RetryProbe>();
@@ -233,7 +233,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let server = RpcServer::setup_unix_server(&sock)?;
     server.set_android13plus(max_version);
-    server.set_max_threads(1);
+    server.set_max_threads(1)?;
     // The handshake honours the client's `fileDescriptorTransportMode`
     // byte only because this is set; v0 stays `None` (AOSP forbids fds
     // there), v1+ carries fds over `SCM_RIGHTS`.

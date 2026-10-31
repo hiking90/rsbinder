@@ -387,15 +387,30 @@ pub struct UnixTransport {
     queue: OutQueue,
 }
 
+impl std::fmt::Debug for UnixTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnixTransport")
+            .field("desc", &self.desc)
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
 impl UnixTransport {
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
     ///
     /// On Apple platforms a socket already shut down in both directions
     /// (its peer closed before the wrap) fails here with
-    /// [`RpcError::EndOfStream`]: XNU refuses the `SO_NOSIGPIPE` this sets,
-    /// and no I/O on such a socket could succeed anyway.
-    pub fn from_stream(stream: UnixStream) -> RpcResult<Self> {
+    /// [`StatusCode::DeadObject`](crate::StatusCode::DeadObject): XNU
+    /// refuses the `SO_NOSIGPIPE` this sets, and no I/O on such a socket
+    /// could succeed anyway.
+    pub fn from_stream(stream: UnixStream) -> crate::Result<Self> {
+        Ok(Self::wrap(stream)?)
+    }
+
+    /// [`from_stream`](Self::from_stream) keeping the transport layer's error, for the server.
+    pub(crate) fn wrap(stream: UnixStream) -> RpcResult<Self> {
         // No `MSG_NOSIGNAL` on Apple (module doc "fd passing"); EINVAL = both directions shut.
         #[cfg(target_vendor = "apple")]
         rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(|e| match e {
@@ -420,7 +435,7 @@ impl UnixTransport {
     /// A connected pair via `socketpair(AF_UNIX, SOCK_STREAM)`. Both
     /// ends are this process, so both report this process's identity.
     /// Used by hermetic tests; no filesystem path involved.
-    pub fn pair() -> RpcResult<(Self, Self)> {
+    pub fn pair() -> crate::Result<(Self, Self)> {
         use rustix::net::{AddressFamily, SocketFlags, SocketType};
         // Atomic CLOEXEC: a `fork`+`exec` before a later `fcntl` would leak both ends (no EOF).
         #[cfg(not(target_vendor = "apple"))]
@@ -454,20 +469,19 @@ impl UnixTransport {
     /// finds no data returns [`RpcError::Timeout`] at once. An Accessor fd
     /// arrives non-blocking; [`crate::rpc::RpcSession::from_preconnected_fd`]
     /// clears the flag, this does not.
-    pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
+    pub fn from_owned_fd(fd: OwnedFd) -> crate::Result<Self> {
         Self::from_stream(UnixStream::from(fd))
     }
 
     /// Connect to a listening Unix socket at `path` (client side).
-    pub fn connect(path: impl AsRef<Path>) -> RpcResult<Self> {
-        // `RpcError: From<std::io::Error>` — `?` does the conversion.
+    pub fn connect(path: impl AsRef<Path>) -> crate::Result<Self> {
         let stream = UnixStream::connect(path)?;
         Self::from_stream(stream)
     }
 
     /// Connect to a Linux/Android abstract Unix socket.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn connect_abstract(name: &[u8]) -> RpcResult<Self> {
+    pub fn connect_abstract(name: &[u8]) -> crate::Result<Self> {
         let addr = UnixSocketAddr::from_abstract_name(name)?;
         Self::from_stream(UnixStream::connect_addr(&addr)?)
     }

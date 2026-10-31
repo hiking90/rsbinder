@@ -9,7 +9,7 @@ use std::os::fd::AsFd;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-use rsbinder::{ExceptionCode, ParcelFileDescriptor, Status};
+use rsbinder::ParcelFileDescriptor;
 
 use crate::aidl::ITopic::WAKE_FUTEX;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
@@ -103,7 +103,7 @@ fn a_loan_is_refused_without_a_pool_past_a_slot_past_the_bound_and_once_closed()
     assert_eq!(publisher.loan_slice(8).err(), Some(too_many));
     drop(held);
     let held = publisher.loan_slice(8).unwrap();
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     assert_eq!(held.publish(), Err(PublishError::Closed));
     assert_eq!(publisher.loan_slice(8).err(), Some(PublishError::Closed));
 }
@@ -406,7 +406,10 @@ fn a_dropped_sample_lets_go_of_its_slot() {
     let mut subscriber = subscribe(&publisher);
     let slot = lend(&publisher, &[3; 8]);
     lend(&publisher, &[4; 8]);
-    drop(subscriber.try_recv_sample().unwrap());
+    let sample = subscriber.try_recv_sample().unwrap();
+    assert_eq!(publisher.stats().subscribers[0].pinned, Some(slot));
+    drop(sample);
+    assert_eq!(publisher.stats().subscribers[0].pinned, None);
     // The free slots first; then the only one read past, as nothing pins it.
     for n in 0..3u8 {
         assert_ne!(lend(&publisher, &[n; 8]), slot);
@@ -431,7 +434,7 @@ fn a_sample_is_waited_for_until_a_value_a_bound_or_the_end() {
         let sample = subscriber.recv_sample().unwrap();
         assert_eq!(sample.to_owned(), pattern(1, 64));
     });
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     assert_eq!(
         subscriber.recv_sample().err(),
         Some(RecvError::Closed(crate::Closed::End))
@@ -483,6 +486,26 @@ fn pinned_slots_are_not_lent_however_many_values_follow() {
     // Let go: the subscribers have read nothing, so the oldest slots go round, this one too.
     page.store_pin(0, Ordering::Release);
     assert!((0..5).any(|n| lend(&publisher, &[n; 8]) == pinned));
+}
+
+/// Plan 17 T-8: a loan moves between threads, as `LentSlot` does and the writer's reference does.
+#[test]
+fn a_loan_is_send() {
+    fn is_send<T: Send>() {}
+    is_send::<crate::LoanMut<'static>>();
+}
+
+/// A loan taken on one thread is published on another, and its value arrives.
+#[test]
+fn a_loan_published_on_another_thread_reaches_the_subscriber() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    let mut loan = publisher.loan_slice(64).unwrap();
+    loan.copy_from_slice(&pattern(5, 64));
+    std::thread::scope(|scope| {
+        scope.spawn(move || loan.publish().unwrap());
+    });
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(5, 64))));
 }
 
 /// Samples received by an async caller, on the blocking pool and on the reactor.
@@ -592,5 +615,25 @@ mod async_samples {
         moved(&trusted.recv_sample_async());
         movable::<Sample<'static, Untrusted>>();
         movable::<Sample<'static, Trusted>>();
+    }
+
+    /// Plan 17 T-8: a spawned future holds a loan across an `.await`, then publishes it.
+    #[test]
+    fn a_spawned_future_holds_a_loan_across_an_await() {
+        let runtime = runtime();
+        let publisher = std::sync::Arc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+        let mut subscriber = subscribe(&publisher);
+        let spawned = {
+            let publisher = publisher.clone();
+            runtime.spawn(async move {
+                let mut loan = publisher.loan_slice(64).unwrap();
+                tokio::task::yield_now().await;
+                loan.copy_from_slice(&pattern(3, 64));
+                tokio::task::yield_now().await;
+                loan.publish()
+            })
+        };
+        assert_eq!(runtime.block_on(spawned).unwrap(), Ok(()));
+        assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(3, 64))));
     }
 }

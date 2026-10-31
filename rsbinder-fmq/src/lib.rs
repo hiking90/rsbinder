@@ -3,6 +3,12 @@
 
 //! AOSP-compatible Fast Message Queue (FMQ) in Rust.
 //!
+//! **Provisional** (`book/src/stability-tiers.md`): the shared-memory layout,
+//! the counters and the EventFlag protocol are libfmq's and change only with
+//! libfmq; the Rust signatures may still change in a minor release. The C header
+//! `c/rsbinder_fmq.h` is in the same tier and carries a version macro,
+//! `RSBINDER_FMQ_H_VERSION`.
+//!
 //! An FMQ is a ring of fixed-size elements in shared memory with two
 //! counters and, optionally, a 32-bit futex word, as Android's `libfmq`
 //! (`system/libfmq`) lays it out. AIDL HALs hand one across binder as an
@@ -106,10 +112,12 @@ pub mod shm;
 mod unsync;
 
 pub use descriptor::{AttachPolicy, Descriptor, Flavor, Grantor};
-pub use error::{Error, Result};
+pub use error::{Errno, Error, Result};
 pub use event_flag::{EventFlag, NOT_EMPTY, NOT_FULL};
-pub use queue::{Element, MessageQueue, Regions};
-pub use unsync::{UnsyncCreate, UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriter};
+pub use queue::{Element, MessageQueue, Notify, ReadTxn, Regions, Transfer, WriteTxn};
+pub use unsync::{
+    UnsyncCreate, UnsyncLatest, UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriteTxn, UnsyncWriter,
+};
 
 #[cfg(all(
     test,
@@ -125,11 +133,7 @@ mod reader_target_tests {
     fn a_reader_attaches_exactly_where_the_wide_word_exists() {
         let writer = UnsyncWriter::<u8>::create(8, &UnsyncCreate::new()).expect("create");
         let desc = writer.descriptor().expect("descriptor");
-        let policy = AttachPolicy {
-            max_capacity: 8,
-            require_seal: true,
-            require_event_flag: false,
-        };
+        let policy = AttachPolicy::new(8);
         let attached = UnsyncReader::<u8>::attach(&desc, &policy, UnsyncStart::Oldest);
         if shm::RoWord64::PRESENT {
             assert!(attached.is_ok(), "{:?}", attached.err());
@@ -165,11 +169,7 @@ mod unsupported_tests {
             quantum: 1,
             flavor: Flavor::SynchronizedReadWrite,
         };
-        let policy = AttachPolicy {
-            max_capacity: 1,
-            require_seal: true,
-            require_event_flag: true,
-        };
+        let policy = AttachPolicy::new(1).require_event_flag(true);
         assert_eq!(
             MessageQueue::<u8>::attach(&desc, &policy).err(),
             Some(Error::Unsupported)
@@ -190,13 +190,19 @@ mod unsupported_tests {
         use std::sync::atomic::AtomicU32;
         let options = shm::CreateOptions::new("unit");
         assert_eq!(shm::create(4096, &options).err(), Some(Error::Unsupported));
+        let mapped = shm::create_mapped(4096, &options, shm::Seals::SHRINK);
+        assert_eq!(mapped.err(), Some(Error::Unsupported));
         let file = std::fs::File::open("/dev/null").expect("/dev/null");
         let seals = shm::Seals::GROW;
         assert_eq!(shm::add_seals(file.as_fd(), seals), Err(Error::Unsupported));
         assert_eq!(shm::seals(file.as_fd()), Err(Error::Unsupported));
         assert!(!shm::shrink_sealed(file.as_fd()));
         let word = AtomicU32::new(0);
-        assert_eq!(shm::futex_wait(&word, 0, 1, None), Err(Error::Unsupported));
-        assert_eq!(shm::futex_wake(&word, 1), Err(Error::Unsupported));
+        let bit = std::num::NonZeroU32::MIN;
+        assert_eq!(
+            shm::futex_wait(&word, 0, bit, None),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(shm::futex_wake(&word, bit), Err(Error::Unsupported));
     }
 }

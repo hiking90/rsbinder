@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder::{BinderResult, DeathRecipient, ExceptionCode, Interface, SIBinder, Status};
 
-use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_FULL};
+use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::{self, Stored, HEADER_OFFSET, MIN_RING, VERSION};
@@ -28,8 +28,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{
     wait_any, Acceptor, Advertisement, Authorize, Backpressure, Bytes, Closed, Disconnected,
-    NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver, Start, Subscriber,
-    SubscriberPolicy, Wait, Wake, Watch,
+    NamedState, NamedSubscriber, PoolPolicy, Publisher, PublisherPolicy, RecvError, Resolver,
+    Start, Subscriber, SubscriberPolicy, Trusted, Wait, Wake, Watch,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -251,7 +251,7 @@ fn a_topic_ended_with_an_error_status_forgets_its_publisher() {
     let publisher = advertise(&names, &policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    publisher.close(&Status::from(ExceptionCode::IllegalState));
+    publisher.close_with(&Status::from(ExceptionCode::IllegalState));
     assert!(matches!(
         recv(&mut subscriber),
         Err(RecvError::Disconnected(Disconnected::Ended(
@@ -280,6 +280,48 @@ fn a_publisher_whose_memory_failed_a_check_stays_remembered() {
         )))
     );
     assert_eq!(subscriber.remembered(), 1);
+    // Nothing is asked again while the name has that publisher: the state says so at each ask.
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.state(), NamedState::Corrupted);
+    assert_eq!(subscriber.state(), NamedState::Corrupted);
+}
+
+#[test]
+fn a_dead_resolver_closes_the_subscriber_once_its_connection_ends() {
+    let names = Names::default();
+    let publisher = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    subscriber.resolver_dies();
+    // The connection goes on.
+    assert_eq!(subscriber.state(), NamedState::Connected);
+    publisher.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    publisher.close();
+    let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
+    assert_eq!(recv(&mut subscriber), ended);
+    let closed = Err(RecvError::Closed(Closed::ResolverDied));
+    assert_eq!(recv(&mut subscriber), closed);
+    assert_eq!(subscriber.try_recv(), closed);
+    assert_eq!(subscriber.state(), NamedState::Closed(Closed::ResolverDied));
+    let asked = Instant::now();
+    assert!(!subscriber.wait_connected(WAIT));
+    assert!(asked.elapsed() < WAIT, "returned at once");
+}
+
+#[test]
+fn a_dead_resolver_closes_a_subscriber_without_a_connection_at_once() {
+    let names = Names::default();
+    let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
+    subscriber.resolver_dies();
+    assert!(!subscriber.prepare_wait(), "a receive returns now");
+    let closed = Err(RecvError::Closed(Closed::ResolverDied));
+    assert_eq!(recv(&mut subscriber), closed);
+    // A publisher that comes later is not connected to.
+    let publisher = advertise(&names, &policy());
+    publisher.publish(&bytes(2)).unwrap();
+    assert!(!subscriber.wait_connected(Duration::from_millis(300)));
+    assert_eq!(recv(&mut subscriber), closed);
 }
 
 /// It lives on, so it stays remembered: given the name again, it is read from `Latest`.
@@ -349,6 +391,136 @@ fn another_binder_for_the_name_is_read_after_the_records_of_the_old_one() {
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
     assert_eq!(old.subscriber_count(), 0);
     assert_eq!(new.subscriber_count(), 1);
+}
+
+/// One subscriber, a ring of 4 KiB and a pool of 4 KiB slots that keeps `depth` values.
+fn pooled(depth: usize) -> PublisherPolicy {
+    PublisherPolicy {
+        max_subscribers: 1,
+        max_per_uid: 1,
+        pool: Some(PoolPolicy {
+            slot_bytes: 4096,
+            depth,
+            max_loans: 1,
+            huge_pages: false,
+        }),
+        ..policy()
+    }
+}
+
+/// Lend a slot, write `value` into it and publish it; the slot's number.
+fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> u32 {
+    let mut loan = publisher.loan_slice(value.len()).unwrap();
+    loan.copy_from_slice(value);
+    let slot = loan.slot();
+    loan.publish().unwrap();
+    slot
+}
+
+/// Samples drain a replaced publisher as values do, each in its slot, then read the next one.
+#[test]
+fn samples_drain_a_replaced_publisher_and_go_on_to_the_next() {
+    let names = Names::default();
+    let old = advertise(&names, &pooled(4));
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let first = lend(&old, &[1; 64]);
+    old.publish(&bytes(2)).unwrap();
+    lend(&old, &[3; 64]);
+    let new = Publisher::<Bytes>::new(&pooled(4)).unwrap();
+    lend(&new, &[9; 64]);
+    names.give(NAME, new.as_binder());
+    let sample = subscriber.recv_sample_timeout(WAIT).unwrap();
+    assert!(sample.is_loaned());
+    assert_eq!(sample.to_owned(), vec![1; 64]);
+    assert_eq!(old.stats().subscribers[0].pinned, Some(first));
+    drop(sample);
+    assert_eq!(old.stats().subscribers[0].pinned, None);
+    // Lent after the replacement was seen: not read.
+    lend(&old, &[4; 64]);
+    let ring = subscriber.recv_sample_timeout(WAIT);
+    assert_eq!(
+        ring.map(|s| (s.is_loaned(), s.to_owned())),
+        Ok((false, bytes(2).0))
+    );
+    let last = subscriber.try_recv_sample().map(|sample| sample.to_owned());
+    assert_eq!(last, Ok(vec![3; 64]));
+    let replaced = RecvError::Disconnected(Disconnected::Replaced);
+    assert_eq!(subscriber.try_recv_sample().err(), Some(replaced));
+    let next = subscriber.recv_sample_timeout(WAIT);
+    assert_eq!(next.map(|sample| sample.to_owned()), Ok(vec![9; 64]));
+    assert_eq!(subscriber.try_recv_sample().err(), Some(RecvError::Empty));
+    assert_eq!(old.subscriber_count(), 0);
+    assert_eq!(new.subscriber_count(), 1);
+}
+
+/// The newest of a drain as a sample: the records before it are skipped, the drain then ends.
+#[test]
+fn a_latest_sample_of_a_drain_skips_to_the_newest_record_before_the_replacement() {
+    let names = Names::default();
+    let old = advertise(&names, &pooled(4));
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    lend(&old, &[1; 64]);
+    let newest = lend(&old, &[2; 64]);
+    let new = Publisher::<Bytes>::new(&pooled(4)).unwrap();
+    names.give(NAME, new.as_binder());
+    let sample = subscriber.try_latest_sample().unwrap();
+    assert_eq!(sample.to_owned(), vec![2; 64]);
+    assert_eq!(old.stats().subscribers[0].pinned, Some(newest));
+    drop(sample);
+    let replaced = RecvError::Disconnected(Disconnected::Replaced);
+    assert_eq!(subscriber.try_latest_sample().err(), Some(replaced));
+}
+
+/// A sample a name subscriber holds keeps its slot pinned: the publisher lends the others.
+#[test]
+fn a_sample_a_name_subscriber_holds_keeps_its_slot_pinned() {
+    let names = Names::default();
+    let publisher = advertise(&names, &pooled(1));
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let slot = lend(&publisher, &[1; 64]);
+    let sample = subscriber.recv_sample_timeout(WAIT).unwrap();
+    assert_eq!(publisher.stats().subscribers[0].pinned, Some(slot));
+    for n in 0..8u8 {
+        assert_ne!(lend(&publisher, &[n; 64]), slot, "lend {n}");
+    }
+    assert_eq!(sample.to_owned(), vec![1; 64]);
+    drop(sample);
+    assert_eq!(publisher.stats().subscribers[0].pinned, None);
+}
+
+/// A trusted name subscriber reads in place, on the connection it vouched on and the next one.
+#[test]
+fn a_trusted_name_subscriber_reads_every_connection_in_place() {
+    let names = Names::default();
+    let first = advertise(&names, &pooled(2));
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    // Taken: the connection is the subscriber's when it vouches.
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    // SAFETY: every publisher of the name is this test's, an rsbinder-topic `Publisher`.
+    let mut subscriber: NamedSubscriber<Bytes, Trusted> = unsafe { subscriber.trust_publisher() };
+    lend(&first, &[5; 64]);
+    let sample = subscriber.recv_sample_timeout(WAIT).unwrap();
+    assert!(sample.is_loaned());
+    assert_eq!(&*sample, &[5; 64][..]);
+    drop(sample);
+    drop(first);
+    let ended = RecvError::Disconnected(Disconnected::Ended(Closed::End));
+    assert_eq!(subscriber.recv_sample_timeout(WAIT).err(), Some(ended));
+    // Made after the subscriber vouched.
+    let second = advertise(&names, &pooled(2));
+    assert!(subscriber.wait_connected(WAIT));
+    lend(&second, &[6; 64]);
+    let sample = subscriber.recv_sample_timeout(WAIT).unwrap();
+    assert!(sample.is_loaned());
+    assert_eq!(&*sample, &[6; 64][..]);
+    drop(sample);
+    lend(&second, &[7; 64]);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![7; 64])));
+    assert_eq!(subscriber.stats().connections, 2);
 }
 
 /// The name given to another binder and back to the one connected: nothing was replaced.
@@ -1490,15 +1662,23 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
         }
         other => panic!("{other:?}"),
     }
+    let refused = |state| {
+        let security = |s: &Status| s.exception_code() == ExceptionCode::Security;
+        matches!(state, NamedState::Refused(s) if security(&s))
+    };
+    assert!(refused(subscriber.state()), "{:?}", subscriber.state());
     names.give(NAME, publisher.as_binder());
     assert_eq!(
         subscriber.recv_timeout(Duration::from_millis(1500)),
         Err(RecvError::Timeout)
     );
     assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // Told once by the receive, at every ask by the state.
+    assert!(refused(subscriber.state()), "{:?}", subscriber.state());
     // Another publisher of the name is asked.
     let admitting = advertise(&names, &policy());
     connected(&subscriber);
+    assert_eq!(subscriber.state(), NamedState::Connected);
     admitting.publish(&bytes(6)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
 }
@@ -1507,16 +1687,82 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
 fn a_closed_publisher_is_waited_past_without_a_notice() {
     let names = Names::default();
     let closed = advertise(&names, &policy());
-    closed.close(&Status::from(ExceptionCode::None));
+    closed.close();
     let mut subscriber = subscribe(&names);
     assert_eq!(
         subscriber.recv_timeout(Duration::from_millis(300)),
         Err(RecvError::Timeout)
     );
+    // An ended publisher is not a refusal of this subscriber: its successor will register.
+    assert_eq!(subscriber.state(), NamedState::Waiting);
     let next = advertise(&names, &policy());
     connected(&subscriber);
     next.publish(&bytes(7)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(7)));
+}
+
+#[test]
+fn a_topic_advertised_after_it_published_is_read_from_its_oldest_record() {
+    let names = Names::default();
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    publisher.publish(&bytes(1)).unwrap();
+    publisher.publish(&bytes(2)).unwrap();
+    let oldest = SubscriberPolicy {
+        start: Start::Oldest,
+        ..SubscriberPolicy::default()
+    };
+    let mut subscriber = NamedSubscriber::subscribe_with(NAME, &oldest, &names).unwrap();
+    publisher.advertise_on(NAME, &names).unwrap();
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+}
+
+#[test]
+fn a_bounded_latest_receive_times_out_and_then_returns_the_newest_record() {
+    let names = Names::default();
+    let publisher = advertise(&names, &policy());
+    let mut named = subscribe(&names);
+    connected(&named);
+    let request =
+        Subscriber::<Bytes>::request(&publisher.as_binder(), &SubscriberPolicy::default());
+    let mut plain = request.unwrap();
+    let short = Duration::from_millis(50);
+    assert_eq!(named.recv_latest_timeout(short), Err(RecvError::Timeout));
+    assert_eq!(plain.recv_latest_timeout(short), Err(RecvError::Timeout));
+    publisher
+        .publish_all(&[bytes(1), bytes(2), bytes(3)])
+        .unwrap();
+    assert_eq!(named.recv_latest_timeout(WAIT), Ok(bytes(3)));
+    assert_eq!(plain.recv_latest_timeout(WAIT), Ok(bytes(3)));
+}
+
+#[test]
+fn a_closed_publisher_gives_no_name() {
+    let names = Names::default();
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    publisher.close();
+    let refused = publisher.advertise_on(NAME, &names).unwrap_err();
+    assert_eq!(refused.service_specific_error(), ERROR_CLOSED);
+    assert!(names.0.lock().unwrap().given.is_empty());
+}
+
+#[test]
+fn a_binder_of_the_applications_own_is_advertised_in_the_publishers_place() {
+    let names = Names::default();
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counted = Counted {
+        acceptor: publisher.acceptor(),
+        asked: asked.clone(),
+    };
+    let binder = BnTopic::new_binder(counted).as_binder();
+    publisher.advertise_binder_on(NAME, binder, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    publisher.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
 }
 
 /// An `ITopic` that counts its subscription calls and hands them to a publisher's acceptor.
@@ -1550,7 +1796,7 @@ thread_local! {
 /// A closed publisher's binder, which refuses with `ERROR_CLOSED`, and its subscription calls.
 fn closed_counted() -> (Publisher<Bytes>, SIBinder, Arc<AtomicUsize>) {
     let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
-    publisher.close(&Status::from(ExceptionCode::None));
+    publisher.close();
     let asked = Arc::new(AtomicUsize::new(0));
     let counted = Counted {
         acceptor: publisher.acceptor(),
@@ -1907,10 +2153,12 @@ impl Resolver for Ending {
 fn a_publisher_drops_its_advertisement_before_its_end_record() {
     let ending = Ending::default();
     let closed = Publisher::<Bytes>::advertise_with(NAME, &policy(), &ending).unwrap();
-    closed.close(&Status::from(ExceptionCode::None));
+    assert!(closed.stats().advertised);
+    closed.close();
+    assert!(!closed.stats().advertised);
     assert_eq!(*ending.0.lock().unwrap(), [Err(RecvError::Empty)]);
     // Closing again, and the drop after a close, have no advertisement left to drop.
-    closed.close(&Status::from(ExceptionCode::None));
+    closed.close();
     drop(closed);
     assert_eq!(ending.0.lock().unwrap().len(), 1);
     let dropped = Publisher::<Bytes>::advertise_with(NAME, &policy(), &ending).unwrap();
@@ -2478,6 +2726,36 @@ mod reactor {
         through_a_new_publisher(Wake::Fd);
     }
 
+    /// An async sample waits for the connection, then for the value, which it holds in its slot.
+    #[test]
+    fn an_async_sample_waits_for_a_connection_and_a_lent_value() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        for wake in [Wake::Futex, Wake::Fd] {
+            let names = Names::default();
+            let mut subscriber = subscribe_on(&names, NAME, wake);
+            let late = names.clone();
+            let publishing = std::thread::spawn(move || {
+                let publisher = advertise(&late, &pooled(1));
+                let deadline = Instant::now() + WAIT;
+                while publisher.subscriber_count() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (lend(&publisher, &[8; 64]), publisher)
+            });
+            let got = runtime.block_on(async {
+                let waited = tokio::time::timeout(WAIT, subscriber.recv_sample_async()).await;
+                waited.map(|got| got.map(|sample| (sample.is_loaned(), sample.to_owned())))
+            });
+            assert_eq!(got.ok(), Some(Ok((true, vec![8; 64]))), "{wake:?}");
+            let (_, publisher) = publishing.join().unwrap();
+            assert_eq!(publisher.stats().subscribers[0].pinned, None, "{wake:?}");
+        }
+    }
+
     #[test]
     fn an_interrupt_ends_an_async_wait_for_a_connection() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -2504,7 +2782,7 @@ mod reactor {
 fn waiting() -> PublisherPolicy {
     PublisherPolicy {
         backpressure: Some(Backpressure {
-            timeout: Duration::from_millis(100),
+            publish_timeout: Duration::from_millis(100),
             ..Backpressure::default()
         }),
         ..policy()
@@ -2570,6 +2848,7 @@ fn a_name_subscriber_and_its_interrupter_move_between_threads() {
     fn moved<T: Send>() {}
     fn shared<T: Send + Sync>() {}
     moved::<NamedSubscriber<Bytes>>();
+    moved::<NamedSubscriber<Bytes, Trusted>>();
     shared::<crate::Interrupter>();
     shared::<Authorize>();
 }

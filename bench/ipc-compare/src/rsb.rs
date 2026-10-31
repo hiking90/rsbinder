@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use rsbinder::stream::{Receiver, ReceiverPolicy, Sink, SinkPolicy, StreamEndpoint};
+use rsbinder::stream::{
+    Receiver, ReceiverPolicy, RecvTimeoutError, Sink, SinkPolicy, StreamEndpoint, TryRecvError,
+};
 use rsbinder::*;
 use rsbinder_topic::{
     Backpressure, Bytes, Closed, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber,
@@ -80,7 +82,7 @@ pub fn topic_ring_for(size: usize) -> usize {
 fn backpressure(ms: i32, window: i32) -> Option<Backpressure> {
     let ms = u64::try_from(ms).ok()?;
     let window = NonZeroUsize::new(window.max(0) as usize);
-    Some(Backpressure { timeout: Duration::from_millis(ms), window })
+    Some(Backpressure { publish_timeout: Duration::from_millis(ms), window })
 }
 
 /// `--backpressure MS` as the producer takes it: -1 without the flag.
@@ -136,7 +138,7 @@ impl Interface for Producer {}
 
 impl IBench for Producer {
     fn r#addStream(&self, endpoint: &StreamEndpoint<StreamBytes>) -> BinderResult<()> {
-        let policy = SinkPolicy { max_ring_bytes: MAX_RING, ..SinkPolicy::default() };
+        let policy = SinkPolicy::default().with_max_ring_bytes(MAX_RING);
         let sink = Sink::open_with(endpoint, &policy)?;
         self.streams.lock().expect("lock").push(sink);
         Ok(())
@@ -270,10 +272,7 @@ pub fn stream_consumer(a: &Args) -> Result<()> {
     let count = a.num("count", 0);
     let poll = a.str("wait", "block") == "poll";
     let bench = connect(&a.str("name", ""))?;
-    let policy = ReceiverPolicy {
-        ring_bytes: a.num("ring", 64 * 1024) as usize,
-        ..ReceiverPolicy::default()
-    };
+    let policy = ReceiverPolicy::default().with_ring_bytes(a.num("ring", 64 * 1024) as usize);
     let (mut rx, endpoint) = Receiver::<StreamBytes>::with_policy(&bench.as_binder(), &policy)?;
     bench.r#addStream(&endpoint)?;
     ready("SUBSCRIBED");
@@ -282,24 +281,24 @@ pub fn stream_consumer(a: &Args) -> Result<()> {
     while record.received < count {
         let item = if poll {
             match rx.try_recv() {
-                Ok(Some(item)) => item,
-                Ok(None) if rx.is_finished() => break,
-                Ok(None) => {
+                Ok(item) => item,
+                Err(TryRecvError::Ended) => break,
+                Err(TryRecvError::Empty) => {
                     if idle.get_or_insert_with(Instant::now).elapsed() > SILENCE {
                         break;
                     }
                     continue;
                 }
-                Err(e) => {
+                Err(TryRecvError::Failed(e)) => {
                     eprintln!("rsb-stream: {e:?}");
                     break;
                 }
             }
         } else {
             match rx.recv_timeout(SILENCE) {
-                Ok(Some(item)) => item,
-                Ok(None) => break,
-                Err(e) => {
+                Ok(item) => item,
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Ended) => break,
+                Err(RecvTimeoutError::Failed(e)) => {
                     eprintln!("rsb-stream: {e:?}");
                     break;
                 }

@@ -539,6 +539,7 @@ impl RpcState {
     }
 
     /// Test/diagnostic: number of live local nodes (leak check).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn local_node_count(&self) -> usize {
         self.local_nodes.len()
     }
@@ -708,7 +709,6 @@ fn warn_async_wrap(addr: &RpcAddress) {
 mod tests {
     use super::*;
     use crate::binder::*;
-    use std::mem::ManuallyDrop;
     use std::sync::Arc;
 
     struct Dummy;
@@ -733,21 +733,6 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             false
-        }
-        fn inc_strong(&self, _: &SIBinder) -> crate::Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> crate::Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> crate::Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> crate::Result<()> {
-            Ok(())
         }
     }
 

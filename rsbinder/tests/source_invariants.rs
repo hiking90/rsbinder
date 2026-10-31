@@ -6,12 +6,13 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Five remain: refuted prose, the one slot un-push, the files a
+//! Seven remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in, the method surface of
-//! `CommandStream`, and the places a raw fd
-//! number becomes an fd — each a closed set, not an enumeration of ways
-//! to get it wrong. The call sites of the layer split are not
-//! scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
+//! `CommandStream`, the places a raw fd number becomes an fd, the
+//! public types whose drop ends something, and the library threads made by
+//! a call that panics — each a closed set, not an enumeration of ways to
+//! get it wrong. The call sites of the layer split
+//! are not scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
 //! stream's callers.
 //!
@@ -89,6 +90,34 @@
 //! number its own `into_raw_fd` released, which does not come from a parcel.
 //! A new site — a second adoption, or a close of an fd named by the
 //! bytes — must be argued for here.
+//!
+//! # Drop with an effect
+//!
+//! A public type whose drop ends what the value was made for (a stream, a
+//! subscription, a registration) carries a type-level `#[must_use = "..."]`
+//! that says what ends, so `add_accessor_provider(..)?;` or
+//! `Publisher::advertise(..)?;` in statement position warns: a type-level
+//! `must_use` reaches through `?`, a `Future`'s does not reach the concrete
+//! type. `types_whose_drop_ends_something_are_must_use` scans `rsbinder`,
+//! `rsbinder-fmq` and `rsbinder-topic`. Each listed type must exist, each in
+//! `MUST_USE` must carry the attribute, and each `pub struct` with a `Drop`
+//! impl in its own file must be listed in `MUST_USE` or in `EXEMPT` with the
+//! reason. A type whose drop effect comes from a field has no `Drop` impl of
+//! its own, so the scan does not find it: add it to `MUST_USE` by hand.
+//!
+//! # Thread creation
+//!
+//! `std::thread::spawn` and a `thread::scope`'s `spawn` panic when the OS
+//! refuses a thread, which is the environment failing, not the caller: the
+//! library makes its threads with `thread::Builder` and returns the error to
+//! a direct caller, or logs it where no caller waits (a kernel-requested
+//! looper). `library_threads_are_made_by_builder` finds either call in the
+//! code of `rsbinder`, `rsbinder-fmq` and `rsbinder-topic`, outside a file
+//! named `*tests.rs` and outside a `mod .. {` under a `cfg` naming `test`,
+//! and allows only the sites in its list. The list is empty: every library
+//! thread is made by `thread::Builder`. A site that has to stay — a call
+//! whose failure no caller could receive — goes into the list with the
+//! reason, as the `Drop` exemptions above carry theirs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -512,4 +541,210 @@ fn command_stream_exposes_no_new_forward() {
              here."
         );
     }
+}
+
+/// Pins which public types with a drop effect are `#[must_use]`; module doc "Drop with an effect".
+#[test]
+fn types_whose_drop_ends_something_are_must_use() {
+    // (crate, file under `src/`, type).
+    const MUST_USE: &[(&str, &str, &str)] = &[
+        ("rsbinder", "bridge.rs", "Rewrap"),
+        ("rsbinder", "entry/server.rs", "Server"),
+        ("rsbinder", "entry/server.rs", "ServerGuard"),
+        (
+            "rsbinder",
+            "hub/accessor_register.rs",
+            "AccessorProviderHandle",
+        ),
+        ("rsbinder", "reconnect.rs", "Reconnecting"),
+        ("rsbinder", "rpc/server.rs", "RpcServerHandle"),
+        ("rsbinder", "rt/tokio_rt.rs", "DeathSignal"),
+        ("rsbinder", "stream/mod.rs", "Receiver"),
+        ("rsbinder", "stream/mod.rs", "Sink"),
+        ("rsbinder-topic", "named.rs", "NamedSubscriber"),
+        ("rsbinder-topic", "publisher.rs", "LoanMut"),
+        ("rsbinder-topic", "publisher.rs", "Publisher"),
+        ("rsbinder-topic", "resolve.rs", "Advertisement"),
+        ("rsbinder-topic", "resolve.rs", "Watch"),
+        ("rsbinder-topic", "subscriber.rs", "Subscriber"),
+    ];
+    const EXEMPT: &[(&str, &str, &str)] = &[
+        // The drop gives back memory, a mapping or a reference, which an unused value never needed.
+        ("rsbinder", "parcel.rs", "Parcel"),
+        ("rsbinder", "process_state.rs", "ProcessState"),
+        ("rsbinder", "proxy.rs", "ProxyHandle"),
+        ("rsbinder", "rpc/proxy.rs", "RpcProxy"),
+        ("rsbinder", "shared_memory/dealer.rs", "Allocation"),
+        ("rsbinder-fmq", "shm/mapping.rs", "Mapping"),
+        // Unpins a record; `recv_sample()?;` skipping one is legitimate.
+        ("rsbinder-topic", "sample.rs", "Sample"),
+        // Returned in an `Arc`, which a type-level `must_use` does not reach; the handle is.
+        ("rsbinder", "rpc/server.rs", "RpcServer"),
+    ];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut failures = Vec::new();
+    for krate in ["rsbinder", "rsbinder-fmq", "rsbinder-topic"] {
+        let src_root = workspace.join(krate).join("src");
+        if !src_root.is_dir() {
+            eprintln!(
+                "skipping {krate}: sources not reachable at {}",
+                src_root.display()
+            );
+            continue;
+        }
+        let listed =
+            |list: &[(&str, &str, &str)], rel: &str, ty: &str| list.contains(&(krate, rel, ty));
+        for (_, rel, ty) in MUST_USE.iter().chain(EXEMPT).filter(|e| e.0 == krate) {
+            let src = fs::read_to_string(src_root.join(rel)).unwrap_or_default();
+            let lines: Vec<&str> = src.lines().collect();
+            match pub_struct_line(&lines, ty) {
+                None => failures.push(format!("{krate}/src/{rel}: no `pub struct {ty}`")),
+                Some(at) if listed(MUST_USE, rel, ty) && !has_must_use(&lines, at) => {
+                    failures.push(format!("{krate}/src/{rel}: `{ty}` has no `#[must_use`"))
+                }
+                Some(_) => {}
+            }
+        }
+        visit(&src_root, &mut |path, content| {
+            let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+            let rel = rel.replace('\\', "/");
+            let lines: Vec<&str> = content.lines().collect();
+            for ty in drop_impls(&lines) {
+                let public = pub_struct_line(&lines, &ty).is_some();
+                if public && !listed(MUST_USE, &rel, &ty) && !listed(EXEMPT, &rel, &ty) {
+                    failures.push(format!(
+                        "{krate}/src/{rel}: `{ty}` has a `Drop`, not listed"
+                    ));
+                }
+            }
+        });
+    }
+    assert!(
+        failures.is_empty(),
+        "a public type with a drop effect is not pinned — see this test's doc:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// 0-based line of `pub struct {ty}` followed by a non-identifier character.
+fn pub_struct_line(lines: &[&str], ty: &str) -> Option<usize> {
+    let head = format!("pub struct {ty}");
+    lines.iter().position(|l| {
+        l.trim_start()
+            .strip_prefix(&head)
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    })
+}
+
+/// Whether the doc and attribute lines right above line `at` hold `#[must_use`.
+fn has_must_use(lines: &[&str], at: usize) -> bool {
+    lines[..at]
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .take_while(|l| !l.is_empty() && (l.starts_with("///") || !l.ends_with(['}', ';'])))
+        .any(|l| l.starts_with("#[must_use"))
+}
+
+/// The types named by `impl .. Drop for X` lines.
+fn drop_impls(lines: &[&str]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| code_only(l).trim_start())
+        .filter(|l| l.starts_with("impl"))
+        .filter_map(|l| l.split_once("Drop for ").map(|(_, rest)| rest))
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect()
+        })
+        .collect()
+}
+
+/// Pins the library's panicking thread creations; see module doc "Thread creation".
+#[test]
+fn library_threads_are_made_by_builder() {
+    // (crate, file under `src/`, enclosing `fn` line prefix), one entry per call.
+    const PINNED: &[(&str, &str, &str)] = &[];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    for krate in ["rsbinder", "rsbinder-fmq", "rsbinder-topic"] {
+        let src_root = workspace.join(krate).join("src");
+        if !src_root.is_dir() {
+            eprintln!(
+                "skipping {krate}: sources not reachable at {}",
+                src_root.display()
+            );
+            continue;
+        }
+        visit(&src_root, &mut |path, content| {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                return;
+            }
+            let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+            let rel = rel.replace('\\', "/");
+            let lines: Vec<&str> = content.lines().map(code_only).collect();
+            let test = test_module_lines(&lines);
+            for (i, line) in lines.iter().enumerate() {
+                let calls =
+                    line.matches("thread::spawn(").count() + line.matches("thread::scope(").count();
+                if test[i] || calls == 0 {
+                    continue;
+                }
+                let enclosing = enclosing_fn(&lines, i + 1).unwrap_or("<no fn>").to_string();
+                for _ in 0..calls {
+                    found.push((krate.to_string(), rel.clone(), enclosing.clone()));
+                }
+            }
+        });
+    }
+    let mut missing = Vec::new();
+    for (krate, file, prefix) in PINNED {
+        match found
+            .iter()
+            .position(|(k, p, f)| k == krate && p == file && f.starts_with(prefix))
+        {
+            Some(at) => drop(found.swap_remove(at)),
+            None => missing.push(format!("{krate}/src/{file}: {prefix}")),
+        }
+    }
+    assert!(
+        found.is_empty() && missing.is_empty(),
+        "a library thread is made by a call that panics on failure, or a pinned site moved — \
+         use `thread::Builder` and return the error; see this test's doc.\n\
+         unpinned: {found:#?}\nmissing: {missing:#?}"
+    );
+}
+
+/// For each line, whether it lies in a `mod .. {` whose attributes hold a `cfg` naming `test`.
+fn test_module_lines(lines: &[&str]) -> Vec<bool> {
+    let mut mask = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let is_mod = line.trim_end().ends_with('{')
+            && (line.trim_start().starts_with("mod ") || line.contains(" mod "));
+        let attrs = lines[..i]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .take_while(|l| !l.is_empty() && !l.ends_with(['}', ';']))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let words = attrs.split(|c: char| !(c.is_alphanumeric() || c == '_'));
+        let cfg_test = attrs.contains("cfg(") && words.into_iter().any(|w| w == "test");
+        if !(is_mod && cfg_test) {
+            i += 1;
+            continue;
+        }
+        let close = format!("{indent}}}");
+        let end = lines[i..]
+            .iter()
+            .position(|l| *l == close)
+            .map_or(lines.len(), |n| i + n + 1);
+        mask[i..end].fill(true);
+        i = end;
+    }
+    mask
 }

@@ -168,7 +168,7 @@ fn a_close_wakes_a_sleeping_subscriber_with_its_status() {
     let publisher = topic(64 << 10);
     let receiving = asleep(subscriber(&publisher), Subscriber::recv);
     let status = Status::new_service_specific_error(5, Some("over".into()));
-    publisher.close(&status);
+    publisher.close_with(&status);
     assert_eq!(
         joined(receiving),
         Err(RecvError::Closed(Closed::Status(status)))
@@ -375,6 +375,59 @@ fn an_interrupt_before_the_wait_ends_the_next_one() {
     interrupter.interrupt();
 }
 
+/// Plan 17 T-11: two subscribers asleep on the topic's one `seq` word with different futex bits.
+/// A raise for one ends its sleep alone; a wake of every bit, as the publisher's, ends both, with
+/// `seq` as it was, so the masks alone decide.
+#[test]
+fn a_raise_wakes_its_own_subscribers_bit_and_a_wake_of_every_bit_ends_every_sleep() {
+    use std::num::NonZeroU32;
+
+    use crate::wait::{Local, Parts, Slept, Until, Words, INTERRUPTED};
+
+    let publisher = topic(64 << 10);
+    let first = subscriber(&publisher);
+    // The count that deals the bits is shared with the other tests: the next one may repeat it.
+    let mut second = subscriber(&publisher);
+    while second.local().bit() == first.local().bit() {
+        second = subscriber(&publisher);
+    }
+    let (a, b) = (first.local().clone(), second.local().clone());
+    let park = |local: &Arc<Local<Parts>>, within: Duration| {
+        let local = local.clone();
+        thread::spawn(move || {
+            let seen = local.words().seq();
+            local.park(seen, Some(&Until::new(Instant::now() + within)))
+        })
+    };
+
+    let woken = park(&a, Duration::from_secs(10));
+    let unwoken = park(&b, Duration::from_millis(500));
+    eventually("both sleep", || a.is_parked() && b.is_parked());
+    // Time to reach the kernel: a wait not yet in it would sleep through a stray wake too.
+    thread::sleep(Duration::from_millis(20));
+    a.raise(INTERRUPTED);
+    assert_eq!(joined(woken), Slept::Woke);
+    assert!(
+        b.is_parked(),
+        "a raise for one subscriber ended another's sleep"
+    );
+    assert_eq!(joined(unwoken), Slept::TimedOut);
+
+    assert!(a.take(INTERRUPTED));
+    let sleeping = [
+        park(&a, Duration::from_secs(10)),
+        park(&b, Duration::from_secs(10)),
+    ];
+    eventually("both sleep", || a.is_parked() && b.is_parked());
+    eventually("a wake of every bit ends both sleeps", || {
+        a.words().wake(NonZeroU32::MAX);
+        !a.is_parked() && !b.is_parked()
+    });
+    for sleeping in sleeping {
+        assert_eq!(joined(sleeping), Slept::Woke);
+    }
+}
+
 /// A wake that lands before a wait on that commit's `seq` sleeps: the next commit still wakes it.
 #[test]
 fn a_wake_sent_before_the_wait_sleeps_does_not_stand_for_the_next_commit() {
@@ -460,7 +513,7 @@ fn a_publishers_stats_name_its_subscriptions_and_count_its_records() {
     let stats = publisher.stats();
     assert_eq!((stats.published, stats.bytes), (3, 12));
     // Outside a transaction, this process's own: the subscribers are in it.
-    let caller = rsbinder::CallingContext::default();
+    let caller = rsbinder::CallingContext::current();
     assert_eq!(stats.subscribers.len(), 2);
     for info in &stats.subscribers {
         assert_eq!((info.uid, info.pid, info.lost), (caller.uid, caller.pid, 0));
@@ -894,7 +947,10 @@ mod pool {
     #[test]
     fn an_interrupt_ends_a_receive_after_a_wait_taken_back_from_a_busy_pool() {
         let interrupt = |interrupter: &Interrupter, _: &_| interrupter.interrupt();
-        a_receive_after_a_wait_taken_back_ends_at(interrupt, RecvError::Cancelled);
+        drop(a_receive_after_a_wait_taken_back_ends_at(
+            interrupt,
+            RecvError::Cancelled,
+        ));
     }
 
     #[test]
@@ -910,7 +966,7 @@ mod pool {
             local.raise(DIED);
         };
         let ends = RecvError::Closed(Closed::PublisherDied);
-        a_receive_after_a_wait_taken_back_ends_at(died, ends);
+        drop(a_receive_after_a_wait_taken_back_ends_at(died, ends));
     }
 
     /// Records behind a leaked wait the pool has not run: receives with no bound get them at once.

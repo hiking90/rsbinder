@@ -93,15 +93,11 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
-use crate::{
-    binder::*, error::*, parcel::*, parcelable::SerializeOption, ref_counter::RefCounter,
-    thread_state,
-};
+use crate::{binder::*, error::*, parcel::*, parcelable::SerializeOption, thread_state};
 
 /// Opt-in flags requested at native-binder construction time.
 ///
@@ -131,7 +127,7 @@ pub struct BinderFeatures {
     /// context to every transaction targeting this binder. When set,
     /// the kernel dispatches via `BR_TRANSACTION_SEC_CTX` and the
     /// transaction handler can read the caller's context through
-    /// [`crate::thread_state::CallingContext::default`]`.sid`.
+    /// [`CallingContext::current`](crate::CallingContext::current)`.sid`.
     ///
     /// Honoured only where SELinux is available: on Android, or on a Linux
     /// host where `/sys/fs/selinux/enforce` exists — the same check that
@@ -271,8 +267,6 @@ struct Inner<T: Remotable + Send + Sync> {
     /// AOSP `BBinder::mParceled`: set on the first parcel write, then the stability setters refuse.
     parceled: AtomicBool,
     binder_flags: u32,
-    strong: RefCounter,
-    weak: RefCounter,
     extension: RwLock<Option<SIBinder>>,
     /// Attached objects, one per `TypeId`; see module doc "Attached objects".
     objects: Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
@@ -394,6 +388,7 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
     #[cfg(feature = "rpc")]
     fn rpc_transact(
         &self,
+        _: crate::binder::sealed::Token,
         code: TransactionCode,
         reader: &mut Parcel,
         reply: &mut Parcel,
@@ -429,31 +424,6 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
 
     fn is_remote(&self) -> bool {
         false
-    }
-
-    fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
-        self.strong.inc(|| Ok(()))
-    }
-
-    fn attempt_inc_strong(&self) -> bool {
-        self.strong.attempt_inc(true, || true, || {})
-    }
-
-    fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        self.strong.dec(|| {
-            if let Some(strong) = strong {
-                let _ = ManuallyDrop::into_inner(strong);
-            }
-            Ok(())
-        })
-    }
-
-    fn inc_weak(&self, _weak: &WIBinder) -> Result<()> {
-        self.weak.inc(|| Ok(()))
-    }
-
-    fn dec_weak(&self) -> Result<()> {
-        self.weak.dec(|| Ok(()))
     }
 }
 
@@ -579,8 +549,6 @@ impl<T: 'static + Remotable> Binder<T> {
                 stability: AtomicU8::new(stability_to_tag(stability)),
                 parceled: AtomicBool::new(false),
                 binder_flags: features.flat_flags(),
-                strong: Default::default(),
-                weak: Default::default(),
                 extension: RwLock::new(None),
                 objects: Mutex::new(HashMap::new()),
             }),
@@ -669,6 +637,14 @@ impl<T: Remotable> Clone for Binder<T> {
     }
 }
 
+impl<T: Remotable> std::fmt::Debug for Binder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Binder")
+            .field("descriptor", &T::descriptor())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: 'static + Remotable> Deref for Binder<T> {
     type Target = T;
 
@@ -708,6 +684,44 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
             }
         }
     }
+}
+
+/// `Ok` when a local binder can be called through the in-process transport
+/// (plan 17 K-4): it needs kernel binder, `InvalidOperation` without it.
+#[doc(hidden)]
+pub fn __local_transport_ready() -> Result<()> {
+    if crate::process_state::ProcessState::is_initialized() {
+        Ok(())
+    } else {
+        log::error!(
+            "a local binder is called in-process through a kernel-mode parcel, \
+             and this process has no kernel binder (ProcessState is not initialized)"
+        );
+        Err(StatusCode::InvalidOperation)
+    }
+}
+
+/// The local side of a generated cast to `B`'s interface (plan 17 K-4, D-13).
+///
+/// `Ok(Some)` for a `Binder<B>`; `Ok(None)` for a local binder of another
+/// `Remotable` with `B`'s descriptor, which a generated proxy then drives
+/// through the in-process transport; `Err(InvalidOperation)` for that case
+/// without kernel binder; otherwise the error of `Binder::<B>::try_from`.
+#[doc(hidden)]
+pub fn __local_binder<B: Remotable + 'static>(binder: &SIBinder) -> Result<Option<Binder<B>>> {
+    let arc: Arc<dyn IBinder> = Arc::clone(binder.as_arc());
+    let any: Arc<dyn Any + Send + Sync> = arc;
+    if let Ok(inner) = any.downcast::<Inner<B>>() {
+        return Ok(Some(Binder { inner }));
+    }
+    let local_of_b = binder.as_remote().is_none()
+        && binder.as_transactable().is_some()
+        && binder.descriptor() == B::descriptor();
+    if local_of_b {
+        __local_transport_ready()?;
+        return Ok(None);
+    }
+    Binder::<B>::try_from(binder.clone()).map(Some)
 }
 
 /// Determine whether the current thread is currently executing an incoming
@@ -1020,21 +1034,6 @@ mod stability_mutation_tests {
         fn is_remote(&self) -> bool {
             false
         }
-        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> Result<()> {
-            Ok(())
-        }
     }
 
     /// The `TypeId` comes from the allocation, so a forwarding `as_any()` cannot pass the cast.
@@ -1183,8 +1182,8 @@ mod rpc_dispatch_tests {
             let root = client.get_root().unwrap();
             let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
             let call = |code| {
-                let data = rp.build_request(Svc::descriptor()).unwrap();
-                rp.transact(code, &data, 0).map(|_| ())
+                let data = rp.request_parcel(Svc::descriptor()).unwrap();
+                rp.send(code, &data, 0).map(|_| ())
             };
             assert_eq!(
                 call(FIRST_CALL_TRANSACTION),
@@ -1214,7 +1213,12 @@ mod rpc_dispatch_tests {
         let binder = Interface::as_binder(&Binder::new(Svc));
         let mut reply = Parcel::new();
         binder
-            .rpc_transact(DUMP_TRANSACTION, &mut data, &mut reply)
+            .rpc_transact(
+                crate::binder::sealed::Token::new(),
+                DUMP_TRANSACTION,
+                &mut data,
+                &mut reply,
+            )
             .unwrap();
         drop(data);
         let mut got = Vec::new();
@@ -1253,7 +1257,12 @@ mod rpc_dispatch_tests {
         let binder = BnCancellationSignal::new_binder(Keeper(Arc::clone(&kept))).as_binder();
         let mut reply = Parcel::new();
         binder
-            .rpc_transact(DUMP_TRANSACTION, &mut data, &mut reply)
+            .rpc_transact(
+                crate::binder::sealed::Token::new(),
+                DUMP_TRANSACTION,
+                &mut data,
+                &mut reply,
+            )
             .unwrap();
         drop(data);
         let fd = kept.lock().unwrap().take().expect("dump_fd kept no fd");

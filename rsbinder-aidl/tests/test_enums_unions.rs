@@ -385,11 +385,12 @@ pub mod ITestService {
                 BnTestService(on_transact),
             },
             proxy: BpTestService,
+            local_transport: enabled,
         }
     }
     impl BpTestService {
         fn build_parcel_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(&_arg_token)?;
             ::core::result::Result::Ok(data)
         }
@@ -409,7 +410,7 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             let _aidl_data = self.build_parcel_RepeatByteEnum(_arg_token)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatByteEnum, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
         }
     }
@@ -422,11 +423,29 @@ pub mod ITestService {
     /// re-published as a local service on another transport in one line:
     /// `BnTestService::new_binder(upstream)` (the **gateway** pattern —
     /// `new_binder` takes any `T: ITestService + Send + Sync + 'static`).
-    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-    /// forwarded as-is is refused at the stack boundary.
+    /// A gateway that has to change some methods (a binder argument crossing
+    /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+    /// stack boundary) implements `ITestServiceDelegate` instead.
     impl ITestService for rsbinder::Strong<dyn ITestService> {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             (**self).r#RepeatByteEnum(_arg_token)
+        }
+    }
+    /// Per-method hooks for a gateway that re-publishes a `ITestService`: each
+    /// method gets the upstream handle and by default forwards the call to it
+    /// unchanged. Override the methods to change and publish with
+    /// `BnTestService::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+    /// A binder argument is forwarded as it is, which is right when caller and
+    /// upstream share one stack; across stacks it is refused, so override that
+    /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+    pub trait ITestServiceDelegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+        fn r#RepeatByteEnum(&self, _aidl_upstream: &rsbinder::Strong<dyn ITestService>, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
+            _aidl_upstream.r#RepeatByteEnum(_arg_token)
+        }
+    }
+    impl<__RsbHooks: ITestServiceDelegate> ITestService for rsbinder::bridge::Delegating<dyn ITestService, __RsbHooks> {
+        fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
+            <__RsbHooks as ITestServiceDelegate>::r#RepeatByteEnum(rsbinder::bridge::Delegating::hooks(self), rsbinder::bridge::Delegating::upstream(self), _arg_token)
         }
     }
     fn on_transact(

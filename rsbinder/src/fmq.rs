@@ -32,7 +32,8 @@
 //! * The two conversions below join them: an [`MQDescriptor`] that arrived in
 //!   a parcel becomes a `Descriptor` to attach to (`TryFrom<&MQDescriptor>`),
 //!   and a queue's `Descriptor` becomes the [`MQDescriptor`] to send
-//!   (`TryFrom<Descriptor>`).
+//!   ([`MQDescriptor::try_from_sized`], which also checks the element size,
+//!   or `TryFrom<Descriptor>`).
 //!
 //! ```no_run
 //! # #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -41,11 +42,11 @@
 //!
 //! // The service side: make a queue and describe it for the reply.
 //! let queue = MessageQueue::<u8>::create(1024, true)?;
-//! let reply: MQDescriptor<i8, SynchronizedReadWrite> = queue.descriptor()?.try_into()?;
+//! let reply = MQDescriptor::<i8, SynchronizedReadWrite>::try_from_sized(queue.descriptor()?)?;
 //!
 //! // The client side: attach to what the reply named.
 //! let desc = Descriptor::try_from(&reply)?;
-//! let policy = AttachPolicy { max_capacity: 4096, require_seal: true, require_event_flag: true };
+//! let policy = AttachPolicy::new(4096).require_event_flag(true);
 //! let reader = MessageQueue::<u8>::attach(&desc, &policy)?;
 //! # let _ = reader; Ok(()) }
 //! # #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -66,12 +67,20 @@
 //! AIDL's signed field (an offset past `i32::MAX`, which no queue libfmq or
 //! `rsbinder-fmq` makes has).
 //!
-//! `rsbinder-fmq`'s `Error` becomes a binder `StatusCode` as follows. A
-//! descriptor or policy check and a corrupted counter are both `BadValue`
-//! (the caller cannot tell a hostile peer from a defective one and treats
-//! both as the end of the queue), a missing EventFlag word or an unsupported
-//! platform is `InvalidOperation`, a wait that ran out is `TimedOut`, and an
-//! OS error keeps its errno.
+//! `rsbinder-fmq`'s `Error` becomes a binder `StatusCode` as follows:
+//!
+//! | `rsbinder_fmq::Error` | `StatusCode` |
+//! |---|---|
+//! | `BadValue` (the caller's argument) | `BadValue` |
+//! | `InvalidDescriptor` (a descriptor or policy check) | `BadValue` |
+//! | `Corrupted` (the shared counters) | `BadValue` |
+//! | `NoEventFlag`, `Unsupported` | `InvalidOperation` |
+//! | `TimedOut` | `TimedOut` |
+//! | `Os(errno)` | the errno's status, as `From<std::io::Error>` maps it |
+//!
+//! A refused descriptor and a corrupted counter are both `BadValue`: the
+//! caller cannot tell a hostile peer from a defective one and treats both as
+//! the end of the queue.
 
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/fmq.rs"));
@@ -120,14 +129,15 @@ mod convert {
     impl From<rsbinder_fmq::Error> for StatusCode {
         fn from(e: rsbinder_fmq::Error) -> Self {
             match e {
-                rsbinder_fmq::Error::BadValue(_) | rsbinder_fmq::Error::Corrupted(_) => {
-                    StatusCode::BadValue
-                }
+                rsbinder_fmq::Error::BadValue(_)
+                | rsbinder_fmq::Error::InvalidDescriptor(_)
+                | rsbinder_fmq::Error::Corrupted(_) => StatusCode::BadValue,
                 rsbinder_fmq::Error::NoEventFlag | rsbinder_fmq::Error::Unsupported => {
                     StatusCode::InvalidOperation
                 }
                 rsbinder_fmq::Error::TimedOut => StatusCode::TimedOut,
-                rsbinder_fmq::Error::Os(errno) => StatusCode::from(errno),
+                // Not rustix's `from_raw_os_error`, which panics on a number no kernel returns.
+                rsbinder_fmq::Error::Os(errno) => StatusCode::from(std::io::Error::from(errno)),
                 // `Error` is `#[non_exhaustive]`; a new variant is `Unknown` until named here.
                 _ => StatusCode::Unknown,
             }
@@ -210,6 +220,27 @@ mod convert {
         }
     }
 
+    impl<T, F: FlavorType> MQDescriptor<T, F> {
+        /// `desc` as the parcelable to send, as `TryFrom<Descriptor>` makes
+        /// it, and `BadValue` also when the queue's `quantum` is not
+        /// `size_of::<T>()`.
+        ///
+        /// `TryFrom<Descriptor>` does not look at `T`, and the AIDL method's
+        /// return type infers it, so a queue of `u32` converts to an
+        /// `MQDescriptor<i8, _>` without a word; the peer's libfmq then
+        /// refuses the descriptor ("Payload size differs") and the failure
+        /// shows on the peer only. This refuses it here. For a
+        /// `@FixedSize` parcelable `T`, whose Rust layout need not be the
+        /// C++ `sizeof`, use `TryFrom<Descriptor>` and size the queue's
+        /// element type to the peer's.
+        pub fn try_from_sized(desc: Descriptor) -> Result<Self, StatusCode> {
+            if usize::try_from(desc.quantum).ok() != Some(std::mem::size_of::<T>()) {
+                return Err(StatusCode::BadValue);
+            }
+            Self::try_from(desc)
+        }
+    }
+
     // `MessageQueue::create` is `Unsupported` off Linux/Android.
     #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     mod tests {
@@ -217,6 +248,15 @@ mod convert {
         use rsbinder_fmq::MessageQueue;
 
         type Sync = super::super::SynchronizedReadWrite;
+
+        #[test]
+        fn a_sized_conversion_refuses_an_element_of_another_size() {
+            let queue = MessageQueue::<u32>::create(64, true).unwrap();
+            let wrong = MQDescriptor::<i8, Sync>::try_from_sized(queue.descriptor().unwrap());
+            assert_eq!(wrong.err(), Some(StatusCode::BadValue));
+            let right = MQDescriptor::<i32, Sync>::try_from_sized(queue.descriptor().unwrap());
+            assert_eq!(right.unwrap().quantum, 4);
+        }
 
         #[test]
         fn descriptor_round_trips_through_the_parcelable() {
@@ -244,16 +284,12 @@ mod convert {
             );
 
             // And the duplicate attaches like the original would.
-            let policy = rsbinder_fmq::AttachPolicy {
-                max_capacity: 64,
-                require_seal: true,
-                require_event_flag: true,
-            };
+            let policy = rsbinder_fmq::AttachPolicy::new(64).require_event_flag(true);
             let mut reader = MessageQueue::<u32>::attach(&back, &policy).unwrap();
             let mut writer = queue;
-            assert!(writer.write(&[7, 8, 9]).unwrap());
+            assert!(writer.write(&[7, 8, 9]).unwrap().is_done());
             let mut out = [0u32; 3];
-            assert!(reader.read(&mut out).unwrap());
+            assert!(reader.read(&mut out).unwrap().is_done());
             assert_eq!(out, [7, 8, 9]);
         }
 
@@ -315,6 +351,10 @@ mod convert {
                 StatusCode::BadValue
             );
             assert_eq!(
+                StatusCode::from(rsbinder_fmq::Error::InvalidDescriptor("x")),
+                StatusCode::BadValue
+            );
+            assert_eq!(
                 StatusCode::from(rsbinder_fmq::Error::Corrupted("x")),
                 StatusCode::BadValue
             );
@@ -326,10 +366,11 @@ mod convert {
                 StatusCode::from(rsbinder_fmq::Error::TimedOut),
                 StatusCode::TimedOut
             );
-            assert_eq!(
-                StatusCode::from(rsbinder_fmq::Error::Os(rustix::io::Errno::NOMEM)),
-                StatusCode::from(rustix::io::Errno::NOMEM)
-            );
+            let nomem = rustix::io::Errno::NOMEM;
+            let os = rsbinder_fmq::Error::Os(rsbinder_fmq::Errno::from_raw(nomem.raw_os_error()));
+            assert_eq!(StatusCode::from(os), crate::error::errno_status(nomem));
+            let not_an_errno = rsbinder_fmq::Error::Os(rsbinder_fmq::Errno::from_raw(0));
+            assert_eq!(StatusCode::from(not_an_errno), StatusCode::Unknown);
         }
     }
 }

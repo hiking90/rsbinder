@@ -31,22 +31,23 @@ use rsbinder::fmq::shm::spin::{spin_until, SPIN};
 /// ([`Publisher::loan_slice`]) waits for a slot that every subscriber has read past. With a
 /// [`window`](Self::window) both also wait until the record leaves no subscriber more than that
 /// many records behind. A subscriber that never falls that far behind costs nothing; one that
-/// does holds the publisher, and with it every other subscriber, for up to `timeout`, and is then
-/// taken out.
+/// does holds the publisher, and with it every other subscriber, for up to
+/// [`publish_timeout`](Self::publish_timeout), and is then taken out.
 ///
 /// # What waits with it
 ///
 /// - The wait holds the topic's lock. Subscriptions that arrive meanwhile, [`Publisher::stats`],
 ///   [`Publisher::close`] and the publishes of other threads wait for the lock, and the timeout
 ///   of each counts from when it holds the lock: a publish queued behind another one's wait can
-///   take longer than `timeout`. [`Publisher::publish_all`] counts the timeout per value, so it
-///   takes up to the number of values times `timeout`.
+///   take longer than `publish_timeout`. [`Publisher::publish_all`] counts the timeout per
+///   value, so it takes up to the number of values times `publish_timeout`.
 /// - [`Publisher::close`], and dropping the publisher, write the end record after the same wait,
-///   so that a subscriber reads every value before the end: a drop can take up to `timeout`.
+///   so that a subscriber reads every value before the end: a drop can take up to
+///   `publish_timeout`.
 /// - The wait sleeps the calling thread. From async code, publish on a blocking thread
 ///   (`tokio::task::spawn_blocking`, or a thread of its own).
 /// - A thread that publishes and is also the topic's only slow subscriber, receiving between
-///   its publishes, waits for itself and takes itself out after `timeout`.
+///   its publishes, waits for itself and takes itself out after `publish_timeout`.
 ///
 /// # Binder threads
 ///
@@ -63,9 +64,9 @@ use rsbinder::fmq::shm::spin::{spin_until, SPIN};
 /// # Subscribing again
 ///
 /// A subscriber taken out may subscribe again, and if it is as slow as before it holds each
-/// publish up for `timeout` again before it is taken out again. The topic does not refuse it:
-/// limit who may subscribe with [`PublisherPolicy::authorize`], and how many subscriptions one
-/// uid holds with [`PublisherPolicy::max_per_uid`].
+/// publish up for `publish_timeout` again before it is taken out again. The topic does not
+/// refuse it: limit who may subscribe with [`PublisherPolicy::authorize`], and how many
+/// subscriptions one uid holds with [`PublisherPolicy::max_per_uid`].
 ///
 /// [`PublisherPolicy::backpressure`]: crate::PublisherPolicy::backpressure
 /// [`PublisherPolicy::authorize`]: crate::PublisherPolicy::authorize
@@ -78,13 +79,23 @@ use rsbinder::fmq::shm::spin::{spin_until, SPIN};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Backpressure {
     /// The longest a publish waits for room, from when it holds the topic's lock. Default 1 s.
+    /// The same bound holds a loan ([`Publisher::loan_slice`](crate::Publisher::loan_slice))
+    /// that waits for a slot, a wait for the [`window`](Self::window), and the wait of
+    /// [`Publisher::close`](crate::Publisher::close), or of dropping the publisher, to write the
+    /// end record.
+    ///
+    /// It is the publisher's timeout, not a subscriber's: a subscriber that stops reading is
+    /// taken out only once it holds up a publish, a loan or the end record, and then after this
+    /// timeout. Until then nothing waits for it, and the time it can stay stopped before it is
+    /// taken out is the time the publisher takes to fill the ring, or the window, behind it,
+    /// which the publish rate decides, plus this timeout (plan 15 #2).
     ///
     /// Once it passes, the subscriptions in the way are taken out and the publish goes on: each
     /// subscriber is told, its receives return
     /// [`Closed::Evicted`](crate::Closed::Evicted), and the publisher logs it and counts it in
-    /// [`PublisherStats::evicted`](crate::PublisherStats::evicted). A `timeout` of zero takes
-    /// them out at once; one past what an `Instant` holds waits without a bound.
-    pub timeout: Duration,
+    /// [`PublisherStats::evicted`](crate::PublisherStats::evicted). A `publish_timeout` of zero
+    /// takes them out at once; one past what an `Instant` holds waits without a bound.
+    pub publish_timeout: Duration,
     /// The most records a subscriber may be behind the publisher, counting the one it is reading:
     /// a record that would leave one further behind waits. `None` (the default) lets it fall as
     /// far behind as the ring holds.
@@ -107,10 +118,11 @@ pub struct Backpressure {
     /// with a depth of `w`) keeps the writes where reading just ended. A pool has no such cost:
     /// a loan takes the slot read most recently.
     ///
-    /// Waiting for the window is waiting for room, with the same `timeout`: a subscriber that
-    /// stops for longer is taken out though the ring has room left. A small window leaves little
-    /// to ride out a subscriber's stall with, and on a topic of small values published at a high
-    /// rate the publisher stalls with it; choose `timeout` longer than the stalls to ride out. A
+    /// Waiting for the window is waiting for room, with the same `publish_timeout`: a subscriber
+    /// that stops for longer is taken out though the ring has room left. A small window leaves
+    /// little to ride out a subscriber's stall with, and on a topic of small values published at
+    /// a high rate the publisher stalls with it; choose `publish_timeout` longer than the stalls
+    /// to ride out. A
     /// window larger than the records the ring holds waits as `None` does.
     pub window: Option<NonZeroUsize>,
 }
@@ -119,7 +131,7 @@ impl Default for Backpressure {
     fn default() -> Self {
         Self {
             // Longer than a scheduling delay, shorter than a stop a person makes (plan 15 §6.5).
-            timeout: Duration::from_secs(1),
+            publish_timeout: Duration::from_secs(1),
             window: None,
         }
     }
@@ -164,7 +176,7 @@ pub(crate) fn wait_until(
     if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Room::TimedOut;
     }
-    if spin_until(SPIN, &mut made).0 {
+    if spin_until(SPIN, &mut made).0.is_found() {
         return Room::Made;
     }
     let mut nap = MIN_NAP;

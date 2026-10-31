@@ -41,10 +41,10 @@ use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
 use rsbinder_topic::aidl::TopicInfo::TopicInfo;
 use rsbinder_topic::aidl::TopicRef::TopicRef;
-use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver};
+use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver, TopicListing};
 use rsbinder_topic::{
-    Bytes, Closed, Disconnected, NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver,
-    Start, SubscriberPolicy,
+    Bytes, Closed, Disconnected, NamedState, NamedSubscriber, Publisher, PublisherPolicy,
+    RecvError, Resolver, Start, SubscriberPolicy,
 };
 
 /// Where a child finds the registry.
@@ -112,7 +112,7 @@ fn timed<T>(what: &str, stopped: &[Stopped], call: impl FnOnce() -> T) -> T {
     })
 }
 
-fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicInfo> {
+fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicListing> {
     let mut infos = resolver.list(name).unwrap();
     infos.retain(|info| info.name == name);
     infos.pop()
@@ -170,12 +170,35 @@ fn a_closed_or_dropped_publishers_name_is_gone_from_the_next_call() {
     let policy = PublisherPolicy::default();
     let publisher = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
-    publisher.close(&Status::from(ExceptionCode::None));
+    assert!(publisher.stats().advertised);
+    publisher.close();
+    assert!(!publisher.stats().advertised);
     assert!(listed(&resolver, &name).is_none());
     let publisher = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
     drop(publisher);
     assert!(listed(&resolver, &name).is_none());
+}
+
+/// The registry keeps one entry for a name and binder given twice: giving it again on the same
+/// host keeps it, and a name given anew moves without a gap.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_name_given_again_on_the_same_host_stays_and_a_new_name_takes_its_place() {
+    let registry = registry_name("again");
+    let (_host, resolver) = host(&registry);
+    let (first, second) = (name("again.first"), name("again.second"));
+    let policy = PublisherPolicy::default();
+    let publisher = Publisher::<Bytes>::advertise_with(&first, &policy, &resolver).unwrap();
+    publisher
+        .advertise_on(&first, &self::resolver(&registry))
+        .unwrap();
+    assert!(listed(&resolver, &first).is_some());
+    publisher.advertise_on(&second, &resolver).unwrap();
+    assert!(listed(&resolver, &second).is_some());
+    assert!(listed(&resolver, &first).is_none());
+    publisher.close();
+    assert!(listed(&resolver, &second).is_none());
 }
 
 /// AC-15.5.6: a hub with no registry has none to find; this one has no feature `topic`.
@@ -197,7 +220,11 @@ fn a_dead_publishers_name_and_a_dead_watchers_watch_go() {
     let mut publisher = publisher(&name, &registry);
     let watcher = Peer::spawn_with("subscribe", &name, &[(REGISTRY, &registry)]);
     assert_eq!(watcher.says(), "watching");
-    assert_eq!(listed(&resolver, &name).map(|info| info.watchers), Some(1));
+    let listing = listed(&resolver, &name).unwrap();
+    assert_eq!(listing.watchers, 1);
+    // The publisher is a child of this test, of its uid.
+    assert_eq!(listing.uid, rustix::process::getuid().as_raw());
+    assert!(listing.age < Duration::from_secs(60), "{listing:?}");
     drop(watcher);
     eventually("the dead watcher's watch to go", || {
         listed(&resolver, &name).map(|info| info.watchers) == Some(0)
@@ -288,6 +315,7 @@ fn a_failed_advertise_withdraws_its_name() {
 }
 
 /// AC-15.5.6, plan 15 D8: connections outlive the host; a new one knows only new publishers.
+/// A name subscriber of the dead host is closed once its connection ends.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_new_host_knows_only_the_publishers_made_again() {
@@ -304,6 +332,15 @@ fn a_new_host_knows_only_the_publishers_made_again() {
     assert_eq!(gone.transaction_error(), StatusCode::DeadObject);
     published(&mut peer, 1);
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![0])));
+    assert_eq!(subscriber.state(), NamedState::Connected);
+    peer.kill();
+    let died = Err(RecvError::Disconnected(Disconnected::Ended(
+        Closed::PublisherDied,
+    )));
+    assert_eq!(subscriber.recv_timeout(WAIT), died);
+    let closed = Err(RecvError::Closed(Closed::ResolverDied));
+    assert_eq!(subscriber.recv_timeout(WAIT), closed);
+    assert_eq!(subscriber.state(), NamedState::Closed(Closed::ResolverDied));
 
     let second_host = Peer::spawn("host", &registry);
     assert_eq!(second_host.says(), "ready");

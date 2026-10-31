@@ -1,20 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `android.os.SharedMemory` / NDK `ASharedMemory` equivalent (Plan
-//! 4-7a Phase C).
-//!
-//! On the wire a `SharedMemory` is **one file descriptor** and nothing
-//! else (`SharedMemory.java` `writeToParcel` → `writeFileDescriptor`);
-//! the receiver recovers the size from the fd itself. So an AIDL
-//! `ParcelFileDescriptor` argument/return carrying a memfd or ashmem fd
-//! is byte-identical to a Java/NDK `SharedMemory`, and this type is the
-//! convenience wrapper on both ends.
-//!
-//! Size recovery follows libcutils `ashmem_get_size_region`: `fstat`
-//! for a memfd / POSIX shm object, and — on Android — the
-//! `ASHMEM_GET_SIZE` ioctl for a legacy `/dev/ashmem` fd, which reports
-//! `st_size == 0`.
+//! `SharedMemory`; documented in the parent module, section "SharedMemory".
 
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -59,7 +46,7 @@ impl SharedMemory {
     }
 
     /// Adopt a received shared-memory fd, recovering its size from the
-    /// fd (see module doc) and mapping it read/write — or read-only
+    /// fd (see the module doc, "SharedMemory") and mapping it read/write — or read-only
     /// when the fd is write-protected (`F_SEAL_WRITE` /
     /// `F_SEAL_FUTURE_WRITE` on Linux/Android — how `ASharedMemory_setProt`
     /// enforces read-only on memfd —, a legacy `/dev/ashmem` fd whose
@@ -206,7 +193,7 @@ impl DeserializeOption for SharedMemory {
 /// Size of a shared-memory region from its fd alone (libcutils
 /// `ashmem_get_size_region`).
 pub fn region_size<F: AsFd>(fd: F) -> Result<usize> {
-    let st = rustix::fs::fstat(fd.as_fd())?;
+    let st = rustix::fs::fstat(fd.as_fd()).map_err(crate::error::errno_status)?;
     if st.st_size > 0 {
         return usize::try_from(st.st_size).map_err(|_| StatusCode::BadValue);
     }
@@ -227,7 +214,7 @@ pub(crate) fn is_ashmem_fd(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn ashmem_size(fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
     let size = rsbinder_fmq::shm::ashmem_size(fd).map_err(|e| match e {
-        rsbinder_fmq::Error::Os(errno) => StatusCode::from(errno),
+        rsbinder_fmq::Error::Os(errno) => StatusCode::from(std::io::Error::from(errno)),
         _ => StatusCode::BadValue,
     })?;
     usize::try_from(size).map_err(|_| StatusCode::BadValue)

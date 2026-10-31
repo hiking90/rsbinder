@@ -30,7 +30,6 @@
 
 #![cfg(feature = "rpc")]
 
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::thread;
 
@@ -38,7 +37,7 @@ use rsbinder::rpc::transport::MemTransport;
 use rsbinder::rpc::{AddressSpace, RpcServer, RpcSession};
 use rsbinder::{
     Binder, DeathRecipient, IBinder, Interface, Parcel, Remotable, Result, SIBinder, StatusCode,
-    Transactable, TransactionCode, WIBinder,
+    Transactable, TransactionCode,
 };
 
 // ---- fixtures -------------------------------------------------------
@@ -128,21 +127,6 @@ impl IBinder for KernelishProxy {
     }
     fn is_remote(&self) -> bool {
         true
-    }
-    fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-        Ok(())
-    }
-    fn attempt_inc_strong(&self) -> bool {
-        true
-    }
-    fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        Ok(())
-    }
-    fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-        Ok(())
-    }
-    fn dec_weak(&self) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -270,10 +254,11 @@ fn registration_refuses_a_remote_binder() {
         StatusCode::InvalidOperation,
         "AC-22.4: RpcServer::add_service refuses a remote binder"
     );
-    // A local binder still registers.
+    // A local binder still registers; a root and a directory need a server each.
     server.set_root(local_root()).expect("local root accepted");
-    server
-        .add_service("gw", local_root())
+    let dir_path = SockPath::new("reg_dir");
+    let dir = RpcServer::setup_unix_server(&dir_path.0).expect("bind");
+    dir.add_service("gw", local_root())
         .expect("local service accepted");
 
     // A kernel proxy is refused the same way: the rule is `is_remote`, not "is an RpcProxy".

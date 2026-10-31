@@ -11,9 +11,10 @@ use std::sync::atomic::Ordering;
 use crate::descriptor::{
     default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor, Grantor,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, EINVAL};
 use crate::queue::{
-    allocate_shared, check_target, ring_bytes, AtomicU64, Counter, Element, Regions, Ring,
+    allocate_shared, check_target, map_grantor, ring_bytes, AtomicU64, Counter, Element, Regions,
+    Ring,
 };
 use crate::ring;
 use crate::shm::{self, Access, Mapping, RoRun, RoWord64, Seals};
@@ -91,6 +92,16 @@ pub enum UnsyncRead {
     },
 }
 
+/// What [`UnsyncReader::read_latest`] did: how many of the newest elements
+/// it copied into the front of the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "only the first `copied` elements of the output buffer were written"]
+pub struct UnsyncLatest {
+    /// Elements copied, from the front of the buffer; `0` for none (see
+    /// [`UnsyncReader::read_latest`] for when).
+    pub copied: usize,
+}
+
 /// A counter the writer stores: 8 bytes it mapped read-write, or an `AtomicU64` of a test.
 struct Stored {
     ptr: NonNull<AtomicU64>,
@@ -157,22 +168,102 @@ impl WriterCore {
     }
 
     /// Reserve `n` elements, fewer than the ring holds, and hand out their ring bytes.
-    fn begin<T: Element>(&mut self, n: usize) -> Result<Regions<'_, T>> {
+    fn begin<T: Element>(&mut self, n: usize) -> Result<UnsyncWriteTxn<'_, T>> {
         let bytes = self.shape.bytes as usize;
         if n >= bytes / size_of::<T>() {
             return Err(Error::BadValue("more elements than the capacity less one"));
         }
         let position = self.reserve((n * size_of::<T>()) as u64)?;
         // SAFETY: `new`'s contract for the ring, borrowed with `self`; `n` elements fit in it.
-        Ok(unsafe { Regions::over(self.ring, bytes, position, n, true) })
+        let regions = unsafe { Regions::over(self.ring, bytes, position, n, true) };
+        Ok(UnsyncWriteTxn {
+            core: self,
+            regions,
+        })
+    }
+}
+
+/// A write reserved by [`UnsyncWriter::begin_write`]: [`len`](Regions::len)
+/// elements at the write position, announced to the readers and not yet
+/// committed.
+///
+/// Copy the elements in with [`write_at`](Self::write_at), then
+/// [`commit`](Self::commit) all of them or
+/// [`commit_first`](Self::commit_first) a prefix. It derefs to its
+/// [`Regions`] for the lengths, shared only, as
+/// [`WriteTxn`](crate::WriteTxn) does:
+///
+/// ```compile_fail,E0596
+/// # fn swap(a: &mut rsbinder_fmq::UnsyncWriter<u8>, b: &mut rsbinder_fmq::UnsyncWriter<u8>)
+/// # -> rsbinder_fmq::Result<()> {
+/// let mut x = a.begin_write(1)?;
+/// let mut y = b.begin_write(1)?;
+/// std::mem::swap(&mut *x, &mut *y);
+/// # Ok(()) }
+/// ```
+///
+/// # Dropped without a commit
+///
+/// A transaction dropped without a commit publishes nothing: the write
+/// counter stays where it was and the next `begin_write` starts at the same
+/// position. The announcement stays — the write region end is never
+/// lowered (see [`UnsyncWriter`]) — so a reader treats the reserved
+/// positions as overwritten until the write counter passes them. AOSP's
+/// Rust binding to libfmq (`WriteCompletion`) commits the whole
+/// reservation when it is dropped; this type does not, since that would
+/// publish elements that were never written.
+#[must_use = "dropping a write transaction publishes nothing; `commit` makes the elements visible"]
+pub struct UnsyncWriteTxn<'a, T: Element> {
+    core: &'a mut WriterCore,
+    regions: Regions<'a, T>,
+}
+
+impl<T: Element> UnsyncWriteTxn<'_, T> {
+    /// Copy `src` into the reserved elements starting at `start`, the index
+    /// running across the wrap as [`Regions`] describes. `BadValue` when
+    /// `start + src.len()` exceeds [`len`](Regions::len).
+    pub fn write_at(&mut self, start: usize, src: &[T]) -> Result<()> {
+        self.regions.write_at(start, src)
     }
 
-    /// Commit the first `n` of the elements `begin` reserved.
-    fn finish<T: Element>(&mut self, n: usize) -> Result<()> {
-        if n >= self.shape.bytes as usize / size_of::<T>() {
+    /// Publish every element the transaction reserved.
+    ///
+    /// It does not fail: the writer keeps its counters to itself and loads
+    /// nothing a peer wrote. The `Result` matches
+    /// [`WriteTxn::commit`](crate::WriteTxn::commit).
+    pub fn commit(self) -> Result<()> {
+        let n = self.regions.len();
+        self.commit_first(n)
+    }
+
+    /// Publish the first `n` of the elements reserved. The rest stay
+    /// announced as being written (see "The region end is never lowered" on
+    /// [`UnsyncWriter`]), and the next write starts right after the `n`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadValue`] when `n` exceeds [`len`](Regions::len).
+    pub fn commit_first(self, n: usize) -> Result<()> {
+        if n > self.regions.len() {
             return Err(Error::BadValue("commit exceeds the elements reserved"));
         }
-        self.commit((n * size_of::<T>()) as u64)
+        self.core.commit((n * size_of::<T>()) as u64)
+    }
+}
+
+impl<'a, T: Element> std::ops::Deref for UnsyncWriteTxn<'a, T> {
+    type Target = Regions<'a, T>;
+
+    fn deref(&self) -> &Regions<'a, T> {
+        &self.regions
+    }
+}
+
+impl<T: Element> std::fmt::Debug for UnsyncWriteTxn<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnsyncWriteTxn")
+            .field("regions", &self.regions)
+            .finish()
     }
 }
 
@@ -200,11 +291,7 @@ impl WriterCore {
 /// let mut writer = UnsyncWriter::<u32>::create(4, &options)?;
 /// let descriptor = writer.descriptor()?; // send it to each reader
 ///
-/// let policy = AttachPolicy {
-///     max_capacity: 1 << 16,
-///     require_seal: true,
-///     require_event_flag: false,
-/// };
+/// let policy = AttachPolicy::new(1 << 16);
 /// let mut reader = UnsyncReader::<u32>::attach(&descriptor, &policy, UnsyncStart::Now)?;
 ///
 /// writer.write(&[1, 2])?;
@@ -228,7 +315,7 @@ impl WriterCore {
 ///
 /// [`begin_write`](Self::begin_write) stores the counter value the write
 /// will reach in the write region end, *before* any element is copied;
-/// [`commit_write`](Self::commit_write) then moves the write counter. A
+/// [`UnsyncWriteTxn::commit`] then moves the write counter. A
 /// reader that copied elements while the writer was overwriting them loads
 /// the region end after its copy, sees that the reserved region reaches the
 /// position it read from, and discards what it copied
@@ -347,9 +434,7 @@ impl<T: Element> UnsyncWriter<T> {
         }
         match shm::add_seals(desc.fds[0].as_fd(), seals) {
             // The kernel applies none of a mask that holds a seal it does not know.
-            Err(Error::Os(rustix::io::Errno::INVAL)) if options.read_only_readers => {
-                return Err(Error::Unsupported)
-            }
+            Err(Error::Os(EINVAL)) if options.read_only_readers => return Err(Error::Unsupported),
             other => other?,
         }
         let shape = Shape {
@@ -387,7 +472,7 @@ impl<T: Element> UnsyncWriter<T> {
     /// * Without it both shared counters become zero. The writer keeps its
     ///   own and stores them again with its next
     ///   [`begin_write`](Self::begin_write) and
-    ///   [`commit_write`](Self::commit_write); until then an
+    ///   [`commit`](UnsyncWriteTxn::commit); until then an
     ///   [`UnsyncReader`] that looks sees the write counter behind what it
     ///   saw before and fails with [`Error::Corrupted`], and a read that
     ///   overlaps the write in progress may miss it.
@@ -413,37 +498,23 @@ impl<T: Element> UnsyncWriter<T> {
     }
 
     /// Reserve `n` elements at the write position and announce the write to
-    /// the readers. Fill the regions, then
-    /// [`commit_write`](Self::commit_write). The two regions of the result
-    /// are the part before the ring's end and the part after its wrap.
+    /// the readers. Copy the elements in through the transaction's
+    /// [`Regions`], then [`commit`](UnsyncWriteTxn::commit) it. The two
+    /// regions are the part before the ring's end and the part after its
+    /// wrap.
     ///
     /// A write never waits for space: the regions may cover elements no
     /// reader has read yet, and from this call on a reader treats the
-    /// reserved elements' positions as overwritten. Reserving again before a
-    /// commit starts over from the same position; the announcement covers
-    /// the longer of the two.
+    /// reserved elements' positions as overwritten. A transaction dropped
+    /// without a commit publishes nothing, and the next `begin_write` starts
+    /// over from the same position; the announcement covers the longer of
+    /// the two.
     ///
     /// # Errors
     ///
     /// [`Error::BadValue`] when `n` is more than `capacity - 1`.
-    pub fn begin_write(&mut self, n: usize) -> Result<Regions<'_, T>> {
+    pub fn begin_write(&mut self, n: usize) -> Result<UnsyncWriteTxn<'_, T>> {
         self.core.begin(n)
-    }
-
-    /// Publish the first `n` of the elements reserved by
-    /// [`begin_write`](Self::begin_write).
-    ///
-    /// `n` may be less than what was reserved. The rest of the reservation
-    /// stays announced as being written (see "The region end is never
-    /// lowered" on the type), and a later `commit_write` may publish it
-    /// without another `begin_write`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::BadValue`] when `n` is more than the elements reserved and
-    /// not yet committed.
-    pub fn commit_write(&mut self, n: usize) -> Result<()> {
-        self.core.finish::<T>(n)
     }
 
     /// Write all of `items`, overwriting the oldest elements when the ring
@@ -454,8 +525,9 @@ impl<T: Element> UnsyncWriter<T> {
     /// [`Error::BadValue`] when `items` is more than `capacity - 1`
     /// elements.
     pub fn write(&mut self, items: &[T]) -> Result<()> {
-        self.begin_write(items.len())?.write_at(0, items)?;
-        self.commit_write(items.len())
+        let mut txn = self.begin_write(items.len())?;
+        txn.write_at(0, items)?;
+        txn.commit()
     }
 }
 
@@ -601,12 +673,7 @@ struct Word {
 impl Word {
     fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
         // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
-        let mapping = Mapping::map(
-            desc.fds[g.fd_index as usize].as_fd(),
-            u64::from(g.offset),
-            8,
-            Access::ReadOnly,
-        )?;
+        let mapping = map_grantor(desc, g, 8, Access::ReadOnly)?;
         Ok(Self {
             at: mapping.as_ptr(),
             _mapping: mapping,
@@ -719,8 +786,8 @@ impl<T: Element> UnsyncReader<T> {
     /// The descriptor's flavor must be [`Flavor::UnsynchronizedWrite`]. A
     /// queue [`UnsyncWriter`] made has three grantors, and one libfmq made
     /// may have the EventFlag word as a fourth; it is validated when present
-    /// and never mapped. `policy.require_event_flag` therefore refuses every
-    /// queue of this crate's writer.
+    /// and never mapped. `policy.require_event_flag` is therefore ignored: a
+    /// reader of this flavor has no use for the word.
     ///
     /// Nothing is stored: the shared counters are left as they are.
     ///
@@ -729,7 +796,8 @@ impl<T: Element> UnsyncReader<T> {
     /// [`Error::Unsupported`] comes first, whatever `desc` and `policy`
     /// hold: on a target that is not Linux or Android, has no 64-bit
     /// atomics, or has `shm::RoWord64::PRESENT` false. On the other targets:
-    /// [`Error::BadValue`] for a descriptor the checks refuse,
+    /// [`Error::InvalidDescriptor`] for a descriptor the checks or `policy`
+    /// refuse,
     /// [`Error::Os`] when a system call those checks or the mappings make
     /// fails, and, with [`UnsyncStart::Now`], [`Error::Corrupted`] when the
     /// counters fail their check.
@@ -803,14 +871,15 @@ impl<T: Element> UnsyncReader<T> {
 
     /// Copy the newest elements into the front of `out` — as many as it
     /// holds, fewer when fewer are unread — and consume everything
-    /// committed so far. Returns how many elements were copied; they are in
-    /// the order they were written, the newest last. libfmq `readLatest`.
+    /// committed so far. Returns how many elements were copied
+    /// ([`UnsyncLatest::copied`]); they are in the order they were written,
+    /// the newest last. libfmq `readLatest`.
     ///
     /// A reader that wants the current value and not the backlog calls this
     /// with a buffer of one element. Elements skipped this way are not
     /// reported as lost.
     ///
-    /// `0` means one of three things: nothing was committed since the last
+    /// A count of `0` means one of three things: nothing was committed since the last
     /// read; a write in progress reaches every unread element (a libfmq
     /// writer that reserved the whole ring), and they are skipped without a
     /// copy; or the writer overwrote the elements while they were copied.
@@ -825,9 +894,11 @@ impl<T: Element> UnsyncReader<T> {
     /// # Errors
     ///
     /// [`Error::Corrupted`] when the counters fail their check.
-    pub fn read_latest(&mut self, out: &mut [T]) -> Result<usize> {
+    pub fn read_latest(&mut self, out: &mut [T]) -> Result<UnsyncLatest> {
         let copied = self.core.take_latest(ring::bytes_of_mut(out))?;
-        Ok(copied / size_of::<T>())
+        Ok(UnsyncLatest {
+            copied: copied / size_of::<T>(),
+        })
     }
 }
 

@@ -17,9 +17,100 @@
  * limitations under the License.
  */
 
-#[cfg(feature = "async")]
+/// The `native` shapes `declare_binder_interface!` accepts, the same in both cfgs (plan 17 D-18).
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __declare_binder_interface {
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                doc: $native_doc:expr,
+                adapter: $native_adapter:ident,
+                r#async: $native_async:ident,
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $(r#async: $async_interface:ident,)?
+            stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
+        }
+    } => {
+        $crate::__declare_binder_interface_adapter! {
+            $interface[$descriptor] {
+                native: {
+                    $native($on_transact),
+                    doc: $native_doc,
+                    adapter: $native_adapter,
+                    r#async: $native_async,
+                },
+                proxy: $proxy {
+                    $($fname: $fty = $finit),*
+                },
+                $(r#async: $async_interface,)?
+                stability: $stability,
+                $(function_names: $function_names,)?
+                local_transport: $local_transport,
+            }
+        }
+    };
+
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                doc: $native_doc:expr,
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
+        }
+    } => {
+        $crate::__declare_binder_interface_sync! {
+            $interface[$descriptor] {
+                native: $native($on_transact),
+                doc: $native_doc,
+                stability: $stability,
+                $(function_names: $function_names,)?
+            }
+        }
+    };
+
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                doc: $native_doc:expr,
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            r#async: $async_interface:ident,
+            stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
+        }
+    } => {
+        ::core::compile_error!(::core::concat!(
+            "declare_binder_interface!: the async interface `", ::core::stringify!($async_interface),
+            "` needs `adapter:` and `r#async:` in `native`; give all three, or none for a sync-only interface",
+        ));
+        // The sync `Bn*` still, so the error above is the only one reported.
+        $crate::__declare_binder_interface_sync! {
+            $interface[$descriptor] {
+                native: $native($on_transact),
+                doc: $native_doc,
+                stability: $stability,
+                $(function_names: $function_names,)?
+            }
+        }
+    };
+
     {
         $interface:path[$descriptor:expr] {
             native: {
@@ -34,84 +125,156 @@ macro_rules! __declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
         }
     } => {
-        $(
-            pub trait $native_adapter {
-                fn as_sync(&self) -> &dyn $interface;
-                #[allow(dead_code, reason = "called only from the async half of the expansion, which an interface may omit")]
-                fn as_async(&self) -> &dyn $native_async;
-                /// `Some` only for an async-backed service; `None` for a
-                /// sync-only one. Lets the async `FromIBinder` cast
-                /// reject a sync-only local binder up front instead of letting
-                /// [`Self::as_async`] panic when a method is later called.
-                #[allow(dead_code, reason = "called only from the async half of the expansion, which an interface may omit")]
-                fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async>;
+        ::core::compile_error!(::core::concat!(
+            "declare_binder_interface!: `native` takes `adapter:` and `r#async:` (the async ",
+            "service trait) together, or neither; this one gives only",
+            $(" `adapter: ", ::core::stringify!($native_adapter), "`",)?
+            $(" `r#async: ", ::core::stringify!($native_async), "`",)?
+        ));
+        // The sync `Bn*` still, so the error above is the only one reported.
+        $crate::__declare_binder_interface_sync! {
+            $interface[$descriptor] {
+                native: $native($on_transact),
+                doc: $native_doc,
+                stability: $stability,
+                $(function_names: $function_names,)?
+            }
+        }
+    };
+}
+
+/// Without the `async` feature an adapter has no async half: the sync `Bn*` (plan 17 D-18).
+#[cfg(not(feature = "async"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __declare_binder_interface_adapter {
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                doc: $native_doc:expr,
+                adapter: $native_adapter:ident,
+                r#async: $native_async:ident,
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $(r#async: $async_interface:ident,)?
+            stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
+        }
+    } => {
+        $crate::__declare_binder_interface_sync! {
+            $interface[$descriptor] {
+                native: $native($on_transact),
+                doc: $native_doc,
+                stability: $stability,
+                $(function_names: $function_names,)?
+            }
+        }
+    };
+}
+
+/// A `native` with an adapter and an async service, and the async interface if one is given.
+#[cfg(feature = "async")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __declare_binder_interface_adapter {
+    {
+        $interface:path[$descriptor:expr] {
+            native: {
+                $native:ident($on_transact:path),
+                doc: $native_doc:expr,
+                adapter: $native_adapter:ident,
+                r#async: $native_async:ident,
+            },
+            proxy: $proxy:ident {
+                $($fname:ident: $fty:ty = $finit:expr),*
+            },
+            $(r#async: $async_interface:ident,)?
+            stability: $stability:expr,
+            $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
+        }
+    } => {
+        pub trait $native_adapter {
+            fn as_sync(&self) -> &dyn $interface;
+            #[allow(dead_code, reason = "called only from the async half of the expansion, which an interface may omit")]
+            fn as_async(&self) -> &dyn $native_async;
+            /// `Some` only for an async-backed service; `None` for a
+            /// sync-only one. Lets the async `FromIBinder` cast
+            /// reject a sync-only local binder up front instead of letting
+            /// [`Self::as_async`] panic when a method is later called.
+            #[allow(dead_code, reason = "called only from the async half of the expansion, which an interface may omit")]
+            fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async>;
+        }
+
+        #[doc = $native_doc]
+        pub struct $native(::std::boxed::Box<dyn $native_adapter + ::core::marker::Send + ::core::marker::Sync + 'static>);
+
+        impl $native {
+            /// Create a new binder service.
+            pub fn new_binder<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
+                Self::new_binder_with_features(inner, $crate::BinderFeatures::default())
             }
 
-            #[doc = $native_doc]
-            pub struct $native(::std::boxed::Box<dyn $native_adapter + ::core::marker::Send + ::core::marker::Sync + 'static>);
-
-            impl $native {
-                /// Create a new binder service.
-                pub fn new_binder<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(inner: T) -> $crate::Strong<dyn $interface> {
-                    Self::new_binder_with_features(inner, $crate::BinderFeatures::default())
+            /// Create a new binder service with explicit binder features.
+            ///
+            /// Equivalent to [`Self::new_binder`] but lets the caller opt into
+            /// kernel-level features such as `set_requesting_sid`.
+            /// See `rsbinder::BinderFeatures`.
+            pub fn new_binder_with_features<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(
+                inner: T,
+                features: $crate::BinderFeatures,
+            ) -> $crate::Strong<dyn $interface> {
+                struct Wrapper<T> {
+                    _inner: T,
                 }
-
-                /// Create a new binder service with explicit binder features.
-                ///
-                /// Equivalent to [`Self::new_binder`] but lets the caller opt into
-                /// kernel-level features such as `set_requesting_sid`.
-                /// See `rsbinder::BinderFeatures`.
-                pub fn new_binder_with_features<T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static>(
-                    inner: T,
-                    features: $crate::BinderFeatures,
-                ) -> $crate::Strong<dyn $interface> {
-                    struct Wrapper<T> {
-                        _inner: T,
+                impl<T> $native_adapter for Wrapper<T>
+                where
+                    T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static,
+                {
+                    fn as_sync(&self) -> &dyn $interface { &self._inner }
+                    fn as_async(&self) -> &dyn $native_async {
+                        // Reachable from `*Async` code generated without `local_transport` only.
+                        panic!("{} was published sync-only; it has no async interface", stringify!($interface))
                     }
-                    impl<T> $native_adapter for Wrapper<T>
-                    where
-                        T: $interface + ::core::marker::Sync + ::core::marker::Send + 'static,
-                    {
-                        fn as_sync(&self) -> &dyn $interface { &self._inner }
-                        fn as_async(&self) -> &dyn $native_async {
-                            // Reachable: `Binder::<Bn*>::try_from`, then a generated `*Async` impl.
-                            panic!("{} was published sync-only; it has no async interface", stringify!($interface))
-                        }
-                        fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async> { ::core::option::Option::None }
-                    }
-                    let binder = $crate::Binder::new_with_stability_and_features(
-                        $native(::std::boxed::Box::new(Wrapper {_inner: inner})),
-                        $stability,
-                        features,
-                    );
-                    $crate::Strong::new(::std::boxed::Box::new(binder))
+                    fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async> { ::core::option::Option::None }
                 }
+                let binder = $crate::Binder::new_with_stability_and_features(
+                    $native(::std::boxed::Box::new(Wrapper {_inner: inner})),
+                    $stability,
+                    features,
+                );
+                $crate::Strong::new(::std::boxed::Box::new(binder))
+            }
+        }
+
+        impl $crate::Remotable for $native {
+            fn descriptor() -> &'static str where Self: Sized {
+                $descriptor
             }
 
-            impl $crate::Remotable for $native {
-                fn descriptor() -> &'static str where Self: Sized {
-                    $descriptor
-                }
-
-                fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
-                    $on_transact(self.0.as_sync(), code, reader, reply)
-                }
-
-                fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
-                    self.0.as_sync().dump(_writer, _args)
-                }
-
-                fn on_dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> $crate::Result<()> {
-                    self.0.as_sync().dump_fd(_fd, _args)
-                }
-
-                fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
-                    Self::__TRANSACTION_NAMES.and_then(|names| $crate::__transaction_name(names, code))
-                }
+            fn on_transact(&self, code: $crate::TransactionCode, reader: &mut $crate::Parcel, reply: &mut $crate::Parcel) -> $crate::Result<()> {
+                $on_transact(self.0.as_sync(), code, reader, reply)
             }
-        )?
+
+            fn on_dump(&self, _writer: &mut dyn ::std::io::Write, _args: &[::std::string::String]) -> $crate::Result<()> {
+                self.0.as_sync().dump(_writer, _args)
+            }
+
+            fn on_dump_fd(&self, _fd: ::std::os::fd::OwnedFd, _args: &[::std::string::String]) -> $crate::Result<()> {
+                self.0.as_sync().dump_fd(_fd, _args)
+            }
+
+            fn transaction_name(code: $crate::TransactionCode) -> ::core::option::Option<&'static str> where Self: Sized {
+                Self::__TRANSACTION_NAMES.and_then(|names| $crate::__transaction_name(names, code))
+            }
+        }
 
         $crate::__transaction_names! { $native $(, $function_names)? }
 
@@ -125,19 +288,37 @@ macro_rules! __declare_binder_interface {
                 fn try_from(ibinder: $crate::SIBinder) -> ::std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
                     match <$proxy as $crate::Proxy>::from_binder(ibinder.clone()) {
                         ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
-                        ::core::option::Option::None => {
-                            match $crate::Binder::<$native>::try_from(ibinder) {
-                                ::core::result::Result::Ok(native) => {
-                                    // Sync-only native: BadType (AOSP proxies the local binder instead).
-                                    if native.0.try_as_async().is_some() {
+                        ::core::option::Option::None => $crate::__if_local_transport! {
+                            $local_transport
+                            {
+                                // Code generated without the in-process transport: a sync-only native is BadType.
+                                match $crate::Binder::<$native>::try_from(ibinder) {
+                                    ::core::result::Result::Ok(native) => {
+                                        if native.0.try_as_async().is_some() {
+                                            ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
+                                        } else {
+                                            ::core::result::Result::Err($crate::StatusCode::BadType)
+                                        }
+                                    }
+                                    ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+                                }
+                            }
+                            {
+                                // AOSP: a local binder without an async service is proxied in-process.
+                                match $crate::__local_binder::<$native>(&ibinder)? {
+                                    ::core::option::Option::Some(native) if native.0.try_as_async().is_some() => {
                                         ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
-                                    } else {
-                                        ::core::result::Result::Err($crate::StatusCode::BadType)
+                                    }
+                                    ::core::option::Option::Some(_) => {
+                                        $crate::__local_transport_ready()?;
+                                        ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(ibinder))))
+                                    }
+                                    ::core::option::Option::None => {
+                                        ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(ibinder))))
                                     }
                                 }
-                                ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -172,21 +353,14 @@ macro_rules! __declare_binder_interface {
     };
 }
 
-#[cfg(not(feature = "async"))]
+/// The sync `Bn*`, shared by both cfgs so a sync-only interface expands the same in each.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! __declare_binder_interface {
+macro_rules! __declare_binder_interface_sync {
     {
         $interface:path[$descriptor:expr] {
-            native: {
-                $native:ident($on_transact:path),
-                doc: $native_doc:expr,
-                $(adapter: $native_adapter:ident,)?
-                $(r#async: $native_async:ident,)?
-            },
-            proxy: $proxy:ident {
-                $($fname:ident: $fty:ty = $finit:expr),*
-            },
-            $(r#async: $async_interface:ident,)?
+            native: $native:ident($on_transact:path),
+            doc: $native_doc:expr,
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
         }
@@ -244,7 +418,7 @@ macro_rules! __declare_binder_interface {
     };
 }
 
-/// `Bn*` method-name table (`None` without `trace`); a macro of its own for the async repetition.
+/// `Bn*` method-name table (`None` without `trace`), shared by the sync and adapter expansions.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __transaction_names {
@@ -262,9 +436,147 @@ macro_rules! __transaction_names {
     };
 }
 
+/// The first block for code generated without `local_transport`, the second with it (plan 17 D-14).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_local_transport {
+    ([] $without:block $with:block) => {
+        $without
+    };
+    ([$marker:ident] $without:block $with:block) => {
+        $with
+    };
+}
+
+/// What `rsbinder-aidl` emits at the top of interface code generated with async support: it
+/// expands to nothing with rsbinder's `async` feature and to a `compile_error!` without it
+/// (plan 17 D-18), so the build names the mismatch and its fix, not only the missing items.
+#[cfg(feature = "async")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __require_async {
+    {} => {};
+}
+
+/// What `rsbinder-aidl` emits at the top of interface code generated with async support: it
+/// expands to nothing with rsbinder's `async` feature and to a `compile_error!` without it
+/// (plan 17 D-18), so the build names the mismatch and its fix, not only the missing items.
+///
+/// ```compile_fail
+/// rsbinder::__require_async! {}
+/// ```
+#[cfg(not(feature = "async"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __require_async {
+    {} => {
+        ::core::compile_error!(
+            "this AIDL interface code was generated with async support, but rsbinder is built \
+             without its `async` feature: enable rsbinder's `async` (or `tokio`) feature, or \
+             generate the code with `rsbinder_aidl::Builder::set_async_support(false)`"
+        );
+    };
+}
+
 /// Declare a binder interface.
 ///
-/// This is mainly used internally by the AIDL compiler.
+/// For generated code; write interfaces with `#[rsbinder::interface]` or `.aidl`.
+///
+/// `native` takes `adapter:` and `r#async:` together, or neither. With
+/// neither, the `Bn*` is sync-only in every feature set; with both, it also
+/// carries the async service when rsbinder's `async` feature is on. An async
+/// interface (`r#async:` after `proxy`) needs both. Any other combination is
+/// a `compile_error!` (plan 17 D-18).
+///
+/// ```
+/// use rsbinder::{Binder, Interface, Parcel, Result, TransactionCode};
+///
+/// pub trait IFoo: Interface {
+///     fn foo(&self) -> Result<()>;
+/// }
+///
+/// rsbinder::declare_binder_interface! {
+///     IFoo["my.foo"] {
+///         native: {
+///             BnFoo(on_transact),
+///         },
+///         proxy: BpFoo{},
+///     }
+/// }
+/// # impl IFoo for Binder<BnFoo> { fn foo(&self) -> Result<()> { self.0.foo() } }
+/// # impl IFoo for BpFoo { fn foo(&self) -> Result<()> { Ok(()) } }
+/// # fn on_transact(_: &dyn IFoo, _: TransactionCode, _: &mut Parcel, _: &mut Parcel)
+/// #     -> Result<()> { Ok(()) }
+/// ```
+///
+/// The same declaration with only one of the two:
+///
+/// ```compile_fail
+/// # use rsbinder::{Binder, Interface, Parcel, Result, TransactionCode};
+/// # pub trait IFoo: Interface { fn foo(&self) -> Result<()>; }
+/// rsbinder::declare_binder_interface! {
+///     IFoo["my.foo"] {
+///         native: {
+///             BnFoo(on_transact),
+///             adapter: BnFooAdapter,
+///         },
+///         proxy: BpFoo{},
+///     }
+/// }
+/// # impl IFoo for Binder<BnFoo> { fn foo(&self) -> Result<()> { self.0.foo() } }
+/// # impl IFoo for BpFoo { fn foo(&self) -> Result<()> { Ok(()) } }
+/// # fn on_transact(_: &dyn IFoo, _: TransactionCode, _: &mut Parcel, _: &mut Parcel)
+/// #     -> Result<()> { Ok(()) }
+/// ```
+///
+/// ```compile_fail
+/// # use rsbinder::{Binder, Interface, Parcel, Result, TransactionCode};
+/// # pub trait IFoo: Interface { fn foo(&self) -> Result<()>; }
+/// # pub trait IFooAsyncService: Interface {}
+/// rsbinder::declare_binder_interface! {
+///     IFoo["my.foo"] {
+///         native: {
+///             BnFoo(on_transact),
+///             r#async: IFooAsyncService,
+///         },
+///         proxy: BpFoo{},
+///     }
+/// }
+/// # impl IFoo for Binder<BnFoo> { fn foo(&self) -> Result<()> { self.0.foo() } }
+/// # impl IFoo for BpFoo { fn foo(&self) -> Result<()> { Ok(()) } }
+/// # fn on_transact(_: &dyn IFoo, _: TransactionCode, _: &mut Parcel, _: &mut Parcel)
+/// #     -> Result<()> { Ok(()) }
+/// ```
+///
+/// And an async interface with neither:
+///
+/// ```compile_fail
+/// # use rsbinder::{Binder, Interface, Parcel, Result, TransactionCode};
+/// # pub trait IFoo: Interface { fn foo(&self) -> Result<()>; }
+/// rsbinder::declare_binder_interface! {
+///     IFoo["my.foo"] {
+///         native: {
+///             BnFoo(on_transact),
+///         },
+///         proxy: BpFoo{},
+///         r#async: IFooAsync,
+///     }
+/// }
+/// # impl IFoo for Binder<BnFoo> { fn foo(&self) -> Result<()> { self.0.foo() } }
+/// # impl IFoo for BpFoo { fn foo(&self) -> Result<()> { Ok(()) } }
+/// # fn on_transact(_: &dyn IFoo, _: TransactionCode, _: &mut Parcel, _: &mut Parcel)
+/// #     -> Result<()> { Ok(()) }
+/// ```
+///
+/// `local_transport: enabled,` (last, optional) is what `rsbinder-aidl`
+/// writes for interface code whose proxy drives a local binder through the
+/// in-process transport (plan 17 K-4). With it, an async cast of a
+/// sync-only local service, and a cast of a local binder of another
+/// `Remotable` with the same descriptor, give the generated proxy over that
+/// binder. Without it the proxy can reach a remote binder only, so those
+/// casts fail: `BadType` for the async cast of a sync-only service, the
+/// `Binder::try_from` error for the other.
+#[doc(hidden)]
 #[macro_export]
 macro_rules! declare_binder_interface {
     {
@@ -277,6 +589,7 @@ macro_rules! declare_binder_interface {
             proxy: $proxy:ident,
             $(r#async: $async_interface:ident,)?
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -290,6 +603,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $crate::Stability::default(),
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -305,6 +619,7 @@ macro_rules! declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -318,6 +633,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $stability,
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -334,6 +650,7 @@ macro_rules! declare_binder_interface {
             },
             $(r#async: $async_interface:ident,)?
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -349,6 +666,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $crate::Stability::default(),
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -366,6 +684,7 @@ macro_rules! declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -376,13 +695,18 @@ macro_rules! declare_binder_interface {
                     $(adapter: $native_adapter,)?
                     $(r#async: $native_async,)?
                 },
-                @doc[concat!("A binder `Proxy` that holds an [`", stringify!($interface), "`] remote interface.")]
+                @doc[concat!(
+                    "A binder `Proxy` for an [`", stringify!($interface), "`]: a remote interface, ",
+                    "or a local binder called through the in-process transport (a sync-only service ",
+                    "reached through its async view; see `rsbinder::Strong::into_async`)."
+                )]
                 proxy: $proxy {
                     $($fname: $fty = $finit),*
                 },
                 $(r#async: $async_interface,)?
                 stability: $stability,
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -403,12 +727,21 @@ macro_rules! declare_binder_interface {
 
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         #[doc = $proxy_doc]
         pub struct $proxy {
             binder: $crate::SIBinder,
             $($fname: $fty,)*
+        }
+
+        impl $proxy {
+            /// A proxy over a local binder, driven through its in-process transport (plan 17 K-4).
+            #[allow(dead_code, reason = "called only by code generated with `local_transport`")]
+            fn __rsb_local(binder: $crate::SIBinder) -> Self {
+                Self { binder, $($fname: $finit),* }
+            }
         }
 
         impl $crate::Interface for $proxy {
@@ -449,6 +782,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $stability,
                 $(function_names: $function_names,)?
+                local_transport: [$($local_transport)?],
             }
         }
 
@@ -460,12 +794,22 @@ macro_rules! declare_binder_interface {
             fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
                     ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
-                    ::core::option::Option::None => {
-                        match $crate::Binder::<$native>::try_from(binder) {
-                            ::core::result::Result::Ok(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
-                            ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+                    ::core::option::Option::None => $crate::__if_local_transport! {
+                        [$($local_transport)?]
+                        {
+                            match $crate::Binder::<$native>::try_from(binder) {
+                                ::core::result::Result::Ok(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
+                                ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+                            }
                         }
-                    }
+                        {
+                            // Another `Remotable` of this descriptor is proxied in-process (plan 17 D-13).
+                            match $crate::__local_binder::<$native>(&binder)? {
+                                ::core::option::Option::Some(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
+                                ::core::option::Option::None => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(binder)))),
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -930,9 +1274,60 @@ mod tests {
         }
     }
 
+    // No `adapter:`/`r#async:`: a sync-only `Bn*` in every feature set (plan 17 D-18).
+    pub trait IPlain: Interface {
+        fn plain(&self) -> Result<i32>;
+    }
+
+    declare_binder_interface! {
+        IPlain["my.plain"] {
+            native: {
+                BnPlain(on_transact_plain),
+            },
+            proxy: BpPlain{},
+        }
+    }
+
+    impl IPlain for Binder<BnPlain> {
+        fn plain(&self) -> Result<i32> {
+            self.0.plain()
+        }
+    }
+
+    impl IPlain for BpPlain {
+        fn plain(&self) -> Result<i32> {
+            unimplemented!("BpPlain::plain")
+        }
+    }
+
+    fn on_transact_plain(
+        _service: &dyn IPlain,
+        _code: TransactionCode,
+        _data: &mut Parcel,
+        _reply: &mut Parcel,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    struct PlainService;
+
+    impl Interface for PlainService {}
+
+    impl IPlain for PlainService {
+        fn plain(&self) -> Result<i32> {
+            Ok(7)
+        }
+    }
+
     #[test]
     fn test_declare_binder_interface() {
         let _ = BnEcho::new_binder(EchoService {});
+    }
+
+    #[test]
+    fn a_sync_only_declaration_publishes_and_calls_in_every_feature_set() {
+        let plain = BnPlain::new_binder(PlainService);
+        assert_eq!(plain.plain().expect("plain"), 7);
     }
 
     // A cross-interface cast fails with `BadType`; `native::try_from` logs both descriptors.

@@ -1,27 +1,5 @@
 pub mod rsbinder_fmq
 pub mod rsbinder_fmq::shm
-pub mod rsbinder_fmq::shm::spin
-pub struct rsbinder_fmq::shm::spin::SpinGauge
-impl rsbinder_fmq::shm::spin::SpinGauge
-pub fn rsbinder_fmq::shm::spin::SpinGauge::budget(&self, core::option::Option<std::time::Instant>) -> core::time::Duration
-pub fn rsbinder_fmq::shm::spin::SpinGauge::is_off(&self) -> bool
-pub fn rsbinder_fmq::shm::spin::SpinGauge::parked(&self, core::time::Duration)
-pub fn rsbinder_fmq::shm::spin::SpinGauge::spun(&self, core::time::Duration, bool)
-impl core::default::Default for rsbinder_fmq::shm::spin::SpinGauge
-pub fn rsbinder_fmq::shm::spin::SpinGauge::default() -> rsbinder_fmq::shm::spin::SpinGauge
-impl core::fmt::Debug for rsbinder_fmq::shm::spin::SpinGauge
-pub fn rsbinder_fmq::shm::spin::SpinGauge::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl !core::marker::Freeze for rsbinder_fmq::shm::spin::SpinGauge
-impl core::marker::Send for rsbinder_fmq::shm::spin::SpinGauge
-impl core::marker::Sync for rsbinder_fmq::shm::spin::SpinGauge
-impl core::marker::Unpin for rsbinder_fmq::shm::spin::SpinGauge
-impl core::marker::UnsafeUnpin for rsbinder_fmq::shm::spin::SpinGauge
-impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::shm::spin::SpinGauge
-impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::spin::SpinGauge
-pub const rsbinder_fmq::shm::spin::SPIN: core::time::Duration
-pub const rsbinder_fmq::shm::spin::SPIN_CLOCK_EVERY: u32
-pub fn rsbinder_fmq::shm::spin::spin_budget(core::option::Option<std::time::Instant>) -> core::time::Duration
-pub fn rsbinder_fmq::shm::spin::spin_until(core::time::Duration, impl core::ops::function::FnMut() -> bool) -> (bool, core::time::Duration)
 pub enum rsbinder_fmq::shm::Access
 pub rsbinder_fmq::shm::Access::ReadOnly
 pub rsbinder_fmq::shm::Access::ReadWrite
@@ -116,8 +94,8 @@ impl rsbinder_fmq::shm::RoWord32
 pub unsafe fn rsbinder_fmq::shm::RoWord32::from_ptr<'a>(core::ptr::non_null::NonNull<u8>) -> &'a Self
 pub fn rsbinder_fmq::shm::RoWord32::load(&self) -> u32
 pub fn rsbinder_fmq::shm::RoWord32::load_acquire(&self) -> u32
-pub fn rsbinder_fmq::shm::RoWord32::wait(&self, u32, u32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
-pub fn rsbinder_fmq::shm::RoWord32::wake(&self, u32) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::shm::RoWord32::wait(&self, u32, core::num::nonzero::NonZeroU32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::shm::RoWord32::wake(&self, core::num::nonzero::NonZeroU32) -> rsbinder_fmq::Result<()>
 impl core::fmt::Debug for rsbinder_fmq::shm::RoWord32
 pub fn rsbinder_fmq::shm::RoWord32::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl !core::marker::Freeze for rsbinder_fmq::shm::RoWord32
@@ -205,8 +183,9 @@ pub fn rsbinder_fmq::shm::add_seals(std::os::fd::owned::BorrowedFd<'_>, rsbinder
 pub fn rsbinder_fmq::shm::ashmem_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
 pub fn rsbinder_fmq::shm::ashmem_write_protected(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<bool>
 pub fn rsbinder_fmq::shm::create(u64, &rsbinder_fmq::shm::CreateOptions<'_>) -> rsbinder_fmq::Result<std::os::fd::owned::OwnedFd>
-pub fn rsbinder_fmq::shm::futex_wait(&core::sync::atomic::AtomicU32, u32, u32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
-pub fn rsbinder_fmq::shm::futex_wake(&core::sync::atomic::AtomicU32, u32) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::shm::create_mapped(u64, &rsbinder_fmq::shm::CreateOptions<'_>, rsbinder_fmq::shm::Seals) -> rsbinder_fmq::Result<(std::os::fd::owned::OwnedFd, rsbinder_fmq::shm::Mapping)>
+pub fn rsbinder_fmq::shm::futex_wait(&core::sync::atomic::AtomicU32, u32, core::num::nonzero::NonZeroU32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::shm::futex_wake(&core::sync::atomic::AtomicU32, core::num::nonzero::NonZeroU32) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::shm::is_ashmem_fd(std::os::fd::owned::BorrowedFd<'_>) -> bool
 pub fn rsbinder_fmq::shm::region_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
 pub fn rsbinder_fmq::shm::seals(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<rsbinder_fmq::shm::Seals>
@@ -215,8 +194,9 @@ pub fn rsbinder_fmq::shm::verify_received(std::os::fd::owned::BorrowedFd<'_>) ->
 #[non_exhaustive] pub enum rsbinder_fmq::Error
 pub rsbinder_fmq::Error::BadValue(&'static str)
 pub rsbinder_fmq::Error::Corrupted(&'static str)
+pub rsbinder_fmq::Error::InvalidDescriptor(&'static str)
 pub rsbinder_fmq::Error::NoEventFlag
-pub rsbinder_fmq::Error::Os(rustix::backend::io::errno::Errno)
+pub rsbinder_fmq::Error::Os(rsbinder_fmq::Errno)
 pub rsbinder_fmq::Error::TimedOut
 pub rsbinder_fmq::Error::Unsupported
 impl core::clone::Clone for rsbinder_fmq::Error
@@ -226,8 +206,6 @@ impl core::cmp::PartialEq for rsbinder_fmq::Error
 pub fn rsbinder_fmq::Error::eq(&self, &rsbinder_fmq::Error) -> bool
 impl core::convert::From<rsbinder_fmq::Error> for std::io::error::Error
 pub fn std::io::error::Error::from(rsbinder_fmq::Error) -> Self
-impl core::convert::From<rustix::backend::io::errno::Errno> for rsbinder_fmq::Error
-pub fn rsbinder_fmq::Error::from(rustix::backend::io::errno::Errno) -> Self
 impl core::error::Error for rsbinder_fmq::Error
 pub fn rsbinder_fmq::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for rsbinder_fmq::Error
@@ -267,6 +245,29 @@ impl core::marker::Unpin for rsbinder_fmq::Flavor
 impl core::marker::UnsafeUnpin for rsbinder_fmq::Flavor
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Flavor
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Flavor
+pub enum rsbinder_fmq::Transfer
+pub rsbinder_fmq::Transfer::Done
+pub rsbinder_fmq::Transfer::WouldBlock
+impl rsbinder_fmq::Transfer
+pub const fn rsbinder_fmq::Transfer::is_done(self) -> bool
+impl core::clone::Clone for rsbinder_fmq::Transfer
+pub fn rsbinder_fmq::Transfer::clone(&self) -> rsbinder_fmq::Transfer
+impl core::cmp::Eq for rsbinder_fmq::Transfer
+impl core::cmp::PartialEq for rsbinder_fmq::Transfer
+pub fn rsbinder_fmq::Transfer::eq(&self, &rsbinder_fmq::Transfer) -> bool
+impl core::fmt::Debug for rsbinder_fmq::Transfer
+pub fn rsbinder_fmq::Transfer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder_fmq::Transfer
+pub fn rsbinder_fmq::Transfer::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder_fmq::Transfer
+impl core::marker::StructuralPartialEq for rsbinder_fmq::Transfer
+impl core::marker::Freeze for rsbinder_fmq::Transfer
+impl core::marker::Send for rsbinder_fmq::Transfer
+impl core::marker::Sync for rsbinder_fmq::Transfer
+impl core::marker::Unpin for rsbinder_fmq::Transfer
+impl core::marker::UnsafeUnpin for rsbinder_fmq::Transfer
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Transfer
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Transfer
 pub enum rsbinder_fmq::UnsyncRead
 pub rsbinder_fmq::UnsyncRead::Done
 pub rsbinder_fmq::UnsyncRead::Empty
@@ -311,10 +312,14 @@ impl core::marker::Unpin for rsbinder_fmq::UnsyncStart
 impl core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncStart
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncStart
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncStart
-pub struct rsbinder_fmq::AttachPolicy
+#[non_exhaustive] pub struct rsbinder_fmq::AttachPolicy
 pub rsbinder_fmq::AttachPolicy::max_capacity: usize
 pub rsbinder_fmq::AttachPolicy::require_event_flag: bool
 pub rsbinder_fmq::AttachPolicy::require_seal: bool
+impl rsbinder_fmq::AttachPolicy
+pub const fn rsbinder_fmq::AttachPolicy::new(usize) -> Self
+pub const fn rsbinder_fmq::AttachPolicy::require_event_flag(self, bool) -> Self
+pub const fn rsbinder_fmq::AttachPolicy::require_seal(self, bool) -> Self
 impl core::clone::Clone for rsbinder_fmq::AttachPolicy
 pub fn rsbinder_fmq::AttachPolicy::clone(&self) -> rsbinder_fmq::AttachPolicy
 impl core::cmp::Eq for rsbinder_fmq::AttachPolicy
@@ -355,6 +360,33 @@ impl core::marker::Unpin for rsbinder_fmq::Descriptor
 impl core::marker::UnsafeUnpin for rsbinder_fmq::Descriptor
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Descriptor
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Descriptor
+pub struct rsbinder_fmq::Errno(_)
+impl rsbinder_fmq::Errno
+pub const fn rsbinder_fmq::Errno::from_raw(i32) -> Self
+pub const fn rsbinder_fmq::Errno::raw(self) -> i32
+impl core::clone::Clone for rsbinder_fmq::Errno
+pub fn rsbinder_fmq::Errno::clone(&self) -> rsbinder_fmq::Errno
+impl core::cmp::Eq for rsbinder_fmq::Errno
+impl core::cmp::PartialEq for rsbinder_fmq::Errno
+pub fn rsbinder_fmq::Errno::eq(&self, &rsbinder_fmq::Errno) -> bool
+impl core::convert::From<rsbinder_fmq::Errno> for std::io::error::Error
+pub fn std::io::error::Error::from(rsbinder_fmq::Errno) -> Self
+impl core::error::Error for rsbinder_fmq::Errno
+impl core::fmt::Debug for rsbinder_fmq::Errno
+pub fn rsbinder_fmq::Errno::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder_fmq::Errno
+pub fn rsbinder_fmq::Errno::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder_fmq::Errno
+pub fn rsbinder_fmq::Errno::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder_fmq::Errno
+impl core::marker::StructuralPartialEq for rsbinder_fmq::Errno
+impl core::marker::Freeze for rsbinder_fmq::Errno
+impl core::marker::Send for rsbinder_fmq::Errno
+impl core::marker::Sync for rsbinder_fmq::Errno
+impl core::marker::Unpin for rsbinder_fmq::Errno
+impl core::marker::UnsafeUnpin for rsbinder_fmq::Errno
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Errno
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Errno
 pub struct rsbinder_fmq::EventFlag
 impl rsbinder_fmq::EventFlag
 pub fn rsbinder_fmq::EventFlag::peek(&self) -> u32
@@ -399,21 +431,20 @@ impl<T: rsbinder_fmq::Element> rsbinder_fmq::MessageQueue<T>
 pub fn rsbinder_fmq::MessageQueue<T>::attach(&rsbinder_fmq::Descriptor, &rsbinder_fmq::AttachPolicy) -> rsbinder_fmq::Result<Self>
 pub fn rsbinder_fmq::MessageQueue<T>::available_to_read(&self) -> rsbinder_fmq::Result<usize>
 pub fn rsbinder_fmq::MessageQueue<T>::available_to_write(&self) -> rsbinder_fmq::Result<usize>
-pub fn rsbinder_fmq::MessageQueue<T>::begin_read(&mut self, usize) -> rsbinder_fmq::Result<core::option::Option<rsbinder_fmq::Regions<'_, T>>>
-pub fn rsbinder_fmq::MessageQueue<T>::begin_write(&mut self, usize) -> rsbinder_fmq::Result<core::option::Option<rsbinder_fmq::Regions<'_, T>>>
-pub fn rsbinder_fmq::MessageQueue<T>::begin_write_cached(&mut self, usize, usize) -> rsbinder_fmq::Result<core::option::Option<rsbinder_fmq::Regions<'_, T>>>
+pub fn rsbinder_fmq::MessageQueue<T>::begin_read(&mut self, usize) -> rsbinder_fmq::Result<core::option::Option<rsbinder_fmq::ReadTxn<'_, T>>>
+pub fn rsbinder_fmq::MessageQueue<T>::begin_write(&mut self, usize) -> rsbinder_fmq::Result<core::option::Option<rsbinder_fmq::WriteTxn<'_, T>>>
+pub fn rsbinder_fmq::MessageQueue<T>::begin_write_cached(&mut self, usize, usize) -> rsbinder_fmq::Result<core::option::Option<rsbinder_fmq::WriteTxn<'_, T>>>
 pub fn rsbinder_fmq::MessageQueue<T>::capacity(&self) -> usize
-pub fn rsbinder_fmq::MessageQueue<T>::commit_read(&mut self, usize) -> rsbinder_fmq::Result<()>
-pub fn rsbinder_fmq::MessageQueue<T>::commit_write(&mut self, usize) -> rsbinder_fmq::Result<()>
-pub fn rsbinder_fmq::MessageQueue<T>::commit_write_cached(&mut self, usize) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::MessageQueue<T>::create(usize, bool) -> rsbinder_fmq::Result<Self>
 pub fn rsbinder_fmq::MessageQueue<T>::descriptor(&self) -> rsbinder_fmq::Result<rsbinder_fmq::Descriptor>
 pub fn rsbinder_fmq::MessageQueue<T>::event_flag(&self) -> core::option::Option<rsbinder_fmq::EventFlag>
 pub fn rsbinder_fmq::MessageQueue<T>::quantum(&self) -> usize
-pub fn rsbinder_fmq::MessageQueue<T>::read(&mut self, &mut [T]) -> rsbinder_fmq::Result<bool>
-pub fn rsbinder_fmq::MessageQueue<T>::read_blocking(&mut self, &mut [T], u32, u32, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
-pub fn rsbinder_fmq::MessageQueue<T>::write(&mut self, &[T]) -> rsbinder_fmq::Result<bool>
-pub fn rsbinder_fmq::MessageQueue<T>::write_blocking(&mut self, &[T], u32, u32, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::MessageQueue<T>::read(&mut self, &mut [T]) -> rsbinder_fmq::Result<rsbinder_fmq::Transfer>
+pub fn rsbinder_fmq::MessageQueue<T>::read_blocking(&mut self, &mut [T], core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::MessageQueue<T>::read_blocking_with(&mut self, &mut [T], rsbinder_fmq::Notify, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::MessageQueue<T>::write(&mut self, &[T]) -> rsbinder_fmq::Result<rsbinder_fmq::Transfer>
+pub fn rsbinder_fmq::MessageQueue<T>::write_blocking(&mut self, &[T], core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::MessageQueue<T>::write_blocking_with(&mut self, &[T], rsbinder_fmq::Notify, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::MessageQueue<T>
 pub fn rsbinder_fmq::MessageQueue<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::MessageQueue<T>
@@ -423,6 +454,47 @@ impl<T> core::marker::Unpin for rsbinder_fmq::MessageQueue<T> where T: core::mar
 impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::MessageQueue<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::MessageQueue<T>
 impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::MessageQueue<T> where T: core::panic::unwind_safe::UnwindSafe
+pub struct rsbinder_fmq::Notify
+pub rsbinder_fmq::Notify::wait: core::num::nonzero::NonZeroU32
+pub rsbinder_fmq::Notify::wake: u32
+impl rsbinder_fmq::Notify
+pub const rsbinder_fmq::Notify::READ: rsbinder_fmq::Notify
+pub const rsbinder_fmq::Notify::WRITE: rsbinder_fmq::Notify
+pub const fn rsbinder_fmq::Notify::new(core::num::nonzero::NonZeroU32, u32) -> Self
+impl core::clone::Clone for rsbinder_fmq::Notify
+pub fn rsbinder_fmq::Notify::clone(&self) -> rsbinder_fmq::Notify
+impl core::cmp::Eq for rsbinder_fmq::Notify
+impl core::cmp::PartialEq for rsbinder_fmq::Notify
+pub fn rsbinder_fmq::Notify::eq(&self, &rsbinder_fmq::Notify) -> bool
+impl core::fmt::Debug for rsbinder_fmq::Notify
+pub fn rsbinder_fmq::Notify::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder_fmq::Notify
+pub fn rsbinder_fmq::Notify::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder_fmq::Notify
+impl core::marker::StructuralPartialEq for rsbinder_fmq::Notify
+impl core::marker::Freeze for rsbinder_fmq::Notify
+impl core::marker::Send for rsbinder_fmq::Notify
+impl core::marker::Sync for rsbinder_fmq::Notify
+impl core::marker::Unpin for rsbinder_fmq::Notify
+impl core::marker::UnsafeUnpin for rsbinder_fmq::Notify
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Notify
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Notify
+pub struct rsbinder_fmq::ReadTxn<'a, T: rsbinder_fmq::Element>
+impl<T: rsbinder_fmq::Element> rsbinder_fmq::ReadTxn<'_, T>
+pub fn rsbinder_fmq::ReadTxn<'_, T>::commit(self) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::ReadTxn<'_, T>::commit_first(self, usize) -> rsbinder_fmq::Result<()>
+impl<'a, T: rsbinder_fmq::Element> core::ops::deref::Deref for rsbinder_fmq::ReadTxn<'a, T>
+pub type rsbinder_fmq::ReadTxn<'a, T>::Target = rsbinder_fmq::Regions<'a, T>
+pub fn rsbinder_fmq::ReadTxn<'a, T>::deref(&self) -> &rsbinder_fmq::Regions<'a, T>
+impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::ReadTxn<'_, T>
+pub fn rsbinder_fmq::ReadTxn<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a, T> core::marker::Freeze for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> !core::marker::Send for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> !core::marker::Sync for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> core::marker::Unpin for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> !core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::ReadTxn<'a, T>
 pub struct rsbinder_fmq::Regions<'a, T: rsbinder_fmq::Element>
 impl<T: rsbinder_fmq::Element> rsbinder_fmq::Regions<'_, T>
 pub fn rsbinder_fmq::Regions<'_, T>::first_len(&self) -> usize
@@ -430,7 +502,6 @@ pub fn rsbinder_fmq::Regions<'_, T>::is_empty(&self) -> bool
 pub fn rsbinder_fmq::Regions<'_, T>::len(&self) -> usize
 pub fn rsbinder_fmq::Regions<'_, T>::read_at(&self, usize, &mut [T]) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::Regions<'_, T>::second_len(&self) -> usize
-pub fn rsbinder_fmq::Regions<'_, T>::write_at(&mut self, usize, &[T]) -> rsbinder_fmq::Result<()>
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::Regions<'_, T>
 pub fn rsbinder_fmq::Regions<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a, T> core::marker::Freeze for rsbinder_fmq::Regions<'a, T>
@@ -463,6 +534,26 @@ impl core::marker::Unpin for rsbinder_fmq::UnsyncCreate
 impl core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncCreate
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncCreate
 impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncCreate
+pub struct rsbinder_fmq::UnsyncLatest
+pub rsbinder_fmq::UnsyncLatest::copied: usize
+impl core::clone::Clone for rsbinder_fmq::UnsyncLatest
+pub fn rsbinder_fmq::UnsyncLatest::clone(&self) -> rsbinder_fmq::UnsyncLatest
+impl core::cmp::Eq for rsbinder_fmq::UnsyncLatest
+impl core::cmp::PartialEq for rsbinder_fmq::UnsyncLatest
+pub fn rsbinder_fmq::UnsyncLatest::eq(&self, &rsbinder_fmq::UnsyncLatest) -> bool
+impl core::fmt::Debug for rsbinder_fmq::UnsyncLatest
+pub fn rsbinder_fmq::UnsyncLatest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for rsbinder_fmq::UnsyncLatest
+pub fn rsbinder_fmq::UnsyncLatest::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for rsbinder_fmq::UnsyncLatest
+impl core::marker::StructuralPartialEq for rsbinder_fmq::UnsyncLatest
+impl core::marker::Freeze for rsbinder_fmq::UnsyncLatest
+impl core::marker::Send for rsbinder_fmq::UnsyncLatest
+impl core::marker::Sync for rsbinder_fmq::UnsyncLatest
+impl core::marker::Unpin for rsbinder_fmq::UnsyncLatest
+impl core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncLatest
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncLatest
+impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncLatest
 pub struct rsbinder_fmq::UnsyncReader<T: rsbinder_fmq::Element>
 impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncReader<T>
 pub fn rsbinder_fmq::UnsyncReader<T>::attach(&rsbinder_fmq::Descriptor, &rsbinder_fmq::AttachPolicy, rsbinder_fmq::UnsyncStart) -> rsbinder_fmq::Result<Self>
@@ -470,7 +561,7 @@ pub fn rsbinder_fmq::UnsyncReader<T>::available_to_read(&self) -> rsbinder_fmq::
 pub fn rsbinder_fmq::UnsyncReader<T>::capacity(&self) -> usize
 pub fn rsbinder_fmq::UnsyncReader<T>::quantum(&self) -> usize
 pub fn rsbinder_fmq::UnsyncReader<T>::read(&mut self, &mut [T]) -> rsbinder_fmq::Result<rsbinder_fmq::UnsyncRead>
-pub fn rsbinder_fmq::UnsyncReader<T>::read_latest(&mut self, &mut [T]) -> rsbinder_fmq::Result<usize>
+pub fn rsbinder_fmq::UnsyncReader<T>::read_latest(&mut self, &mut [T]) -> rsbinder_fmq::Result<rsbinder_fmq::UnsyncLatest>
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncReader<T>
 pub fn rsbinder_fmq::UnsyncReader<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::UnsyncReader<T>
@@ -480,11 +571,27 @@ impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncReader<T> where T: core::mar
 impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncReader<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncReader<T>
 impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncReader<T> where T: core::panic::unwind_safe::UnwindSafe
+pub struct rsbinder_fmq::UnsyncWriteTxn<'a, T: rsbinder_fmq::Element>
+impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncWriteTxn<'_, T>
+pub fn rsbinder_fmq::UnsyncWriteTxn<'_, T>::commit(self) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::UnsyncWriteTxn<'_, T>::commit_first(self, usize) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::UnsyncWriteTxn<'_, T>::write_at(&mut self, usize, &[T]) -> rsbinder_fmq::Result<()>
+impl<'a, T: rsbinder_fmq::Element> core::ops::deref::Deref for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+pub type rsbinder_fmq::UnsyncWriteTxn<'a, T>::Target = rsbinder_fmq::Regions<'a, T>
+pub fn rsbinder_fmq::UnsyncWriteTxn<'a, T>::deref(&self) -> &rsbinder_fmq::Regions<'a, T>
+impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncWriteTxn<'_, T>
+pub fn rsbinder_fmq::UnsyncWriteTxn<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a, T> core::marker::Freeze for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> !core::marker::Send for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> !core::marker::Sync for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> core::marker::Unpin for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncWriteTxn<'a, T> where T: core::panic::unwind_safe::RefUnwindSafe
+impl<'a, T> !core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncWriteTxn<'a, T>
 pub struct rsbinder_fmq::UnsyncWriter<T: rsbinder_fmq::Element>
 impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncWriter<T>
-pub fn rsbinder_fmq::UnsyncWriter<T>::begin_write(&mut self, usize) -> rsbinder_fmq::Result<rsbinder_fmq::Regions<'_, T>>
+pub fn rsbinder_fmq::UnsyncWriter<T>::begin_write(&mut self, usize) -> rsbinder_fmq::Result<rsbinder_fmq::UnsyncWriteTxn<'_, T>>
 pub fn rsbinder_fmq::UnsyncWriter<T>::capacity(&self) -> usize
-pub fn rsbinder_fmq::UnsyncWriter<T>::commit_write(&mut self, usize) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::UnsyncWriter<T>::create(usize, &rsbinder_fmq::UnsyncCreate) -> rsbinder_fmq::Result<Self>
 pub fn rsbinder_fmq::UnsyncWriter<T>::descriptor(&self) -> rsbinder_fmq::Result<rsbinder_fmq::Descriptor>
 pub fn rsbinder_fmq::UnsyncWriter<T>::quantum(&self) -> usize
@@ -499,6 +606,23 @@ impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncWriter<T> where T: core::mar
 impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncWriter<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncWriter<T>
 impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncWriter<T> where T: core::panic::unwind_safe::UnwindSafe
+pub struct rsbinder_fmq::WriteTxn<'a, T: rsbinder_fmq::Element>
+impl<T: rsbinder_fmq::Element> rsbinder_fmq::WriteTxn<'_, T>
+pub fn rsbinder_fmq::WriteTxn<'_, T>::commit(self) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::WriteTxn<'_, T>::commit_first(self, usize) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::WriteTxn<'_, T>::write_at(&mut self, usize, &[T]) -> rsbinder_fmq::Result<()>
+impl<'a, T: rsbinder_fmq::Element> core::ops::deref::Deref for rsbinder_fmq::WriteTxn<'a, T>
+pub type rsbinder_fmq::WriteTxn<'a, T>::Target = rsbinder_fmq::Regions<'a, T>
+pub fn rsbinder_fmq::WriteTxn<'a, T>::deref(&self) -> &rsbinder_fmq::Regions<'a, T>
+impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::WriteTxn<'_, T>
+pub fn rsbinder_fmq::WriteTxn<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<'a, T> core::marker::Freeze for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> !core::marker::Send for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> !core::marker::Sync for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> core::marker::Unpin for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> !core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::WriteTxn<'a, T>
 pub const rsbinder_fmq::NOT_EMPTY: u32
 pub const rsbinder_fmq::NOT_FULL: u32
 pub unsafe trait rsbinder_fmq::Element: core::marker::Copy + 'static

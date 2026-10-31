@@ -103,12 +103,21 @@ tls://<host>:<port>[#<service>]             feature rpc-tls; IPv6 host in [ ]
 
 Kernel `serve(Uri::kernel())` initializes the process-wide `ProcessState`
 idempotently; a second kernel server in the same process reuses it, and is
-refused with `StatusCode::BadValue` if it asked for a different driver,
-thread count, or mapping size — the process cannot give it one. The refusal
-lands where the option is read: `serve()` itself for the `KernelEndpoint`
-settings (`?driver=` / `?threads=` / `?mmap=`), `run`/`spawn` for `ServeOptions::threads` and
+refused with `StatusCode::BadValue` if it asked for a different driver or
+mapping size — both are fixed at init and the process cannot give it
+another. The refusal lands where the option is read: `serve()` itself for the
+`KernelEndpoint` settings (`?driver=` / `?mmap=`), `run`/`spawn` for
 `ServeOptions::mmap_size`, and `open` for `ClientOptions::driver` and
-`ClientOptions::mmap_size`. RPC
+`ClientOptions::mmap_size`.
+
+The thread count is different: the kernel pool ceiling is a driver setting
+that can change while the process runs. `?threads=` sizes the pool when
+`serve()` is the call that initializes `ProcessState`; otherwise it, or
+`ServeOptions::threads`, is applied at `run`/`spawn` with
+`ProcessState::set_max_threads` (AOSP `setThreadPoolMaxThreadCount`). Giving
+both with different values is `BadValue`. Once the pool has started the
+ceiling may grow but not shrink: a smaller value is
+`StatusCode::InvalidOperation`. RPC
 servers bind their listener at `run`/`spawn`, so options (TLS config, limits)
 set via `with` apply first.
 
@@ -194,12 +203,13 @@ rsbinder::serve(KernelEndpoint::default().with_mmap_size(4 << 20))?   // 4 MB, t
   rest so an async flood cannot starve synchronous calls.
 - Only address space is reserved; pages are faulted in as they are used.
 - Process-wide and fixed at the first `serve` / `Client::open`, like
-  the driver and thread count. `ProcessState::init_with_mmap_size` is the
+  the driver. `ProcessState::init_with_mmap_size` is the
   direct form, and `ProcessState::mmap_size()` reports what is in force.
 - `ServeOptions::mmap_size` cannot make the mapping: `serve` initializes
-  `ProcessState` before the option is read, so the field can only agree with
-  the size already in force and a different one is `BadValue` at
-  `run`/`spawn` — the same rule as `ServeOptions::threads`. What sets the
+  `ProcessState` before the option is read, and a mapping cannot be resized,
+  so the field can only agree with the size already in force and a different
+  one is `BadValue` at `run`/`spawn` (unlike `ServeOptions::threads`, which
+  is applied there). What sets the
   size on a kernel server is `KernelEndpoint::with_mmap_size`
   (`binder://?mmap=`), or `ProcessState::init_with_mmap_size` called before
   `serve`.
@@ -271,17 +281,33 @@ makes it publishable.
 
 **The rule: every binder object crossing B is unwrapped by B and wrapped
 again. Plain data flows through untouched.** So a method with a binder
-argument — a callback registration, say — needs B to override just that
-method and re-wrap the argument before forwarding it:
+argument — a callback registration, say — needs B to re-wrap the argument
+before forwarding it, and only that method. For every interface `IFoo` the
+generator emits a trait `IFooDelegate` whose methods receive the upstream
+handle and forward the call to it by default. B overrides the one method and
+publishes the pair as
+[`bridge::Delegating`](https://docs.rs/rsbinder/latest/rsbinder/bridge/struct.Delegating.html):
 
 ```rust
-fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-    self.upstream.register(&BnCallback::new_binder(cb.clone()))
+use rsbinder::bridge::Delegating;
+
+struct Hooks;
+
+impl IFooDelegate for Hooks {
+    fn register(&self, upstream: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+        upstream.register(&BnCallback::new_binder(cb.clone()))
+    }
 }
+
+let service = BnFoo::new_binder(Delegating::new(upstream, Hooks));
 ```
 
-Forwarding `cb` as-is fails with `InvalidOperation`, reported back to the
-original caller.
+Every other method takes the default and forwards. Forwarding `cb` as-is
+fails with `InvalidOperation`, reported back to the original caller. The
+generator does not force the override and does not re-wrap on its own: a
+delegate whose caller and upstream share one stack (both on kernel binder)
+forwards a binder correctly as it is, and only the gateway knows whether a
+binder's identity matters to the upstream.
 
 That inline `new_binder` is correct for one call and wrong across calls:
 each one mints a *new* object, so `register(cb)` and `unregister(cb)` reach C
@@ -290,22 +316,30 @@ as two unrelated binders and the removal matches nothing.
 is the table that fixes it — same remote in, same local out:
 
 ```rust
-struct Gateway {
-    upstream: Strong<dyn IFoo>,
+struct Hooks {
     callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(BnCallback::new_binder)
 }
 
-fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-    self.upstream.register(&self.callbacks.wrap(cb))
-}
-fn unregister(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-    self.upstream.unregister(&self.callbacks.wrap(cb))   // the same object
+impl IFooDelegate for Hooks {
+    fn register(&self, upstream: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+        upstream.register(&self.callbacks.wrap(cb))
+    }
+    fn unregister(&self, upstream: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+        upstream.unregister(&self.callbacks.wrap(cb))   // the same object
+    }
 }
 ```
 
 It holds only weak references, so it never keeps a wrapper alive: the
 wrapper lives as long as C holds it, and the entry goes when the remote dies
 or the wrapper is dropped.
+
+**Versions.** On a versioned interface the gateway reports C's
+`getInterfaceVersion` and `getInterfaceHash` — the one-line form and the
+delegate defaults both forward them — but never a version above B's own
+module: when B was built from an older AIDL than C, B cannot dispatch the
+methods C added, so B's generated dispatch answers its own `VERSION` and,
+with it, its own `HASH`.
 
 What a gateway costs, all of it visible in B:
 

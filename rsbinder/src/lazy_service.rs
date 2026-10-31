@@ -133,7 +133,7 @@ impl Registry for HubRegistry {
         binder: &SIBinder,
         callback: &Strong<dyn IClientCallback>,
     ) -> std::result::Result<(), Status> {
-        crate::hub::register_client_callback_status(name, binder, callback)
+        crate::hub::register_client_callback(name, binder, callback)
     }
 
     fn try_unregister_service(
@@ -141,7 +141,7 @@ impl Registry for HubRegistry {
         name: &str,
         binder: &SIBinder,
     ) -> std::result::Result<(), Status> {
-        crate::hub::try_unregister_service_status(name, binder)
+        crate::hub::try_unregister_service(name, binder)
     }
 }
 
@@ -660,6 +660,25 @@ impl LazyServiceRegistrar {
 impl Default for LazyServiceRegistrar {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for LazyServiceRegistrar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("LazyServiceRegistrar");
+        d.field("force_persist", &self.is_force_persisted());
+        let inner = match self.shared.inner.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        match inner {
+            Some(inner) => d
+                .field("services", &inner.services.len())
+                .field("connected_services", &inner.num_connected_services),
+            None => d.field("state", &"<locked>"),
+        };
+        d.finish_non_exhaustive()
     }
 }
 

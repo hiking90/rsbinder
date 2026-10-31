@@ -123,6 +123,41 @@ keeps the `#[expect]` rule everywhere and the `reason` rule in targets
 those roots do not build (bins, `example-hello`); the no-`unwrap` rule
 covers library code only.
 
+## Public API design
+
+The rules below come from the public API review of plan 17, where most
+findings repeated one of these causes. Two are checked by
+`rsbinder/tests/source_invariants.rs`; review holds the rest.
+
+- **A state that only an outside change ends is reported on every ask.**
+  A receive that has seen the end returns the end again on the next call,
+  and a long-lived handle that can wait in such a state (refused,
+  resolver gone, corrupt peer) has a way to ask for it. Reporting it once,
+  or only in a log, leaves the next call waiting with no reason given.
+- **A public type whose drop ends something is `#[must_use = ".."]`**,
+  with a message saying what ends. A type-level attribute reaches through
+  `?`. Checked: `types_whose_drop_ends_something_are_must_use`.
+- **Library threads are made with `thread::Builder`.** A direct caller
+  gets the spawn failure as an `Err`; a path with no caller waiting (a
+  kernel-requested looper) logs it. Checked:
+  `library_threads_are_made_by_builder`.
+- **No adjacent positional arguments of one primitive type, and no `bool`
+  with two meanings.** Use a named struct, an enum or two functions
+  (`ProcessState::freeze` / `thaw`, not `freeze_process(pid, bool, ..)`).
+- **Timeouts.** A required deadline is a `Duration`, an optional one an
+  `Option<Duration>` with `None` waiting without end. `Duration::ZERO`
+  means "do not wait" where one attempt is meaningful (a receive, a send, a
+  wait) and is refused with `BadValue` where it is not (a reply, idle or
+  handshake deadline); it never means "without end". A timed-out wait and
+  an ended source return different values, as `std::sync::mpsc` does.
+- **Permission and identity checks read the dispatcher's thread state**
+  (`calling_caller()`), never data the caller passes in.
+- **Error types follow AOSP's layers**: the Parcel and transport layer
+  returns `StatusCode` (`status_t`), a service call returns `Status`
+  (`BinderResult`).
+- **Peer input never panics or crashes the process**: a size, offset or
+  count that came from a peer is checked and refused with an `Err`.
+
 ## Comment & docstring policy
 
 This project deliberately splits the comment convention by audience.
@@ -199,6 +234,11 @@ one can resolve it:
 5. `rsbinder-topic` — depends on `rsbinder` and builds its AIDL with
    `rsbinder-aidl`.
 6. `rsbinder-tools`
+
+The workspace requires `rsbinder-aidl` with `=` (generated code calls
+hidden items of the `rsbinder` it was generated for), so a version bump
+changes that requirement in the root `Cargo.toml` together with
+`workspace.package.version`.
 
 `source envsetup.sh` and then `publish_dry_run` / `publish` run
 `cargo publish` in this order (`publish_dirs` there); a crate added to the

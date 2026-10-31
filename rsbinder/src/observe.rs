@@ -40,7 +40,8 @@
 //!   rsbinder lock held and no thread-state borrow outstanding, so an
 //!   observer may itself make binder calls.
 //! - Every `on_transact` is followed by exactly one `on_reply` on the same
-//!   thread; the value `on_transact` returns comes back as `tag`.
+//!   thread; the value `on_transact` returns comes back as `tag`, which
+//!   never leaves that thread and so need not be `Send`.
 //! - A panic in either call is caught and logged. It does not change the
 //!   transaction's result, and `on_reply` still runs after a panicking
 //!   `on_transact` (with `tag = None`). The same holds for a panic in the
@@ -65,8 +66,9 @@
 //!   `rsbinder_aidl::Builder::trace(true)` open the matching `::client`
 //!   span under the same feature.
 //!
-//! Only one observer is installed at a time; to combine these, write one
-//! that forwards to each and returns their tags together.
+//! Only one observer is installed at a time; to combine these, install a
+//! [`Fanout`] of them. [`observer`] returns the one installed, and
+//! [`replace_observer`] installs one and returns the one it replaced.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,20 +118,75 @@ pub struct TxnContext<'a> {
     pub transport: TransportCaps,
 }
 
+impl<'a> TxnContext<'a> {
+    /// A context for a two-way kernel binder transaction with `code` on
+    /// `descriptor`: no method name, caller uid and pid `0`, transport
+    /// [`TransportCaps::KERNEL`]. The `with_*` methods set the other fields.
+    ///
+    /// The dispatcher builds the contexts an installed observer receives;
+    /// this constructor exists so an observer can be unit-tested without a
+    /// binder transaction.
+    pub const fn new(descriptor: &'a str, code: TransactionCode) -> Self {
+        Self {
+            descriptor,
+            code,
+            method: None,
+            is_oneway: false,
+            calling_uid: 0,
+            calling_pid: 0,
+            transport: TransportCaps::KERNEL,
+        }
+    }
+
+    /// Set [`method`](Self::method).
+    pub const fn with_method(mut self, method: &'static str) -> Self {
+        self.method = Some(method);
+        self
+    }
+
+    /// Set [`is_oneway`](Self::is_oneway).
+    pub const fn with_oneway(mut self, is_oneway: bool) -> Self {
+        self.is_oneway = is_oneway;
+        self
+    }
+
+    /// Set [`calling_uid`](Self::calling_uid).
+    pub const fn with_calling_uid(mut self, uid: crate::sys::binder::uid_t) -> Self {
+        self.calling_uid = uid;
+        self
+    }
+
+    /// Set [`calling_pid`](Self::calling_pid).
+    pub const fn with_calling_pid(mut self, pid: crate::sys::binder::pid_t) -> Self {
+        self.calling_pid = pid;
+        self
+    }
+
+    /// Set [`transport`](Self::transport).
+    pub const fn with_transport(mut self, transport: TransportCaps) -> Self {
+        self.transport = transport;
+        self
+    }
+}
+
 /// Called around every incoming transaction; see the [module
 /// docs](self) for when, on which thread, and what is guaranteed.
 pub trait TransactionObserver: Send + Sync {
     /// Called before the handler runs. The returned value is handed back to
     /// [`on_reply`](Self::on_reply) for the same transaction — a start
     /// marker, a span guard, anything per-call.
-    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>>;
+    ///
+    /// The tag need not be `Send`: both calls and the tag's drop run on the
+    /// thread that serves the transaction, on kernel binder and over RPC, so
+    /// a thread-bound guard such as `tracing`'s `EnteredSpan` may be the tag.
+    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>>;
 
     /// Called after the handler returns and before the reply is sent.
     /// `elapsed` is the time spent in the handler, `on_transact` excluded.
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        tag: Option<Box<dyn Any + Send>>,
+        tag: Option<Box<dyn Any>>,
         result: &Result<()>,
         elapsed: Duration,
     );
@@ -145,16 +202,111 @@ static OBSERVER: RwLock<Option<Arc<dyn TransactionObserver>>> = RwLock::new(None
 /// There is one observer per process because kernel binder serves every
 /// object from one process-wide thread pool; an observer that only cares
 /// about some transactions filters on [`TxnContext::descriptor`] or
-/// [`TxnContext::transport`]. To run several, install one that forwards to
-/// each.
+/// [`TxnContext::transport`]. To run several, install a [`Fanout`].
+///
+/// The previous observer is dropped here, after the slot's lock is
+/// released. Code that installs an observer into a process it does not own
+/// (a library) should use [`replace_observer`] and keep what it replaced,
+/// or read [`observer`] first and install a [`Fanout`] of both.
 pub fn set_observer(observer: Option<Arc<dyn TransactionObserver>>) {
-    // The old observer's Drop is user code; run it after the write lock is released.
-    let old = {
-        let mut slot = OBSERVER.write().unwrap_or_else(PoisonError::into_inner);
-        INSTALLED.store(observer.is_some(), Ordering::Release);
-        std::mem::replace(&mut *slot, observer)
-    };
-    drop(old);
+    drop(replace_observer(observer));
+}
+
+/// Install the process-wide transaction observer like [`set_observer`]
+/// and return the one it replaced, `None` if there was none.
+///
+/// The returned observer may still be serving transactions that started
+/// before the call; they finish with it.
+pub fn replace_observer(
+    observer: Option<Arc<dyn TransactionObserver>>,
+) -> Option<Arc<dyn TransactionObserver>> {
+    let mut slot = OBSERVER.write().unwrap_or_else(PoisonError::into_inner);
+    INSTALLED.store(observer.is_some(), Ordering::Release);
+    // Returned after the guard drops, so the old observer's user `Drop` never runs under the lock.
+    std::mem::replace(&mut *slot, observer)
+}
+
+/// The process-wide transaction observer installed now, `None` if there
+/// is none.
+pub fn observer() -> Option<Arc<dyn TransactionObserver>> {
+    current()
+}
+
+/// An observer that forwards every call to each of several observers, in
+/// order.
+///
+/// Each observer gets its own `tag` back, and the guarantees of the
+/// [module docs](self) hold per observer: a panic in one observer's call
+/// is caught and logged, the remaining observers are still called, and the
+/// panicking observer's `on_reply` still runs (with `tag = None` after a
+/// panicking `on_transact`). The `elapsed` each `on_reply` receives
+/// excludes every observer's `on_transact`.
+#[derive(Clone)]
+pub struct Fanout {
+    observers: Vec<Arc<dyn TransactionObserver>>,
+}
+
+impl Fanout {
+    /// Forward to `observers`, in iteration order.
+    pub fn new(observers: impl IntoIterator<Item = Arc<dyn TransactionObserver>>) -> Self {
+        Self {
+            observers: observers.into_iter().collect(),
+        }
+    }
+
+    /// The observers this forwards to, in call order.
+    pub fn observers(&self) -> &[Arc<dyn TransactionObserver>] {
+        &self.observers
+    }
+}
+
+impl std::fmt::Debug for Fanout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fanout")
+            .field("observers", &self.observers.len())
+            .finish()
+    }
+}
+
+struct FanoutTags(Vec<Option<Box<dyn Any>>>);
+
+impl TransactionObserver for Fanout {
+    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
+        let tags = self
+            .observers
+            .iter()
+            .map(|observer| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.on_transact(ctx)))
+                    .unwrap_or_else(|payload| {
+                        log_panic("Fanout: TransactionObserver::on_transact", &*payload);
+                        None
+                    })
+            })
+            .collect();
+        Some(Box::new(FanoutTags(tags)))
+    }
+
+    fn on_reply(
+        &self,
+        ctx: &TxnContext<'_>,
+        tag: Option<Box<dyn Any>>,
+        result: &Result<()>,
+        elapsed: Duration,
+    ) {
+        let mut tags = tag
+            .and_then(|tag| tag.downcast::<FanoutTags>().ok())
+            .map(|tags| tags.0)
+            .unwrap_or_default()
+            .into_iter();
+        for observer in &self.observers {
+            let tag = tags.next().flatten();
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.on_reply(ctx, tag, result, elapsed)
+            })) {
+                log_panic("Fanout: TransactionObserver::on_reply", &*payload);
+            }
+        }
+    }
 }
 
 fn current() -> Option<Arc<dyn TransactionObserver>> {
@@ -215,15 +367,79 @@ mod tests {
     use std::sync::Mutex;
 
     fn ctx() -> TxnContext<'static> {
-        TxnContext {
-            descriptor: "x.y.IZ",
-            code: 7,
-            method: Some("m"),
-            is_oneway: false,
-            calling_uid: 1,
-            calling_pid: 2,
-            transport: TransportCaps::KERNEL,
+        TxnContext::new("x.y.IZ", 7)
+            .with_method("m")
+            .with_calling_uid(1)
+            .with_calling_pid(2)
+    }
+
+    #[test]
+    fn txn_context_new_sets_defaults_and_with_sets_each_field() {
+        let c = TxnContext::new("a.b.IC", 3);
+        assert_eq!(
+            (c.descriptor, c.code, c.method, c.is_oneway),
+            ("a.b.IC", 3, None, false)
+        );
+        assert_eq!((c.calling_uid, c.calling_pid), (0, 0));
+        assert!(c.transport == TransportCaps::KERNEL);
+
+        let c = c
+            .with_method("m")
+            .with_oneway(true)
+            .with_calling_uid(10)
+            .with_calling_pid(20)
+            .with_transport(TransportCaps::SAME_HOST);
+        assert_eq!(
+            (c.descriptor, c.code, c.method, c.is_oneway),
+            ("a.b.IC", 3, Some("m"), true)
+        );
+        assert_eq!((c.calling_uid, c.calling_pid), (10, 20));
+        assert!(c.transport == TransportCaps::SAME_HOST);
+    }
+
+    #[test]
+    #[serial_test::serial(observer)]
+    fn observer_getter_replace_and_fanout_keep_each_tag() {
+        let as_dyn = |r: &Arc<Recorder>| -> Arc<dyn TransactionObserver> { r.clone() };
+        let plain = Arc::new(Recorder::default());
+        let bad_transact = Arc::new(Recorder {
+            panic_in: Some("on_transact"),
+            ..Default::default()
+        });
+        let bad_reply = Arc::new(Recorder {
+            panic_in: Some("on_reply"),
+            ..Default::default()
+        });
+
+        assert!(replace_observer(Some(as_dyn(&plain))).is_none());
+        let installed = observer().expect("the getter sees the installed observer");
+        assert!(Arc::ptr_eq(&installed, &as_dyn(&plain)));
+
+        let fanout: Arc<dyn TransactionObserver> = Arc::new(Fanout::new([
+            as_dyn(&bad_transact),
+            as_dyn(&plain),
+            as_dyn(&bad_reply),
+        ]));
+        let previous = replace_observer(Some(fanout.clone())).expect("the replaced observer");
+        assert!(Arc::ptr_eq(&previous, &installed));
+        drop((previous, installed));
+
+        assert_eq!(observed(ctx, || Ok(())), Ok(()));
+        assert_eq!(
+            *bad_transact.events.lock().unwrap(),
+            ["transact 7", "reply 7 None Ok(())"],
+            "a panicking on_transact costs only its own tag"
+        );
+        for r in [&plain, &bad_reply] {
+            assert_eq!(
+                *r.events.lock().unwrap(),
+                ["transact 7", "reply 7 Some(42) Ok(())"]
+            );
         }
+
+        let last = replace_observer(None).expect("the fanout");
+        assert!(Arc::ptr_eq(&last, &fanout));
+        assert!(observer().is_none());
     }
 
     #[derive(Default)]
@@ -234,7 +450,7 @@ mod tests {
 
     // Parallel lib tests dispatch real transactions; record only this test's context.
     impl TransactionObserver for Recorder {
-        fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+        fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
             if ctx.descriptor != "x.y.IZ" {
                 return None;
             }
@@ -251,7 +467,7 @@ mod tests {
         fn on_reply(
             &self,
             ctx: &TxnContext<'_>,
-            tag: Option<Box<dyn Any + Send>>,
+            tag: Option<Box<dyn Any>>,
             result: &Result<()>,
             _elapsed: Duration,
         ) {

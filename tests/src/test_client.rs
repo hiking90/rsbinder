@@ -132,14 +132,17 @@ fn test_check_interface_resolves_running_service() {
     assert_eq!(service.RepeatString("check"), Ok("check".to_string()));
 }
 
-/// Casting a *sync-only* local service to its async interface view must fail
-/// with `BadType` at cast time — not succeed and then panic (`unreachable!`)
-/// at the first method call. A local `Binder<BnOldName>` published from a sync
-/// `new_binder` has no async server behind it, so the async `FromIBinder` gates
-/// on the adapter's `try_as_async()` and rejects the cast (AOSP returns
-/// `BadType` for the same sync/async mismatch). Hermetic — no `/dev/binder`.
+/// A *sync-only* local service casts to its async interface view, as AOSP's
+/// Rust backend does: the cast gives the generated proxy over the local
+/// binder, and each call runs the service in-process (plan 17 K-4). The
+/// in-process transport needs kernel binder, which `init_test` opens;
+/// `tests/local_async_no_kernel.rs` covers a process without it.
 #[test]
-fn sync_only_service_cannot_cast_to_async_interface() {
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
+fn sync_only_service_casts_to_async_interface_through_the_local_binder() {
     struct OldName;
     impl rsbinder::Interface for OldName {}
     impl IOldName::IOldName for OldName {
@@ -148,11 +151,21 @@ fn sync_only_service_cannot_cast_to_async_interface() {
         }
     }
 
+    init_test();
     let sync: rsbinder::Strong<dyn IOldName::IOldName> = IOldName::BnOldName::new_binder(OldName);
     let cast = sync
         .as_binder()
-        .into_interface::<dyn IOldName::IOldNameAsync<rsbinder::Tokio>>();
-    assert_eq!(cast.err(), Some(rsbinder::StatusCode::BadType));
+        .into_interface::<dyn IOldName::IOldNameAsync<rsbinder::Tokio>>()
+        .expect("a sync-only local service casts to its async view");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .expect("a Tokio runtime");
+    // Called inside the runtime: `Tokio` hands the transact to `spawn_blocking` at the call.
+    assert_eq!(
+        rt.block_on(async { cast.RealName().await }),
+        Ok("OldName".to_string())
+    );
 }
 
 #[test]
@@ -2239,23 +2252,11 @@ fn test_concurrent_service_resolution_slow_path_no_deadlock() {
 
 /// Test for issue #47: cached interface string bug
 ///
-/// Originally reproduced the case where `handle_to_proxy` returned a
-/// stale proxy with an incorrect descriptor when handles were reused
-/// for different services. The bug pattern below intentionally drove
-/// the kernel weak count for each service handle to zero between
-/// resolutions:
-///
-/// ```ignore
-/// let service_manager = rsbinder::hub::default()?;
-/// let all_services = service_manager.list_services(0xf);
-/// for service_name in &all_services {
-///     let service = service_manager.get_service(service_name).unwrap();
-///     println!("{} interface: {}", service_name, service.descriptor());
-///     service.dec_weak().unwrap();
-/// }
-/// ```
-///
-/// `dec_weak()` below is a no-op on proxies (the cache pin owns the kernel weak ref); a marker.
+/// Reproduces the case where `handle_to_proxy` returned a stale proxy
+/// with an incorrect descriptor when handles were reused for different
+/// services. The reported pattern released each service between
+/// resolutions so the kernel could hand its handle to the next one; the
+/// test drops each proxy before the next lookup for the same effect.
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
@@ -2297,7 +2298,7 @@ fn test_issue_47_cached_interface_string() {
             service_descriptors.push((service_name.clone(), descriptor));
 
             // Release the service (this is important to potentially trigger handle reuse)
-            let _ = service.dec_weak();
+            drop(service);
         }
     }
 
@@ -2329,7 +2330,7 @@ fn test_issue_47_cached_interface_string() {
                 bug_detected = true;
             }
 
-            let _ = service.dec_weak();
+            drop(service);
         }
     }
 
@@ -2515,9 +2516,8 @@ fn test_binder_extension_use_as_interface() {
 /// Verifies that user-space `SIBinder` clones do NOT raise the kernel
 /// strong count: under the cache-pin model the kernel observes exactly
 /// **one `BC_ACQUIRE` per `Arc<ProxyHandle>` lifetime**, regardless of
-/// how many `SIBinder` / `Strong<I>` clones exist. A per-clone
-/// `RefCounter.strong` cycle would have been able to elevate the kernel
-/// count.
+/// how many `SIBinder` / `Strong<I>` clones exist. A per-clone kernel
+/// command would elevate the kernel count.
 ///
 /// Sampling discipline: every command must reach the kernel before we
 /// read the count, so we issue a `ping_binder()` (which forces a driver

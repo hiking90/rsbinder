@@ -1,32 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wire-faithful `android.utils.IMemoryHeap` / `android.utils.IMemory`
-//! stubs (Plan 4-7a Phase B).
-//!
-//! AOSP `IMemory.cpp` is handwritten, not AIDL; the transaction layout
-//! reproduced here is (android17-release):
-//!
-//! | interface | code | request | reply |
-//! |---|---|---|---|
-//! | `android.utils.IMemoryHeap` | `HEAP_ID` = `FIRST_CALL_TRANSACTION` | token only | **raw** `fd` object · `u64 size` · `i64 offset` · `u32 flags` (`IMemory.cpp:404-409`) |
-//! | `android.utils.IMemory` | `GET_MEMORY` = `FIRST_CALL_TRANSACTION` | token only | `strong binder (heap)` · `i64 offset` · `u64 size` (`IMemory.cpp:239-245`) |
-//!
-//! Neither reply carries a `Status` header — the transaction status is
-//! the only error channel, as in AOSP. The heap fd is AOSP
-//! `writeFileDescriptor` / `readFileDescriptor`: the bare fd object with
-//! **no** `ParcelFileDescriptor` not-null / comm markers (STAGE3 against
-//! real libbinder is what pins this — rsbinder↔rsbinder is symmetric
-//! and would not notice an 8-byte skew). The interface token on the
-//! request is checked by the native dispatcher before `on_transact`
-//! runs, so the `Bn*` types here do not re-check it.
-//!
-//! Proxies go through `SIBinder::as_remote` (kernel `ProxyHandle` or
-//! RPC `RpcProxy`) and fall back to an in-process
-//! `Transactable` call for a local binder, so one `Bp*` serves all
-//! three cases. A `Bp*` resolves its remote geometry **once**, on
-//! first use, like AOSP `BpMemoryHeap::assertReallyMapped()` /
-//! `BpMemory::getMemory()`; it never re-transacts.
+//! The `IMemoryHeap` / `IMemory` wire; documented in the parent module, section "Wire".
 //!
 //! # Tests
 //!
@@ -41,7 +16,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::heap::MappedHeap;
 use super::{IMemory, IMemoryHeap};
-use crate::binder::{Interface, Remotable, SIBinder, TransactionCode, FIRST_CALL_TRANSACTION};
+use crate::binder::{
+    Interface, Remotable, SIBinder, TransactionCode, Transport, FIRST_CALL_TRANSACTION,
+};
 use crate::error::{Result, StatusCode};
 use crate::native::Binder;
 use crate::parcel::Parcel;
@@ -58,7 +35,8 @@ pub const GET_MEMORY: TransactionCode = FIRST_CALL_TRANSACTION;
 
 /// Token-only transaction: a remote binder via the proxy path, a local `Binder<T>` in-process.
 fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Parcel> {
-    if let Some(remote) = binder.as_remote() {
+    let transport = binder.__transport().ok_or(StatusCode::BadType)?;
+    if let Transport::Remote(_) = transport {
         // A cached other interface is refused unasked; the server's token check does the rest.
         if let Some(actual) = binder.cached_descriptor() {
             if actual != descriptor {
@@ -66,22 +44,12 @@ fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Pa
                 return Err(StatusCode::BadType);
             }
         }
-        let data = remote.prepare_request(descriptor)?;
-        return remote
-            .submit_transact(code, &data, crate::FLAG_CLEAR_BUF)?
-            .ok_or(StatusCode::UnexpectedNull);
     }
-    let local = binder.as_transactable().ok_or(StatusCode::BadType)?;
-    // A kernel-mode interface token needs the kernel `ProcessState`; RPC-only has none.
-    if !crate::process_state::ProcessState::is_initialized() {
-        return Err(StatusCode::InvalidOperation);
-    }
-    let mut data = Parcel::new();
-    data.write_interface_token(descriptor)?;
-    let mut reply = Parcel::new();
-    local.transact(code, &mut data, &mut reply)?;
-    reply.set_data_position(0);
-    Ok(reply)
+    // Local: `InvalidOperation` without kernel binder, from the shared in-process transport.
+    let data = transport.prepare_request(descriptor)?;
+    transport
+        .submit_transact(code, data, crate::FLAG_CLEAR_BUF)?
+        .ok_or(StatusCode::UnexpectedNull)
 }
 
 // --- IMemoryHeap ---

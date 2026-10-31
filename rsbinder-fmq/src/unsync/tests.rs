@@ -66,9 +66,9 @@ impl Heap {
 }
 
 fn put(writer: &mut WriterCore, items: &[u64]) {
-    let mut regions = writer.begin::<u64>(items.len()).unwrap();
-    regions.write_at(0, items).unwrap();
-    writer.finish::<u64>(items.len()).unwrap();
+    let mut txn = writer.begin::<u64>(items.len()).unwrap();
+    txn.write_at(0, items).unwrap();
+    txn.commit().unwrap();
 }
 
 fn take(reader: &mut ReaderCore, out: &mut [u64]) -> UnsyncRead {
@@ -151,9 +151,15 @@ fn the_region_end_stays_where_a_partly_committed_write_put_it() {
     assert_eq!(take(&mut reader, &mut out), UnsyncRead::Done);
 
     // write = 16 elements, read = 4: fill a reservation of eight, commit two of them.
-    let mut regions = writer.begin::<u64>(8).unwrap();
-    regions.write_at(0, &[100; 8]).unwrap();
-    writer.finish::<u64>(2).unwrap();
+    let mut txn = writer.begin::<u64>(8).unwrap();
+    txn.write_at(0, &[100; 8]).unwrap();
+    assert!(matches!(
+        txn.commit_first(9),
+        Err(Error::BadValue("commit exceeds the elements reserved"))
+    ));
+    let mut txn = writer.begin::<u64>(8).unwrap();
+    txn.write_at(0, &[100; 8]).unwrap();
+    txn.commit_first(2).unwrap();
     // A shorter reservation from the new write counter does not lower the end.
     writer.reserve(8).unwrap();
     assert_eq!(heap.end.load(Ordering::Relaxed), 24 * 8);
@@ -261,11 +267,11 @@ fn a_copy_that_caught_a_write_is_followed_by_a_view_of_its_reservation() {
             let writer = s.spawn(move || {
                 let mut writer = heap.writer();
                 for value in 0..rounds {
-                    let mut regions = writer.begin::<u64>(1).unwrap();
-                    regions.write_at(0, &[value]).unwrap();
+                    let mut txn = writer.begin::<u64>(1).unwrap();
+                    txn.write_at(0, &[value]).unwrap();
                     // The reader runs here: the element is in the ring and not committed.
                     std::thread::yield_now();
-                    writer.finish::<u64>(1).unwrap();
+                    txn.commit().unwrap();
                 }
             });
             s.spawn(move || {

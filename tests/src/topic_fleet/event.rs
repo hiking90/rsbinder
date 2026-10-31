@@ -102,17 +102,23 @@ pub enum Kind {
     Full { topic: String },
 }
 
-/// One subscription in a [`Kind::PubStats`]: `pid:lost:evicted` in the line.
+/// One subscription in a [`Kind::PubStats`]: `pid:lost:evicted:pinned` in the line, `pinned`
+/// the pool slot the subscription pins or `-`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Subscribed {
     pub pid: i32,
     pub lost: u64,
     pub evicted: bool,
+    pub pinned: Option<u32>,
 }
 
 impl fmt::Display for Subscribed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.pid, self.lost, u8::from(self.evicted))
+        write!(f, "{}:{}:{}:", self.pid, self.lost, u8::from(self.evicted))?;
+        match self.pinned {
+            Some(slot) => write!(f, "{slot}"),
+            None => f.write_str("-"),
+        }
     }
 }
 
@@ -120,11 +126,15 @@ impl std::str::FromStr for Subscribed {
     type Err = String;
 
     fn from_str(word: &str) -> Result<Self, String> {
-        let [pid, lost, evicted] = split::<3>(word, ':')?;
+        let [pid, lost, evicted, pinned] = split::<4>(word, ':')?;
         Ok(Self {
             pid: number(pid)?,
             lost: number(lost)?,
             evicted: flag(evicted)?,
+            pinned: match pinned {
+                "-" => None,
+                slot => Some(number(slot)?),
+            },
         })
     }
 }
@@ -145,6 +155,7 @@ pub fn closed_reason(closed: &Closed) -> &'static str {
         Closed::PublisherDied => "PublisherDied",
         Closed::Corrupted => "Corrupted",
         Closed::Evicted => "Evicted",
+        Closed::ResolverDied => "ResolverDied",
         _ => "Unknown",
     }
 }
@@ -461,11 +472,13 @@ mod tests {
                         pid: 12,
                         lost: 0,
                         evicted: false,
+                        pinned: Some(3),
                     },
                     Subscribed {
                         pid: 13,
                         lost: 5,
                         evicted: true,
+                        pinned: None,
                     },
                 ],
                 bytes: 3168,

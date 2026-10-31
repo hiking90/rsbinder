@@ -22,7 +22,7 @@ struct Service {
     dump_priority: i32,
     has_clients: bool,
     guarantee_client: bool,
-    context: rsbinder::thread_state::CallingContext,
+    context: rsbinder::CallingContext,
 }
 
 /// Collected under the `Inner` lock, fired after it drops: no outbound transaction under it (R1).
@@ -666,7 +666,7 @@ impl ServiceManager {
         let Some(target) = self.refused_in(config, caller.as_ref(), permission, name) else {
             return Ok(());
         };
-        let ctx = rsbinder::thread_state::CallingContext::default();
+        let ctx = rsbinder::CallingContext::current();
         let why = if permission == Permission::Add && is_reserved(target) {
             "rsb_hub reserves the name and refused"
         } else {
@@ -966,7 +966,7 @@ impl ServiceManager {
 impl Interface for ServiceManager {
     /// Gated by `list`, each name by `find` too, else it would bypass the per-name policy.
     fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> rsbinder::Result<()> {
-        let ctx = rsbinder::thread_state::CallingContext::default();
+        let ctx = rsbinder::CallingContext::current();
         let config = self.enforcer.config();
         let caller = rsbinder::calling_caller();
         if !self.allows_in(&config, caller.as_ref(), Permission::List, "") {
@@ -1001,7 +1001,7 @@ fn send_dump(
     writer: &DumpWriter,
     fd: std::os::fd::OwnedFd,
     text: Vec<u8>,
-    caller: &rsbinder::thread_state::CallingContext,
+    caller: &rsbinder::CallingContext,
 ) -> rsbinder::Result<()> {
     let who = format!("uid={} (pid={})", caller.uid, caller.pid);
     {
@@ -1109,7 +1109,7 @@ impl IServiceManager for ServiceManager {
             );
         }
 
-        let caller = rsbinder::thread_state::CallingContext::default();
+        let caller = rsbinder::CallingContext::current();
 
         // Linux has no isolated-app UID range to gate on.
         let _ = allowIsolated;
@@ -1398,7 +1398,7 @@ impl IServiceManager for ServiceManager {
             .collect();
         // AOSP `ServiceManager.cpp:748`: all filtered out is a denial, not "none declared".
         if allowed.is_empty() && declared != 0 {
-            let ctx = rsbinder::thread_state::CallingContext::default();
+            let ctx = rsbinder::CallingContext::current();
             let msg = format!(
                 "policy denied find on every instance of {arg_iface:?} for uid={} (pid={})",
                 ctx.uid, ctx.pid
@@ -1456,7 +1456,7 @@ impl IServiceManager for ServiceManager {
             };
 
             // AOSP `ServiceManager.cpp:911`: EX_UNSUPPORTED_OPERATION, visible on the wire.
-            if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
+            if service.context.pid != rsbinder::CallingContext::current().pid {
                 let msg = format!(
                     "{:?} Only a server can register for client callbacks (for {})",
                     service.context, name
@@ -1536,7 +1536,7 @@ impl IServiceManager for ServiceManager {
     ) -> rsbinder::BinderResult<()> {
         self.require(Permission::Add, name)?;
 
-        let context = rsbinder::thread_state::CallingContext::default();
+        let context = rsbinder::CallingContext::current();
 
         let _order = lock_recover(&self.fire_order);
         let mut pending = Vec::new();
@@ -1554,7 +1554,7 @@ impl IServiceManager for ServiceManager {
             };
 
             // AOSP `ServiceManager.cpp:1090`: EX_UNSUPPORTED_OPERATION.
-            if service.context.pid != rsbinder::thread_state::CallingContext::default().pid {
+            if service.context.pid != rsbinder::CallingContext::current().pid {
                 let msg = format!(
                     "{:?} Only a server can unregister itself (for {})",
                     service.context, name
@@ -2580,12 +2580,12 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let slot = Arc::clone(&writing);
         std::thread::spawn(move || {
-            let caller = rsbinder::thread_state::CallingContext::default();
+            let caller = rsbinder::CallingContext::current();
             let _ = tx.send(send_dump(&slot, fd.into(), vec![b'x'; LEN], &caller));
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(Ok(())));
 
-        let caller = rsbinder::thread_state::CallingContext::default();
+        let caller = rsbinder::CallingContext::current();
         let (_, other) = UnixStream::pair().expect("socketpair");
         let reply = send_dump(&writing, other.into(), b"y".to_vec(), &caller);
         assert_eq!(reply, Err(StatusCode::WouldBlock));
@@ -2647,7 +2647,7 @@ mod tests {
     #[test]
     fn a_dump_to_a_broken_fd_answers_ok() {
         let writing = DumpWriter::default();
-        let caller = rsbinder::thread_state::CallingContext::default();
+        let caller = rsbinder::CallingContext::current();
         let (reader, fd) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(reader);
         assert_eq!(

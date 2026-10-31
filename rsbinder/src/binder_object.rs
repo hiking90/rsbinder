@@ -31,11 +31,9 @@
 //!   `acquire`. The pairing therefore needs no per-object bookkeeping.
 //! - `release` decrements `publish_count`. When `publish_count`,
 //!   `kernel_refs` and `pending_reservations` are all zero, `decref_publish`
-//!   removes the entry, which drives
-//!   `RefCounter.strong` / `RefCounter.weak` 1→0 and drops the canonical
-//!   `Arc<dyn IBinder>`. `Inner<T>::drop` then runs cleanly: since
-//!   `kernel_refs` was 0 at removal, the kernel sends no further `BR_*` naming
-//!   the id.
+//!   removes the entry, which drops the table's `Arc<dyn IBinder>`.
+//!   `Inner<T>::drop` then runs cleanly: since `kernel_refs` was 0 at
+//!   removal, the kernel sends no further `BR_*` naming the id.
 //!
 //! # Scheduler bits
 //!

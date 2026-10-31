@@ -111,7 +111,7 @@ echo "==> building C++ launcher (NDK)"
 echo "==> cross-compiling rsbinder server"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
     cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
-        --features rpc \
+        --features rpc,test-util \
         --bin rpc_fd_interop_server )
 
 echo "==> pushing binaries"

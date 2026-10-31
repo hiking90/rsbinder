@@ -15,8 +15,8 @@ use crate::{end, Payload, Record, Sample, Trust};
 
 /// Why a receive returned no value.
 ///
-/// `Empty`, `Timeout`, `Cancelled`, `Lagged` and `Decode` leave the subscription as it was;
-/// `Closed` ends it, and every later receive returns it again. `Disconnected` is the
+/// `Empty`, `Timeout`, `Cancelled`, `Runtime`, `Lagged` and `Decode` leave the subscription as it
+/// was; `Closed` ends it, and every later receive returns it again. `Disconnected` is the
 /// [`NamedSubscriber`](crate::NamedSubscriber)'s, which goes on with the next publisher.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -26,9 +26,14 @@ pub enum RecvError {
     /// A wait with a bound reached it with no record unread. The next receive tries again from
     /// the same place.
     Timeout,
-    /// An [`Interrupter`](crate::Interrupter) ended the wait, or the async runtime could not run
-    /// it. The next receive tries again from the same place.
+    /// An [`Interrupter`](crate::Interrupter) ended the wait, and nothing else does. The next
+    /// receive tries again from the same place.
     Cancelled,
+    /// The async runtime could not run the wait of a `recv_async`: the blocking pool did not run
+    /// it (`Other`, as when its runtime shuts down), or the reactor did not take the
+    /// subscription's file descriptor (the kind of `AsyncFd`'s error). The next receive tries
+    /// again from the same place, and fails the same way while the runtime does.
+    Runtime(std::io::ErrorKind),
     /// The publisher overwrote this many records before they were read. The next receive returns
     /// the first record after them.
     ///
@@ -138,6 +143,14 @@ pub enum Closed {
     /// this one past its timeout. The records it had not read are not returned, as the publisher
     /// no longer keeps them; those before the notice arrived were.
     Evicted,
+    /// A [`NamedSubscriber`](crate::NamedSubscriber)'s resolver died: the process that held its
+    /// watch of the name is gone, so no publisher of the name will reach the subscriber again.
+    /// Only a resolver that names its host reports it ([`Resolver::host`](crate::Resolver::host)):
+    /// a registry does, the service manager does not. Returned once no connection is left: a
+    /// connection held when the resolver died goes on until it ends, and the `Disconnected` of
+    /// that end comes first. Make the subscriber again with a resolver of the new host (plan 15
+    /// D8). A [`Subscriber`](crate::Subscriber) never returns it.
+    ResolverDied,
 }
 
 impl fmt::Display for RecvError {
@@ -146,6 +159,7 @@ impl fmt::Display for RecvError {
             Self::Empty => f.write_str("no record is unread"),
             Self::Timeout => f.write_str("no record arrived within the wait"),
             Self::Cancelled => f.write_str("the wait was cancelled"),
+            Self::Runtime(kind) => write!(f, "the async runtime could not run the wait: {kind}"),
             Self::Lagged(records) => write!(f, "{records} records were overwritten unread"),
             Self::Decode(code) => write!(f, "a record failed to decode: {code}"),
             Self::Closed(closed) => fmt::Display::fmt(closed, f),
@@ -172,6 +186,7 @@ impl fmt::Display for Closed {
             Self::PublisherDied => f.write_str("the publisher's process died"),
             Self::Corrupted => f.write_str("the topic's memory is corrupted"),
             Self::Evicted => f.write_str("the publisher took the subscription out"),
+            Self::ResolverDied => f.write_str("the resolver of the name died"),
         }
     }
 }

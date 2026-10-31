@@ -37,8 +37,8 @@ use rsbinder::rpc::{
     AddressSpace, FileDescriptorTransportMode as FdMode, RpcProxy, RpcServer, RpcSession,
 };
 use rsbinder::{
-    Binder, Interface, Parcel, ParcelFileDescriptor, Remotable, Result, SIBinder, Status,
-    StatusCode, TransactionCode, FIRST_CALL_TRANSACTION,
+    Binder, Interface, Parcel, ParcelFileDescriptor, Remotable, RemoteProxy, Result, SIBinder,
+    Status, StatusCode, TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IFdSvc";
@@ -141,10 +141,10 @@ fn rp_of(b: &SIBinder) -> &RpcProxy {
 
 fn call_len_of(root: &SIBinder, pfd: &ParcelFileDescriptor) -> Result<i32> {
     let rp = rp_of(root);
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.prepare_request(DESC)?;
     d.write(pfd)?;
     let mut r = rp
-        .transact(TX_LEN_OF, &d, 0)?
+        .submit_transact(TX_LEN_OF, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if !st.is_ok() {
@@ -185,7 +185,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
     server
         .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     wait_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -205,8 +205,8 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
 
     // reply direction: server hands back an fd; client reads it + checks it is O_CLOEXEC.
     let rp = rp_of(&root);
-    let d = rp.build_request(DESC).unwrap();
-    let mut r = rp.transact(TX_GIVE_FD, &d, 0).unwrap().unwrap();
+    let d = rp.prepare_request(DESC).unwrap();
+    let mut r = rp.submit_transact(TX_GIVE_FD, &d, 0).unwrap().unwrap();
     let st: Status = r.read().unwrap();
     assert!(st.is_ok());
     let got: ParcelFileDescriptor = r.read().unwrap();
@@ -225,8 +225,7 @@ fn fd_roundtrip_when_both_opt_in_over_uds() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -240,7 +239,7 @@ fn fd_rejected_without_mutual_opt_in() {
     server
         .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     wait_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -261,8 +260,7 @@ fn fd_rejected_without_mutual_opt_in() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
     let _ = std::fs::remove_file(&path);
 
     // (b) server supports Unix; the client never negotiates.
@@ -272,7 +270,7 @@ fn fd_rejected_without_mutual_opt_in() {
     server
         .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     wait_sock(&path);
 
     let client = RpcSession::setup_unix_client(&path).expect("connect");
@@ -288,8 +286,7 @@ fn fd_rejected_without_mutual_opt_in() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -324,7 +321,7 @@ fn a13_server_refuses_a_client_requesting_an_unsupported_fd_mode() {
     server
         .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     wait_sock(&path);
 
     let client = RpcSession::setup_client_android13plus_with_config(
@@ -338,8 +335,7 @@ fn a13_server_refuses_a_client_requesting_an_unsupported_fd_mode() {
 
     drop(plain);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -389,7 +385,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
         server
             .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
             .expect("set_root");
-        let bg = server.run_background();
+        let bg = server.run_background().expect("run_background");
         wait_sock(&path);
 
         // FD mode rides the connection header, not the R34 GET_FD_MODE special-transact.
@@ -416,8 +412,8 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
 
         // reply direction: server hands back an fd; client reads it + checks O_CLOEXEC.
         let rp = rp_of(&root);
-        let d = rp.build_request(DESC).unwrap();
-        let mut r = rp.transact(TX_GIVE_FD, &d, 0).unwrap().unwrap();
+        let d = rp.prepare_request(DESC).unwrap();
+        let mut r = rp.submit_transact(TX_GIVE_FD, &d, 0).unwrap().unwrap();
         let st: Status = r.read().unwrap();
         assert!(st.is_ok(), "v{ver}: give_fd status");
         let got: ParcelFileDescriptor = r.read().unwrap();
@@ -435,8 +431,7 @@ fn fd_v1plus_aosp_roundtrip_both_directions() {
 
         drop(root);
         drop(client);
-        server.stop_accepting();
-        let _ = bg.join();
+        let _ = bg.stop_and_join();
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -449,12 +444,12 @@ fn fd_v1_abstract_unix_roundtrip_arg() {
     let name = format!("rsb_rpcfd_abs_{}", std::process::id()).into_bytes();
     let server = RpcServer::setup_unix_server_abstract(&name).expect("bind abstract fd");
     server.set_android13plus(1);
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server.set_supported_fd_modes(&[FdMode::Unix]);
     server
         .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     let client = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix_abstract(&name, 1)
@@ -476,6 +471,5 @@ fn fd_v1_abstract_unix_roundtrip_arg() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }

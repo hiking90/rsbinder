@@ -27,7 +27,7 @@
 //! # `AccessorRoot`
 //!
 //! The wrapper pins the [`RpcSession`] for as long as the user holds the binder the accessor
-//! bridge returned; it is an implementation detail of [`resolve_accessor`]. `as_any`
+//! bridge returned; it is an implementation detail of [`try_resolve_accessor`]. `as_any`
 //! deliberately forwards to the inner `RpcProxy` — that is what the AIDL-generated `Bp*`
 //! stubs and `<dyn IBinder>::as_remote()`/`as_proxy()` downcast against, so the wrapper is
 //! transparent to consumers. The inner proxy is the only concrete `IBinder` anyone outside
@@ -47,23 +47,22 @@
 //! `Service::Accessor` to a log line and `None`
 //! ([`super::servicemanager_16`] cfg guards the whole resolve path).
 //!
-//! Process-wide state: **none**. There is no global registry, no
-//! `OnceLock<Mutex<Vec<RpcSession>>>`; the session
+//! Process-wide state: one switch, `rpc-tcp-debug` only (`set_accessor_plaintext_inet`, plan 17
+//! R-23). There is no global registry, no `OnceLock<Mutex<Vec<RpcSession>>>`; the session
 //! lives exactly as long as the wrapper the caller holds.
 
 // cfg lives on the mod decl in super; repeating it trips clippy::duplicated_attributes.
 
 use std::any::Any;
-use std::mem::ManuallyDrop;
 use std::sync::{Arc, Weak};
 
 use crate::binder::{
     DeathRecipient, IBinder, Interface, SIBinder, Stability, Transactable, TransactionCode,
-    WIBinder,
 };
-use crate::error::Result;
+use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
 use crate::rpc::RpcSession;
+use crate::status::{BinderResult, Status};
 
 // A separate AIDL output keeps `IServiceManager.aidl`'s transitive resolution unchanged.
 include!(concat!(env!("OUT_DIR"), "/accessor_16.rs"));
@@ -149,77 +148,90 @@ impl IBinder for AccessorRoot {
 
     fn rpc_transact(
         &self,
+        token: crate::binder::sealed::Token,
         code: TransactionCode,
         reader: &mut Parcel,
         reply: &mut Parcel,
     ) -> Result<()> {
-        self.inner_binder().rpc_transact(code, reader, reply)
-    }
-
-    fn inc_strong(&self, strong: &SIBinder) -> Result<()> {
-        self.inner_binder().inc_strong(strong)
-    }
-
-    fn attempt_inc_strong(&self) -> bool {
-        self.inner_binder().attempt_inc_strong()
-    }
-
-    fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        self.inner_binder().dec_strong(strong)
-    }
-
-    fn inc_weak(&self, weak: &WIBinder) -> Result<()> {
-        self.inner_binder().inc_weak(weak)
-    }
-
-    fn dec_weak(&self) -> Result<()> {
-        self.inner_binder().dec_weak()
+        self.inner_binder().rpc_transact(token, code, reader, reply)
     }
 }
 
-/// AOSP `BackendUnifiedServiceManager::toBinder` for the
+/// AOSP `BackendUnifiedServiceManager::toBinderService` for the
 /// `Service::Accessor` arm (android-16). Resolve `accessor` (a kernel
-/// remote `IAccessor`) into an RPC-root `ServiceWithMetadata`:
+/// remote `IAccessor`) into the RPC root binder of the service it
+/// fronts:
 ///
 /// 1. Cast to `BpAccessor` (kernel proxy — `addConnection`/
 ///    `getInstanceName` ride the kernel binder driver).
 /// 2. `validateAccessor`: `getInstanceName() == name` — AOSP requires
 ///    this so a misbehaving / hijacked Accessor cannot impersonate a
 ///    different service name.
-/// 3. `addConnection()` — server-side connected socket fd. Failures
-///    surface as `Status::service_specific_error()` with one of the
-///    five `IAccessor::ERROR_*` codes (decoded by the caller via
-///    [`accessor_error_name`] for logging).
+/// 3. `addConnection()` — server-side connected socket fd.
 /// 4. `RpcSession::from_preconnected_fd(fd, max_version=2)` —
 ///    android-16 max wire version.
-/// 5. `get_root()` → wrap in `AccessorRoot` so the session stays
-///    alive until the caller drops the returned binder.
+/// 5. `get_root()`, wrapped so the session stays alive until the caller
+///    drops the returned binder (AOSP `setSessionSpecificRoot`).
 ///
-/// Returns `None` on any failure (instance-name mismatch, transport
-/// rejection, root not available). The caller logs the original
-/// `Status`/`StatusCode` separately so the silent-`None` is informative
-/// rather than mute.
-pub fn resolve_accessor(
+/// # Errors
+///
+/// Each step fails with its own value. Steps 1 and 2 follow AOSP
+/// `validateAccessor` (`IServiceManager.cpp`, android-16.0.0_r4); steps
+/// 3–5 follow `toBinderService`, which returns the `addConnection`
+/// status as is and `Status::fromStatusT` of a session failure.
+///
+/// - `accessor` is not an `IAccessor`: [`StatusCode::BadType`](crate::StatusCode::BadType).
+/// - `getInstanceName` fails: that call's `Status`, unchanged.
+/// - The accessor reports another instance name:
+///   [`StatusCode::NameNotFound`](crate::StatusCode::NameNotFound). No
+///   connection is requested from such an accessor.
+/// - `addConnection` fails: that call's `Status`, unchanged — typically a
+///   service-specific error carrying one of the `IAccessor::ERROR_*`
+///   codes ([`accessor_error_name`] names it). AOSP turns
+///   `ERROR_FAILED_TO_CONNECT_TO_SOCKET` into a null service so the
+///   caller retries; here it is this `Err`, and the retry is the caller's.
+/// - The connection is an `AF_INET`/`AF_INET6` socket:
+///   [`StatusCode::BadType`](crate::StatusCode::BadType), unless
+///   `rpc::set_accessor_plaintext_inet(true)` was called (feature
+///   `rpc-tcp-debug`). Without that feature every inet socket is `BadType`,
+///   as any family with no backend is.
+/// - The RPC handshake, the root request, or the wrapper fails: the
+///   [`StatusCode`](crate::StatusCode) of that failure as a `Status`.
+///
+/// Every failure is also logged at `warn` with the instance name.
+///
+/// # Plaintext inet
+///
+/// AOSP accepts any family here and runs it in plaintext
+/// (`IServiceManager.cpp`, android-16.0.0_r4). rsbinder has a plaintext
+/// inet transport only with `rpc-tcp-debug`, and Cargo turns that feature
+/// on for the whole build as soon as any crate in the dependency graph asks
+/// for it. So the feature alone does not let an accessor hand this process
+/// an unencrypted, unauthenticated TCP connection: that also needs the
+/// process-wide opt-in, off by default. A direct
+/// [`RpcSession::from_preconnected_fd`] call is not affected: its caller
+/// chose the socket.
+pub fn try_resolve_accessor(name: &str, accessor: SIBinder) -> BinderResult<SIBinder> {
+    let bp = validate_accessor(name, accessor)?;
+    connect_accessor(name, &bp)
+}
+
+/// AOSP `validateAccessor`: steps 1–2 of [`try_resolve_accessor`], with its error values.
+pub(crate) fn validate_accessor(
     name: &str,
     accessor: SIBinder,
-) -> Option<super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata> {
-    // Step 1: kernel `BpAccessor` via the generated `FromIBinder` hook.
-    let bp = match <dyn IAccessor as crate::FromIBinder>::try_from(accessor) {
-        Ok(bp) => bp,
-        Err(e) => {
-            log::warn!("IAccessor cast failed for {name}: {e}");
-            return None;
-        }
-    };
-
-    // Step 2: instance-name validation (AOSP `validateAccessor`).
+) -> BinderResult<crate::Strong<dyn IAccessor>> {
+    let bp = <dyn IAccessor as crate::FromIBinder>::try_from(accessor).map_err(|e| {
+        log::warn!("IAccessor cast failed for {name}: {e}");
+        Status::from(StatusCode::BadType)
+    })?;
     match bp.getInstanceName() {
-        Ok(reported) if reported == name => {}
+        Ok(reported) if reported == name => Ok(bp),
         Ok(other) => {
             log::warn!(
                 "IAccessor instance-name mismatch for {name}: reported {other:?} — rejecting"
             );
-            return None;
+            Err(StatusCode::NameNotFound.into())
         }
         Err(status) => {
             log::warn!(
@@ -227,60 +239,125 @@ pub fn resolve_accessor(
                  (service_specific={})",
                 accessor_error_name(status.service_specific_error())
             );
-            return None;
+            Err(status)
         }
     }
+}
 
-    // Step 3: server-side connected fd.
-    let pfd = match bp.addConnection() {
-        Ok(pfd) => pfd,
-        Err(status) => {
-            log::warn!(
-                "IAccessor::addConnection failed for {name}: {status} \
-                 (service_specific={})",
-                accessor_error_name(status.service_specific_error())
-            );
-            return None;
-        }
-    };
+/// Steps 3–5 of [`try_resolve_accessor`] on an accessor `validate_accessor` accepted.
+pub(crate) fn connect_accessor(
+    name: &str,
+    bp: &crate::Strong<dyn IAccessor>,
+) -> BinderResult<SIBinder> {
+    let pfd = bp.addConnection().map_err(|status| {
+        log::warn!(
+            "IAccessor::addConnection failed for {name}: {status} \
+             (service_specific={})",
+            accessor_error_name(status.service_specific_error())
+        );
+        status
+    })?;
     let fd: std::os::fd::OwnedFd = pfd.into();
+    #[cfg(feature = "rpc-tcp-debug")]
+    refuse_plaintext_inet(name, std::os::fd::AsFd::as_fd(&fd))?;
 
-    // Step 4: versioned handshake capped at android-16's v2; an older peer may pick v0/v1.
-    let session = match RpcSession::from_preconnected_fd(fd, 2) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!(
-                "RpcSession::from_preconnected_fd failed for {name}: {e} (code={:?})",
-                e
-            );
-            return None;
-        }
+    // Versioned handshake capped at android-16's v2; an older peer may pick v0/v1.
+    let session = RpcSession::from_preconnected_fd(fd, 2).map_err(|e| {
+        log::warn!("RpcSession::from_preconnected_fd failed for {name}: {e} (code={e:?})");
+        Status::from(e)
+    })?;
+    let root = session.get_root().map_err(|e| {
+        log::warn!("RPC get_root failed for {name}: {e}");
+        Status::from(e)
+    })?;
+    AccessorRoot::into_sibinder(root, session).map_err(|e| {
+        log::warn!("AccessorRoot wrap failed for {name}: {e}");
+        Status::from(e)
+    })
+}
+
+#[cfg(feature = "rpc-tcp-debug")]
+static ACCESSOR_PLAINTEXT_INET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Let an `IAccessor` connection be a plaintext `AF_INET`/`AF_INET6`
+/// socket, process-wide; returns the value it replaces. Off by default.
+///
+/// The switch is read by the accessor path only
+/// ([`try_resolve_accessor`](crate::hub::android_16::try_resolve_accessor),
+/// [`try_resolve_via_process_local`](crate::hub::android_16::try_resolve_via_process_local)
+/// and a service manager lookup that resolves an accessor). There the
+/// accessor, not this process, picks the socket, and an inet socket runs
+/// the `rpc-tcp-debug` transport: no encryption, no peer identity
+/// ([`PeerIdentity::Anonymous`](crate::rpc::PeerIdentity::Anonymous)).
+/// With the switch off such a socket is refused with
+/// [`StatusCode::BadType`](crate::StatusCode::BadType) and an `error` log
+/// that names this function.
+///
+/// The `rpc-tcp-debug` feature is not enough by itself because Cargo
+/// unifies features: one crate in the graph that enables it enables it for
+/// every crate, release builds included. This switch is the decision of the
+/// program that runs.
+/// [`RpcSession::from_preconnected_fd`](crate::rpc::RpcSession::from_preconnected_fd)
+/// called directly does not read it.
+#[cfg(feature = "rpc-tcp-debug")]
+pub fn set_accessor_plaintext_inet(allow: bool) -> bool {
+    ACCESSOR_PLAINTEXT_INET.swap(allow, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether [`set_accessor_plaintext_inet`] last allowed plaintext inet
+/// accessor connections (`false` until it is called).
+#[cfg(feature = "rpc-tcp-debug")]
+pub fn accessor_plaintext_inet() -> bool {
+    ACCESSOR_PLAINTEXT_INET.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `BadType` for an inet accessor socket unless the opt-in is on; other families pass through.
+#[cfg(feature = "rpc-tcp-debug")]
+fn refuse_plaintext_inet(name: &str, fd: std::os::fd::BorrowedFd<'_>) -> BinderResult<()> {
+    if accessor_plaintext_inet() {
+        return Ok(());
+    }
+    // A failed `getsockname` is `from_preconnected_fd`'s to report.
+    let Ok(local) = rustix::net::getsockname(fd) else {
+        return Ok(());
     };
+    let family = local.address_family();
+    if family == rustix::net::AddressFamily::INET || family == rustix::net::AddressFamily::INET6 {
+        log::error!(
+            "IAccessor for {name} returned a plaintext inet socket; refusing it. Call \
+             rsbinder::rpc::set_accessor_plaintext_inet(true) to accept one (feature rpc-tcp-debug)"
+        );
+        return Err(StatusCode::BadType.into());
+    }
+    Ok(())
+}
 
-    // Step 5: get the RPC root and wrap with a session-keeper.
-    let root = match session.get_root() {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("RPC get_root failed for {name}: {e}");
-            return None;
-        }
-    };
+/// The `ServiceWithMetadata` an accessor-resolved root is returned in: never lazy.
+pub(crate) fn accessor_service_with_metadata(
+    root: SIBinder,
+) -> super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
+    super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
+        r#service: Some(root),
+        // AOSP `setSessionSpecificRoot` keeps an RPC root for the session's lifetime.
+        r#isLazyService: false,
+    }
+}
 
-    let wrapped = match AccessorRoot::into_sibinder(root, session) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("AccessorRoot wrap failed for {name}: {e}");
-            return None;
-        }
-    };
-
-    Some(
-        super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata {
-            r#service: Some(wrapped),
-            // Never lazy: AOSP `setSessionSpecificRoot` keeps an RPC root for the session.
-            r#isLazyService: false,
-        },
-    )
+/// [`try_resolve_accessor`] with every error turned into `None` (each is
+/// still logged). On success `service` is always `Some` and
+/// `isLazyService` is `false`.
+#[deprecated(
+    since = "0.13.0",
+    note = "use try_resolve_accessor, which says why a resolve failed"
+)]
+pub fn resolve_accessor(
+    name: &str,
+    accessor: SIBinder,
+) -> Option<super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata> {
+    try_resolve_accessor(name, accessor)
+        .ok()
+        .map(accessor_service_with_metadata)
 }
 
 /// Map an `IAccessor::ERROR_*` service-specific code

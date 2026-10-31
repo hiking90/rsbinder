@@ -31,7 +31,7 @@ use rsbinder::rpc::transport::{MemTransport, UnixTransport};
 use rsbinder::rpc::{
     AddressSpace, FileDescriptorTransportMode, PeerIdentity, RpcSession, RpcTransport,
 };
-use rsbinder::{Endpoint, Interface, SIBinder, StatusCode, TransportCaps};
+use rsbinder::{Endpoint, Interface, RemoteProxy, SIBinder, StatusCode, TransportCaps};
 
 include!(concat!(env!("OUT_DIR"), "/rpc_caller.rs"));
 
@@ -313,7 +313,9 @@ fn caps_do_not_replace_the_write_time_check() {
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()
         .expect("RpcProxy");
-    let mut parcel = proxy.build_request("rsbinder.test.ICaps").expect("request");
+    let mut parcel = proxy
+        .prepare_request("rsbinder.test.ICaps")
+        .expect("request");
     let devnull = std::fs::File::open("/dev/null").expect("/dev/null");
     let pfd = rsbinder::ParcelFileDescriptor::new(devnull);
     assert_eq!(
@@ -344,7 +346,7 @@ fn incoming_connections_grant_callbacks_on_both_ends() {
     server
         .set_root(BnRpcCaller::new_binder(CapsSvc(Arc::clone(&observed))).as_binder())
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     // The listener is bound by `setup_unix_server`, so the socket exists
     // before `run_background` — connect straight away.
@@ -382,9 +384,7 @@ fn incoming_connections_grant_callbacks_on_both_ends() {
 
     drop(caller);
     client.close_session();
-    server.stop_accepting();
-    let _ = bg.join();
-    server.terminate();
+    bg.stop_and_join().expect("accept loop");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -448,11 +448,11 @@ fn outgoing_connections_do_not_grant_callbacks() {
     server.set_android13plus(2);
     // fan-out is min(local, remote); the server default of 1 silently folds
     // outgoing_connections(2) into a single-connection session.
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(BnRpcCaller::new_binder(CapsSvc(Arc::clone(&observed))).as_binder())
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     let client = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::unix(&path, 2).outgoing_connections(2),
@@ -487,8 +487,6 @@ fn outgoing_connections_do_not_grant_callbacks() {
 
     drop(caller);
     client.close_session();
-    server.stop_accepting();
-    let _ = bg.join();
-    server.terminate();
+    bg.stop_and_join().expect("accept loop");
     let _ = std::fs::remove_file(&path);
 }

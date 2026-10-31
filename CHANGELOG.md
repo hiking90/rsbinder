@@ -17,21 +17,297 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 Each item below changes what a 0.12.0 program observes.
 
-- On a 32-bit target `MessageQueue::attach` refuses, with `BadValue`, a data
-  grantor whose `extent` plus `offset` modulo the page size is more than
+- **`MessageQueue::begin_write`, `begin_write_cached` and `begin_read`
+  return a transaction, `WriteTxn` or `ReadTxn`; `commit_write`,
+  `commit_write_cached` and `commit_read` are gone.** The transaction gives
+  `write_at` (a `WriteTxn`) or `read_at` (a `ReadTxn`) and is committed with
+  `commit()` (all of it) or `commit_first(n)` (a prefix):
+  `if let Some(mut r) = q.begin_write(n)? { r.write_at(0, x)?; } q.commit_write(n)?;`
+  becomes
+  `if let Some(mut txn) = q.begin_write(n)? { txn.write_at(0, x)?; txn.commit()?; }`.
+  A transaction dropped without a commit publishes or frees nothing (AOSP's
+  Rust `WriteCompletion` commits the whole reservation on drop, which
+  publishes elements never written). A commit cannot exceed its own
+  reservation (`commit_first(n)` above `len` is `BadValue`), and one that
+  finds this side's counter moved since its begin, or the peer's moved
+  back, is `Corrupted`; 0.12.0 returned `BadValue("commit exceeds …")`
+  there and accepted a commit with no begin.
+- **`MessageQueue::write` and `read` return `Result<Transfer>`**
+  (`Transfer::Done` / `Transfer::WouldBlock`, `is_done()`), not
+  `Result<bool>`. `Transfer` is `#[must_use]`, so `q.write(&x)?;`, which
+  loses the items of a write that would block, now warns.
+- **`write_blocking` and `read_blocking` take the items and the timeout
+  only**, waiting on and waking the default bits; other bits go through
+  `write_blocking_with` / `read_blocking_with` and
+  `Notify { wait, wake }`. `write_blocking(items, NOT_FULL, NOT_EMPTY, t)`
+  becomes `write_blocking(items, t)`, `read_blocking(out, NOT_EMPTY,
+  NOT_FULL, t)` becomes `read_blocking(out, t)`, and other masks become
+  `*_with(.., Notify::new(wait, wake), t)` with `wait` a `NonZeroU32`.
+  libfmq's `readBlocking` lists the wake mask before the wait mask, the
+  reverse of the 0.12.0 positions; named fields cannot be swapped by
+  position. `Some(Duration::ZERO)` tries once and returns `TimedOut`
+  without touching the EventFlag word; 0.12.0 waited on a deadline already
+  past, which cleared the wait bits it found set.
+- **`shm::futex_wait`, `shm::futex_wake`, `shm::RoWord32::wait` and `wake`
+  take the bit mask as `NonZeroU32`**; the `BadValue("empty bit mask")`
+  for `0` is gone. `EventFlag::wait(0)` is still `BadValue` and
+  `EventFlag::wake(0)` a no-op, as in libfmq.
+- **`AttachPolicy` is `#[non_exhaustive]`**: `AttachPolicy { max_capacity:
+  n, require_seal: true, require_event_flag: e }` becomes
+  `AttachPolicy::new(n).require_event_flag(e)`. `new` sets `require_seal`
+  and leaves `require_event_flag` off; `.require_seal(false)` turns the
+  seal check off. The fields stay readable.
+- **A descriptor that `MessageQueue::attach` or `UnsyncReader::attach`
+  refuses is `Error::InvalidDescriptor`, not `BadValue`**: flavor, quantum,
+  grantor geometry and overlap, an fd that is unsealed, too small or a
+  hugetlbfs file, a ring mapping over `isize::MAX` on 32-bit, and the
+  `AttachPolicy` refusals. `BadValue` is for the caller's own arguments.
+  `StatusCode::from` maps `InvalidDescriptor` to `BadValue`, so code that
+  converts to a binder status sees no change.
+- **`Error::Os` carries `rsbinder_fmq::Errno`, not `rustix::io::Errno`**, and
+  `impl From<rustix::io::Errno> for rsbinder_fmq::Error` is removed, so a
+  rustix major release is no longer a semver break of this crate.
+  `Errno::raw()` gives the number and `Errno::from_raw` builds one;
+  `std::io::Error::from` takes both `Errno` and `Error`.
+- **`RpcServer::run_background` returns `Result<RpcServerHandle>`, and
+  dropping the handle stops the server.** The handle is `#[must_use]`; its
+  drop, or `stop_and_join()` (which also returns how the accept loop
+  ended), raises `stop_accepting`, joins the accept thread and calls
+  `terminate`, which ends every session and joins its workers. 0.12.0
+  returned a `JoinHandle<()>` whose drop detached the loop, and the server
+  kept accepting after its last `Arc` went. `let bg =
+  server.run_background();` becomes `let bg = server.run_background()?;`,
+  and `server.stop_accepting(); bg.join()` becomes `bg.stop_and_join()?`.
+  **`let _ = server.run_background();` still compiles without a warning
+  and now stops the server on that line**: bind the handle to a named
+  variable or keep it beside the server. A thread the OS refuses is an
+  `Err` instead of a panic; `Server::spawn` returns it too, and
+  `ServerGuard` wraps the handle.
+- **`stream::Receiver::recv_timeout` returns `Result<T, RecvTimeoutError>`
+  and `try_recv` returns `Result<T, TryRecvError>`**, the shape of
+  `std::sync::mpsc`: `Err(Timeout)` / `Err(Empty)` while the stream runs,
+  `Err(Ended)` on every call once it is over, and `Err(Failed(status))`
+  once for a stream that ended in error (where `recv` yields
+  `Some(Err(status))` once before `None`). 0.12.0 returned `Ok(None)` for
+  both a timeout and an end, so a loop that called again on `Ok(None)`
+  spun after the end. `recv`, `recv_async` and the `Iterator` are
+  unchanged.
+- **A zero RPC deadline is refused with `BadValue`.**
+  `RpcSession::set_reply_timeout` and `RpcServer::set_reply_timeout`,
+  `set_idle_timeout` and `set_handshake_timeout` return `Result<()>` and
+  refuse `Some(Duration::ZERO)`, keeping the value in force. A zero
+  `RpcClientConfig::timeout` (and the deprecated `handshake_timeout`) is
+  refused by the setup call, a zero `ClientOptions::timeout` by
+  `Client::open`, and a zero `ServeOptions` deadline by `Server::run` /
+  `spawn`, all before connecting or registering a name. 0.12.0 read a zero
+  reply or idle deadline as "no deadline" and a zero handshake deadline as
+  "keep the 10 s default". `None` is still no deadline.
+- **`RpcSession::set_timeout` is `set_reply_timeout`**, the name the server
+  gives the same deadline; `set_timeout` is a deprecated alias, also
+  returning `Result<()>`.
+- **`RpcServer::set_max_threads` returns `Result<()>`.** It, `set_root` and
+  `add_service` return `InvalidOperation` once `run` or `run_background`
+  has started (AOSP `RpcServer` aborts there), and a server has either a
+  `set_root` root or an `add_service` directory: whichever comes second is
+  `InvalidOperation`. 0.12.0 let `add_service` replace a root silently and
+  took changes that sessions already accepted never saw.
+  `set_max_connections` still changes while the server runs.
+- **`RpcClientConfig` has no lifetime parameter and owns its source**
+  (`unix(impl AsRef<Path>, ..)`, `unix_abstract(impl AsRef<[u8]>, ..)`,
+  `tls(impl Into<String>, port, impl Into<String>, ..)`), and the
+  connector of `new(.., connect)` is `'static`. The session keeps it:
+  **`RpcSession::add_outgoing_connection()` and
+  `add_incoming_connection()`** open one more connection as the founding
+  one was opened, with the session's own id, wire version and fd mode.
+  `add_outgoing_connection_with_config`,
+  `add_incoming_connection_with_config` and `RpcClientConfig::session_id`
+  are deprecated. A session built from a transport (`connect_android13plus`,
+  `from_preconnected_fd`, r34) has no connector, so the new calls return
+  `InvalidOperation` there.
+- **`RpcSession::session_id()` and `serve_blocking_on` are no longer
+  public.** The client-local id was never the one to echo; the server's is
+  `get_session_id()`.
+- **`RpcTransport::send_raw` and `recv_raw` are required; `send_frame` and
+  `recv_frame` have default implementations** (a `u32` little-endian
+  length and the body, through the raw calls). Every session moves its
+  bytes through the raw calls, so a transport that implemented only the
+  frame methods compiled in 0.12.0 and could open no session.
+- **`RpcSession::new` and the bundled transport constructors
+  (`UnixTransport`, `TcpDebugTransport`, `TlsTransport`, `VsockTransport`)
+  return `rsbinder::Result`**, not `RpcResult`; a `.map_err(StatusCode::from)`
+  after them can go, and a TLS handshake cut by its deadline is `TimedOut`.
+  The `RpcTransport` methods keep `RpcResult`.
+- **`RpcProxy::build_request` and `transact` are deprecated** in favour of
+  the `RemoteProxy` methods they duplicated, `prepare_request` and
+  `submit_transact`.
+- **`stream::ReceiverPolicy` and `stream::SinkPolicy` are
+  `#[non_exhaustive]`** with a `with_*` setter per field:
+  `ReceiverPolicy { ring_use: x, ..Default::default() }` becomes
+  `ReceiverPolicy::default().with_ring_use(x)`. `entry::WireProfile` is
+  `#[non_exhaustive]`, and so is the `PeerIdentity::Local` variant: match
+  `PeerIdentity::Local { uid, .. }`, build it with
+  `PeerIdentity::local(uid, pid)`.
+- **`rsbinder::rpc::{address, end, fd_mode, proxy, server, session}` are
+  private modules**; everything public in them is reached through
+  `rsbinder::rpc::*` (`rpc::session::RpcSession` becomes `rpc::RpcSession`).
+  `RPC_SESSION_ID_NEW`, `SpecialTransaction`, `RpcAddress::unique` and
+  `transport::insecure_warning_emitted` are gone from the API, and
+  `RpcSession::accept_android13plus`, `accept_android13plus_fd`,
+  `local_node_count` and `RpcServer::{live_session_node_count,
+  session_live_conns, session_slot_count}` are `#[doc(hidden)]` behind the
+  `test-util` feature.
+- **`IBinder` no longer has `inc_strong`, `attempt_inc_strong`,
+  `dec_strong`, `inc_weak` and `dec_weak`.** They counted nothing that
+  decided a lifetime (the `Arc` does), and a stray `dec_strong(None)`
+  panicked the next `SIBinder` drop in a debug build. Delete them from a
+  hand-written `IBinder` impl; to release a binder, drop it
+  (`service.dec_weak()?;` becomes `drop(service);`). `rpc_transact`, which
+  skips `check_interface`, now takes an argument only rsbinder can build.
+  `set_parceled` stays.
+- **`hub::register_for_notifications`, `unregister_for_notifications`,
+  `register_client_callback` and `try_unregister_service` return
+  `BinderResult<()>`**, as `add_service` does, and so do the
+  `ServiceManager` methods and the `hub::android_N` functions of those
+  names. The service manager's exception reaches the caller: a refused name
+  is `EX_SECURITY` rather than `StatusCode::FailedTransaction`. `?` into a
+  `StatusCode` or `Box<dyn Error>` function still compiles; a `match` on a
+  `StatusCode` becomes one on `exception_code()` or `transaction_error()`.
+  On Android 10 all four return `EX_UNSUPPORTED_OPERATION`.
+- **`hub::try_get_service` and `try_get_interface` return
+  `BinderResult<Option<_>>`** (`Status`, not `StatusCode`), as every
+  `hub::try_*` lookup does; `Err(StatusCode::X)` patterns become
+  `Err(s) if s.transaction_error() == StatusCode::X`, and a denied lookup
+  shows as `EX_SECURITY`. **`get_interface_async` is deprecated** in favour
+  of `try_get_interface_async`, which is `Ok(None)` for a name that is not
+  registered: `try_get_interface_async::<T>(name).await?.ok_or(StatusCode::NameNotFound)?`.
+- **`CallingContext::default()` is gone; use `CallingContext::current()`.**
+  `Default` read the caller at construction, so a `#[derive(Default)]`
+  struct or an `unwrap_or_default()` recorded whichever caller happened to
+  be current. `CallingContext` is `#[non_exhaustive]`.
+- **`ProcessState::init`, `init_with_mmap_size` and `init_default` return
+  `Result<&'static ProcessState, StatusCode>`** instead of
+  `Box<dyn Error>` (`?` into `Box<dyn Error>` still works). A second call
+  with a different driver path, `max_threads` or mmap size returns
+  `BadValue` instead of `Ok` with the earlier state (AOSP `initWithDriver`
+  aborts); the same settings again stay `Ok`. `driver_name()` and
+  `max_threads()` read the settings in force. A missing driver node is
+  `NameNotFound`, a failed ioctl or mmap its errno status, a protocol
+  version mismatch `NoInit`.
+- **`rsbinder::thread_state` and `shared_memory::{heap, dealer, shared,
+  wire}` are private modules**: `rsbinder::thread_state::X` becomes
+  `rsbinder::X` (`rsbinder::CallingContext`, `rsbinder::get_calling_uid`),
+  `rsbinder::shared_memory::heap::MemoryHeapBase` becomes
+  `rsbinder::shared_memory::MemoryHeapBase`. The generated
+  `cancel::android::os::…` and `permission_controller::android::os::…`
+  modules are private too; their items stay at `rsbinder::cancel::*` and
+  `rsbinder::permission_controller::*`. `__declare_binder_interface!` is
+  `#[doc(hidden)]`.
+- **`impl From<rustix::io::Errno> for StatusCode` is removed**, so `rustix`
+  is in neither crate's public API. Convert an errno with
+  `StatusCode::from(std::io::Error::from_raw_os_error(n))`; the mapping is
+  unchanged.
+- **`ParcelableHolder::new(Stability)` is deprecated; use
+  `ParcelableHolder::local()` or `vintf()`.** A holder's wire stability is
+  LOCAL or VINTF only: `new(Stability::Vendor)` and `new(Stability::System)`
+  now panic (they wrote LOCAL while behaving otherwise, and `Vendor` refused
+  non-VINTF parcelables). Generated code uses `vintf()`.
+- **`TransactionObserver`'s tag is `Option<Box<dyn Any>>`**, not
+  `Option<Box<dyn Any + Send>>`: `on_transact` and `on_reply` run on the
+  serving thread, so the tag may be a thread-bound guard; a
+  `Box<dyn Any + Send>` still coerces. `TracingObserver` keeps the entered
+  span as its tag.
+- **A sync-only local service converts to its async view.** `into_async`,
+  `try_into_async` and the async `FromIBinder` cast of a binder published
+  with `Bn*::new_binder` give the generated async proxy over the local
+  binder, as AOSP's Rust backend does: each call is serialized into a
+  parcel and runs the service's dispatch in this process. 0.12.0 refused
+  the cast with `BadType` and `into_async` panicked. In a process without
+  kernel binder (`ProcessState` not initialized) the cast is
+  `InvalidOperation` and `into_async` panics saying so. A local binder of
+  another `Remotable` that answers with the interface's descriptor gets
+  the same in-process proxy, sync or async, where 0.12.0 refused it with
+  `BadValue`. Off any transaction such a call has the new caller
+  `Caller::InProcess { uid, pid }`, this process's own, and
+  `@EnforcePermission` decides it for that identity; inside a handler it
+  keeps the outer caller. The calling thread's strict-mode policy and work
+  source are restored after the dispatch. `Strong::into_async` lists the
+  four call semantics of one local object and what the in-process path
+  does not do (no `DeadObject` mapping, no observer, `link_to_death` is
+  `InvalidOperation`).
+- **A generated async proxy runs its transact inline on a thread that is
+  handling a transaction, whatever its `BinderAsyncPool`**, and
+  `Tokio::spawn` always hands off to `spawn_blocking`. A pool written as
+  the trait doc says keeps the kernel's deadlock avoidance and the RPC
+  nested-call pin. Code that called `<Tokio as BinderAsyncPool>::spawn`
+  directly inside a handler and relied on it running inline checks
+  `is_handling_transaction()` itself.
+- **`rsbinder` requires `rsbinder-aidl` with `=`.** Generated code calls
+  hidden items of the `rsbinder` it was generated for, so another
+  `rsbinder-aidl` patch in the same build no longer resolves. Interface
+  code from an older generator keeps 0.12.0's `BadType` for the async cast
+  of a sync-only local service.
+- **A refused TLS certificate has its own status code** on Linux and
+  Android: `StatusCode::Errno(-EKEYREJECTED)` (untrusted issuer, bad
+  signature, wrong name, no certificate; the peer's `unknown_ca`,
+  `access_denied`, `certificate_required` or `unsupported_certificate`
+  alert), `-EKEYREVOKED` (revoked) or `-EKEYEXPIRED` (expired, not yet
+  valid, an expired CRL; `certificate_expired`), where 0.12.0 returned
+  `Unknown`, as AOSP still does. Other TLS failures stay `Unknown`. A rustls
+  failure after the handshake is `RpcError::Io(InvalidData)` carrying the
+  `rustls::Error`, as a handshake failure is, not `RpcError::Protocol`. An
+  rsbinder TLS server half-closes and drains the client (at most 500 ms and
+  64 KiB) after a failed handshake, so a TLS 1.3 client whose certificate
+  was refused reads the alert instead of `DeadObject`. `Reconnecting::build`
+  fails on a rejected or revoked certificate; the background thread keeps
+  retrying it and reports it in `last_error()`; an expired one is never
+  permanent.
+- **With `rpc-tcp-debug`, an `IAccessor` connection that is an inet socket
+  is refused with `BadType`** unless the process calls
+  `rpc::set_accessor_plaintext_inet(true)`. The feature is unified across
+  the build, so a debug feature enabled anywhere changed what a plain
+  `get_service` accepted. `RpcSession::from_preconnected_fd` called
+  directly is unaffected: its caller picked the socket.
+- **`ServeOptions::threads` and `binder://?threads=` take effect on a
+  running process**: `run` / `spawn` apply a ceiling that differs from the
+  one in force through the new `ProcessState::set_max_threads`
+  (`BINDER_SET_MAX_THREADS`, AOSP `setThreadPoolMaxThreadCount`), where
+  0.12.0 returned `BadValue`. A started pool may grow but not shrink
+  (`InvalidOperation`), and the two given with different values is
+  `BadValue`. `ServeOptions::mmap_size` is still compared only, as a
+  mapping cannot be resized.
+- **`rsbinder_fmq::Regions::write_at` is no longer public**; write through
+  `WriteTxn::write_at` / `UnsyncWriteTxn::write_at`. No transaction hands
+  out a `&mut Regions`, so it could not be called.
+- **A published service never reports a version above its generated
+  module's `VERSION`.** The generated `on_transact` for
+  `getInterfaceVersion` and `impl IFoo for Binder<BnFoo>` answer
+  `min(service, VERSION)`, and `getInterfaceHash` answers the module's own
+  `HASH` when the service's version was above it. A gateway built from an
+  older `.aidl` than its upstream reported the upstream's version, whose
+  newer methods its own `on_transact` cannot dispatch. The client-side
+  `impl IFoo for Strong<dyn IFoo>` still reports the upstream's values.
+- **A nested `.aidl` type named `{Interface}Delegate` is refused**: it
+  collides with the generated delegate trait (see Added).
+- **`declare_binder_interface!` is hidden from the docs**: it is for
+  generated code; write interfaces with `#[rsbinder::interface]` or
+  `.aidl`. Its `native` block takes `adapter:` and `r#async:` together or
+  neither; one of them alone, or an async interface without them, is a
+  `compile_error!` naming what is missing.
+- On a 32-bit target `MessageQueue::attach` refuses, with
+  `InvalidDescriptor`, a data grantor whose `extent` plus `offset` modulo the page size is more than
   `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and
   `shm::Mapping` maps no more than a Rust slice may span. 0.12.0 passed the
   length to `mmap`: on 32-bit Linux it attached the queue when the address
   space had room for it (it does in an i686 process on an x86_64 kernel);
   on 32-bit Android bionic's `mmap64` refused the length with `ENOMEM`, so
-  there only the error changes (`Os(ENOMEM)` to `BadValue`). Only a
+  there only the error changes (`Os(ENOMEM)` to `InvalidDescriptor`). Only a
   descriptor with an `extent` within one page of `i32::MAX` and a data
   `offset` that is not a multiple of the page size can be refused; one from
   `MessageQueue::create` never is, and 64-bit targets are not affected. Make
   the ring smaller; on 32-bit Linux a data grantor on a page boundary
   attaches too.
-- `MessageQueue::attach` refuses, with `BadValue`, a descriptor in which a
-  counter, the data or the EventFlag grantor names an fd that is a hugetlbfs
+- `MessageQueue::attach` refuses, with `InvalidDescriptor`, a descriptor in
+  which a counter, the data or the EventFlag grantor names an fd that is a hugetlbfs
   file, such as a memfd created `MFD_HUGETLB`; the check is in
   `shm::Mapping::map`, which on Linux and Android calls `fstatfs`
   (`fstatfs64` on a 32-bit target) before each `mmap` and refuses an fd
@@ -62,10 +338,9 @@ Each item below changes what a 0.12.0 program observes.
   memfd or ashmem regions, which are not refused. The `fstatfs` of the item
   above is made here too, once for each mapping.
 - `MessageQueue::attach` refuses a descriptor of the unsynchronized flavor
-  with `BadValue("descriptor is not of the synchronized flavor")` (0.12.0:
-  `"only the synchronized flavor is supported"`). The flavor now has types
-  of its own (see Added). Code that compares the text needs the new one;
-  matching on the variant is unaffected.
+  with `InvalidDescriptor("descriptor is not of the synchronized flavor")`
+  (0.12.0: `BadValue("only the synchronized flavor is supported")`). The
+  flavor now has types of its own (see Added).
 - Off Linux and Android (macOS), `MessageQueue::create` and
   `MessageQueue::attach` return `Error::Unsupported` before they look at
   their arguments or make a system call. 0.12.0 checked `create`'s
@@ -331,11 +606,73 @@ Each item below changes what a 0.12.0 program observes.
   `SharedMemory::from_fd`, `Parcel::read_blob` and a received `IMemory`.
   An fd that is not a regular file (ashmem, a device) is not measured, and
   a failed `fstat` leaves the fd to `mmap` as before.
+- **`rsbinder-fmq/c/rsbinder_fmq.h`'s internal helpers are
+  `rsbfmq_internal_*`**, not `rsbfmq__*`, a name C++ reserves; the header
+  states its stability (the C API is Provisional) and defines
+  `RSBINDER_FMQ_H_VERSION` (1), raised with each change to the C API. A
+  copy of the 0.12.0 header that calls an `rsbfmq__*` helper directly
+  renames the call.
 
 ### Added
 
+- **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
+  has it.
+- **`bridge::Delegating` and a generated `IFooDelegate` trait per
+  interface**: a gateway overrides only the methods it changes (typically
+  the one that re-wraps a binder argument) and publishes
+  `BnFoo::new_binder(Delegating::new(upstream, hooks))`; every other
+  method, `getInterfaceVersion` and `getInterfaceHash` forward to the
+  upstream. Sync only; binder arguments are not re-wrapped automatically,
+  and a method that carries a binder is not forced to be overridden (a
+  same-stack gateway may forward it as it is).
+- **`Caller::InProcess`**, **`ProcessState::set_max_threads`**, and with
+  `rpc-tcp-debug` **`rpc::set_accessor_plaintext_inet` /
+  `accessor_plaintext_inet`**: see Migrating.
 - **`ProcessState::try_start_thread_pool()`**: `start_thread_pool` that
   returns the failure to create the first worker.
+- **`AccessorProviderHandle::keep_for_process()`**: keeps the provider
+  registered until the process exits, as AOSP's `addAccessorProvider` does
+  when its caller discards the returned weak pointer.
+- **`ProcessState::freeze(pid, timeout)` and `thaw(pid)`**, which name the
+  direction; `freeze_process(pid, enable, timeout)` is deprecated (a
+  positional `bool`, and a `timeout` a thaw ignores).
+- **The process-wide slots can be read and swapped**:
+  `observe::observer()` and `replace_observer()`,
+  `permission_controller::permission_authority()` and
+  `replace_permission_authority()`. A library that installs into a process
+  it does not own keeps what it replaced, or installs an `observe::Fanout`,
+  which forwards to several observers, each with its own tag, a panic in
+  one not reaching the others. The replaced authority is dropped after the
+  slot's lock is released, so a panicking `Drop` no longer poisons it.
+- **`TxnContext::new(descriptor, code)`** and `with_*` setters, to
+  unit-test a `TransactionObserver` without a transaction.
+- **`bridge::Rewrap::remote_of(&wrapper)`**: the remote a wrapper was made
+  for, for an upstream that hands a wrapper back.
+- **`rpc::TlsTransport::connect_stream_with` / `accept_stream_with`**
+  (`rpc-tls`): the hand-assembled TLS handshake with a deadline, set for
+  the handshake as a whole and cleared after it, as the built-in `tls`
+  client path sets one. `connect_stream` / `accept_stream` keep no
+  deadline; a zero one is `BadValue`.
+- **`pub use rsbinder::rpc::vsock`** (`rpc-vsock`): the `vsock` crate that
+  `VsockTransport::from_stream` and the `TlsStream` impl name.
+- **`hub::android_16::try_resolve_accessor` and
+  `try_resolve_via_process_local`** return why a resolve failed: `BadType`
+  for a binder that is not an `IAccessor`, `NameNotFound` for one serving
+  another instance, `addConnection`'s status, the handshake's error; a
+  name no provider claims is `Ok(None)`. The `Option` forms
+  `resolve_accessor` and `resolve_via_process_local`, which logged each
+  failure and returned `None`, are deprecated.
+- **`fmq::MQDescriptor::try_from_sized(descriptor)`**: `TryFrom<Descriptor>`
+  that also refuses a queue whose element size is not `size_of::<T>()`,
+  which the untyped conversion leaves for the peer's libfmq to refuse.
+- **`Debug` for the public types that had none**: `ProcessState`,
+  `Binder<T>`, `Reconnecting<T>`, `WeakReconnecting<T>`,
+  `ReconnectBuilder<T>`, `LazyServiceRegistrar`, `hub::ServiceManager`,
+  `DeathSignal`, `entry::{Server, ServeOptions}`, and with `rpc`
+  `RpcSession`, `RpcServer`, `RpcClientConfig`, `RpcUnixClientConfig`,
+  `RpcProxy` and the transports. None blocks, takes a lock a binder thread
+  holds (a busy one prints `<locked>`), makes a call, or prints key
+  material or a session id.
 
 - **`[[service]] accessor` in `rsb_hub`'s configuration**: the name the
   `IAccessor` of an instance is registered under, AOSP's VINTF `<accessor>`
@@ -381,8 +718,14 @@ Each item below changes what a 0.12.0 program observes.
   - `Publisher<T>` and `Subscriber<T>` for any parcelable or `Bytes`
     (`Payload`). A publish never waits: a subscriber that falls a ring
     behind gets `RecvError::Lagged` with the number it lost. With
-    `PublisherPolicy::backpressure` a publish waits up to a timeout and then
-    takes the subscribers in the way out (`Closed::Evicted`).
+    `PublisherPolicy::backpressure` a publish waits up to
+    `Backpressure::publish_timeout` (which also bounds a loan and the end
+    record of `close` or a drop) and then takes the subscribers in the way
+    out (`Closed::Evicted`); a stopped subscriber is taken out only once it
+    holds a publish up. `Publisher::close()` ends the topic with
+    `Closed::End`, `close_with(&Status)` with a status. `Publisher::new`
+    returns `BinderResult` as the other constructors do
+    (`EX_ILLEGAL_ARGUMENT` with the failed check for a policy out of range).
   - `Publisher::advertise` and `NamedSubscriber`: a topic found by a service
     manager name, the subscriber reconnecting to whichever publisher holds
     it (`RecvError::Disconnected` between connections). A registration
@@ -390,30 +733,58 @@ Each item below changes what a 0.12.0 program observes.
     room for it) is made up by a `check_service` when a publisher ends, or
     refuses as ended, with no other binder for the name; it asks once more
     when a notice during the call gives the name a binder it cannot use. `Resolver`
-    (`Advertisement`, `Watch::with_lookup`) puts the names somewhere else; a
-    `Publisher` drops the `Advertisement` its resolver returned in `close`, or
-    as it drops, before its end record.
+    (`Advertisement`, `Watch::with_lookup`, `host`) puts the names somewhere
+    else; a `Publisher` drops the `Advertisement` its resolver returned in
+    `close`, or as it drops, before its end record, and
+    `Publisher::advertise_on` gives a name after the topic was made.
+    `NamedSubscriber::state` reports, at every ask, a refusal a retry cannot
+    change, a corrupt ring, or `Closed::ResolverDied` once a registry's host
+    died and no connection is left. A `NamedSubscriber<Bytes>` receives
+    samples too (`recv_sample`, `try_recv_sample`, `try_latest_sample`,
+    `recv_sample_timeout`, `recv_sample_async`), with the value receives'
+    connection and drain rules; `unsafe` `trust_publisher` makes a
+    `NamedSubscriber<Bytes, Trusted>` that vouches for every publisher of
+    the name.
   - `registry`: a registry of topic names apart from service names, which
     `rsb_hub` serves with its `topic` feature. `RegistryResolver` is its
     client (`find`, `list`), taken by `Publisher::advertise_with` and
     `NamedSubscriber::subscribe_with`: a name is taken back as its publisher
     closes or its process dies, and a notice a watcher had no room for is
     sent again. `Registry`, `RegistryAccess` and `RegistryStats` are the host
-    side; its AIDL (`ITopicRegistry`, `ITopicWatcher`, `TopicInfo`,
-    `TopicRef`) is rsbinder's own. See the book's Topics chapter.
+    side. `RegistryResolver::list` returns `registry::TopicListing` (`uid:
+    u32`, `age: Duration`). The AIDL is rsbinder's own; the wire-only types
+    (`ITopicWatcher`, `TopicInfo`, `TopicRef`, `ISubscription`, `Pool`) are
+    hidden from the docs, and `ITopic`, `ITopicRegistry`, `SubscribeRequest`
+    and `TopicEndpoint` stay documented. See the book's Topics chapter.
   - Waits on a futex word of the topic (`Wake::Futex`, one wake system call
     per publish for every sleeping subscriber) or on a socket of the
     subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);
-    `recv_async` with the `tokio` feature; `Interrupter`.
+    `recv_async` with the `tokio` feature, `RecvError::Runtime` when the
+    runtime cannot run a wait; `Interrupter`, the only source of
+    `RecvError::Cancelled`; `recv_latest_timeout`. Each futex subscriber
+    sleeps on one of 32 futex bits, and a wake this process sends for it
+    (an interrupt, a death, an eviction) names that bit alone, so it ends
+    about 1 in 32 of the topic's other futex sleeps instead of all of them;
+    a publish still wakes every bit. The layout and `VERSION` do not change.
   - Loans (`PoolPolicy`, `Publisher::loan_slice`, `LoanMut`): a `Bytes` value
     written straight into a slot of a second memfd and received in place as
     a `Sample` (`recv_sample`, `try_latest_sample`, `recv_sample_async`).
     An `Untrusted` subscriber copies a slot with atomic loads; `unsafe`
     `trust_publisher` makes a `Trusted` one, whose samples deref to `[u8]`.
+    `LoanMut` is `Send` (not `Sync`): a loan can be published on another
+    thread or held across an `.await` in a spawned future. With
+    backpressure, `loan_slice` and `LoanMut::publish` wait up to
+    `publish_timeout` holding the topic's lock, which blocks the thread they
+    run on.
   - `PublisherPolicy::authorize` and `Acceptor` decide who may subscribe;
-    `Publisher::stats` and `Subscriber::stats` count what went through.
-  - The error enums `RecvError`, `Closed`, `Disconnected` and `PublishError`
-    are `#[non_exhaustive]`. The subscription AIDL (`aidl/rsbinder/topic/`)
+    `Publisher::stats` and `Subscriber::stats` count what went through, and
+    `Publisher::stats` reports each subscription's pinned pool slot
+    (`SubscriberInfo::pinned`) and whether the publisher holds a name
+    (`PublisherStats::advertised`).
+  - The error enums `RecvError`, `Closed`, `Disconnected` and `PublishError`,
+    the enums `Start` and `Wake`, and `PublisherStats`, `SubscriberInfo`,
+    `SubscriberStats` and `registry::TopicListing` are `#[non_exhaustive]`.
+    The subscription AIDL (`aidl/rsbinder/topic/`)
     and the memory layout are rsbinder's own; a publisher and a subscriber
     of different layout versions refuse each other
     (`ITopic::ERROR_VERSION`).
@@ -443,8 +814,13 @@ Each item below changes what a 0.12.0 program observes.
     libfmq from `android-16.0.0_r4`), which the writer stores before it
     copies and a reader loads after its own copy to find out that it was
     overwritten. `UnsyncReader::read_latest` follows libfmq's `readLatest`,
-    except that a write in progress on a full ring makes it return `0` only
-    when that write reserves the whole ring.
+    except that a write in progress on a full ring makes it copy nothing
+    (`UnsyncLatest { copied: 0 }`) only when that write reserves the whole
+    ring.
+  - `UnsyncWriter::begin_write` returns an `UnsyncWriteTxn`, committed with
+    `commit()` or `commit_first(n)` as the synchronized flavor's
+    transactions are. `UnsyncReader::attach` maps no EventFlag word, so it
+    ignores `AttachPolicy::require_event_flag`.
   - `UnsyncCreate::read_only_readers` seals the memfd `F_SEAL_FUTURE_WRITE`
     after the writer mapped it, so no reader can write the counters or the
     ring. On a kernel without that seal (mainline Linux before 5.1)
@@ -469,6 +845,8 @@ Each item below changes what a 0.12.0 program observes.
   than FMQ. `create` with `CreateOptions`, `add_seals`, `seals` and `Seals`
   (a memfd and its seals; `add_seals` returns the kernel's error unchanged,
   so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle);
+  `create_mapped` (create, map writable, then seal, the one order in which
+  the owner keeps a writable mapping under `FUTURE_WRITE`);
   `Mapping` with `Access` (a shared mapping at any byte offset, read-only or
   read-write, on macOS as well as Linux and Android); `Run` (copies in and
   out of shared memory through atomics); `futex_wait`, `futex_wake` and
@@ -511,12 +889,17 @@ Each item below changes what a 0.12.0 program observes.
     length grows by the run's length, and the bytes it held stay in front.
     A caller that receives into a new or reused buffer no longer writes
     every byte twice, once with zeros and once with the copy.
-- **`rsbinder_fmq::shm::spin`**: how long a side of a shared-memory channel
-  looks at the memory before it parks on a futex — `SPIN`, `spin_budget`,
-  `spin_until`, `SpinGauge` and `SPIN_CLOCK_EVERY`. This is the policy
-  `rsbinder::stream`'s ring has used since 0.12.0, moved here unchanged so
-  that every channel in a process counts against one limit on concurrent
-  looks (half the cores); `stream` now calls it from here.
+- **`rsbinder_fmq::shm::spin`** (workspace-internal, `#[doc(hidden)]`, not
+  covered by the stability tier): how long a side of a shared-memory
+  channel looks at the memory before it parks on a futex. This is the
+  policy `rsbinder::stream`'s ring has used since 0.12.0, moved here so
+  that every channel in a process, `stream`'s and `rsbinder-topic`'s,
+  counts against one limit on concurrent looks (half the cores).
+- **`MessageQueue::write_blocking_with` / `read_blocking_with` and
+  `Notify`** (with `Notify::WRITE` / `Notify::READ`, the default bits),
+  **`Transfer`**, **`WriteTxn` / `ReadTxn`**, **`AttachPolicy::new`** with
+  `require_seal` / `require_event_flag`, **`Error::InvalidDescriptor`** and
+  **`rsbinder_fmq::Errno`**: see Migrating.
 - **`to_bytes_into` and `from_bytes_in`**: `to_bytes` and `from_bytes` on a
   buffer the caller keeps. `to_bytes_into(&value, &mut out)` appends to `out`
   the bytes `to_bytes` returns, wherever `out` ends, and on an error leaves
@@ -547,9 +930,22 @@ Each item below changes what a 0.12.0 program observes.
   `AsyncFd::register_with_interest`; the constructors it replaces are
   deprecated there as unsound (tokio #8587). `rsbinder` itself makes no new
   call; the workspace shares one floor.
+- **Types whose drop ends something are `#[must_use]`**: `stream::Sink`
+  (ends the stream as failed), `stream::Receiver` (cancels it),
+  `DeathSignal` (unregisters the notification), `hub::AccessorProviderHandle`
+  (un-registers the provider), `reconnect::Reconnecting` (closes the helper)
+  and `bridge::Rewrap` (unlinks its wrappers). A value of one of them left
+  unused, `add_accessor_provider(set, f)?;` for one, now warns; the
+  attribute reaches through `?`. A provider meant to stay registered calls
+  `keep_for_process`.
 
 ### Fixed
 
+- **Interface code generated with `Builder::set_async_support(false)`
+  compiles against rsbinder with its `async` feature on** (the default); it
+  failed with `cannot find type BnFoo`. Code generated with async support
+  and built against rsbinder without `async` fails with one error that
+  names the fix (enable `async`/`tokio`, or `set_async_support(false)`).
 - **A `dump` of `rsb_hub` no longer waits on the caller.** The hub has one
   binder thread, and 0.12.0 wrote the dump, or the reason it was denied, to
   the caller's fd on that thread: a caller that passed a pipe and did not

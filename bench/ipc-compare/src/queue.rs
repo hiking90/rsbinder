@@ -42,11 +42,7 @@ where
 pub fn fmq(cpus: (usize, usize), count: u64) -> rsbinder::fmq::Result<f64> {
     let pair = || -> rsbinder::fmq::Result<(MessageQueue<u64>, MessageQueue<u64>)> {
         let writer = MessageQueue::<u64>::create(CAPACITY, false)?;
-        let policy = AttachPolicy {
-            max_capacity: CAPACITY,
-            require_seal: false,
-            require_event_flag: false,
-        };
+        let policy = AttachPolicy::new(CAPACITY).require_seal(false);
         let reader = MessageQueue::<u64>::attach(&writer.descriptor()?, &policy)?;
         Ok((writer, reader))
     };
@@ -58,15 +54,15 @@ pub fn fmq(cpus: (usize, usize), count: u64) -> rsbinder::fmq::Result<f64> {
         move |count| {
             let mut one = [0u64];
             for i in 0..count {
-                while !a2b_w.write(&[i]).expect("write") {}
-                while !b2a_r.read(&mut one).expect("read") {}
+                while !a2b_w.write(&[i]).expect("write").is_done() {}
+                while !b2a_r.read(&mut one).expect("read").is_done() {}
             }
         },
         move |count| {
             let mut one = [0u64];
             for _ in 0..count {
-                while !a2b_r.read(&mut one).expect("read") {}
-                while !b2a_w.write(&one).expect("write") {}
+                while !a2b_r.read(&mut one).expect("read").is_done() {}
+                while !b2a_w.write(&one).expect("write").is_done() {}
             }
         },
     ))

@@ -31,12 +31,12 @@
 //! - `process_local_provider_resolves_root_via_resolve_helper`: removing the
 //!   `or_else(|| try_process_local_fallback(name))` from
 //!   `hub::servicemanager_16::dispatch_typed_service` (the *consume*-side wire-up) does not
-//!   break this test, because the test calls `resolve_via_process_local` directly;
+//!   break this test, because the test calls `try_resolve_via_process_local` directly;
 //!   `hub::servicemanager_16::tests` catches it
 //!   (`dispatch_falls_back_when_accessor_arm_binder_is_none`).
 //! - `resolve_via_process_local_keys_strictly_by_instance_name`: a provider that returns
 //!   `Some(_)` for every name *and* a registry that ignores its instance set, both at once,
-//!   resolve the `unknown` lookup, and the `is_none()` assertions fail. Either mutant alone
+//!   resolve the `unknown` lookup, and the `is_none` assertions fail. Either mutant alone
 //!   passes: the test provider answers only its own name. This is the contract the
 //!   `hub::servicemanager_16::dispatch_typed_service` fallback relies on; the dispatcher's own
 //!   routing is exercised by the unit tests in `hub::servicemanager_16::tests`.
@@ -51,14 +51,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rsbinder::hub::android_16::{
-    accessor_error_name, resolve_accessor, BnAccessor, IAccessor, ERROR_CONNECTION_INFO_NOT_FOUND,
-    ERROR_FAILED_TO_CONNECT_EACCES, ERROR_FAILED_TO_CONNECT_TO_SOCKET,
-    ERROR_FAILED_TO_CREATE_SOCKET, ERROR_UNSUPPORTED_SOCKET_FAMILY,
+    accessor_error_name, try_resolve_accessor, BnAccessor, IAccessor,
+    ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
+    ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
+    ERROR_UNSUPPORTED_SOCKET_FAMILY,
 };
-use rsbinder::rpc::{RpcProxy, RpcServer};
+use rsbinder::rpc::{RpcProxy, RpcServer, RpcServerHandle};
 use rsbinder::{
-    Interface, Parcel, ParcelFileDescriptor, Remotable, Result, SIBinder, Status, StatusCode,
-    Strong, TransactionCode, FIRST_CALL_TRANSACTION,
+    ExceptionCode, Interface, Parcel, ParcelFileDescriptor, Remotable, RemoteProxy, Result,
+    SIBinder, Status, StatusCode, Strong, TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 // ---- echo service (the RPC root behind the Accessor) ----------------
@@ -200,7 +201,7 @@ struct EchoServerGuard {
     path: PathBuf,
     calls: Arc<AtomicI64>,
     server: Arc<RpcServer>,
-    bg: Option<thread::JoinHandle<()>>,
+    bg: Option<RpcServerHandle>,
 }
 
 impl EchoServerGuard {
@@ -209,9 +210,9 @@ impl EchoServerGuard {
         let calls = Arc::new(AtomicI64::new(0));
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(2); // android-16 v2 ceiling
-        server.set_max_threads(2);
+        server.set_max_threads(2).expect("set_max_threads");
         server.set_root(make_echo(calls.clone())).expect("set_root");
-        let bg = server.run_background();
+        let bg = server.run_background().expect("run_background");
         wait_for_sock(&path);
         EchoServerGuard {
             path,
@@ -224,9 +225,8 @@ impl EchoServerGuard {
 
 impl Drop for EchoServerGuard {
     fn drop(&mut self) {
-        self.server.stop_accepting();
         if let Some(bg) = self.bg.take() {
-            let _ = bg.join();
+            let _ = bg.stop_and_join();
         }
         let _ = std::fs::remove_file(&self.path);
     }
@@ -238,10 +238,10 @@ fn rpc_echo(root: &SIBinder, s: &str) -> Result<String> {
         .as_any()
         .downcast_ref::<RpcProxy>()
         .ok_or(StatusCode::BadType)?;
-    let mut data = rp.build_request(ECHO_DESC)?;
+    let mut data = rp.prepare_request(ECHO_DESC)?;
     data.write(&s.to_owned())?;
     let mut reply = rp
-        .transact(TX_ECHO, &data, 0)?
+        .submit_transact(TX_ECHO, &data, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = reply.read()?;
     if !st.is_ok() {
@@ -265,10 +265,7 @@ fn accessor_arm_resolves_root_and_echoes() {
         nonblocking: false,
     });
 
-    // `Service::Accessor` → `ServiceWithMetadata { Some(rpc_root), isLazyService: false }`.
-    let swm = resolve_accessor("test.echo", accessor).expect("bridge resolves");
-    assert!(!swm.r#isLazyService);
-    let root = swm.r#service.expect("bridge yields an RPC root binder");
+    let root = try_resolve_accessor("test.echo", accessor).expect("bridge yields an RPC root");
 
     // Exactly one `addConnection()` call (single-connection model).
     assert_eq!(addconn_calls.load(Ordering::SeqCst), 1);
@@ -298,8 +295,7 @@ fn kernel_parcel_refuses_the_accessor_root_wrapper() {
         nonblocking: false,
     });
 
-    let swm = resolve_accessor("test.echo", accessor).expect("bridge resolves");
-    let root = swm.r#service.expect("bridge yields an RPC root binder");
+    let root = try_resolve_accessor("test.echo", accessor).expect("bridge yields an RPC root");
 
     let mut p = Parcel::new();
     assert_eq!(
@@ -326,16 +322,24 @@ fn accessor_instance_name_mismatch_rejects() {
         nonblocking: false,
     });
 
-    assert!(
-        resolve_accessor("test.echo", accessor).is_none(),
-        "instance-name mismatch must reject"
-    );
+    // AOSP `validateAccessor` answers a mismatch with `NAME_NOT_FOUND`.
+    let err = try_resolve_accessor("test.echo", accessor).expect_err("mismatch must reject");
+    assert_eq!(err.exception_code(), ExceptionCode::TransactionFailed);
+    assert_eq!(err.transaction_error(), StatusCode::NameNotFound);
     // As AOSP `validateAccessor`: reject before a misbehaving Accessor gets a socket.
     assert_eq!(
         addconn_calls.load(Ordering::SeqCst),
         0,
         "instance-name reject must short-circuit before addConnection()"
     );
+}
+
+/// A binder that is not an `IAccessor` is `BadType`, as AOSP `validateAccessor` returns.
+#[test]
+fn accessor_cast_failure_is_bad_type() {
+    let not_an_accessor = make_echo(Arc::new(AtomicI64::new(0)));
+    let err = try_resolve_accessor("test.echo", not_an_accessor).expect_err("cast must fail");
+    assert_eq!(err.transaction_error(), StatusCode::BadType);
 }
 
 // ---- mutant 2: addConnection ServiceSpecificError reject ------------
@@ -358,10 +362,10 @@ fn accessor_add_connection_service_specific_error_rejects() {
             addconnection_calls: calls.clone(),
             nonblocking: false,
         });
-        assert!(
-            resolve_accessor("test.echo", accessor).is_none(),
-            "ERROR={code} must reject"
-        );
+        // The accessor's own `Status` comes back unchanged, as AOSP `toBinderService` returns it.
+        let err = try_resolve_accessor("test.echo", accessor).expect_err("ERROR must reject");
+        assert_eq!(err.exception_code(), ExceptionCode::ServiceSpecific);
+        assert_eq!(err.service_specific_error(), code, "ERROR={code}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
@@ -381,8 +385,7 @@ fn accessor_root_keeps_session_alive_then_terminates_on_drop() {
         addconnection_calls: addconn_calls.clone(),
         nonblocking: false,
     });
-    let swm = resolve_accessor("test.echo", accessor).expect("bridge");
-    let root = swm.r#service.expect("root");
+    let root = try_resolve_accessor("test.echo", accessor).expect("bridge");
     // The wrapper holds the `RpcSession` the caller never sees.
     assert_eq!(rpc_echo(&root, "alive").unwrap(), "alive");
 
@@ -429,9 +432,8 @@ fn accessor_arm_handles_nonblocking_fd_from_libbinder() {
         // Faithfully mimic AOSP: returned fd has `O_NONBLOCK` set.
         nonblocking: true,
     });
-    let swm = resolve_accessor("test.echo", accessor)
+    let root = try_resolve_accessor("test.echo", accessor)
         .expect("bridge must clear O_NONBLOCK before the v2 handshake");
-    let root = swm.r#service.expect("RPC root");
     assert_eq!(addconn_calls.load(Ordering::SeqCst), 1);
 
     // Completes only because the bridge cleared the inherited `O_NONBLOCK`.
@@ -444,12 +446,27 @@ fn accessor_arm_handles_nonblocking_fd_from_libbinder() {
 // ---- process-local AccessorProvider fallback e2e --------------------
 
 use rsbinder::hub::android_16::{
-    add_accessor_provider, create_accessor, resolve_via_process_local, AccessorAddrProvider,
+    add_accessor_provider, create_accessor, try_resolve_via_process_local, AccessorAddrProvider,
     AccessorProviderFn, AccessorSockAddr,
 };
 use std::collections::HashSet;
 
-/// `add_accessor_provider` → `resolve_via_process_local` root echoes; see module doc gates.
+/// A provider answering only `want`, with an accessor that reports `reports` and dials `path`.
+fn provider_for(want: String, reports: String, path: PathBuf) -> AccessorProviderFn {
+    Box::new(move |name: &str| {
+        if name == want {
+            let addr_provider: AccessorAddrProvider = Box::new({
+                let p = path.clone();
+                move |_| Ok(AccessorSockAddr::Unix(p.clone()))
+            });
+            Some(create_accessor(reports.clone(), addr_provider))
+        } else {
+            None
+        }
+    })
+}
+
+/// `add_accessor_provider` → `try_resolve_via_process_local` root echoes; see module doc gates.
 #[test]
 fn process_local_provider_resolves_root_via_resolve_helper() {
     let server = EchoServerGuard::start("a5-helper");
@@ -458,28 +475,14 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
     let instance = format!("rsb.test.a5.helper.{}.{}", std::process::id(), line!());
 
     // A `LocalAccessor` whose `addr_provider` always returns the server's UDS path.
-    let server_path = server.path.clone();
-    let provider: AccessorProviderFn = {
-        let want = instance.clone();
-        Box::new(move |name: &str| {
-            if name == want {
-                let addr_provider: AccessorAddrProvider = Box::new({
-                    let p = server_path.clone();
-                    move |_| Ok(AccessorSockAddr::Unix(p.clone()))
-                });
-                Some(create_accessor(name, addr_provider))
-            } else {
-                None
-            }
-        })
-    };
+    let provider = provider_for(instance.clone(), instance.clone(), server.path.clone());
     let provider_handle =
         add_accessor_provider(HashSet::from([instance.clone()]), provider).expect("registry add");
 
-    // Public entrypoint: combined `getInjectedAccessor` + `toBinder` path.
-    let swm = resolve_via_process_local(&instance).expect("process-local fallback yields root SWM");
-    assert!(!swm.r#isLazyService, "RPC root is never a LazyService");
-    let root = swm.r#service.expect("RPC root binder");
+    // Public entrypoint: combined `getInjectedAccessor` + `toBinderService` path.
+    let root = try_resolve_via_process_local(&instance)
+        .expect("process-local fallback yields root")
+        .expect("a provider claims the instance");
 
     // An echo proves `addr_provider` ran and `addConnection` reached the server's listener.
     assert_eq!(
@@ -491,7 +494,7 @@ fn process_local_provider_resolves_root_via_resolve_helper() {
     drop(provider_handle);
 }
 
-/// Unregistered names stay `None` even beside a sibling registration; see module doc gates.
+/// Unregistered names find nothing even beside a sibling registration; see module doc.
 #[test]
 fn resolve_via_process_local_keys_strictly_by_instance_name() {
     let server = EchoServerGuard::start("a5-fallback");
@@ -500,44 +503,81 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
         std::process::id(),
         line!()
     );
-    // An instance no provider ever claimed yields `None`, not a phantom binder.
-    assert!(
-        resolve_via_process_local(&unknown).is_none(),
-        "unregistered name must not yield a phantom binder"
-    );
+    // An instance no provider ever claimed is `Ok(None)`, not a phantom binder.
+    let found = try_resolve_via_process_local(&unknown).expect("a lookup, not an error");
+    assert!(found.is_none(), "unregistered name");
 
     // A provider for a *different* instance must answer only its registered name.
     let target = format!("rsb.test.a5.targeted.{}.{}", std::process::id(), line!());
-    let server_path = server.path.clone();
-    let provider: AccessorProviderFn = {
-        let want = target.clone();
-        Box::new(move |name: &str| {
-            if name == want {
-                let addr_provider: AccessorAddrProvider = Box::new({
-                    let p = server_path.clone();
-                    move |_| Ok(AccessorSockAddr::Unix(p.clone()))
-                });
-                Some(create_accessor(name, addr_provider))
-            } else {
-                None
-            }
-        })
-    };
+    let provider = provider_for(target.clone(), target.clone(), server.path.clone());
     // Named, not `_`: dropping the RAII handle unregisters the provider.
     let provider_handle =
         add_accessor_provider(HashSet::from([target.clone()]), provider).expect("registry add");
 
-    // Unregistered name still None after registration of a sibling.
+    let found = try_resolve_via_process_local(&unknown).expect("a lookup, not an error");
     assert!(
-        resolve_via_process_local(&unknown).is_none(),
+        found.is_none(),
         "registered sibling must not leak into unrelated names"
     );
-    // Target name resolves.
     assert!(
-        resolve_via_process_local(&target).is_some(),
+        matches!(try_resolve_via_process_local(&target), Ok(Some(_))),
         "registered name must resolve"
     );
     drop(provider_handle);
+}
+
+/// A provider's accessor that reports another instance is `InvalidOperation`, never a root.
+#[test]
+fn process_local_instance_mismatch_is_invalid_operation() {
+    let server = EchoServerGuard::start("a5-mismatch");
+    let target = format!("rsb.test.a5.mismatch.{}.{}", std::process::id(), line!());
+    // AOSP `getInjectedAccessor` answers a failed `validateAccessor` with `INVALID_OPERATION`.
+    let provider = provider_for(
+        target.clone(),
+        "evil.imposter".to_string(),
+        server.path.clone(),
+    );
+    let provider_handle =
+        add_accessor_provider(HashSet::from([target.clone()]), provider).expect("registry add");
+    let err = try_resolve_via_process_local(&target).expect_err("mismatch must reject");
+    assert_eq!(err.transaction_error(), StatusCode::InvalidOperation);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+    drop(provider_handle);
+}
+
+/// The deprecated `Option` forms are the `try_` forms with the error dropped.
+#[test]
+#[expect(
+    deprecated,
+    reason = "pins the deprecated Option forms while they are kept"
+)]
+fn deprecated_option_forms_wrap_the_try_forms() {
+    use rsbinder::hub::android_16::{resolve_accessor, resolve_via_process_local};
+
+    let server = EchoServerGuard::start("a5-deprecated");
+    let ok = make_mock_accessor(MockAccessor {
+        server_path: server.path.clone(),
+        name: "test.echo".to_string(),
+        add_connection_error: None,
+        addconnection_calls: Arc::new(AtomicU32::new(0)),
+        nonblocking: false,
+    });
+    let swm = resolve_accessor("test.echo", ok).expect("bridge resolves");
+    assert!(!swm.r#isLazyService, "an RPC root is never a LazyService");
+    let root = swm.r#service.expect("an RPC root binder");
+    assert_eq!(rpc_echo(&root, "wrapped").unwrap(), "wrapped");
+
+    let imposter = make_mock_accessor(MockAccessor {
+        server_path: server.path.clone(),
+        name: "evil.imposter".to_string(),
+        add_connection_error: None,
+        addconnection_calls: Arc::new(AtomicU32::new(0)),
+        nonblocking: false,
+    });
+    assert!(resolve_accessor("test.echo", imposter).is_none());
+
+    let unknown = format!("rsb.test.a5.deprecated.{}.{}", std::process::id(), line!());
+    assert!(resolve_via_process_local(&unknown).is_none());
 }
 
 // ---- sanity: accessor_error_name surface lock -----------------------
@@ -546,7 +586,7 @@ fn resolve_via_process_local_keys_strictly_by_instance_name() {
 fn accessor_error_name_unknown_codes_safe() {
     // Non-ServiceSpecific statuses read as `0`, so another `ERROR_*=0` would mask failures.
     assert_eq!(accessor_error_name(0), "ERROR_CONNECTION_INFO_NOT_FOUND");
-    // Each name is what `resolve_accessor`'s operator-facing log line shows.
+    // Each name is what `try_resolve_accessor`'s operator-facing log line shows.
     for (code, name) in [
         (
             ERROR_CONNECTION_INFO_NOT_FOUND,

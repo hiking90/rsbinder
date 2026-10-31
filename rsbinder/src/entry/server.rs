@@ -23,16 +23,21 @@ pub type Authorizer = Box<dyn Fn(&crate::rpc::PeerIdentity) -> bool + Send + Syn
 pub struct ServeOptions {
     /// RPC: `RpcServer::set_max_threads`.
     ///
-    /// Kernel: **[`KernelEndpoint::with_threads`](super::KernelEndpoint::with_threads)
-    /// (`binder://?threads=`) is the only form that takes effect.**
-    /// [`serve`](super::serve) initializes the
-    /// process-wide `ProcessState` — where the kernel pool size is
-    /// fixed, once, for the life of the process — before this option
-    /// can be read, so a value set here is only compared against the
-    /// pool already in force, and a *different* one is
-    /// [`StatusCode::BadValue`] at [`run`](Server::run) /
-    /// [`spawn`](Server::spawn). A value equal to the pool in force is
-    /// accepted (it asks for what is already true).
+    /// Kernel: the binder thread-pool ceiling, applied at
+    /// [`run`](Server::run) / [`spawn`](Server::spawn) with
+    /// [`ProcessState::set_max_threads`] (`BINDER_SET_MAX_THREADS`, AOSP
+    /// `setThreadPoolMaxThreadCount`) when it differs from the ceiling in
+    /// force. [`KernelEndpoint::with_threads`](super::KernelEndpoint::with_threads)
+    /// (`binder://?threads=`) is the same setting: it sizes the pool when
+    /// [`serve`](super::serve) is the call that initializes `ProcessState`,
+    /// and is otherwise applied at `run` / `spawn` the same way. Both given
+    /// and different is [`StatusCode::BadValue`].
+    ///
+    /// The ceiling is process-wide, so the last server to start sets it.
+    /// Once the pool has started (the first kernel `run` / `spawn`, or
+    /// [`ProcessState::start_thread_pool`]) it may grow but not shrink: a
+    /// smaller value is [`StatusCode::InvalidOperation`] and leaves the
+    /// ceiling as it was.
     pub threads: Option<u32>,
     /// Kernel: the size of the mapping this process receives
     /// transactions into — [`ProcessState::init_with_mmap_size`], where
@@ -41,12 +46,13 @@ pub struct ServeOptions {
     /// default.
     ///
     /// **[`KernelEndpoint::with_mmap_size`](super::KernelEndpoint::with_mmap_size)
-    /// (`binder://?mmap=`) is the only form that takes effect**, for the
-    /// same reason as [`threads`](Self::threads): the mapping is made when [`serve`](super::serve) initializes
-    /// `ProcessState`, before this option is read. A value set here is
-    /// only compared against the mapping already in force, and a
-    /// *different* one (after page rounding) is [`StatusCode::BadValue`]
-    /// at [`run`](Server::run) / [`spawn`](Server::spawn).
+    /// (`binder://?mmap=`) is the only form that takes effect.** The
+    /// mapping is made once, when [`serve`](super::serve) initializes
+    /// `ProcessState`, before this option is read, and a mapped region
+    /// cannot be resized. A value set here is only compared against the
+    /// mapping in force: a *different* one (after page rounding) is
+    /// [`StatusCode::BadValue`] at [`run`](Server::run) /
+    /// [`spawn`](Server::spawn), the same one is accepted.
     pub mmap_size: Option<usize>,
     /// RPC: `RpcServer::set_max_connections`.
     pub max_connections: Option<usize>,
@@ -54,14 +60,13 @@ pub struct ServeOptions {
     /// "leave it alone" — the setter is not called and the server keeps
     /// its 10 s default. It is *not* the setter's own `None` (deadline
     /// deliberately disabled), which this facade cannot express.
-    /// `Some(Duration::ZERO)` is passed through and refused by the
-    /// setter, which keeps the 10 s default (`idle_timeout` treats a
-    /// zero the other way — as `None`).
+    /// `Some(Duration::ZERO)` is not a deadline: [`run`](Server::run) /
+    /// [`spawn`](Server::spawn) refuse it with [`StatusCode::BadValue`],
+    /// as the setter does, and so for `idle_timeout` and `reply_timeout`.
     pub handshake_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_idle_timeout`. `None` here means "leave it
     /// alone"; the server's own default is already `None` (no idle
-    /// deadline), so the two coincide. `Some(Duration::ZERO)` is passed
-    /// through and the setter treats it as `None`.
+    /// deadline), so the two coincide.
     pub idle_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_reply_timeout` — bounds the wait for a reply
     /// to a callback this server issues to a client outside a handler of
@@ -70,7 +75,8 @@ pub struct ServeOptions {
     /// callbacks to clients it does not control (see
     /// [`ClientOptions::incoming_connections`](super::ClientOptions::incoming_connections),
     /// the client side of that path). Its expiry ends the session with
-    /// that client.
+    /// that client. The client side of the same deadline is
+    /// [`ClientOptions::timeout`](super::ClientOptions::timeout).
     pub reply_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_authorizer` — accept/reject a peer by identity.
     #[cfg(feature = "rpc")]
@@ -98,6 +104,25 @@ pub struct ServeOptions {
     pub call_restriction: Option<CallRestriction>,
 }
 
+impl std::fmt::Debug for ServeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("ServeOptions");
+        d.field("threads", &self.threads)
+            .field("mmap_size", &self.mmap_size)
+            .field("max_connections", &self.max_connections)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("reply_timeout", &self.reply_timeout);
+        #[cfg(feature = "rpc")]
+        d.field("authorizer", &self.authorizer.is_some());
+        #[cfg(feature = "rpc-tls")]
+        d.field("tls", &self.tls.is_some());
+        #[cfg(feature = "rpc")]
+        d.field("fd_modes", &self.fd_modes);
+        d.field("call_restriction", &self.call_restriction).finish()
+    }
+}
+
 /// A server being assembled by [`serve`](super::serve). Transport is
 /// fixed by the URI; services are added with [`add`](Self::add); then
 /// [`run`](Self::run) (blocking) or [`spawn`](Self::spawn).
@@ -105,8 +130,9 @@ pub struct ServeOptions {
 /// Kernel (`binder://`): construction initializes the process-wide
 /// [`ProcessState`] (idempotently — a second kernel server in the same
 /// process reuses it, and is refused with [`StatusCode::BadValue`] if it
-/// asked for a different driver, thread count or mapping size, which the
-/// process cannot give it). RPC: the listener is bound at `run`/`spawn` so
+/// asked for a different driver or mapping size, which are fixed at init).
+/// A different thread count is applied at `run`/`spawn` instead
+/// ([`ServeOptions::threads`]). RPC: the listener is bound at `run`/`spawn` so
 /// [`ServeOptions`] (TLS config, limits) can be applied first.
 ///
 /// On either transport, names given to [`add`](Self::add) are registered
@@ -132,10 +158,7 @@ pub struct Server {
 #[must_use = "dropping the guard stops an RPC server; bind it to a named variable"]
 pub struct ServerGuard {
     #[cfg(feature = "rpc")]
-    rpc: Option<(
-        std::sync::Arc<crate::rpc::RpcServer>,
-        std::thread::JoinHandle<()>,
-    )>,
+    rpc: Option<crate::rpc::RpcServerHandle>,
 }
 
 impl std::fmt::Debug for ServerGuard {
@@ -164,18 +187,14 @@ impl ServerGuard {
     /// counters. Mirrors [`super::Client::session`].
     #[cfg(feature = "rpc")]
     pub fn server(&self) -> Option<&std::sync::Arc<crate::rpc::RpcServer>> {
-        self.rpc.as_ref().map(|(s, _)| s)
+        self.rpc.as_ref().map(crate::rpc::RpcServerHandle::server)
     }
 
     fn stop(&mut self) {
         #[cfg(feature = "rpc")]
-        if let Some((server, jh)) = self.rpc.take() {
-            // Flag, then join, so nothing is accepted after this; then end what is connected.
-            server.stop_accepting();
-            if jh.join().is_err() {
-                log::warn!("RPC: accept loop thread panicked");
-            }
-            server.terminate();
+        if let Some(handle) = self.rpc.take() {
+            // The accept thread logged a fatal error; this caller has no use for it.
+            let _ = handle.stop_and_join();
         }
     }
 }
@@ -189,7 +208,8 @@ impl Drop for ServerGuard {
 pub(super) fn new_server(uri: Uri) -> Result<Server> {
     uri.validate()?;
     if let Endpoint::Kernel(k) = &uri.endpoint {
-        kernel_init(k.driver(), k.threads(), k.mmap_size())?;
+        // `?threads=` sizes a first init here; on a state that exists, `run`/`spawn` applies it.
+        kernel_state(k.driver(), k.threads(), k.mmap_size())?;
     }
     #[cfg(not(feature = "rpc"))]
     if !uri.endpoint.is_kernel() {
@@ -206,12 +226,33 @@ pub(super) fn new_server(uri: Uri) -> Result<Server> {
     })
 }
 
-/// Idempotent kernel `ProcessState` init; `None` asks for nothing, a mismatch is `BadValue`.
+/// `kernel_state` with the thread count compared too: the client path, which never resizes.
 pub(super) fn kernel_init(
     driver: Option<&std::path::Path>,
     max_threads: Option<u32>,
     mmap_size: Option<usize>,
 ) -> Result<()> {
+    let ps = kernel_state(driver, max_threads, mmap_size)?;
+    if max_threads.is_some_and(|n| n != ps.max_threads()) {
+        log::error!(
+            "rsbinder: ProcessState is already initialized with max_threads={}; requested \
+             max_threads={max_threads:?} cannot be applied by a client — initialize once, or \
+             omit the option",
+            ps.max_threads()
+        );
+        return Err(StatusCode::BadValue);
+    }
+    Ok(())
+}
+
+/// Idempotent kernel `ProcessState` init; `max_threads` sizes a first init only.
+///
+/// `None` asks for nothing; a driver or mapping mismatch is `BadValue`.
+pub(super) fn kernel_state(
+    driver: Option<&std::path::Path>,
+    max_threads: Option<u32>,
+    mmap_size: Option<usize>,
+) -> Result<&'static ProcessState> {
     // Normalize first: a bad size is `BadValue` (not `NoInit`) and compares as the kernel maps it.
     let mmap_size = mmap_size
         .map(ProcessState::normalized_mmap_size)
@@ -223,7 +264,8 @@ pub(super) fn kernel_init(
         })?,
         None => ProcessState::default_driver_path(),
     };
-    let ps = ProcessState::init_with_mmap_size(
+    // Not `init_with_mmap_size`: an option left `None` must accept whatever state exists.
+    let ps = ProcessState::init_or_existing(
         driver_path,
         max_threads.unwrap_or(crate::DEFAULT_MAX_BINDER_THREADS),
         mmap_size.unwrap_or_else(ProcessState::default_mmap_size),
@@ -234,20 +276,19 @@ pub(super) fn kernel_init(
     })?;
     // Check what `init` returned: a pre-init `is_initialized()` sample misses a racing init.
     let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
-    let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
     let mmap_mismatch = mmap_size.is_some_and(|n| n != ps.mmap_size());
-    if driver_mismatch || threads_mismatch || mmap_mismatch {
+    if driver_mismatch || mmap_mismatch {
         log::error!(
-            "rsbinder: ProcessState is already initialized with driver={:?} max_threads={} \
-             mmap_size={}; requested driver={driver:?} max_threads={max_threads:?} \
-             mmap_size={mmap_size:?} cannot be applied — initialize once, or omit the option",
+            "rsbinder: ProcessState is already initialized with driver={:?} mmap_size={}; \
+             requested driver={driver:?} mmap_size={mmap_size:?} cannot be applied — the \
+             device and the receive mapping are fixed at init; initialize once, or omit the \
+             option",
             ps.driver_name(),
-            ps.max_threads(),
             ps.mmap_size()
         );
         return Err(StatusCode::BadValue);
     }
-    Ok(())
+    Ok(ps)
 }
 
 impl Server {
@@ -321,8 +362,9 @@ impl Server {
 
     /// Start serving in the background. Kernel: as [`run`](Self::run)
     /// without the join — every name is registered when this returns `Ok`
-    /// (the returned guard is inert). RPC: accept loop on its own thread;
-    /// dropping the guard shuts it down.
+    /// (the returned guard is inert). RPC: accept loop on its own thread
+    /// (`RpcServer::run_background`); dropping the guard shuts it down. A
+    /// thread the OS refuses to create is the `Err`.
     pub fn spawn(self) -> Result<ServerGuard> {
         match self.uri.endpoint {
             Endpoint::Kernel(_) => {
@@ -334,11 +376,8 @@ impl Server {
             }
             #[cfg(feature = "rpc")]
             _ => {
-                let server = self.build_rpc()?;
-                let jh = server.run_background();
-                Ok(ServerGuard {
-                    rpc: Some((server, jh)),
-                })
+                let handle = self.build_rpc()?.run_background()?;
+                Ok(ServerGuard { rpc: Some(handle) })
             }
             #[cfg(not(feature = "rpc"))]
             _ => Err(StatusCode::InvalidOperation),
@@ -383,9 +422,29 @@ impl Server {
         if o.tls.is_some() {
             return Err(self.reject("tls"));
         }
-        if o.threads.is_some() || o.mmap_size.is_some() {
-            // Both are fixed at init; re-running init makes a mismatch `BadValue`, as in a URI.
-            kernel_init(None, o.threads, o.mmap_size)?;
+        if o.mmap_size.is_some() {
+            // Fixed at init; re-running init makes a mismatch `BadValue`, as in a URI.
+            kernel_state(None, None, o.mmap_size)?;
+        }
+        let from_uri = match &self.uri.endpoint {
+            Endpoint::Kernel(k) => k.threads(),
+            _ => None,
+        };
+        let threads = match (o.threads, from_uri) {
+            (Some(opt), Some(uri)) if opt != uri => {
+                log::error!(
+                    "rsbinder::serve: ServeOptions::threads={opt} conflicts with the URI's \
+                     ?threads={uri} — give the value once"
+                );
+                return Err(StatusCode::BadValue);
+            }
+            (opt, uri) => opt.or(uri),
+        };
+        if let Some(n) = threads {
+            let ps = ProcessState::as_self();
+            if n != ps.max_threads() {
+                ps.set_max_threads(n)?;
+            }
         }
         if let Some(cr) = o.call_restriction {
             ProcessState::as_self().set_call_restriction(cr);
@@ -474,20 +533,21 @@ impl Server {
             server.set_android13plus(v.get());
         }
         if let Some(n) = o.threads {
-            server.set_max_threads(n);
+            server.set_max_threads(n)?;
         }
         if let Some(n) = o.max_connections {
             server.set_max_connections(n);
         }
+        // A zero duration is `BadValue` from each setter, before any name is registered.
         if let Some(t) = o.handshake_timeout {
-            server.set_handshake_timeout(Some(t));
+            server.set_handshake_timeout(Some(t))?;
         }
         if let Some(t) = o.idle_timeout {
-            server.set_idle_timeout(Some(t));
+            server.set_idle_timeout(Some(t))?;
         }
         // Set before `run`: it is read once per session, when the founding connection is accepted.
         if let Some(t) = o.reply_timeout {
-            server.set_reply_timeout(Some(t));
+            server.set_reply_timeout(Some(t))?;
         }
         if let Some(f) = o.authorizer {
             server.set_authorizer(f);
@@ -509,5 +569,16 @@ impl Server {
             server.add_service(&name, binder)?;
         }
         Ok(server)
+    }
+}
+
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.pending.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("Server")
+            .field("uri", &format_args!("{}", self.uri))
+            .field("services", &names)
+            .field("options", &self.options)
+            .finish()
     }
 }

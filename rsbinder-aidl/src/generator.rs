@@ -220,6 +220,9 @@ pub mod {{mod}} {
 const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
+    {%- if enabled_async %}
+    {{crate}}::__require_async! {}
+    {%- endif %}
     {%- for member in const_members %}
     {%- if member.3 %}
     {{ member.3 }}
@@ -276,7 +279,7 @@ pub mod {{mod}} {
     /// The type parameter selects the async pool that drives the underlying blocking
     /// transact; with the default `tokio` feature use `rsbinder::Tokio`. Obtain a handle by
     /// upgrading a sync proxy with `Strong::into_async::<rsbinder::Tokio>()`, or
-    /// directly via `rsbinder::get_interface_async::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
+    /// directly via `rsbinder::try_get_interface_async::<dyn {{name}}Async<rsbinder::Tokio>>(name).await`.
     /// A `type {{name}}AsyncTokio = dyn {{name}}Async<rsbinder::Tokio>;` alias is a
     /// handy way to avoid repeating the turbofish. Requires the `async` (and,
     /// for `Tokio`, `tokio`) feature.
@@ -465,18 +468,19 @@ pub mod {{mod}} {
                 {%- endfor %}
             ],
             {%- endif %}
+            local_transport: enabled,
         }
     }
     impl {{ bp_name }} {
         {%- for member in fn_members %}
         fn build_parcel_{{ member.identifier }}({{ member.args }}) -> {{crate}}::Result<{{crate}}::Parcel> {
             {%- if member.write_funcs|length > 0 %}
-            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- for func in member.write_funcs %}
             {{ func }}
             {%- endfor %}
             {%- else %}
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- endif %}
             ::core::result::Result::Ok(data)
         }
@@ -509,7 +513,7 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
         fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
@@ -523,7 +527,7 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
         fn build_parcel_getInterfaceHash(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<::std::string::String> {
@@ -542,9 +546,9 @@ pub mod {{mod}} {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }})
-                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL));
+                .in_scope(|| self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL));
             {%- else %}
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL);
             {%- endif %}
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
@@ -560,9 +564,9 @@ pub mod {{mod}} {
             let _aidl_data = self.build_parcel_getInterfaceVersion()?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion)
-                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
+                .in_scope(|| self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
             {%- else %}
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
             {%- endif %}
             self.read_response_getInterfaceVersion(_aidl_reply)
         }
@@ -575,9 +579,9 @@ pub mod {{mod}} {
             let _aidl_data = self.build_parcel_getInterfaceHash()?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash)
-                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
+                .in_scope(|| self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
             {%- else %}
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
             {%- endif %}
             self.read_response_getInterfaceHash(_aidl_reply)
         }
@@ -594,11 +598,11 @@ pub mod {{mod}} {
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }});
-            __RsbPool::spawn(
-                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || _aidl_span.in_scope(|| binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
             {%- else %}
-            __RsbPool::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
             {%- endif %}
                 move |_aidl_reply| async move {
                     {%- if member.func_call_params|length > 0 %}
@@ -621,11 +625,11 @@ pub mod {{mod}} {
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion);
-            __RsbPool::spawn(
-                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || _aidl_span.in_scope(|| binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
             {%- else %}
-            __RsbPool::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
             {%- endif %}
                 move |_aidl_reply| async move {
                     self.read_response_getInterfaceVersion(_aidl_reply)
@@ -645,11 +649,11 @@ pub mod {{mod}} {
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash);
-            __RsbPool::spawn(
-                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || _aidl_span.in_scope(|| binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
             {%- else %}
-            __RsbPool::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
             {%- endif %}
                 move |_aidl_reply| async move {
                     self.read_response_getInterfaceHash(_aidl_reply)
@@ -662,7 +666,16 @@ pub mod {{mod}} {
     {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>> {
-            self.0.as_async().r#{{ member.identifier }}({{ member.func_call_params }})
+            match self.0.try_as_async() {
+                ::core::option::Option::Some(_aidl_service) => _aidl_service.r#{{ member.identifier }}({{ member.func_call_params }}),
+                // Sync-only: the in-process transport, as the async cast gives (plan 17 D-24).
+                ::core::option::Option::None => {
+                    let _aidl_proxy = {{ bp_name }}::__rsb_local({{crate}}::Interface::as_binder(self));
+                    ::std::boxed::Box::pin(async move {
+                        <{{ bp_name }} as {{name}}Async<__RsbPool>>::r#{{ member.identifier }}(&_aidl_proxy{% if member.func_call_params|length > 0 %}, {{ member.func_call_params }}{% endif %}).await
+                    })
+                }
+            }
         }
         {%- endfor %}
     }
@@ -678,21 +691,29 @@ pub mod {{mod}} {
         }
         {%- endfor %}
         {%- if version is number %}
-        // Forward so an in-process call sees the same override `on_transact` dispatches to.
+        // The service's override, clamped as `on_transact` clamps it (plan 17 D-16).
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             {%- if enabled_async %}
-            self.0.as_sync().r#getInterfaceVersion()
+            self.0.as_sync().r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION))
             {%- else %}
-            self.0.r#getInterfaceVersion()
+            self.0.r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION))
             {%- endif %}
         }
         {%- endif %}
         {%- if hash %}
         fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             {%- if enabled_async %}
-            self.0.as_sync().r#getInterfaceHash()
+            let _aidl_service = self.0.as_sync();
             {%- else %}
-            self.0.r#getInterfaceHash()
+            let _aidl_service = &*self.0;
+            {%- endif %}
+            {%- if version is number %}
+            match _aidl_service.r#getInterfaceVersion() {
+                ::core::result::Result::Ok(_aidl_v) if _aidl_v > VERSION => ::core::result::Result::Ok(::std::string::String::from(HASH)),
+                _ => _aidl_service.r#getInterfaceHash(),
+            }
+            {%- else %}
+            _aidl_service.r#getInterfaceHash()
             {%- endif %}
         }
         {%- endif %}
@@ -701,8 +722,9 @@ pub mod {{mod}} {
     /// re-published as a local service on another transport in one line:
     /// `{{ bn_name }}::new_binder(upstream)` (the **gateway** pattern —
     /// `new_binder` takes any `T: {{ name }} + Send + Sync + 'static`).
-    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-    /// forwarded as-is is refused at the stack boundary.
+    /// A gateway that has to change some methods (a binder argument crossing
+    /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+    /// stack boundary) implements `{{ name }}Delegate` instead.
     impl {{ name }} for {{crate}}::Strong<dyn {{ name }}> {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
@@ -718,6 +740,47 @@ pub mod {{mod}} {
         {%- if hash %}
         fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             (**self).r#getInterfaceHash()
+        }
+        {%- endif %}
+    }
+    /// Per-method hooks for a gateway that re-publishes a `{{ name }}`: each
+    /// method gets the upstream handle and by default forwards the call to it
+    /// unchanged. Override the methods to change and publish with
+    /// `{{ bn_name }}::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+    /// A binder argument is forwarded as it is, which is right when caller and
+    /// upstream share one stack; across stacks it is refused, so override that
+    /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+    pub trait {{ name }}Delegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}(&self, _aidl_upstream: &{{crate}}::Strong<dyn {{ name }}>{{ member.args | trim_start_matches(pat="&self") }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
+            _aidl_upstream.r#{{ member.identifier }}({{ member.func_call_params }})
+        }
+        {%- endfor %}
+        {%- if version is number %}
+        fn r#getInterfaceVersion(&self, _aidl_upstream: &{{crate}}::Strong<dyn {{ name }}>) -> {{crate}}::BinderResult<i32> {
+            _aidl_upstream.r#getInterfaceVersion()
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self, _aidl_upstream: &{{crate}}::Strong<dyn {{ name }}>) -> {{crate}}::BinderResult<::std::string::String> {
+            _aidl_upstream.r#getInterfaceHash()
+        }
+        {%- endif %}
+    }
+    impl<__RsbHooks: {{ name }}Delegate> {{ name }} for {{crate}}::bridge::Delegating<dyn {{ name }}, __RsbHooks> {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
+            <__RsbHooks as {{ name }}Delegate>::r#{{ member.identifier }}({{crate}}::bridge::Delegating::hooks(self), {{crate}}::bridge::Delegating::upstream(self), {{ member.func_call_params }})
+        }
+        {%- endfor %}
+        {%- if version is number %}
+        fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
+            <__RsbHooks as {{ name }}Delegate>::r#getInterfaceVersion({{crate}}::bridge::Delegating::hooks(self), {{crate}}::bridge::Delegating::upstream(self))
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
+            <__RsbHooks as {{ name }}Delegate>::r#getInterfaceHash({{crate}}::bridge::Delegating::hooks(self), {{crate}}::bridge::Delegating::upstream(self))
         }
         {%- endif %}
     }
@@ -760,7 +823,8 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
             transactions::r#getInterfaceVersion => {
-                let _aidl_return = _service.r#getInterfaceVersion();
+                // At most VERSION: a newer one's methods are not dispatched here (plan 17 D-16).
+                let _aidl_return = _service.r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION));
                 match &_aidl_return {
                     ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
@@ -775,7 +839,15 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
             transactions::r#getInterfaceHash => {
+                {%- if version is number %}
+                // A clamped version answers with this module's HASH (plan 17 D-16).
+                let _aidl_return = match _service.r#getInterfaceVersion() {
+                    ::core::result::Result::Ok(_aidl_v) if _aidl_v > VERSION => ::core::result::Result::Ok(::std::string::String::from(HASH)),
+                    _ => _service.r#getInterfaceHash(),
+                };
+                {%- else %}
                 let _aidl_return = _service.r#getInterfaceHash();
+                {%- endif %}
                 match &_aidl_return {
                     ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
@@ -2107,6 +2179,7 @@ impl Generator {
             format!("Bp{stem}"),
             format!("{}Default", decl.name),
             format!("{}DefaultRef", decl.name),
+            format!("{}Delegate", decl.name),
         ];
         if self.enabled_async {
             generated_types.push(format!("Bn{stem}Adapter"));
@@ -2844,7 +2917,8 @@ mod tests {
     #[test]
     fn binder_impl_forwards_version_and_hash() {
         let source = "package t; interface IFoo { void m(); }";
-        for (enabled_async, call) in [(false, "self.0.r#"), (true, "self.0.as_sync().r#")] {
+        for (enabled_async, service) in [(false, "&*self.0"), (true, "self.0.as_sync()")] {
+            let call = service.trim_start_matches("&*").to_owned() + ".r#";
             let ctx = crate::SourceContext::new("t.aidl", source);
             let doc = crate::parse_document(&ctx).expect("parse");
             let out = Generator::new(enabled_async, false)
@@ -2856,13 +2930,31 @@ mod tests {
                 .find("impl IFoo for rsbinder::Binder<BnFoo>")
                 .expect("Binder impl");
             let block = &out[start..start + out[start..].find("\n    }\n").expect("impl end")];
+            // Plan 17 D-16: clamped to VERSION, and HASH when the service's version is above it.
             assert!(
-                block.contains(&format!("{call}getInterfaceVersion()")),
+                block.contains(&format!(
+                    "{call}getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION))"
+                )),
                 "{block}"
             );
             assert!(
-                block.contains(&format!("{call}getInterfaceHash()")),
+                block.contains(&format!("let _aidl_service = {service};")),
                 "{block}"
+            );
+            assert!(
+                block.contains("Ok(_aidl_v) if _aidl_v > VERSION => ::core::result::Result::Ok(::std::string::String::from(HASH))"),
+                "{block}"
+            );
+            assert!(
+                block.contains("_ => _aidl_service.r#getInterfaceHash(),"),
+                "{block}"
+            );
+            // `on_transact` answers the same way as the in-process impl.
+            assert!(
+                out.contains(
+                    "let _aidl_return = _service.r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION));"
+                ),
+                "{out}"
             );
         }
     }

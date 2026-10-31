@@ -41,12 +41,6 @@ fn warn_once() {
     }
 }
 
-/// `true` once the process-wide insecure warning has been emitted.
-/// Test/diagnostic hook.
-pub fn insecure_warning_emitted() -> bool {
-    INSECURE_WARNED.load(Ordering::SeqCst)
-}
-
 /// A framed transport over a plaintext TCP connection. Debug/interop
 /// only — see the module docs.
 pub struct TcpDebugTransport {
@@ -56,9 +50,21 @@ pub struct TcpDebugTransport {
     queue: OutQueue,
 }
 
+impl std::fmt::Debug for TcpDebugTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpDebugTransport")
+            .field("desc", &self.desc)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TcpDebugTransport {
     /// Wrap an accepted/connected `TcpStream` (sets `TCP_NODELAY`).
-    pub fn from_stream(stream: TcpStream) -> RpcResult<Self> {
+    pub fn from_stream(stream: TcpStream) -> crate::Result<Self> {
+        Ok(Self::wrap(stream)?)
+    }
+
+    fn wrap(stream: TcpStream) -> RpcResult<Self> {
         warn_once();
         // No `MSG_NOSIGNAL` on Apple, as `UnixTransport::from_stream`; EINVAL: both ways shut.
         #[cfg(target_vendor = "apple")]
@@ -89,20 +95,20 @@ impl TcpDebugTransport {
     /// finds no data returns `RpcError::Timeout` at once. An Accessor fd
     /// arrives non-blocking; [`crate::rpc::RpcSession::from_preconnected_fd`]
     /// clears the flag, this does not.
-    pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
+    pub fn from_owned_fd(fd: OwnedFd) -> crate::Result<Self> {
         Self::from_stream(TcpStream::from(fd))
     }
 
     /// Connect to `addr` (client side). Warns; identity is always
     /// [`PeerIdentity::Anonymous`].
-    pub fn connect(addr: SocketAddr) -> RpcResult<Self> {
+    pub fn connect(addr: SocketAddr) -> crate::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         Self::from_stream(stream)
     }
 
     /// Bind a listener on an ephemeral **loopback** port. The default,
     /// safe bind. Returns the raw listener for tests / bring-up.
-    pub fn bind_loopback() -> RpcResult<TcpListener> {
+    pub fn bind_loopback() -> crate::Result<TcpListener> {
         warn_once();
         Ok(TcpListener::bind(SocketAddr::from((
             Ipv4Addr::LOCALHOST,
@@ -113,7 +119,7 @@ impl TcpDebugTransport {
     /// Bind a listener on a caller-chosen, possibly **non-loopback**
     /// address. Separate name + extra warning so a non-loopback bind is
     /// always an explicit, visible choice (never an accident).
-    pub fn bind_insecure(addr: SocketAddr) -> RpcResult<TcpListener> {
+    pub fn bind_insecure(addr: SocketAddr) -> crate::Result<TcpListener> {
         warn_once();
         if !addr.ip().is_loopback() {
             log::warn!(
@@ -126,7 +132,7 @@ impl TcpDebugTransport {
 
     /// Connected loopback pair for hermetic tests (analogous to
     /// `UnixTransport::pair`): bind ephemeral loopback, connect, accept.
-    pub fn pair_loopback() -> RpcResult<(Self, Self)> {
+    pub fn pair_loopback() -> crate::Result<(Self, Self)> {
         let listener = Self::bind_loopback()?;
         let addr = listener.local_addr()?;
         let client = Self::connect(addr)?;
@@ -241,7 +247,6 @@ mod tests {
         // Identity is hard-wired Anonymous on both ends.
         assert_eq!(client.peer_identity(), PeerIdentity::Anonymous);
         assert_eq!(server.peer_identity(), PeerIdentity::Anonymous);
-        // `insecure_warning_emitted()` is process-global (another test may set it): not asserted.
 
         let client = Arc::new(client);
         for size in [0usize, 1, 64 * 1024, 1 << 20] {

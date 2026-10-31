@@ -229,8 +229,9 @@ fn mmap_shared(
             fd,
             map_offset,
         )
-    }?;
-    NonNull::new(raw.cast::<u8>()).ok_or(Error::Os(rustix::io::Errno::NOMEM))
+    }
+    .map_err(crate::error::os)?;
+    NonNull::new(raw.cast::<u8>()).ok_or(crate::error::os(rustix::io::Errno::NOMEM))
 }
 
 #[cfg(any(
@@ -504,7 +505,7 @@ mod tests {
     fn a_read_only_fd_refuses_a_writable_mapping() {
         let (file, page) = two_pages(std::fs::OpenOptions::new().read(true));
         let err = Mapping::map(file.as_fd(), 0, page as u64, Access::ReadWrite).unwrap_err();
-        assert_eq!(err, Error::Os(rustix::io::Errno::ACCESS));
+        assert_eq!(err, crate::error::os(rustix::io::Errno::ACCESS));
         Mapping::map(file.as_fd(), 0, page as u64, Access::ReadOnly).unwrap();
     }
 }

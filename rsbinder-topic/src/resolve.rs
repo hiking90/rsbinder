@@ -48,6 +48,25 @@ pub trait Resolver: Send + Sync {
         name: &str,
         on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
     ) -> BinderResult<Watch>;
+
+    /// The binder of the process that holds the names and the watches, if the resolver knows
+    /// one; `None` by default.
+    ///
+    /// A [`NamedSubscriber`](crate::NamedSubscriber) links to its death: once it dies, no call
+    /// of a watch comes again, and the subscriber returns
+    /// [`Closed::ResolverDied`](crate::Closed::ResolverDied) once no connection is left.
+    /// [`Publisher::advertise_on`](crate::Publisher::advertise_on) asks no resolver of the same
+    /// host again for the name and binder it holds: a registry given the same name and binder
+    /// twice keeps one entry, which the drop of either advertisement would take back.
+    ///
+    /// A [`RegistryResolver`](crate::registry::RegistryResolver) returns the registry's binder.
+    /// [`ServiceManager`] returns none: a death link on the service manager's binder (handle 0)
+    /// marks this process's proxy of it dead, and once a restarted service manager serves
+    /// handle 0, every call through that proxy, the next watch of a name among them, fails with
+    /// `DeadObject`.
+    fn host(&self) -> Option<SIBinder> {
+        None
+    }
 }
 
 /// A name [`Resolver::advertise`] gave: dropping it takes the name back, as far as the resolver

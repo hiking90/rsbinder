@@ -627,10 +627,7 @@ impl ValueType {
             }
             ValueType::Holder => {
                 if param.is_vintf {
-                    format!(
-                        "{}::ParcelableHolder::new({}::Stability::Vintf)",
-                        param.crate_name, param.crate_name
-                    )
+                    format!("{}::ParcelableHolder::vintf()", param.crate_name)
                 } else {
                     "::core::default::Default::default()".to_string()
                 }

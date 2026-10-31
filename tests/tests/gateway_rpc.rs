@@ -16,7 +16,10 @@
 //!
 //! What it does **not** do is hide the stack boundary: a binder-typed
 //! argument forwarded as-is is still refused (`InvalidOperation`), and
-//! re-wrapping it is the gateway's job. Both halves are pinned here.
+//! re-wrapping it is the gateway's job — in the generated `IFooDelegate`
+//! hook for that one method, published through `bridge::Delegating`. Both
+//! halves are pinned here, and so is the version a gateway reports in
+//! either direction of a version skew (AC-22.13, plan 17 D-16).
 //!
 //! Hermetic, in-process (three sessions over `unix://`), no kernel
 //! binder — runs on macOS. Separate `#![cfg(feature = "rpc")]` binary.
@@ -27,13 +30,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rsbinder::bridge::Rewrap;
+use rsbinder::bridge::{Delegating, Rewrap};
 use rsbinder::entry::{WireProfile, WireVersion};
 use rsbinder::{Endpoint, Interface, StatusCode, Strong, Uri};
 
 include!(concat!(env!("OUT_DIR"), "/mesh.rs"));
 
-use mesh::IMeshNode::{BnMeshNode, IMeshNode};
+use mesh::IMeshNode::{BnMeshNode, IMeshNode, IMeshNodeDelegate};
 use mesh::IMeshObserver::{BnMeshObserver, IMeshObserver};
 use mesh::MeshMessage::MeshMessage;
 use mesh::MeshValue::MeshValue;
@@ -265,50 +268,38 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
         .spawn()
         .expect("spawn C");
 
-    // B's delegate overrides exactly one method: the one with a binder
-    // argument. Everything else rides the generated delegation. The
-    // re-wrap goes through `Rewrap`, so the same observer always yields
-    // the same local object (see `rewrap_*` below).
-    struct RewrappingGateway {
-        upstream: Strong<dyn IMeshNode>,
+    // B's hooks override exactly one method: the one with a binder
+    // argument. Every other method takes the generated default, which
+    // forwards to the upstream. The re-wrap goes through `Rewrap`, so the
+    // same observer always yields the same local object (see `rewrap_*`
+    // below).
+    struct RewrapObservers {
         observers: Rewrap<dyn IMeshObserver>,
     }
-    impl Interface for RewrappingGateway {}
-    impl IMeshNode for RewrappingGateway {
-        fn r#exchange(&self, req: &MeshMessage) -> rsbinder::BinderResult<MeshMessage> {
-            self.upstream.r#exchange(req)
-        }
-        fn r#accumulate(&self, v: &MeshValue) -> rsbinder::BinderResult<i64> {
-            self.upstream.r#accumulate(v)
-        }
-        fn r#notify(&self, msg: &MeshMessage) -> rsbinder::BinderResult<()> {
-            self.upstream.r#notify(msg)
-        }
+    impl IMeshNodeDelegate for RewrapObservers {
         fn r#registerObserver(
             &self,
+            upstream: &Strong<dyn IMeshNode>,
             obs: &Strong<dyn IMeshObserver>,
         ) -> rsbinder::BinderResult<()> {
             // The re-wrap: a *local* binder of B's, delegating to A's
             // observer. `Rewrap` mints it once and hands the same object
             // back on every later call for the same observer.
-            self.upstream.r#registerObserver(&self.observers.wrap(obs))
-        }
-        fn r#receivedCount(&self) -> rsbinder::BinderResult<i32> {
-            self.upstream.r#receivedCount()
+            upstream.r#registerObserver(&self.observers.wrap(obs))
         }
     }
 
     let b_to_c =
         rsbinder::Client::open_with(c_sock.uri().with_wire(A13), callback_ready).expect("B→C");
     let c_proxy: Strong<dyn IMeshNode> = b_to_c.get("mesh").expect("B→C mesh");
+    let hooks = RewrapObservers {
+        observers: Rewrap::new(BnMeshObserver::new_binder),
+    };
     let _b = rsbinder::serve(b_sock.uri().with_wire(A13))
         .expect("serve B")
         .add(
             "mesh",
-            BnMeshNode::new_binder(RewrappingGateway {
-                upstream: c_proxy,
-                observers: Rewrap::new(BnMeshObserver::new_binder),
-            }),
+            BnMeshNode::new_binder(Delegating::new(c_proxy, hooks)),
         )
         .expect("add B")
         .spawn()
@@ -321,6 +312,11 @@ fn gateway_rewrapping_a_callback_reaches_the_original_observer() {
     let obs = BnMeshObserver::new_binder(CountingObserver(hits.clone()));
     a.r#registerObserver(&obs)
         .expect("re-wrapped observer lands");
+    assert_eq!(
+        a.r#exchange(&msg(3, "node-a")).expect("exchange").r#origin,
+        "node-c",
+        "a method the hooks leave alone forwards to C"
+    );
 
     a.r#notify(&msg(1, "node-a")).expect("oneway notify");
 
@@ -348,13 +344,22 @@ mod trunk_v2_gen {
     include!(concat!(env!("OUT_DIR"), "/trunk_v2.rs"));
 }
 
+use trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::ITrunkStableTestDelegate as ITrunkV1Delegate;
 use trunk_v1_gen::android::aidl::test::trunk::ITrunkStableTest::{
     BnTrunkStableTest as BnTrunkV1, ITrunkStableTest as ITrunkV1,
     MyParcelable::MyParcelable as V1Parcelable,
 };
 use trunk_v2_gen::android::aidl::test::trunk::ITrunkStableTest::{
     BnTrunkStableTest as BnTrunkV2, ITrunkStableTest as ITrunkV2,
+    ITrunkStableTestDelegate as ITrunkV2Delegate,
 };
+
+const TRUNK_V1_HASH: &str = "88311b9118fb6fe9eff4a2ca19121de0587f6d5f";
+
+/// Hooks that override nothing: every call takes the generated default.
+struct ForwardAll;
+impl ITrunkV1Delegate for ForwardAll {}
+impl ITrunkV2Delegate for ForwardAll {}
 
 struct TrunkV1Svc;
 impl Interface for TrunkV1Svc {}
@@ -388,49 +393,156 @@ impl ITrunkV1 for TrunkV1Svc {
     }
 }
 
+use trunk_v2_gen::android::aidl::test::trunk::ITrunkStableTest as v2;
+
+struct TrunkV2Svc;
+impl Interface for TrunkV2Svc {}
+impl ITrunkV2 for TrunkV2Svc {
+    fn r#repeatParcelable(
+        &self,
+        input: &v2::MyParcelable::MyParcelable,
+    ) -> rsbinder::BinderResult<v2::MyParcelable::MyParcelable> {
+        Ok(input.clone())
+    }
+    fn r#repeatEnum(
+        &self,
+        input: v2::MyEnum::MyEnum,
+    ) -> rsbinder::BinderResult<v2::MyEnum::MyEnum> {
+        Ok(input)
+    }
+    fn r#repeatUnion(
+        &self,
+        input: &v2::MyUnion::MyUnion,
+    ) -> rsbinder::BinderResult<v2::MyUnion::MyUnion> {
+        Ok(input.clone())
+    }
+    fn r#callMyCallback(
+        &self,
+        _cb: &Strong<dyn v2::IMyCallback::IMyCallback>,
+    ) -> rsbinder::BinderResult<()> {
+        Ok(())
+    }
+    fn r#repeatOtherParcelable(
+        &self,
+        input: &v2::MyOtherParcelable::MyOtherParcelable,
+    ) -> rsbinder::BinderResult<v2::MyOtherParcelable::MyOtherParcelable> {
+        Ok(input.clone())
+    }
+}
+
+/// Publish `service` at `sock` under "trunk" and return the server's handle.
+fn serve_trunk(sock: &SockPath, service: rsbinder::SIBinder) -> rsbinder::ServerGuard {
+    rsbinder::serve(sock.uri())
+        .expect("serve")
+        .add("trunk", service)
+        .expect("add")
+        .spawn()
+        .expect("spawn")
+}
+
 /// A gateway speaks for the service it fronts, including its *version*.
 ///
 /// The trait's `getInterfaceVersion` has a default body returning the
-/// **generating module's** `VERSION`, so a delegate that forgets to
-/// override it still compiles and quietly answers with its own number.
-/// Here C is built from the frozen V1 AIDL (`VERSION` 1, hash
+/// **generating module's** `VERSION`, so a hand-written gateway that
+/// forgets to override it still compiles and quietly answers with its own
+/// number. Here C is built from the frozen V1 AIDL (`VERSION` 1, hash
 /// `88311b…`) and B from V2 (`VERSION` 2, hash `notfrozen`) — same
-/// descriptor, so the proxy casts across. A must see **C's** values;
-/// dropping the override in the generated delegating impl turns this
+/// descriptor, so the proxy casts across. A must see **C's** values, both
+/// through the one-line gateway and through `Delegating` with no
+/// overrides; dropping the forward in either generated impl turns this
 /// red with 2 / "notfrozen".
 #[test]
 fn gateway_reports_the_upstream_version_and_hash() {
     let c_sock = SockPath::new("verc");
-    let b_sock = SockPath::new("verb");
-
-    let _c = rsbinder::serve(c_sock.uri())
-        .expect("serve C")
-        .add("trunk", BnTrunkV1::new_binder(TrunkV1Svc))
-        .expect("add C")
-        .spawn()
-        .expect("spawn C");
+    let _c = serve_trunk(&c_sock, BnTrunkV1::new_binder(TrunkV1Svc).as_binder());
 
     // B sees C through the *V2* stub and re-publishes it with the V2 `Bn`.
     let c_proxy: Strong<dyn ITrunkV2> =
         rsbinder::connect(c_sock.uri().with_service("trunk")).expect("B→C");
-    let _b = rsbinder::serve(b_sock.uri())
-        .expect("serve B")
-        .add("trunk", BnTrunkV2::new_binder(c_proxy))
-        .expect("add B")
-        .spawn()
-        .expect("spawn B");
+    let gateways = [
+        ("one-line", BnTrunkV2::new_binder(c_proxy.clone())),
+        (
+            "Delegating",
+            BnTrunkV2::new_binder(Delegating::new(c_proxy, ForwardAll)),
+        ),
+    ];
+    for (kind, gateway) in gateways {
+        let b_sock = SockPath::new("verb");
+        let _b = serve_trunk(&b_sock, gateway.as_binder());
 
-    let a: Strong<dyn ITrunkV2> =
-        rsbinder::connect(b_sock.uri().with_service("trunk")).expect("A→B");
+        let a: Strong<dyn ITrunkV2> =
+            rsbinder::connect(b_sock.uri().with_service("trunk")).expect("A→B");
+        assert_eq!(
+            a.r#getInterfaceVersion().expect("version"),
+            1,
+            "AC-22.13 ({kind}): the gateway reports C's version, not its own module's"
+        );
+        assert_eq!(
+            a.r#getInterfaceHash().expect("hash"),
+            TRUNK_V1_HASH,
+            "AC-22.13 ({kind}): and C's hash"
+        );
+    }
+}
+
+/// The reverse of AC-22.13: gateway B is **older** than upstream C (B
+/// built from V1, C from V2). B's dispatch has no `repeatOtherParcelable`,
+/// so advertising C's version 2 would promise A a method B answers with
+/// `UnknownTransaction`. The generated dispatch clamps: A sees B's own
+/// `VERSION` 1 and, with it, B's own frozen hash (plan 17 D-16). B's
+/// upstream handle still reports C's values — the clamp is on dispatch,
+/// not in the client-side `Strong` impl.
+#[test]
+fn an_older_gateway_reports_its_own_version_and_hash() {
+    let c_sock = SockPath::new("oldc");
+    let _c = serve_trunk(&c_sock, BnTrunkV2::new_binder(TrunkV2Svc).as_binder());
+
+    let c_proxy: Strong<dyn ITrunkV1> =
+        rsbinder::connect(c_sock.uri().with_service("trunk")).expect("B→C");
+    assert_eq!(c_proxy.r#getInterfaceVersion().expect("C's version"), 2);
+    assert_eq!(c_proxy.r#getInterfaceHash().expect("C's hash"), "notfrozen");
+
+    let gateways = [
+        ("one-line", BnTrunkV1::new_binder(c_proxy.clone())),
+        (
+            "Delegating",
+            BnTrunkV1::new_binder(Delegating::new(c_proxy.clone(), ForwardAll)),
+        ),
+    ];
+    for (kind, gateway) in gateways {
+        // In-process, through `impl ITrunkV1 for Binder<BnTrunkV1>`.
+        assert_eq!(
+            gateway.r#getInterfaceVersion().expect("version"),
+            1,
+            "{kind}"
+        );
+        assert_eq!(
+            gateway.r#getInterfaceHash().expect("hash"),
+            TRUNK_V1_HASH,
+            "{kind}"
+        );
+
+        let b_sock = SockPath::new("oldb");
+        let _b = serve_trunk(&b_sock, gateway.as_binder());
+
+        // A is a V2 client: it reads the version to learn what it may call.
+        let a: Strong<dyn ITrunkV2> =
+            rsbinder::connect(b_sock.uri().with_service("trunk")).expect("A→B");
+        assert_eq!(
+            a.r#getInterfaceVersion().expect("version"),
+            1,
+            "plan 17 D-16 ({kind}): an older gateway reports its own VERSION, not C's 2"
+        );
+        assert_eq!(
+            a.r#getInterfaceHash().expect("hash"),
+            TRUNK_V1_HASH,
+            "plan 17 D-16 ({kind}): and its own hash, not C's \"notfrozen\""
+        );
+    }
     assert_eq!(
-        a.r#getInterfaceVersion().expect("version"),
-        1,
-        "AC-22.13: the gateway reports C's version, not its own module's"
-    );
-    assert_eq!(
-        a.r#getInterfaceHash().expect("hash"),
-        "88311b9118fb6fe9eff4a2ca19121de0587f6d5f",
-        "AC-22.13: and C's hash"
+        c_proxy.r#getInterfaceVersion().expect("C's version"),
+        2,
+        "the client-side handle keeps C's value"
     );
 }
 

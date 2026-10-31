@@ -77,11 +77,12 @@ pub mod ITestService {
                 BnTestService(on_transact),
             },
             proxy: BpTestService,
+            local_transport: enabled,
         }
     }
     impl BpTestService {
         fn build_parcel_ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(_arg_input)?;
             data.write_slice_size(::core::option::Option::Some(_arg_repeated))?;
             ::core::result::Result::Ok(data)
@@ -100,7 +101,7 @@ pub mod ITestService {
             ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(&_arg_input)?;
             ::core::result::Result::Ok(data)
         }
@@ -117,7 +118,7 @@ pub mod ITestService {
             ::core::result::Result::Ok(_aidl_return)
         }
         fn build_parcel_FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(_arg_parcel)?;
             ::core::result::Result::Ok(data)
         }
@@ -137,17 +138,17 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             let _aidl_data = self.build_parcel_ReverseBoolean(_arg_input, _arg_repeated)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#ReverseBoolean, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#ReverseBoolean, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_ReverseBoolean(_arg_input, _arg_repeated, _aidl_reply)
         }
         fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
             let _aidl_data = self.build_parcel_RepeatNullableIntArray(_arg_input)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatNullableIntArray, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_RepeatNullableIntArray(_arg_input, _aidl_reply)
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
             let _aidl_data = self.build_parcel_FillOutStructuredParcelable(_arg_parcel)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#FillOutStructuredParcelable, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#FillOutStructuredParcelable, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_FillOutStructuredParcelable(_arg_parcel, _aidl_reply)
         }
     }
@@ -166,8 +167,9 @@ pub mod ITestService {
     /// re-published as a local service on another transport in one line:
     /// `BnTestService::new_binder(upstream)` (the **gateway** pattern —
     /// `new_binder` takes any `T: ITestService + Send + Sync + 'static`).
-    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-    /// forwarded as-is is refused at the stack boundary.
+    /// A gateway that has to change some methods (a binder argument crossing
+    /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+    /// stack boundary) implements `ITestServiceDelegate` instead.
     impl ITestService for rsbinder::Strong<dyn ITestService> {
         fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
             (**self).r#ReverseBoolean(_arg_input, _arg_repeated)
@@ -177,6 +179,35 @@ pub mod ITestService {
         }
         fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
             (**self).r#FillOutStructuredParcelable(_arg_parcel)
+        }
+    }
+    /// Per-method hooks for a gateway that re-publishes a `ITestService`: each
+    /// method gets the upstream handle and by default forwards the call to it
+    /// unchanged. Override the methods to change and publish with
+    /// `BnTestService::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+    /// A binder argument is forwarded as it is, which is right when caller and
+    /// upstream share one stack; across stacks it is refused, so override that
+    /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+    pub trait ITestServiceDelegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+        fn r#ReverseBoolean(&self, _aidl_upstream: &rsbinder::Strong<dyn ITestService>, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
+            _aidl_upstream.r#ReverseBoolean(_arg_input, _arg_repeated)
+        }
+        fn r#RepeatNullableIntArray(&self, _aidl_upstream: &rsbinder::Strong<dyn ITestService>, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
+            _aidl_upstream.r#RepeatNullableIntArray(_arg_input)
+        }
+        fn r#FillOutStructuredParcelable(&self, _aidl_upstream: &rsbinder::Strong<dyn ITestService>, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
+            _aidl_upstream.r#FillOutStructuredParcelable(_arg_parcel)
+        }
+    }
+    impl<__RsbHooks: ITestServiceDelegate> ITestService for rsbinder::bridge::Delegating<dyn ITestService, __RsbHooks> {
+        fn r#ReverseBoolean(&self, _arg_input: &[bool], _arg_repeated: &mut ::std::vec::Vec<bool>) -> rsbinder::BinderResult<::std::vec::Vec<bool>> {
+            <__RsbHooks as ITestServiceDelegate>::r#ReverseBoolean(rsbinder::bridge::Delegating::hooks(self), rsbinder::bridge::Delegating::upstream(self), _arg_input, _arg_repeated)
+        }
+        fn r#RepeatNullableIntArray(&self, _arg_input: ::core::option::Option<&[i32]>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<i32>>> {
+            <__RsbHooks as ITestServiceDelegate>::r#RepeatNullableIntArray(rsbinder::bridge::Delegating::hooks(self), rsbinder::bridge::Delegating::upstream(self), _arg_input)
+        }
+        fn r#FillOutStructuredParcelable(&self, _arg_parcel: &mut super::StructuredParcelable::StructuredParcelable) -> rsbinder::BinderResult<()> {
+            <__RsbHooks as ITestServiceDelegate>::r#FillOutStructuredParcelable(rsbinder::bridge::Delegating::hooks(self), rsbinder::bridge::Delegating::upstream(self), _arg_parcel)
         }
     }
     fn on_transact(
@@ -375,11 +406,12 @@ pub mod FixedSizeArrayExample {
                     BnRepeatFixedSizeArray(on_transact),
                 },
                 proxy: BpRepeatFixedSizeArray,
+                local_transport: enabled,
             }
         }
         impl BpRepeatFixedSizeArray {
             fn build_parcel_Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::Result<rsbinder::Parcel> {
-                let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+                let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
                 data.write(_arg_input)?;
                 ::core::result::Result::Ok(data)
             }
@@ -400,7 +432,7 @@ pub mod FixedSizeArrayExample {
         impl IRepeatFixedSizeArray for BpRepeatFixedSizeArray {
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 let _aidl_data = self.build_parcel_Repeat2dParcelables(_arg_input, _arg_repeated)?;
-                let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#Repeat2dParcelables, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+                let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#Repeat2dParcelables, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
                 self.read_response_Repeat2dParcelables(_arg_input, _arg_repeated, _aidl_reply)
             }
         }
@@ -413,11 +445,29 @@ pub mod FixedSizeArrayExample {
         /// re-published as a local service on another transport in one line:
         /// `BnRepeatFixedSizeArray::new_binder(upstream)` (the **gateway** pattern —
         /// `new_binder` takes any `T: IRepeatFixedSizeArray + Send + Sync + 'static`).
-        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-        /// forwarded as-is is refused at the stack boundary.
+        /// A gateway that has to change some methods (a binder argument crossing
+        /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+        /// stack boundary) implements `IRepeatFixedSizeArrayDelegate` instead.
         impl IRepeatFixedSizeArray for rsbinder::Strong<dyn IRepeatFixedSizeArray> {
             fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
                 (**self).r#Repeat2dParcelables(_arg_input, _arg_repeated)
+            }
+        }
+        /// Per-method hooks for a gateway that re-publishes a `IRepeatFixedSizeArray`: each
+        /// method gets the upstream handle and by default forwards the call to it
+        /// unchanged. Override the methods to change and publish with
+        /// `BnRepeatFixedSizeArray::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+        /// A binder argument is forwarded as it is, which is right when caller and
+        /// upstream share one stack; across stacks it is refused, so override that
+        /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+        pub trait IRepeatFixedSizeArrayDelegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+            fn r#Repeat2dParcelables(&self, _aidl_upstream: &rsbinder::Strong<dyn IRepeatFixedSizeArray>, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+                _aidl_upstream.r#Repeat2dParcelables(_arg_input, _arg_repeated)
+            }
+        }
+        impl<__RsbHooks: IRepeatFixedSizeArrayDelegate> IRepeatFixedSizeArray for rsbinder::bridge::Delegating<dyn IRepeatFixedSizeArray, __RsbHooks> {
+            fn r#Repeat2dParcelables(&self, _arg_input: &[[super::IntParcelable::IntParcelable; 3]; 2], _arg_repeated: &mut [[super::IntParcelable::IntParcelable; 3]; 2]) -> rsbinder::BinderResult<[[super::IntParcelable::IntParcelable; 3]; 2]> {
+                <__RsbHooks as IRepeatFixedSizeArrayDelegate>::r#Repeat2dParcelables(rsbinder::bridge::Delegating::hooks(self), rsbinder::bridge::Delegating::upstream(self), _arg_input, _arg_repeated)
             }
         }
         fn on_transact(
@@ -509,6 +559,7 @@ pub mod FixedSizeArrayExample {
                     BnEmptyInterface(on_transact),
                 },
                 proxy: BpEmptyInterface,
+                local_transport: enabled,
             }
         }
         impl BpEmptyInterface {
@@ -521,9 +572,21 @@ pub mod FixedSizeArrayExample {
         /// re-published as a local service on another transport in one line:
         /// `BnEmptyInterface::new_binder(upstream)` (the **gateway** pattern —
         /// `new_binder` takes any `T: IEmptyInterface + Send + Sync + 'static`).
-        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-        /// forwarded as-is is refused at the stack boundary.
+        /// A gateway that has to change some methods (a binder argument crossing
+        /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+        /// stack boundary) implements `IEmptyInterfaceDelegate` instead.
         impl IEmptyInterface for rsbinder::Strong<dyn IEmptyInterface> {
+        }
+        /// Per-method hooks for a gateway that re-publishes a `IEmptyInterface`: each
+        /// method gets the upstream handle and by default forwards the call to it
+        /// unchanged. Override the methods to change and publish with
+        /// `BnEmptyInterface::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+        /// A binder argument is forwarded as it is, which is right when caller and
+        /// upstream share one stack; across stacks it is refused, so override that
+        /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+        pub trait IEmptyInterfaceDelegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+        }
+        impl<__RsbHooks: IEmptyInterfaceDelegate> IEmptyInterface for rsbinder::bridge::Delegating<dyn IEmptyInterface, __RsbHooks> {
         }
         fn on_transact(
             _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {

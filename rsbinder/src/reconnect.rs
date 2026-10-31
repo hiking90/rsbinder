@@ -77,7 +77,7 @@ use std::any::Any;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -281,8 +281,19 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     /// the service manager refuses to watch ([`StatusCode::BadValue`] for an
     /// invalid name, [`StatusCode::PermissionDenied`] for an SELinux `find`
     /// denial; Android 10's service manager watches no name, so there the
-    /// helper polls and neither is a build error), or [`ConnectError::stop`]
-    /// from `on_connect`.
+    /// helper polls and neither is a build error), a TLS certificate refused
+    /// as untrusted or revoked, by either end (`StatusCode::Errno(-EKEYREJECTED)`,
+    /// `Errno(-EKEYREVOKED)`; Linux and Android, see `From<rpc::RpcError> for
+    /// StatusCode`), or
+    /// [`ConnectError::stop`] from `on_connect`.
+    ///
+    /// A certificate refusal ends only `build`. Once the helper is running,
+    /// the reconnect thread retries one like any failed attempt and reports
+    /// it in [`last_error`](Reconnecting::last_error): the server may be
+    /// redeployed with another certificate while this process runs. An
+    /// expired or not-yet-valid certificate (`Errno(-EKEYEXPIRED)`) is never
+    /// permanent, at `build` either: a device that has just booted can run
+    /// with its clock at the epoch until the network sets it.
     ///
     /// Anything else — the server not up yet, the name not registered yet —
     /// returns a helper that keeps connecting in the background, so a
@@ -351,11 +362,23 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     }
 }
 
+impl<T: FromIBinder + ?Sized> std::fmt::Debug for ReconnectBuilder<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReconnectBuilder")
+            .field("uri", &format_args!("{}", self.uri))
+            .field("options", &self.options.is_some())
+            .field("on_connect", &self.on_connect.is_some())
+            .field("policy", &self.policy)
+            .finish()
+    }
+}
+
 /// A proxy to one service that reconnects when the service goes away; see
 /// the [module doc](self).
 ///
 /// Not `Clone`: dropping it ends the helper. Share it behind an `Arc`, and
 /// give callback objects a [`WeakReconnecting`].
+#[must_use = "dropping the helper at once closes it at once"]
 pub struct Reconnecting<T: FromIBinder + ?Sized + 'static> {
     shared: Arc<Shared<T>>,
 }
@@ -479,6 +502,23 @@ impl<T: FromIBinder + ?Sized + 'static> Drop for Reconnecting<T> {
     }
 }
 
+impl<T: FromIBinder + ?Sized + 'static> std::fmt::Debug for Reconnecting<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Reconnecting");
+        d.field("target", &format_args!("{}", self.shared.cfg));
+        let state = match self.shared.state.try_lock() {
+            Ok(st) => Some(st),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        match state {
+            Some(st) => d.field("phase", &st.phase).field("generation", &st.gen),
+            None => d.field("state", &"<locked>"),
+        };
+        d.finish_non_exhaustive()
+    }
+}
+
 /// A [`Reconnecting`] that does not keep it alive: every call is
 /// `DeadObject` once the helper is dropped or closed.
 pub struct WeakReconnecting<T: FromIBinder + ?Sized + 'static> {
@@ -490,6 +530,15 @@ impl<T: FromIBinder + ?Sized + 'static> Clone for WeakReconnecting<T> {
         Self {
             shared: self.shared.clone(),
         }
+    }
+}
+
+impl<T: FromIBinder + ?Sized + 'static> std::fmt::Debug for WeakReconnecting<T> {
+    // No `upgrade`: a temporary strong ref could become the last one and drop the helper here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakReconnecting")
+            .field("live", &(self.shared.strong_count() > 0))
+            .finish_non_exhaustive()
     }
 }
 
@@ -954,15 +1003,17 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         let client =
             open_staged(self.cfg.uri.clone(), options).map_err(|(stage, code)| Failure {
                 code,
-                permanent: stage == OpenStage::Setup,
+                permanent: stage == OpenStage::Setup || refused_at_build(mode, code),
             })?;
         #[cfg(feature = "rpc")]
         let opened = client.session().cloned();
         let binder = match self.lookup(&client, mode) {
             Ok(b) => b,
-            Err(f) => {
+            Err(mut f) => {
                 #[cfg(feature = "rpc")]
                 end_if_live(opened.as_ref());
+                // A TLS 1.3 client-certificate refusal arrives on the first call: the lookup.
+                f.permanent |= refused_at_build(mode, f.code);
                 return Err(f);
             }
         };
@@ -1104,7 +1155,8 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
     /// `build` looks once; the thread then waits for the name to be registered, not attempting.
     fn kernel_lookup(&self, name: &str, mode: Mode) -> std::result::Result<SIBinder, Failure> {
         let sm = crate::hub::default().map_err(Failure::transient)?;
-        if let Some(b) = sm.try_get_service(name).map_err(Failure::transient)? {
+        let found = sm.try_get_service(name);
+        if let Some(b) = found.map_err(|s| Failure::transient(s.into()))? {
             return Ok(b);
         }
         // Android 10 has no registration to probe; the thread's wait polls instead.
@@ -1115,7 +1167,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         if mode == Mode::Build {
             // `getService` answers a denied name as an absent one; a registration tells them apart.
             let probe = crate::hub::BnServiceCallback::new_binder(Unwatched);
-            return match sm.register_for_notifications_status(name, &probe) {
+            return match sm.register_for_notifications(name, &probe) {
                 Ok(()) => {
                     let _ = sm.unregister_for_notifications(name, &probe);
                     Err(Failure::transient(StatusCode::NameNotFound))
@@ -1293,6 +1345,19 @@ fn end_if_live(session: Option<&RpcSession>) {
         if !s.is_ended() {
             s.close_session();
         }
+    }
+}
+
+/// `build` stops on a refused or revoked TLS certificate; the reconnect thread retries it.
+fn refused_at_build(mode: Mode, code: StatusCode) -> bool {
+    #[cfg(feature = "rpc")]
+    {
+        mode == Mode::Build && crate::rpc::certificate_refused(code)
+    }
+    #[cfg(not(feature = "rpc"))]
+    {
+        let _ = (mode, code);
+        false
     }
 }
 

@@ -36,7 +36,7 @@
 //! `getInjectedAccessor` — `BackendUnifiedServiceManager::getService2`
 //! calls it as a *fallback* when servicemanager returns no binder for
 //! `name`. `add_accessor_provider`, `remove_accessor_provider` and
-//! `resolve_via_process_local` are the rsbinder counterparts.
+//! `try_resolve_via_process_local` are the rsbinder counterparts.
 //!
 //! The registry is one process-wide `Mutex<Vec<_>>`, empty until a provider is
 //! added, so a process that never adds one never allocates, and walked on add,
@@ -100,9 +100,15 @@ pub enum AccessorSockAddr {
     /// returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
     Vsock { cid: u32, port: u32 },
     /// AF_INET v4 address. Only usable when the binary was built with
-    /// the `rpc-tcp-debug` feature (debug builds only — see
-    /// `rpc::transport::tcp_debug`); otherwise the connect
-    /// helper returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
+    /// the `rpc-tcp-debug` feature (the plaintext `rpc::transport::TcpDebugTransport`);
+    /// otherwise the connect helper returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
+    /// The feature is not tied to debug builds: Cargo unifies features, so
+    /// any crate in the graph that enables it enables it for the release
+    /// build too.
+    ///
+    /// The consuming side refuses the resulting socket with `BadType`
+    /// unless that process called `rpc::set_accessor_plaintext_inet(true)`:
+    /// the connection is unencrypted and its peer anonymous.
     Inet(SocketAddrV4),
 }
 
@@ -162,7 +168,7 @@ impl AccessorSockAddr {
 /// `Display` is implemented for log lines; the inner `io::Error` is
 /// preserved so callers can surface the OS-level cause alongside the
 /// AOSP code in their `log::warn!` line (matching the pattern used by
-/// [`super::accessor_16::resolve_accessor`]).
+/// [`super::accessor_16::try_resolve_accessor`]).
 ///
 /// The AF_UNIX helpers never produce `CreateSocketFailed`: `std`'s
 /// `UnixStream::connect` reports `socket(2)` and `connect(2)` failures
@@ -264,7 +270,7 @@ fn connect_vsock_owned_fd(
     Err(AccessorConnectError::UnsupportedFamily)
 }
 
-/// AF_INET v4 connect, behind debug-only `rpc-tcp-debug`; the stub returns `UnsupportedFamily`.
+/// AF_INET v4 connect, behind the `rpc-tcp-debug` feature; the stub returns `UnsupportedFamily`.
 #[cfg(feature = "rpc-tcp-debug")]
 fn connect_inet_owned_fd(addr: SocketAddrV4) -> std::result::Result<OwnedFd, AccessorConnectError> {
     connected(std::net::TcpStream::connect(addr))
@@ -285,8 +291,9 @@ use super::accessor_16::{
     ERROR_UNSUPPORTED_SOCKET_FAMILY,
 };
 use crate::binder::{Interface, Strong};
+use crate::error::StatusCode;
 use crate::file_descriptor::ParcelFileDescriptor;
-use crate::status::Status;
+use crate::status::{BinderResult, Status};
 
 /// The AOSP `LocalAccessor` analog — a server-side
 /// `BnAccessor` whose `addConnection()` calls a user-supplied
@@ -535,8 +542,11 @@ pub fn remove_accessor_provider(
 
 /// RAII handle returned by
 /// [`add_accessor_provider`]. Dropping the handle un-registers the
-/// provider; ignore the handle (`_handle`) only if you want the
-/// provider to live for the whole process lifetime.
+/// provider, and so does `let _ = add_accessor_provider(..)` at once;
+/// `let _handle = ..` keeps it until the end of the scope.
+/// [`keep_for_process`](Self::keep_for_process) keeps it until the
+/// process exits, which is what AOSP's `addAccessorProvider` does when
+/// its caller discards the returned weak pointer.
 ///
 /// The handle carries a `Weak` reference to the provider entry's
 /// `Arc<AccessorProviderFn>` so its lifetime tracks the registry
@@ -548,6 +558,7 @@ pub fn remove_accessor_provider(
 /// `Debug` is implemented so callers can `.expect()`/`.expect_err()`
 /// against `Result<AccessorProviderHandle, _>`; the body deliberately
 /// omits the inner `Weak` pointer value (only liveness is meaningful).
+#[must_use = "dropping the handle at once un-registers the provider; see `keep_for_process`"]
 pub struct AccessorProviderHandle {
     provider: Weak<AccessorProviderFn>,
 }
@@ -561,6 +572,14 @@ impl std::fmt::Debug for AccessorProviderHandle {
 }
 
 impl AccessorProviderHandle {
+    /// Keep the provider registered until the process exits.
+    ///
+    /// The handle is consumed, so [`remove_accessor_provider`] can no
+    /// longer remove this provider.
+    pub fn keep_for_process(self) {
+        std::mem::forget(self);
+    }
+
     /// Test-only: `true` while the provider entry is still in the registry.
     #[cfg(test)]
     fn is_live(&self) -> bool {
@@ -601,23 +620,58 @@ pub(crate) fn lookup_accessor_provider(name: &str) -> Option<crate::binder::SIBi
 
 /// Process-local "consume" — look up a registered
 /// `IAccessor` provider for `name` (via the registry) and bridge
-/// it to an `RpcSession` root using
-/// [`super::accessor_16::resolve_accessor`]. Returns `None` if no
-/// provider claims `name`, or if the bridge fails
-/// (instance-name mismatch / addConnection failure / handshake / no
-/// root). This is the AOSP `getInjectedAccessor` →
-/// `Service::accessor → toBinder` *combined* path, exposed as a
+/// it to an `RpcSession` root as
+/// [`try_resolve_accessor`](super::accessor_16::try_resolve_accessor)
+/// does. This is the AOSP `getInjectedAccessor` →
+/// `Service::accessor → toBinderService` *combined* path, exposed as a
 /// single public helper so a caller without a kernel servicemanager
 /// (hermetic tests on macOS, no-binderfs hosts) can drive the
 /// fallback directly.
 ///
+/// `Ok(None)` when no registered provider claims `name`, or every one that
+/// claims it returns `None`: a lookup that finds nothing, as the `hub`
+/// `try_` lookups report it.
+///
+/// # Errors
+///
+/// - The first provider binder for `name` is not an `IAccessor`, cannot
+///   report its instance name, or reports another one:
+///   [`StatusCode::InvalidOperation`](crate::StatusCode::InvalidOperation),
+///   as AOSP `getInjectedAccessor` returns for any `validateAccessor`
+///   failure. The cause is logged at `error`.
+/// - Connecting through the accessor fails: the error
+///   [`try_resolve_accessor`](super::accessor_16::try_resolve_accessor)
+///   returns for that step.
+///
 /// `cfg(feature = "rpc")` — without `rpc`, no `IAccessor` stub exists
 /// so the function isn't compiled.
+pub fn try_resolve_via_process_local(name: &str) -> BinderResult<Option<crate::binder::SIBinder>> {
+    let Some(accessor) = lookup_accessor_provider(name) else {
+        return Ok(None);
+    };
+    let bp = super::accessor_16::validate_accessor(name, accessor).map_err(|status| {
+        log::error!(
+            "A provider returned a binder that is not an IAccessor for instance {name}: {status}"
+        );
+        Status::from(StatusCode::InvalidOperation)
+    })?;
+    super::accessor_16::connect_accessor(name, &bp).map(Some)
+}
+
+/// [`try_resolve_via_process_local`] with every error and a missing
+/// provider turned into `None`. On success `service` is always `Some` and
+/// `isLazyService` is `false`.
+#[deprecated(
+    since = "0.13.0",
+    note = "use try_resolve_via_process_local, which says why a resolve failed"
+)]
 pub fn resolve_via_process_local(
     name: &str,
 ) -> Option<super::servicemanager_16::android::os::ServiceWithMetadata::ServiceWithMetadata> {
-    let accessor = lookup_accessor_provider(name)?;
-    super::accessor_16::resolve_accessor(name, accessor)
+    try_resolve_via_process_local(name)
+        .ok()
+        .flatten()
+        .map(super::accessor_16::accessor_service_with_metadata)
 }
 
 /// AOSP `createAccessor`
@@ -1120,6 +1174,18 @@ mod tests {
             lookup_accessor_provider(&instance).is_none(),
             "after explicit remove, lookup must be None"
         );
+    }
+
+    /// A kept provider stays registered: adding its instance again is refused.
+    #[test]
+    fn a_kept_provider_outlives_its_handle() {
+        let instance = unique_instance("kept");
+        let none: fn() -> AccessorProviderFn = || Box::new(|_: &str| None);
+        add_accessor_provider(HashSet::from([instance.clone()]), none())
+            .expect("add")
+            .keep_for_process();
+        let again = add_accessor_provider(HashSet::from([instance]), none());
+        assert_eq!(again.err(), Some(crate::error::StatusCode::AlreadyExists));
     }
 
     /// Concurrent register + lookup: no panic or deadlock; a lookup finds its provider or `None`.

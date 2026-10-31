@@ -159,7 +159,7 @@ want_result add    ac61.outgroup.svc SECURITY  "AC-6.1.6b add denied, caller not
 want_result add    ac61.hidden.svc   OK        "hidden service registered"
 want_result find   ac61.allowed.svc  OK        "allowed lookup succeeds"
 want_result find   ac61.hidden.svc   NOTFOUND  "AC-6.1.5a denied lookup reports not-registered, not an error"
-want_result notify ac61.denied.svc   FAILEDTXN "denied registerForNotifications IS an error"
+want_result notify ac61.denied.svc   SECURITY  "denied registerForNotifications IS an error (EX_SECURITY)"
 want_result list   ""                OK        "listServices allowed by the global gate"
 want_line   "LIST ac61.allowed.svc"             "AC-6.1.5b list contains a findable name"
 reject_line "LIST ac61.hidden.svc"              "AC-6.1.5c list filtered the non-findable name"

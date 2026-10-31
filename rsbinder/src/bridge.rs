@@ -9,10 +9,17 @@
 //! unwrapped and wrapped again: a proxy of one session cannot enter a parcel
 //! of another, and rsbinder refuses it at write time.
 //!
-//! Wrapping is one call — `BnFoo::new_binder(proxy)`. Doing it *per
-//! forwarded call* is the trap: each `new_binder` mints a new object, so the
-//! upstream sees a different callback identity every time and any interface
-//! that pairs registration with removal by identity breaks.
+//! A gateway that changes nothing is one call: `BnFoo::new_binder(proxy)`.
+//! A gateway that has to change some methods — the ones carrying a binder,
+//! say — implements the generated `IFooDelegate` trait, whose every method
+//! forwards to the upstream by default, overrides just those, and publishes
+//! the pair as a [`Delegating`](crate::bridge::Delegating)
+//! (`BnFoo::new_binder(Delegating::new(proxy, hooks))`).
+//!
+//! Wrapping a binder argument is one call too — `BnCallback::new_binder(cb)`.
+//! Doing it *per forwarded call* is the trap: each `new_binder` mints a new
+//! object, so the upstream sees a different callback identity every time and
+//! any interface that pairs registration with removal by identity breaks.
 //! [`Rewrap`](crate::bridge::Rewrap) is the memo table that fixes it — same
 //! remote in, same local out.
 //!
@@ -22,6 +29,114 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WIBinder};
+
+/// An upstream handle plus the hooks that override some of its methods: the
+/// service a gateway publishes when it changes only part of an interface.
+///
+/// For every AIDL interface `IFoo` the generator emits a trait
+/// `IFooDelegate` and `impl<H: IFooDelegate> IFoo for Delegating<dyn IFoo, H>`.
+/// Each `IFooDelegate` method takes the upstream as its first argument and
+/// by default forwards the call to it unchanged, so a gateway overrides only
+/// the methods it has to change and publishes the result with the usual
+/// constructor:
+///
+/// ```ignore
+/// use rsbinder::bridge::{Delegating, Rewrap};
+///
+/// struct Hooks {
+///     callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(BnCallback::new_binder)
+/// }
+///
+/// impl IFooDelegate for Hooks {
+///     // The one method with a binder argument; every other method forwards.
+///     fn register(
+///         &self,
+///         upstream: &Strong<dyn IFoo>,
+///         cb: &Strong<dyn ICallback>,
+///     ) -> BinderResult<()> {
+///         upstream.register(&self.callbacks.wrap(cb))
+///     }
+/// }
+///
+/// let service = BnFoo::new_binder(Delegating::new(upstream, Hooks { callbacks }));
+/// ```
+///
+/// # What the defaults do and do not do
+///
+/// - A forwarded call passes its arguments through as they are. Plain data
+///   needs nothing more. A binder argument does when it crosses stacks: a
+///   proxy of one session written into a parcel of another (an RPC caller's
+///   callback forwarded to a kernel upstream, or two RPC sessions) is refused
+///   with `InvalidOperation`, so such a gateway overrides that method and
+///   re-wraps the binder ([`Rewrap`]). Nothing forces the override, because a
+///   delegate whose caller and upstream share one stack (both on kernel
+///   binder) forwards a binder correctly as it is. The generator does not
+///   re-wrap on its own (plan 2-22 D-3): only the gateway knows whether a
+///   binder's identity matters to the upstream.
+/// - `getInterfaceVersion` / `getInterfaceHash` (on a versioned interface)
+///   forward too, so the gateway reports the upstream's values. The generated
+///   dispatch then answers a caller with at most the gateway module's own
+///   `VERSION` (and its own `HASH` in that case), since the gateway cannot
+///   dispatch a method its module does not have (plan 17 D-16).
+/// - The delegate is sync only (plan 2-22 D-2). A sync `Bn*` is reachable
+///   from async clients as any sync service is.
+/// - [`Interface`] on `Delegating` forwards `as_binder`, `dump` and
+///   `dump_fd` to the upstream, as `Strong`'s own impl does: the hooks are not
+///   asked.
+///
+/// `I` is always a `dyn IFoo` in practice; it is a parameter so that one
+/// library type serves every generated interface.
+pub struct Delegating<I: FromIBinder + ?Sized, H> {
+    upstream: Strong<I>,
+    hooks: H,
+}
+
+impl<I: FromIBinder + ?Sized, H> Delegating<I, H> {
+    /// Pair `upstream` with the `hooks` that override some of its methods.
+    pub fn new(upstream: Strong<I>, hooks: H) -> Self {
+        Self { upstream, hooks }
+    }
+
+    /// The handle the default methods forward to.
+    pub fn upstream(&self) -> &Strong<I> {
+        &self.upstream
+    }
+
+    /// The hooks given to [`new`](Self::new).
+    pub fn hooks(&self) -> &H {
+        &self.hooks
+    }
+
+    /// The upstream handle and the hooks, taken apart again.
+    pub fn into_parts(self) -> (Strong<I>, H) {
+        (self.upstream, self.hooks)
+    }
+}
+
+impl<I: FromIBinder + ?Sized, H: Send + Sync> Interface for Delegating<I, H> {
+    fn as_binder(&self) -> SIBinder {
+        self.upstream.as_binder()
+    }
+
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> crate::Result<()> {
+        self.upstream.dump(writer, args)
+    }
+
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> crate::Result<()> {
+        self.upstream.dump_fd(fd, args)
+    }
+}
+
+impl<I: FromIBinder + std::fmt::Debug + ?Sized, H: std::fmt::Debug> std::fmt::Debug
+    for Delegating<I, H>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Delegating")
+            .field("upstream", &self.upstream)
+            .field("hooks", &self.hooks)
+            .finish()
+    }
+}
 
 /// One remote → one local wrapper, for as long as the pair is alive.
 ///
@@ -34,23 +149,27 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 /// unrelated objects, so the removal matches nothing.
 ///
 /// `Rewrap` keeps the mapping, so the second call re-uses the wrapper the
-/// first one made:
+/// first one made. In a gateway built on [`Delegating`], the two hooks that
+/// carry the callback are the only methods it overrides:
 ///
 /// ```ignore
-/// struct Gateway {
-///     upstream: Strong<dyn IFoo>,
+/// struct Hooks {
 ///     callbacks: Rewrap<dyn ICallback>,
 /// }
 ///
-/// // once, at construction:
-/// callbacks: Rewrap::new(BnCallback::new_binder),
+/// impl IFooDelegate for Hooks {
+///     fn register(&self, up: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+///         up.register(&self.callbacks.wrap(cb))
+///     }
+///     fn unregister(&self, up: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>)
+///         -> BinderResult<()>
+///     {
+///         up.unregister(&self.callbacks.wrap(cb))   // same object
+///     }
+/// }
 ///
-/// fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-///     self.upstream.register(&self.callbacks.wrap(cb))
-/// }
-/// fn unregister(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-///     self.upstream.unregister(&self.callbacks.wrap(cb))   // same object
-/// }
+/// let hooks = Hooks { callbacks: Rewrap::new(BnCallback::new_binder) };
+/// let service = BnFoo::new_binder(Delegating::new(upstream, hooks));
 /// ```
 ///
 /// # Lifetimes
@@ -120,6 +239,7 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 ///   boundary — a silently wrong table is worse than none.
 ///
 /// [`purge_dead`]: Self::purge_dead
+#[must_use = "dropping the table unlinks the death links of every wrapper it made"]
 pub struct Rewrap<I: FromIBinder + ?Sized> {
     // `Box<dyn Fn>`, not a fn pointer, so a capturing closure is accepted too.
     make_local: Box<dyn Fn(Strong<I>) -> Strong<I> + Send + Sync>,
@@ -205,8 +325,11 @@ impl DeathRecipient for Reaper {
 impl<I: FromIBinder + ?Sized> Rewrap<I> {
     /// Build a table whose wrappers are made by `make_local`.
     ///
-    /// `make_local` is normally `BnFoo::new_binder` itself — the generated
-    /// delegating impl means the proxy satisfies `new_binder`'s bound.
+    /// `make_local` is normally `BnCallback::new_binder` itself: the generated
+    /// `impl ICallback for Strong<dyn ICallback>` forwards every method, so the
+    /// remote satisfies `new_binder`'s bound. A callback interface whose own
+    /// methods need changing on the way passes
+    /// `|cb| BnCallback::new_binder(Delegating::new(cb, CallbackHooks))` instead.
     pub fn new(make_local: impl Fn(Strong<I>) -> Strong<I> + Send + Sync + 'static) -> Self {
         Self {
             make_local: Box::new(make_local),
@@ -264,6 +387,37 @@ impl<I: FromIBinder + ?Sized> Rewrap<I> {
         // Unlink outside the lock: it takes the proxy's recipient lock and can reach the driver.
         unlink_all(&dead, true);
         local
+    }
+
+    /// The remote that `local` wraps, if `local` is a wrapper this table
+    /// made and both halves are still alive.
+    ///
+    /// This is the reverse of [`wrap`](Self::wrap), for an upstream that
+    /// hands a wrapper back: it arrives as the gateway's own local object,
+    /// and passing it to `wrap` would mint a wrapper of the wrapper instead
+    /// of reaching the original remote. A gateway forwarding a returned
+    /// binder downstream does
+    ///
+    /// ```ignore
+    /// let cb = self.upstream.current_callback()?;
+    /// let out = self.callbacks.remote_of(&cb).unwrap_or(cb);
+    /// ```
+    ///
+    /// `None` for any binder the table did not make, a wrapper whose entry
+    /// was swept, a remote that has died, and a remote that no longer casts
+    /// to `I`. The lookup scans the table, so it costs one comparison per
+    /// entry; the cast runs after the table lock is released, since it may
+    /// query a proxy's descriptor.
+    pub fn remote_of(&self, local: &Strong<I>) -> Option<Strong<I>> {
+        let local = SIBinder::downgrade(&local.as_binder());
+        let remote = {
+            let entries = self.entries.lock().expect("rewrap table poisoned");
+            entries
+                .values()
+                .find(|e| e.local == local)
+                .and_then(|e| e.remote.upgrade().ok())?
+        };
+        <I as FromIBinder>::try_from(remote).ok()
     }
 
     /// Drop every entry whose remote or wrapper is gone, and report how many
@@ -339,7 +493,6 @@ fn key_of(binder: &SIBinder) -> usize {
 mod tests {
     use super::*;
     use crate::binder::{IBinder, Stability};
-    use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// `unlink_to_death` counts or panics, like a proxy with a poisoned `recipients` lock.
@@ -374,21 +527,6 @@ mod tests {
         }
         fn stability(&self) -> Stability {
             Stability::default()
-        }
-        fn inc_strong(&self, _: &SIBinder) -> crate::Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> crate::Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> crate::Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> crate::Result<()> {
-            Ok(())
         }
     }
 
@@ -431,6 +569,45 @@ mod tests {
             2,
             "the entries either side of the panicking one must still be unlinked"
         );
+    }
+
+    struct Callback;
+
+    impl crate::Interface for Callback {}
+
+    impl crate::hub::IServiceCallback for Callback {
+        fn onRegistration(&self, _: &str, _: &SIBinder) -> crate::status::BinderResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Plan 17 K-27: a wrapper maps back to its remote; a binder the table did not make, to none.
+    #[test]
+    fn remote_of_returns_the_remote_a_wrapper_was_made_for() {
+        use crate::hub::{BnServiceCallback, IServiceCallback};
+
+        let table: Rewrap<dyn IServiceCallback> = Rewrap::new(BnServiceCallback::new_binder);
+        let remote = BnServiceCallback::new_binder(Callback);
+        let other = BnServiceCallback::new_binder(Callback);
+        let local = table.wrap(&remote);
+        let other_local = table.wrap(&other);
+        assert!(local.as_binder() != remote.as_binder());
+
+        let back = table.remote_of(&local).expect("the wrapper's remote");
+        assert!(back.as_binder() == remote.as_binder());
+        let back = table
+            .remote_of(&other_local)
+            .expect("the other wrapper's remote");
+        assert!(back.as_binder() == other.as_binder());
+
+        assert!(
+            table.remote_of(&remote).is_none(),
+            "a remote is not a wrapper"
+        );
+        let unrelated = BnServiceCallback::new_binder(Callback);
+        assert!(table.remote_of(&unrelated).is_none());
+        // Wrapping the wrapper is what `remote_of` lets a gateway avoid: that wrapper is new.
+        assert!(table.wrap(&local).as_binder() != local.as_binder());
     }
 
     /// `Drop` swallows the panic: unwinding out of a drop during another unwind aborts.

@@ -107,3 +107,14 @@ pub(crate) fn status_of(error: rsbinder::fmq::Error) -> Status {
         other => Status::from(StatusCode::from(other)),
     }
 }
+
+/// [`status_of`] for a check of the caller's own policy: `EX_ILLEGAL_ARGUMENT` with the check
+/// that failed. A status carries a message only with an exception, as AOSP's does.
+pub(crate) fn policy_status(error: rsbinder::fmq::Error) -> Status {
+    match error {
+        rsbinder::fmq::Error::BadValue(_) => {
+            Status::from((ExceptionCode::IllegalArgument, error.to_string().as_str()))
+        }
+        other => status_of(other),
+    }
+}

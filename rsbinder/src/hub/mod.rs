@@ -56,8 +56,8 @@
 //! |---|---|---|---|---|
 //! | [`check_service`](crate::hub::check_service) | `Option<SIBinder>` | `None` | `None` | — |
 //! | [`check_interface`](crate::hub::check_interface) | `Result<Strong<T>>` | `Err(NameNotFound)` | [`default`](crate::hub::default)'s `Err(..)` if it fails, else `Err(NameNotFound)` | `Err(BadType)` |
-//! | [`try_get_service`](crate::hub::try_get_service) | `Result<Option<SIBinder>>` | `Ok(None)` | `Err(..)` | — |
-//! | [`try_get_interface`](crate::hub::try_get_interface) | `Result<Option<Strong<T>>>` | `Ok(None)` | `Err(..)` | `Err(BadType)` |
+//! | [`try_get_service`](crate::hub::try_get_service) | `BinderResult<Option<SIBinder>>` | `Ok(None)` | `Err(..)` | — |
+//! | [`try_get_interface`](crate::hub::try_get_interface) | `BinderResult<Option<Strong<T>>>` | `Ok(None)` | `Err(..)` | `Err(BadType)` |
 //! | [`wait_for_service`](crate::hub::wait_for_service) | `Option<SIBinder>` | *blocks*; `None` on give-up | `None` | — |
 //! | [`wait_for_interface`](crate::hub::wait_for_interface) | `Result<Strong<T>>` | *blocks*; `Err(NameNotFound)` on give-up | [`default`](crate::hub::default)'s `Err(..)` if it fails, else `Err(NameNotFound)` | `Err(BadType)` |
 //!
@@ -72,6 +72,12 @@
 //! cannot distinguish not-found from a transport failure, `try_get_service`
 //! maps any failure of the lookup to `Ok(None)`; `try_get_interface` still
 //! returns the error of the service's own descriptor query (below).
+//!
+//! Every `try_*` call of this module returns its error as the service
+//! manager's [`Status`] (`BinderResult`), the type the service manager
+//! answers with, and a `try_*` lookup that can find nothing returns
+//! `Ok(None)` for it. A transport failure is a `Status` carrying the
+//! [`StatusCode`]; `?` converts it into a `StatusCode` where one is needed.
 //!
 //! The `*_interface` functions cast with
 //! [`SIBinder::into_interface_checked`](crate::SIBinder::into_interface_checked):
@@ -178,8 +184,11 @@ macro_rules! impl_sm_module_body {
         /// (`Ok(None)`) from "service manager unreachable" (`Err`) — the
         /// distinction AOSP `realGetService` carries in its `Status`.
         #[allow(deprecated, reason = "lookups stay on `getService`; see `get_service`")]
-        pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
-            sm.getService(name).map_err(|e| e.into())
+        pub fn try_get_service(
+            sm: &BpServiceManager,
+            name: &str,
+        ) -> std::result::Result<Option<SIBinder>, Status> {
+            sm.getService(name)
         }
 
         /// Return a list of all currently running services.
@@ -206,8 +215,8 @@ macro_rules! impl_sm_module_body {
             sm: &BpServiceManager,
             name: &str,
             callback: &crate::Strong<dyn IServiceCallback>,
-        ) -> Result<()> {
-            sm.registerForNotifications(name, callback).map_err(|e| e.into())
+        ) -> std::result::Result<(), Status> {
+            sm.registerForNotifications(name, callback)
         }
 
         /// Unregisters all requests for notifications for a specific callback.
@@ -215,8 +224,8 @@ macro_rules! impl_sm_module_body {
             sm: &BpServiceManager,
             name: &str,
             callback: &crate::Strong<dyn IServiceCallback>,
-        ) -> Result<()> {
-            sm.unregisterForNotifications(name, callback).map_err(|e| e.into())
+        ) -> std::result::Result<(), Status> {
+            sm.unregisterForNotifications(name, callback)
         }
 
         /// Register a callback for client (proxy) presence transitions on a
@@ -226,8 +235,8 @@ macro_rules! impl_sm_module_body {
             name: &str,
             service: &SIBinder,
             callback: &crate::Strong<dyn IClientCallback>,
-        ) -> Result<()> {
-            sm.registerClientCallback(name, service, callback).map_err(|e| e.into())
+        ) -> std::result::Result<(), Status> {
+            sm.registerClientCallback(name, service, callback)
         }
 
         /// Attempt to unregister a service previously registered with
@@ -236,8 +245,8 @@ macro_rules! impl_sm_module_body {
             sm: &BpServiceManager,
             name: &str,
             service: &SIBinder,
-        ) -> Result<()> {
-            sm.tryUnregisterService(name, service).map_err(|e| e.into())
+        ) -> std::result::Result<(), Status> {
+            sm.tryUnregisterService(name, service)
         }
 
         /// Returns whether a given interface is declared on the device,
@@ -422,11 +431,17 @@ pub mod android_16 {
     pub use super::accessor_16::__fuzz_accessor_error_decode;
     #[cfg(feature = "rpc")]
     pub use super::accessor_16::{
-        accessor_error_name, resolve_accessor, BnAccessor, BpAccessor, IAccessor, IAccessorDefault,
-        IAccessorDefaultRef, ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
-        ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
-        ERROR_UNSUPPORTED_SOCKET_FAMILY,
+        accessor_error_name, try_resolve_accessor, BnAccessor, BpAccessor, IAccessor,
+        IAccessorDefault, IAccessorDefaultRef, ERROR_CONNECTION_INFO_NOT_FOUND,
+        ERROR_FAILED_TO_CONNECT_EACCES, ERROR_FAILED_TO_CONNECT_TO_SOCKET,
+        ERROR_FAILED_TO_CREATE_SOCKET, ERROR_UNSUPPORTED_SOCKET_FAMILY,
     };
+    #[cfg(feature = "rpc")]
+    #[expect(
+        deprecated,
+        reason = "re-exports the deprecated Option forms while they are kept"
+    )]
+    pub use super::{accessor_16::resolve_accessor, accessor_register::resolve_via_process_local};
     // Same `async` gate as the codegen re-export in `accessor_16`.
     #[cfg(all(feature = "rpc", feature = "async"))]
     pub use super::accessor_16::IAccessorAsyncService;
@@ -434,8 +449,8 @@ pub mod android_16 {
     #[cfg(feature = "rpc")]
     pub use super::accessor_register::{
         add_accessor_provider, create_accessor, remove_accessor_provider,
-        resolve_via_process_local, AccessorAddrProvider, AccessorConnectError, AccessorProviderFn,
-        AccessorProviderHandle, AccessorSockAddr, LocalAccessor,
+        try_resolve_via_process_local, AccessorAddrProvider, AccessorConnectError,
+        AccessorProviderFn, AccessorProviderHandle, AccessorSockAddr, LocalAccessor,
     };
     pub use super::servicemanager_16::*;
 }
@@ -504,6 +519,29 @@ pub enum ServiceManager {
     #[cfg(all(target_os = "android", feature = "android_15"))]
     Android15(android_15::BpServiceManager),
     Android16(android_16::BpServiceManager),
+}
+
+impl std::fmt::Debug for ServiceManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let protocol = match self {
+            #[cfg(all(target_os = "android", feature = "android_10"))]
+            ServiceManager::Android10(_) => "android_10",
+            #[cfg(all(target_os = "android", feature = "android_11"))]
+            ServiceManager::Android11(_) => "android_11",
+            #[cfg(all(target_os = "android", feature = "android_12"))]
+            ServiceManager::Android12(_) => "android_12",
+            #[cfg(all(target_os = "android", feature = "android_13"))]
+            ServiceManager::Android13(_) => "android_13",
+            #[cfg(all(target_os = "android", feature = "android_14"))]
+            ServiceManager::Android14(_) => "android_14",
+            #[cfg(all(target_os = "android", feature = "android_15"))]
+            ServiceManager::Android15(_) => "android_15",
+            ServiceManager::Android16(_) => "android_16",
+        };
+        f.debug_struct("ServiceManager")
+            .field("protocol", &protocol)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Which of Android 15's two service-manager numberings this device speaks ([`android_15`]).
@@ -1369,29 +1407,22 @@ impl ServiceManager {
     }
 
     /// Registers for notifications when a service becomes available.
+    /// AOSP `IServiceManager::registerForNotifications`.
     ///
-    /// Note: not supported on Android 10 - returns an error on that version.
+    /// The service manager's refusal keeps its exception: `EX_SECURITY` for
+    /// a name the caller may not find, `EX_ILLEGAL_ARGUMENT` for an invalid
+    /// name, `EX_NULL_POINTER` for a null callback. A transport failure is
+    /// a [`Status`] carrying its [`StatusCode`].
+    ///
+    /// Not supported on Android 10: returns `EX_UNSUPPORTED_OPERATION` there.
     pub fn register_for_notifications(
         &self,
         name: &str,
         callback: &crate::Strong<dyn IServiceCallback>,
-    ) -> Result<()> {
-        self.register_for_notifications_status(name, callback)
-            .map_err(StatusCode::from)
-    }
-
-    /// `register_for_notifications` keeping the `Status`, whose refusal exception it would lose.
-    pub(crate) fn register_for_notifications_status(
-        &self,
-        name: &str,
-        callback: &crate::Strong<dyn IServiceCallback>,
-    ) -> std::result::Result<(), Status> {
+    ) -> BinderResult<()> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("register_for_notifications: not supported on Android 10");
-                Err(StatusCode::UnknownTransaction.into())
-            }
+            ServiceManager::Android10(_) => Err(unsupported("registerForNotifications", 11)),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::IServiceManager::registerForNotifications(
                 sm,
@@ -1429,19 +1460,21 @@ impl ServiceManager {
     }
 
     /// Unregisters from notifications for a service.
+    /// AOSP `IServiceManager::unregisterForNotifications`.
     ///
-    /// Note: not supported on Android 10 - returns an error on that version.
+    /// A callback that was not registered for `name` is
+    /// `EX_ILLEGAL_STATE`, as in AOSP; other refusals keep their exception
+    /// as for [`register_for_notifications`](Self::register_for_notifications).
+    ///
+    /// Not supported on Android 10: returns `EX_UNSUPPORTED_OPERATION` there.
     pub fn unregister_for_notifications(
         &self,
         name: &str,
         callback: &crate::Strong<dyn IServiceCallback>,
-    ) -> Result<()> {
+    ) -> BinderResult<()> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("unregister_for_notifications: not supported on Android 10");
-                Err(StatusCode::UnknownTransaction)
-            }
+            ServiceManager::Android10(_) => Err(unsupported("unregisterForNotifications", 11)),
             #[cfg(all(target_os = "android", feature = "android_11"))]
             ServiceManager::Android11(sm) => android_11::unregister_for_notifications(
                 sm,
@@ -1478,13 +1511,26 @@ impl ServiceManager {
         }
     }
 
-    /// `register_client_callback` keeping the SM's own [`Status`], for `LazyServiceRegistrar`.
-    pub(crate) fn register_client_callback_status(
+    /// Registers a callback that fires when the set of clients holding a
+    /// reference to `service` changes — the building block for lazy
+    /// (on-demand) services. AOSP `IServiceManager::registerClientCallback`.
+    ///
+    /// `service` is the binder previously handed to [`add_service`](Self::add_service)
+    /// (e.g. `my_binder.as_binder()`); `callback` is a `BnClientCallback`.
+    ///
+    /// The service manager's refusal keeps its exception, as AOSP returns
+    /// it: `EX_NULL_POINTER` (null callback), `EX_ILLEGAL_ARGUMENT` (no such
+    /// service, or `service` is not the binder registered under `name`),
+    /// `EX_UNSUPPORTED_OPERATION` (the caller is not the process that
+    /// registered the service), `EX_SECURITY` (the caller may not add `name`).
+    ///
+    /// Not supported on Android 10: returns `EX_UNSUPPORTED_OPERATION` there.
+    pub fn register_client_callback(
         &self,
         name: &str,
         service: &SIBinder,
         callback: &crate::Strong<dyn IClientCallback>,
-    ) -> std::result::Result<(), Status> {
+    ) -> BinderResult<()> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(_) => Err(unsupported("registerClientCallback", 11)),
@@ -1529,12 +1575,20 @@ impl ServiceManager {
         }
     }
 
-    /// `try_unregister_service` keeping the SM's own [`Status`], for `LazyServiceRegistrar`.
-    pub(crate) fn try_unregister_service_status(
-        &self,
-        name: &str,
-        service: &SIBinder,
-    ) -> std::result::Result<(), Status> {
+    /// Attempts to unregister a service previously added with
+    /// [`add_service`](Self::add_service); the service manager honors it only
+    /// if no clients currently hold a reference. AOSP
+    /// `IServiceManager::tryUnregisterService`.
+    ///
+    /// The service manager's refusal keeps its exception: `EX_ILLEGAL_STATE`
+    /// for a name not registered, another binder under the name, or a
+    /// client that holds or is about to hold the service (the last two can
+    /// pass on a later attempt; only the message tells them apart, as in
+    /// AOSP), `EX_UNSUPPORTED_OPERATION` when the caller is not the
+    /// registering process, `EX_SECURITY` when the caller may not add `name`.
+    ///
+    /// Not supported on Android 10: returns `EX_UNSUPPORTED_OPERATION` there.
+    pub fn try_unregister_service(&self, name: &str, service: &SIBinder) -> BinderResult<()> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(_) => Err(unsupported("tryUnregisterService", 11)),
@@ -1564,94 +1618,6 @@ impl ServiceManager {
         }
     }
 
-    /// Registers a callback that fires when the set of clients holding a
-    /// reference to `service` changes — the building block for lazy
-    /// (on-demand) services. AOSP `IServiceManager::registerClientCallback`.
-    ///
-    /// `service` is the binder previously handed to [`add_service`](Self::add_service)
-    /// (e.g. `my_binder.as_binder()`); `callback` is a `BnClientCallback`.
-    ///
-    /// Note: not supported on Android 10 — returns an error on that version.
-    pub fn register_client_callback(
-        &self,
-        name: &str,
-        service: &SIBinder,
-        callback: &crate::Strong<dyn IClientCallback>,
-    ) -> Result<()> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("register_client_callback: not supported on Android 10");
-                Err(StatusCode::UnknownTransaction)
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::register_client_callback(
-                sm,
-                name,
-                service,
-                &wrap_client_callback!(android_11, callback),
-            ),
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::register_client_callback(
-                sm,
-                name,
-                service,
-                &wrap_client_callback!(android_12, callback),
-            ),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::register_client_callback(
-                sm,
-                name,
-                service,
-                &wrap_client_callback!(android_13, callback),
-            ),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::register_client_callback(
-                sm,
-                name,
-                service,
-                &wrap_client_callback!(android_14, callback),
-            ),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::register_client_callback(
-                sm,
-                name,
-                service,
-                &wrap_client_callback!(android_15, callback),
-            ),
-            ServiceManager::Android16(sm) => {
-                android_16::register_client_callback(sm, name, service, callback)
-            }
-        }
-    }
-
-    /// Attempts to unregister a service previously added with
-    /// [`add_service`](Self::add_service); the service manager honors it only
-    /// if no clients currently hold a reference. AOSP
-    /// `IServiceManager::tryUnregisterService`.
-    ///
-    /// Note: not supported on Android 10 — returns an error on that version.
-    pub fn try_unregister_service(&self, name: &str, service: &SIBinder) -> Result<()> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("try_unregister_service: not supported on Android 10");
-                Err(StatusCode::UnknownTransaction)
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::try_unregister_service(sm, name, service),
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::try_unregister_service(sm, name, service),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::try_unregister_service(sm, name, service),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::try_unregister_service(sm, name, service),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::try_unregister_service(sm, name, service),
-            ServiceManager::Android16(sm) => android_16::try_unregister_service(sm, name, service),
-        }
-    }
-
     /// Error-preserving, non-blocking lookup: `Ok(Some)` found, `Ok(None)` not
     /// registered, `Err` on a transport/SM failure — the distinction that
     /// [`check_service`](Self::check_service) collapses to `None`. Reach for
@@ -1668,7 +1634,12 @@ impl ServiceManager {
     /// `realGetService`). The Android 10 legacy C SM cannot tell not-found from
     /// a transport error, so its arm reports any failure as `Ok(None)` and never
     /// `Err`.
-    pub fn try_get_service(&self, name: &str) -> Result<Option<SIBinder>> {
+    ///
+    /// The error is the service manager's [`Status`], as for the other
+    /// service-manager calls in this module: a refusal keeps its exception
+    /// (`EX_SECURITY` for a name the caller may not find), a transport
+    /// failure carries its [`StatusCode`] (`status.transaction_error()`).
+    pub fn try_get_service(&self, name: &str) -> BinderResult<Option<SIBinder>> {
         match self {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             ServiceManager::Android10(sm) => android_10::try_get_service(sm, name),
@@ -1702,12 +1673,16 @@ impl ServiceManager {
     /// [`check_interface`](Self::check_interface), which folds not-found into
     /// `Err(NameNotFound)`, and [`wait_for_interface`](Self::wait_for_interface),
     /// which blocks until the service appears.
+    ///
+    /// The error is a [`Status`] as for [`try_get_service`](Self::try_get_service);
+    /// a cast or descriptor-query failure is a `Status` carrying its
+    /// [`StatusCode`].
     pub fn try_get_interface<T: FromIBinder + ?Sized>(
         &self,
         name: &str,
-    ) -> Result<Option<Strong<T>>> {
+    ) -> BinderResult<Option<Strong<T>>> {
         match self.try_get_service(name)? {
-            Some(binder) => binder.into_interface_checked().map(Some),
+            Some(binder) => Ok(Some(binder.into_interface_checked()?)),
             None => Ok(None),
         }
     }
@@ -1781,7 +1756,7 @@ impl ServiceManager {
         state: Arc<WaiterState>,
     ) -> std::result::Result<SIBinder, WaitEnd> {
         // Fast path; a transport error means SM unreachable (AOSP `realGetService` → nullptr).
-        if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::Transient)? {
+        if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
             return Ok(binder);
         }
 
@@ -1792,7 +1767,7 @@ impl ServiceManager {
 
         let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
 
-        if let Err(status) = self.register_for_notifications_status(name, &callback) {
+        if let Err(status) = self.register_for_notifications(name, &callback) {
             #[cfg(all(target_os = "android", feature = "android_10"))]
             if matches!(self, ServiceManager::Android10(_)) {
                 return self.poll_for_service(name, &state);
@@ -1831,7 +1806,7 @@ impl ServiceManager {
             }
             waited_secs += 1;
             // Lazy-service race: re-poll each tick (AOSP `realGetService`); stop if SM is gone.
-            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::Transient)? {
+            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
                 return Ok(binder);
             }
         }
@@ -1857,7 +1832,7 @@ impl ServiceManager {
         state: &WaiterState,
     ) -> std::result::Result<SIBinder, WaitEnd> {
         loop {
-            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::Transient)? {
+            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
                 return Ok(binder);
             }
             let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1884,6 +1859,11 @@ pub(crate) enum WaitEnd {
 
 impl WaitEnd {
     /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry (plan 10-10b §3.10).
+    /// A failed lookup ends the wait as AOSP `realGetService`'s error does.
+    pub(crate) fn lookup(status: Status) -> Self {
+        WaitEnd::Transient(status.into())
+    }
+
     pub(crate) fn from_registration(status: Status) -> Self {
         match status.exception_code() {
             ExceptionCode::Security | ExceptionCode::IllegalArgument => WaitEnd::Refused(status),
@@ -1989,7 +1969,7 @@ pub fn list_services(dump_priority: i32) -> Vec<String> {
 pub fn register_for_notifications(
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
-) -> Result<()> {
+) -> BinderResult<()> {
     default()?.register_for_notifications(name, callback)
 }
 
@@ -2000,7 +1980,7 @@ pub fn register_for_notifications(
 pub fn unregister_for_notifications(
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
-) -> Result<()> {
+) -> BinderResult<()> {
     default()?.unregister_for_notifications(name, callback)
 }
 
@@ -2014,7 +1994,7 @@ pub fn register_client_callback(
     name: &str,
     service: &SIBinder,
     callback: &crate::Strong<dyn IClientCallback>,
-) -> Result<()> {
+) -> BinderResult<()> {
     default()?.register_client_callback(name, service, callback)
 }
 
@@ -2024,7 +2004,7 @@ pub fn register_client_callback(
 /// Equivalent to `default().try_unregister_service(name, service)`.
 /// See [`ServiceManager::try_unregister_service`].
 #[inline]
-pub fn try_unregister_service(name: &str, service: &SIBinder) -> Result<()> {
+pub fn try_unregister_service(name: &str, service: &SIBinder) -> BinderResult<()> {
     default()?.try_unregister_service(name, service)
 }
 
@@ -2048,23 +2028,6 @@ pub(crate) fn add_lazy_service(
     binder: impl Into<SIBinder>,
 ) -> std::result::Result<(), Status> {
     default()?.add_lazy_service(identifier, binder)
-}
-
-/// [`ServiceManager::register_client_callback_status`] on [`default`].
-pub(crate) fn register_client_callback_status(
-    name: &str,
-    service: &SIBinder,
-    callback: &crate::Strong<dyn IClientCallback>,
-) -> std::result::Result<(), Status> {
-    default()?.register_client_callback_status(name, service, callback)
-}
-
-/// [`ServiceManager::try_unregister_service_status`] on [`default`].
-pub(crate) fn try_unregister_service_status(
-    name: &str,
-    service: &SIBinder,
-) -> std::result::Result<(), Status> {
-    default()?.try_unregister_service_status(name, service)
 }
 
 /// Convenience function to wait for a service from the default
@@ -2123,7 +2086,7 @@ pub fn check_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>>
 /// registered" (`Ok(None)`) from "service manager unreachable" (`Err`). See
 /// [`ServiceManager::try_get_service`].
 #[inline]
-pub fn try_get_service(name: &str) -> Result<Option<SIBinder>> {
+pub fn try_get_service(name: &str) -> BinderResult<Option<SIBinder>> {
     default()?.try_get_service(name)
 }
 
@@ -2135,7 +2098,7 @@ pub fn try_get_service(name: &str) -> Result<Option<SIBinder>> {
 /// descriptor mismatch or a failure of the service's own descriptor query.
 /// See [`ServiceManager::try_get_interface`].
 #[inline]
-pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Option<Strong<T>>> {
+pub fn try_get_interface<T: FromIBinder + ?Sized>(name: &str) -> BinderResult<Option<Strong<T>>> {
     default()?.try_get_interface(name)
 }
 

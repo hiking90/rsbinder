@@ -143,7 +143,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let server: Arc<RpcServer> = RpcServer::setup_unix_server(&sock_path)?;
     server.set_android13plus(max_version);
     server.set_root(Interface::as_binder(&Binder::new(Interop)))?;
-    let _bg = server.run_background();
+    // Held to the end of `main`: dropping the handle stops the server.
+    let _bg = server.run_background()?;
 
     // One instance per server, so the provider ignores the queried name.
     let path_for_provider = PathBuf::from(&sock_path);

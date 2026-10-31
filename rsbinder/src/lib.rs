@@ -97,7 +97,12 @@
 //!   and `--no-default-features` builds carry zero RPC/networking cost.
 //! - `rpc-tcp-debug` — plaintext TCP backend (implies `rpc`). Debug and
 //!   interop bring-up **only**, never production — use `rpc-tls` for real
-//!   networks.
+//!   networks. It is a feature, not a build profile: Cargo unifies features,
+//!   so one crate in the dependency graph that enables it enables it for the
+//!   whole build, release builds included. The one path where a peer rather
+//!   than this process picks an inet socket, an Android 16 `IAccessor`
+//!   connection, therefore also needs the run-time opt-in
+//!   `rpc::set_accessor_plaintext_inet(true)`.
 //! - `rpc-vsock` — vsock backend for host↔VM channels (implies `rpc`;
 //!   Linux and Android targets only).
 //! - `rpc-tls` — TLS backend over rustls (implies `rpc`). rsbinder never
@@ -292,7 +297,6 @@ mod proxy;
 /// (`getBinderProxyCount` / `setBinderProxyCountWatermarks` /
 /// `setBinderProxyCountEventCallback` / `enableCountByUid`).
 pub mod proxy_count;
-mod ref_counter;
 /// Shared-memory IPC: AOSP `IMemoryHeap` / `IMemory` traits, a
 /// `memfd_create` (Linux/Android) / `shm_open` (macOS) backed
 /// `MemoryHeapBase`, and wire-faithful `android.utils.IMemory*`
@@ -302,8 +306,8 @@ pub mod shared_memory;
 // Status and exception handling, re-exported at the crate root.
 mod status;
 mod sys;
-/// Thread-local binder state
-pub mod thread_state;
+// Thread-local binder state; the crate-root re-exports are the public path.
+mod thread_state;
 mod transaction_data;
 // Transport capabilities; not under `rpc`: the kernel path answers the same questions.
 mod transport_caps;
@@ -378,9 +382,16 @@ pub use binder::{
 // The `function_names` arm of `declare_binder_interface!` calls it from consumer crates.
 #[doc(hidden)]
 pub use binder::__transaction_name;
+// Generated casts reach a local binder's in-process transport through these.
+#[doc(hidden)]
+pub use native::{__local_binder, __local_transport_ready};
 
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
+// Generated async proxies, `stream` and `rsbinder-topic` apply the inline rule through it.
+#[cfg(feature = "async")]
+#[doc(hidden)]
+pub use binder_async::__spawn_transact;
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
 // Fuzz entry points: the out-of-workspace `fuzz/` crate reaches them only via the root.
@@ -422,8 +433,14 @@ pub use proxy::{Proxy, ProxyHandle};
 
 // Explicit, not glob, so a new `pub` item in `rt` cannot leak past semver review.
 #[cfg(feature = "tokio")]
+#[expect(
+    deprecated,
+    reason = "re-exports `get_interface_async` while it is kept"
+)]
+pub use rt::get_interface_async;
+#[cfg(feature = "tokio")]
 pub use rt::{
-    check_interface_async, death_signal, get_interface_async, wait_for_interface_async,
+    check_interface_async, death_signal, try_get_interface_async, wait_for_interface_async,
     DeathSignal, Tokio, TokioRuntime,
 };
 // `status` stays private: the root re-exports are the only path to these types.

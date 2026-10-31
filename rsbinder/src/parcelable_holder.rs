@@ -160,17 +160,55 @@ pub struct ParcelableHolder {
 }
 
 impl Default for ParcelableHolder {
+    /// [`ParcelableHolder::local`].
     fn default() -> Self {
-        Self::new(Stability::Local)
+        Self::local()
     }
 }
 
 impl ParcelableHolder {
-    /// Construct a new `ParcelableHolder` with the given stability.
-    pub fn new(stability: Stability) -> Self {
+    fn with_stability(stability: Stability) -> Self {
         Self {
             data: Mutex::new(ParcelableHolderData::Empty),
             stability,
+        }
+    }
+
+    /// An empty holder of `STABILITY_LOCAL` (wire `0`), the stability of a
+    /// holder field without `@VintfStability`; also [`Default`].
+    pub fn local() -> Self {
+        Self::with_stability(Stability::Local)
+    }
+
+    /// An empty holder of `STABILITY_VINTF` (wire `1`), the stability of a
+    /// `@VintfStability` holder field. It accepts only a parcelable whose
+    /// stability includes VINTF and reads only a holder written as VINTF.
+    pub fn vintf() -> Self {
+        Self::with_stability(Stability::Vintf)
+    }
+
+    /// Construct a new `ParcelableHolder` with the given stability.
+    ///
+    /// # Panics
+    ///
+    /// For [`Stability::Vendor`] and [`Stability::System`]. A holder's wire
+    /// stability is AOSP `Parcelable::Stability`, which has only LOCAL and
+    /// VINTF; those two binder levels have no holder encoding. A holder made
+    /// with one would write LOCAL, and a `Vendor` one would also refuse the
+    /// non-VINTF parcelables a LOCAL holder takes.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `ParcelableHolder::local()` or `ParcelableHolder::vintf()`: a holder's \
+                stability is LOCAL or VINTF only"
+    )]
+    pub fn new(stability: Stability) -> Self {
+        match stability {
+            Stability::Local => Self::local(),
+            Stability::Vintf => Self::vintf(),
+            other => panic!(
+                "ParcelableHolder::new({other:?}): a holder's stability is Local or Vintf \
+                 (AOSP Parcelable::Stability); use ParcelableHolder::local() or vintf()"
+            ),
         }
     }
 
@@ -433,7 +471,7 @@ mod tests {
     #[test]
     fn holder_serializes_parcelable_stability_not_binder_level_bitmask() {
         // Golden bytes, as a symmetric round trip cannot catch a wrong value; see struct rustdoc.
-        let vintf = ParcelableHolder::new(Stability::Vintf);
+        let vintf = ParcelableHolder::vintf();
         let mut vp = Parcel::new();
         vintf.write_to_parcel(&mut vp).unwrap();
         vp.set_data_position(0);
@@ -455,7 +493,7 @@ mod tests {
 
         // Round-trip back into a same-stability holder accepts it.
         vp.set_data_position(0);
-        let mut dst = ParcelableHolder::new(Stability::Vintf);
+        let mut dst = ParcelableHolder::vintf();
         dst.read_from_parcel(&mut vp).unwrap();
 
         // A Local holder still rejects a Vintf (1) wire value with BadValue.
@@ -465,6 +503,24 @@ mod tests {
             local_dst.read_from_parcel(&mut vp),
             Err(StatusCode::BadValue)
         ));
+    }
+
+    /// `new` keeps the two holder stabilities and refuses the two that have no holder encoding.
+    #[test]
+    #[expect(deprecated, reason = "pins the deprecated constructor's contract")]
+    fn new_takes_local_and_vintf_and_panics_on_the_binder_only_levels() {
+        assert_eq!(
+            ParcelableHolder::new(Stability::Local).get_stability(),
+            Stability::Local
+        );
+        assert_eq!(
+            ParcelableHolder::new(Stability::Vintf).get_stability(),
+            Stability::Vintf
+        );
+        for level in [Stability::Vendor, Stability::System] {
+            let made = std::panic::catch_unwind(|| ParcelableHolder::new(level));
+            assert!(made.is_err(), "{level:?} has no holder encoding");
+        }
     }
 
     /// Non-nullable: only `NON_NULL_PARCELABLE_FLAG` (1) passes; 0 or garbage is `UnexpectedNull`.

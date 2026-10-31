@@ -20,14 +20,16 @@
 use std::sync::Arc;
 use std::thread;
 
-use rsbinder::rpc::{FileDescriptorTransportMode as FdMode, RpcServer, RpcSession};
+use rsbinder::rpc::{
+    FileDescriptorTransportMode as FdMode, RpcServer, RpcServerHandle, RpcSession,
+};
 use rsbinder::shared_memory::{
     export_heap, BpMemory, BpMemoryHeap, HeapCache, IMemory, IMemoryHeap, MemoryBase, MemoryDealer,
     MemoryHeapBase, FLAG_READ_ONLY,
 };
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result as RsResult, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION,
+    Binder, Interface, Parcel, Remotable, RemoteProxy, Result as RsResult, StatusCode,
+    TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 fn page() -> usize {
@@ -71,9 +73,9 @@ impl Bound {
         }
     }
 
-    /// Start serving; returns the join handle.
-    fn run(&self) -> thread::JoinHandle<()> {
-        let bg = self.server.run_background();
+    /// Start serving; returns the handle that ends the server.
+    fn run(&self) -> RpcServerHandle {
+        let bg = self.server.run_background().expect("run_background");
         #[cfg(not(target_os = "android"))]
         for _ in 0..400 {
             if self.path.exists() {
@@ -108,9 +110,8 @@ impl Bound {
         }
     }
 
-    fn finish(self, bg: thread::JoinHandle<()>) {
-        self.server.stop_accepting();
-        let _ = bg.join();
+    fn finish(self, bg: RpcServerHandle) {
+        let _ = bg.stop_and_join();
         #[cfg(not(target_os = "android"))]
         let _ = std::fs::remove_file(&self.path);
     }
@@ -342,10 +343,10 @@ fn dealer_allocations_share_one_mapping_through_heap_cache() {
     let cache = HeapCache::new();
     let mut heaps = Vec::new();
     for i in 0..3i32 {
-        let mut data = rp.build_request("rsbinder.test.IAllocs").unwrap();
+        let mut data = rp.prepare_request("rsbinder.test.IAllocs").unwrap();
         data.write(&i).unwrap();
         let mut reply = rp
-            .transact(FIRST_CALL_TRANSACTION, &data, 0)
+            .submit_transact(FIRST_CALL_TRANSACTION, &data, 0)
             .unwrap()
             .unwrap();
         let mem_binder: rsbinder::SIBinder = reply.read().unwrap();

@@ -12,8 +12,8 @@ use rsbinder::{hub, BinderResult, Interface, SIBinder, StatusCode, Strong};
 use crate::aidl::ITopic::ITopic;
 use crate::aidl::ITopicRegistry::{ITopicRegistry, SERVICE_NAME};
 use crate::aidl::ITopicWatcher::{BnTopicWatcher, ITopicWatcher};
-use crate::aidl::TopicInfo::TopicInfo;
 use crate::aidl::TopicRef::TopicRef;
+use crate::registry::TopicListing;
 use crate::resolve::{Advertisement, Resolver, Watch};
 
 /// A registry of topic names as a [`Resolver`]: names apart from service names, under the policy
@@ -34,8 +34,10 @@ use crate::resolve::{Advertisement, Resolver, Watch};
 ///
 /// A host that ends takes its names and watches with it. Every call of this resolver then fails
 /// with `DeadObject`, publishers and subscribers already connected go on, and a publisher does
-/// not advertise its name to the next host: make the publisher and the name subscriber again
-/// with a resolver of the new host (plan 15 D8). A refusal of a call is `DeadObject` only when
+/// not advertise its name to the next host. A [`NamedSubscriber`](crate::NamedSubscriber)
+/// returns [`Closed::ResolverDied`](crate::Closed::ResolverDied) once it has no connection left:
+/// make the publisher and the name subscriber again with a resolver of the new host (plan 15
+/// D8). A refusal of a call is `DeadObject` only when
 /// the host died: a binder of the call that is dead is `ILLEGAL_STATE`.
 #[derive(Clone)]
 pub struct RegistryResolver {
@@ -64,9 +66,11 @@ impl RegistryResolver {
         })
     }
 
-    /// The names under `prefix` with a topic that this process may subscribe to, sorted.
-    pub fn list(&self, prefix: &str) -> BinderResult<Vec<TopicInfo>> {
-        self.registry.r#list(prefix)
+    /// The names under `prefix` with a topic that this process may subscribe to, sorted, as the
+    /// registry sends them. `EX_SECURITY` when the host's policy does not let this process list.
+    pub fn list(&self, prefix: &str) -> BinderResult<Vec<TopicListing>> {
+        let listed = self.registry.r#list(prefix)?;
+        Ok(listed.into_iter().map(TopicListing::from).collect())
     }
 }
 
@@ -128,6 +132,10 @@ impl Resolver for RegistryResolver {
             newest,
         };
         Ok(Watch::with_lookup(watching, lookup))
+    }
+
+    fn host(&self) -> Option<SIBinder> {
+        Some(self.registry.as_binder())
     }
 }
 

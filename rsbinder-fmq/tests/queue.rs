@@ -15,15 +15,12 @@ use std::time::{Duration, Instant};
 
 use rsbinder_fmq::shm::{Access, Mapping};
 use rsbinder_fmq::{
-    AttachPolicy, Descriptor, Error, Flavor, Grantor, MessageQueue, NOT_EMPTY, NOT_FULL,
+    AttachPolicy, Descriptor, Error, Flavor, Grantor, MessageQueue, Notify, Transfer, NOT_EMPTY,
+    NOT_FULL,
 };
 
 fn policy(max_capacity: usize, event_flag: bool) -> AttachPolicy {
-    AttachPolicy {
-        max_capacity,
-        require_seal: true,
-        require_event_flag: event_flag,
-    }
+    AttachPolicy::new(max_capacity).require_event_flag(event_flag)
 }
 
 fn attach<T: rsbinder_fmq::Element>(q: &MessageQueue<T>) -> MessageQueue<T> {
@@ -31,13 +28,17 @@ fn attach<T: rsbinder_fmq::Element>(q: &MessageQueue<T>) -> MessageQueue<T> {
     MessageQueue::<T>::attach(&desc, &policy(q.capacity(), desc.has_event_flag())).expect("attach")
 }
 
+/// The check a refused descriptor failed.
 fn bad(r: Result<MessageQueue<u32>, Error>) -> &'static str {
     match r {
-        Err(Error::BadValue(what)) => what,
-        Err(e) => panic!("expected BadValue, got {e:?}"),
-        Ok(_) => panic!("expected BadValue, attach succeeded"),
+        Err(Error::InvalidDescriptor(what)) => what,
+        Err(e) => panic!("expected InvalidDescriptor, got {e:?}"),
+        Ok(_) => panic!("expected InvalidDescriptor, attach succeeded"),
     }
 }
+
+const DONE: Transfer = Transfer::Done;
+const WOULD_BLOCK: Transfer = Transfer::WouldBlock;
 
 /// A raw view of a single-fd queue's counters, to play the hostile peer.
 struct Counters(Mapping);
@@ -78,12 +79,12 @@ fn create_descriptor_attach_round_trip() {
     assert_eq!(reader.available_to_read().unwrap(), 0);
 
     let items: Vec<u32> = (1..=10).collect();
-    assert!(writer.write(&items).unwrap());
+    assert_eq!(writer.write(&items).unwrap(), DONE);
     assert_eq!(reader.available_to_read().unwrap(), 10);
     assert_eq!(writer.available_to_write().unwrap(), 6);
 
     let mut out = [0u32; 10];
-    assert!(reader.read(&mut out).unwrap());
+    assert_eq!(reader.read(&mut out).unwrap(), DONE);
     assert_eq!(&out[..], &items[..]);
     assert_eq!(reader.available_to_read().unwrap(), 0);
     assert_eq!(writer.available_to_write().unwrap(), 16);
@@ -100,9 +101,9 @@ fn descriptor_fds_are_duplicates() {
     // The queue still works after a descriptor's fds are closed.
     let mut r = MessageQueue::<u8>::attach(&b, &policy(8, false)).unwrap();
     let mut w = q;
-    assert!(w.write(&[7]).unwrap());
+    assert_eq!(w.write(&[7]).unwrap(), DONE);
     let mut out = [0u8];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert_eq!(out, [7]);
 }
 
@@ -114,14 +115,17 @@ fn queue_without_event_flag_has_three_grantors_and_no_blocking() {
     assert!(!desc.has_event_flag());
     assert!(q.event_flag().is_none());
     assert_eq!(
-        q.write_blocking(&[1], NOT_FULL, NOT_EMPTY, None)
-            .unwrap_err(),
+        q.write_blocking(&[1], None).unwrap_err(),
         Error::NoEventFlag
     );
     let mut out = [0u8];
     assert_eq!(
-        q.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, None)
-            .unwrap_err(),
+        q.read_blocking(&mut out, None).unwrap_err(),
+        Error::NoEventFlag
+    );
+    // Before anything else, even a try that waits for nothing.
+    assert_eq!(
+        q.write_blocking(&[1], Some(Duration::ZERO)).unwrap_err(),
         Error::NoEventFlag
     );
 }
@@ -133,49 +137,45 @@ fn wrap_splits_the_regions_and_keeps_the_order() {
     let mut w = MessageQueue::<u16>::create(8, false).unwrap();
     let mut r = attach(&w);
 
-    assert!(w.write(&[1, 2, 3, 4, 5]).unwrap());
+    assert_eq!(w.write(&[1, 2, 3, 4, 5]).unwrap(), DONE);
     let mut out = [0u16; 5];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
 
     // Position 5 of 8: 3 before the end, 3 after the wrap.
-    {
-        let mut regions = w.begin_write(6).unwrap().expect("6 fit");
-        assert_eq!(regions.len(), 6);
-        assert_eq!(regions.first_len(), 3);
-        assert_eq!(regions.second_len(), 3);
-        regions.write_at(0, &[10, 11]).unwrap();
-        regions.write_at(2, &[12, 13, 14, 15]).unwrap();
-        assert_eq!(
-            regions.write_at(5, &[0, 0]).unwrap_err(),
-            Error::BadValue("write past the reserved elements")
-        );
-    }
-    w.commit_write(6).unwrap();
+    let mut txn = w.begin_write(6).unwrap().expect("6 fit");
+    assert_eq!(txn.len(), 6);
+    assert_eq!(txn.first_len(), 3);
+    assert_eq!(txn.second_len(), 3);
+    txn.write_at(0, &[10, 11]).unwrap();
+    txn.write_at(2, &[12, 13, 14, 15]).unwrap();
+    assert_eq!(
+        txn.write_at(5, &[0, 0]).unwrap_err(),
+        Error::BadValue("write past the reserved elements")
+    );
+    txn.commit().unwrap();
 
-    {
-        let regions = r.begin_read(6).unwrap().expect("6 available");
-        assert_eq!(regions.first_len(), 3);
-        assert_eq!(regions.second_len(), 3);
-        let mut a = [0u16; 2];
-        let mut b = [0u16; 4];
-        regions.read_at(0, &mut a).unwrap();
-        regions.read_at(2, &mut b).unwrap();
-        assert_eq!(a, [10, 11]);
-        assert_eq!(b, [12, 13, 14, 15]);
-        // Starting at the wrap and past it: only the second part is read.
-        let mut at_wrap = [0u16; 3];
-        let mut past_wrap = [0u16; 2];
-        regions.read_at(3, &mut at_wrap).unwrap();
-        regions.read_at(4, &mut past_wrap).unwrap();
-        assert_eq!(at_wrap, [13, 14, 15]);
-        assert_eq!(past_wrap, [14, 15]);
-        let mut c = [0u16; 1];
-        assert_eq!(
-            regions.read_at(6, &mut c).unwrap_err(),
-            Error::BadValue("read past the available elements")
-        );
-    }
-    r.commit_read(6).unwrap();
+    let txn = r.begin_read(6).unwrap().expect("6 available");
+    assert_eq!(txn.first_len(), 3);
+    assert_eq!(txn.second_len(), 3);
+    let mut a = [0u16; 2];
+    let mut b = [0u16; 4];
+    txn.read_at(0, &mut a).unwrap();
+    txn.read_at(2, &mut b).unwrap();
+    assert_eq!(a, [10, 11]);
+    assert_eq!(b, [12, 13, 14, 15]);
+    // Starting at the wrap and past it: only the second part is read.
+    let mut at_wrap = [0u16; 3];
+    let mut past_wrap = [0u16; 2];
+    txn.read_at(3, &mut at_wrap).unwrap();
+    txn.read_at(4, &mut past_wrap).unwrap();
+    assert_eq!(at_wrap, [13, 14, 15]);
+    assert_eq!(past_wrap, [14, 15]);
+    let mut c = [0u16; 1];
+    assert_eq!(
+        txn.read_at(6, &mut c).unwrap_err(),
+        Error::BadValue("read past the available elements")
+    );
+    txn.commit().unwrap();
     assert_eq!(r.available_to_read().unwrap(), 0);
 
     // Many laps: the counters keep growing and every element comes back.
@@ -183,9 +183,9 @@ fn wrap_splits_the_regions_and_keeps_the_order() {
     for lap in 0..50u16 {
         let n = (lap % 8 + 1) as usize;
         let items: Vec<u16> = (0..n as u16).map(|i| next + i).collect();
-        assert!(w.write(&items).unwrap());
+        assert_eq!(w.write(&items).unwrap(), DONE);
         let mut got = vec![0u16; n];
-        assert!(r.read(&mut got).unwrap());
+        assert_eq!(r.read(&mut got).unwrap(), DONE);
         assert_eq!(got, items);
         next += n as u16;
     }
@@ -203,54 +203,104 @@ fn write_and_read_are_all_or_nothing() {
         w.begin_write_cached(3, 2).err(),
         Some(Error::BadValue("more items than the limit in flight"))
     );
-    assert!(w.write(&[1, 2, 3, 4]).unwrap());
-    assert!(!w.write(&[5]).unwrap());
-    assert!(w.write(&[]).unwrap());
+    assert_eq!(w.write(&[1, 2, 3, 4]).unwrap(), DONE);
+    assert_eq!(w.write(&[5]).unwrap(), WOULD_BLOCK);
+    assert_eq!(w.write(&[]).unwrap(), DONE);
     let mut five = [0u8; 5];
     assert_eq!(r.read(&mut five).err(), too_many);
     assert_eq!(r.begin_read(5).err(), too_many);
     let mut two = [0u8; 2];
-    assert!(r.read(&mut two).unwrap());
+    assert_eq!(r.read(&mut two).unwrap(), DONE);
     assert_eq!(two, [1, 2]);
-    assert!(w.write(&[5, 6]).unwrap());
+    assert_eq!(w.write(&[5, 6]).unwrap(), DONE);
     let mut four = [0u8; 4];
-    assert!(r.read(&mut four).unwrap());
+    assert_eq!(r.read(&mut four).unwrap(), DONE);
     assert_eq!(four, [3, 4, 5, 6]);
-    assert!(!r.read(&mut two).unwrap());
-    assert!(r.read(&mut []).unwrap());
+    two = [9, 9];
+    assert_eq!(r.read(&mut two).unwrap(), WOULD_BLOCK);
+    assert_eq!(
+        two,
+        [9, 9],
+        "a read that would block leaves the buffer alone"
+    );
+    assert_eq!(r.read(&mut []).unwrap(), DONE);
 }
 
 #[test]
-fn commit_beyond_free_space_or_available_elements_is_refused() {
+fn a_commit_publishes_what_its_transaction_reserved_and_no_more() {
     let mut w = MessageQueue::<u8>::create(4, false).unwrap();
     let mut r = attach(&w);
+    let mut txn = w.begin_write(2).unwrap().expect("2 fit");
+    txn.write_at(0, &[1, 2]).unwrap();
     assert_eq!(
-        w.commit_write(5).unwrap_err(),
-        Error::BadValue("commit exceeds the space that was free")
+        txn.commit_first(3).unwrap_err(),
+        Error::BadValue("commit exceeds the elements reserved")
     );
     assert_eq!(
-        r.commit_read(1).unwrap_err(),
-        Error::BadValue("commit exceeds the elements available")
+        r.available_to_read().unwrap(),
+        0,
+        "a refused commit publishes nothing"
     );
-    w.commit_write(0).unwrap();
-    assert!(w.write(&[1, 2]).unwrap());
+
+    // A prefix: the next write starts right after it.
+    let mut txn = w.begin_write(3).unwrap().expect("3 fit");
+    txn.write_at(0, &[1, 2, 3]).unwrap();
+    txn.commit_first(1).unwrap();
+    assert_eq!(w.write(&[4]).unwrap(), DONE);
+    let mut out = [0u8; 2];
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
+    assert_eq!(out, [1, 4]);
+
+    // A read prefix leaves the rest unread.
+    assert_eq!(w.write(&[5, 6]).unwrap(), DONE);
+    let txn = r.begin_read(2).unwrap().expect("2 available");
     assert_eq!(
-        r.commit_read(3).unwrap_err(),
-        Error::BadValue("commit exceeds the elements available")
+        txn.commit_first(3).unwrap_err(),
+        Error::BadValue("commit exceeds the elements reserved")
     );
-    r.commit_read(2).unwrap();
+    let txn = r.begin_read(2).unwrap().expect("2 available");
+    txn.commit_first(1).unwrap();
+    let mut one = [0u8; 1];
+    assert_eq!(r.read(&mut one).unwrap(), DONE);
+    assert_eq!(one, [6]);
+    let txn = r.begin_read(0).unwrap().expect("nothing is always there");
+    txn.commit().unwrap();
     assert_eq!(r.available_to_read().unwrap(), 0);
+}
+
+/// AOSP Rust's `WriteCompletion` commits on drop; a dropped transaction here publishes nothing.
+#[test]
+fn a_dropped_transaction_publishes_and_frees_nothing() {
+    let mut w = MessageQueue::<u8>::create(4, false).unwrap();
+    let mut r = attach(&w);
+    {
+        let mut txn = w.begin_write(2).unwrap().expect("2 fit");
+        txn.write_at(0, &[7, 7]).unwrap();
+    }
+    assert_eq!(r.available_to_read().unwrap(), 0);
+    assert_eq!(w.available_to_write().unwrap(), 4);
+    assert_eq!(w.write(&[1, 2]).unwrap(), DONE);
+
+    drop(r.begin_read(2).unwrap().expect("2 available"));
+    assert_eq!(w.available_to_write().unwrap(), 2);
+    let mut out = [0u8; 2];
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
+    assert_eq!(
+        out,
+        [1, 2],
+        "the same elements, and not the dropped write's"
+    );
 }
 
 // ---- The cached writer -----------------------------------------------------
 
 /// Write `items` as the cached writer; `false` when they do not fit within `limit`.
 fn write_cached(w: &mut MessageQueue<u32>, items: &[u32], limit: usize) -> bool {
-    match w.begin_write_cached(items.len(), limit).unwrap() {
-        Some(mut regions) => regions.write_at(0, items).unwrap(),
-        None => return false,
-    }
-    w.commit_write_cached(items.len()).unwrap();
+    let Some(mut txn) = w.begin_write_cached(items.len(), limit).unwrap() else {
+        return false;
+    };
+    txn.write_at(0, items).unwrap();
+    txn.commit().unwrap();
     true
 }
 
@@ -264,7 +314,7 @@ fn a_cached_writer_full_by_its_view_reloads_the_read_counter() {
         "full, and the reload agrees"
     );
     let mut out = [0u32; 3];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert!(
         write_cached(&mut w, &[9, 10, 11], 8),
         "the reload saw the read"
@@ -273,7 +323,7 @@ fn a_cached_writer_full_by_its_view_reloads_the_read_counter() {
 
     // `limit` keeps room the writer will not use for these elements.
     let mut out = [0u32; 8];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert_eq!(out, [4, 5, 6, 7, 8, 9, 10, 11]);
     assert!(write_cached(&mut w, &[1, 2, 3, 4, 5, 6], 6));
     assert!(!write_cached(&mut w, &[7], 6));
@@ -292,23 +342,33 @@ fn a_plain_commit_drops_the_cached_view() {
     let mut w = MessageQueue::<u32>::create(8, false).unwrap();
     let mut r = attach(&w);
     assert!(write_cached(&mut w, &[1], 8));
-    assert!(w.write(&[2]).unwrap());
+    assert_eq!(w.write(&[2]).unwrap(), DONE);
     // A stale view would write this over `2`.
     assert!(write_cached(&mut w, &[3], 8));
     let mut out = [0u32; 3];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert_eq!(out, [1, 2, 3]);
+}
 
-    let mut fresh = MessageQueue::<u32>::create(8, false).unwrap();
+#[test]
+fn a_cached_transaction_commits_through_the_view() {
+    let mut w = MessageQueue::<u32>::create(8, false).unwrap();
+    let mut r = attach(&w);
+    let txn = w.begin_write_cached(2, 8).unwrap().expect("2 fit");
     assert_eq!(
-        fresh.commit_write_cached(1).unwrap_err(),
-        Error::BadValue("commit with no cached view")
+        txn.commit_first(3).unwrap_err(),
+        Error::BadValue("commit exceeds the elements reserved")
     );
-    assert!(fresh.begin_write_cached(2, 8).unwrap().is_some());
-    assert_eq!(
-        fresh.commit_write_cached(9).unwrap_err(),
-        Error::BadValue("commit exceeds the space that was free")
-    );
+    // Dropped: nothing published, and the view still starts where it did.
+    drop(w.begin_write_cached(2, 8).unwrap().expect("2 fit"));
+    let mut txn = w.begin_write_cached(3, 8).unwrap().expect("3 fit");
+    txn.write_at(0, &[1, 2, 3]).unwrap();
+    txn.commit_first(2).unwrap();
+    assert!(write_cached(&mut w, &[4], 8));
+    let mut out = [0u32; 3];
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
+    assert_eq!(out, [1, 2, 4]);
+    assert_eq!(r.available_to_read().unwrap(), 0);
 }
 
 #[test]
@@ -344,18 +404,18 @@ fn a_cached_writer_checks_the_read_counter_it_reloads() {
 fn write_blocking_returns_only_after_the_reader_frees_space() {
     let mut w = MessageQueue::<u8>::create(4, true).unwrap();
     let mut r = attach(&w);
-    assert!(w.write(&[1, 2, 3, 4]).unwrap());
+    assert_eq!(w.write(&[1, 2, 3, 4]).unwrap(), DONE);
 
     let started = Instant::now();
     let reader = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
         let mut out = [0u8; 2];
-        r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(Duration::from_secs(5)))
+        r.read_blocking(&mut out, Some(Duration::from_secs(5)))
             .unwrap();
         assert_eq!(out, [1, 2]);
         r
     });
-    w.write_blocking(&[5, 6], NOT_FULL, NOT_EMPTY, Some(Duration::from_secs(5)))
+    w.write_blocking(&[5, 6], Some(Duration::from_secs(5)))
         .unwrap();
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
@@ -363,17 +423,17 @@ fn write_blocking_returns_only_after_the_reader_frees_space() {
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     let mut r = reader.join().unwrap();
     let mut out = [0u8; 4];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert_eq!(out, [3, 4, 5, 6]);
 }
 
 #[test]
 fn write_blocking_times_out_on_a_full_queue() {
     let mut w = MessageQueue::<u8>::create(2, true).unwrap();
-    assert!(w.write(&[1, 2]).unwrap());
+    assert_eq!(w.write(&[1, 2]).unwrap(), DONE);
     let started = Instant::now();
     assert_eq!(
-        w.write_blocking(&[3], NOT_FULL, NOT_EMPTY, Some(Duration::from_millis(60)))
+        w.write_blocking(&[3], Some(Duration::from_millis(60)))
             .unwrap_err(),
         Error::TimedOut
     );
@@ -384,15 +444,46 @@ fn write_blocking_times_out_on_a_full_queue() {
     assert_eq!(w.available_to_write().unwrap(), 0);
 }
 
+/// `Some(ZERO)` is one try: no wait, and the EventFlag word is not touched.
+#[test]
+fn a_zero_timeout_tries_once_without_waiting() {
+    let mut w = MessageQueue::<u8>::create(2, true).unwrap();
+    let mut r = attach(&w);
+    let flag = w.event_flag().unwrap();
+    assert_eq!(w.write(&[1, 2]).unwrap(), DONE);
+    flag.wake(NOT_FULL).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        w.write_blocking(&[3], Some(Duration::ZERO)).unwrap_err(),
+        Error::TimedOut
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(flag.peek(), NOT_FULL, "the try consumed no bit");
+    assert_eq!(flag.wait(NOT_FULL, Some(Duration::ZERO)), Ok(NOT_FULL));
+
+    let mut out = [0u8; 2];
+    r.read_blocking(&mut out, Some(Duration::ZERO)).unwrap();
+    assert_eq!(out, [1, 2]);
+    assert_eq!(flag.peek() & NOT_FULL, NOT_FULL, "the read woke the writer");
+    w.write_blocking(&[3], Some(Duration::ZERO)).unwrap();
+    assert_eq!(
+        flag.peek() & NOT_EMPTY,
+        NOT_EMPTY,
+        "the write woke the reader"
+    );
+    assert_eq!(
+        r.read_blocking(&mut out, Some(Duration::ZERO)).unwrap_err(),
+        Error::TimedOut
+    );
+}
+
 #[test]
 fn a_timeout_past_the_clock_waits_without_a_deadline() {
     let mut q = MessageQueue::<u8>::create(2, true).unwrap();
     for timeout in [Duration::MAX, Duration::from_secs(i64::MAX as u64)] {
-        q.write_blocking(&[1], NOT_FULL, NOT_EMPTY, Some(timeout))
-            .unwrap();
+        q.write_blocking(&[1], Some(timeout)).unwrap();
         let mut out = [0u8];
-        q.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(timeout))
-            .unwrap();
+        q.read_blocking(&mut out, Some(timeout)).unwrap();
         assert_eq!(out, [1]);
     }
 
@@ -400,17 +491,15 @@ fn a_timeout_past_the_clock_waits_without_a_deadline() {
     for timeout in [Duration::MAX, Duration::from_secs(i64::MAX as u64)] {
         let mut w = MessageQueue::<u8>::create(2, true).unwrap();
         let mut r = attach(&w);
-        w.write(&[1, 2]).unwrap();
+        assert_eq!(w.write(&[1, 2]).unwrap(), DONE);
         let started = std::time::Instant::now();
         let reader = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             let mut out = [0u8];
-            r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, None)
-                .unwrap();
+            r.read_blocking(&mut out, None).unwrap();
             out
         });
-        w.write_blocking(&[3], NOT_FULL, NOT_EMPTY, Some(timeout))
-            .unwrap();
+        w.write_blocking(&[3], Some(timeout)).unwrap();
         assert!(
             started.elapsed() >= Duration::from_millis(40),
             "{:?}",
@@ -427,11 +516,10 @@ fn read_blocking_wakes_on_the_writers_notification() {
     let started = Instant::now();
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
-        w.write_blocking(&[9, 8, 7], NOT_FULL, NOT_EMPTY, None)
-            .unwrap();
+        w.write_blocking(&[9, 8, 7], None).unwrap();
     });
     let mut out = [0u32; 3];
-    r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(Duration::from_secs(5)))
+    r.read_blocking(&mut out, Some(Duration::from_secs(5)))
         .unwrap();
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
@@ -441,13 +529,8 @@ fn read_blocking_wakes_on_the_writers_notification() {
 
     let started = Instant::now();
     assert_eq!(
-        r.read_blocking(
-            &mut out,
-            NOT_EMPTY,
-            NOT_FULL,
-            Some(Duration::from_millis(40))
-        )
-        .unwrap_err(),
+        r.read_blocking(&mut out, Some(Duration::from_millis(40)))
+            .unwrap_err(),
         Error::TimedOut
     );
     assert!(started.elapsed() >= Duration::from_millis(40));
@@ -459,20 +542,46 @@ fn blocking_rejects_a_request_the_queue_can_never_satisfy() {
     // Bounded, so a lost capacity check fails as `TimedOut` instead of hanging.
     let bound = Some(Duration::from_secs(5));
     assert_eq!(
-        q.write_blocking(&[0; 3], NOT_FULL, NOT_EMPTY, bound)
-            .unwrap_err(),
+        q.write_blocking(&[0; 3], bound).unwrap_err(),
         Error::BadValue("more items than the queue holds")
     );
     let mut out = [0u8; 3];
     assert_eq!(
-        q.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, bound)
-            .unwrap_err(),
+        q.read_blocking(&mut out, bound).unwrap_err(),
         Error::BadValue("more items than the queue holds")
     );
-    assert_eq!(
-        q.write_blocking(&[0], 0, NOT_EMPTY, None).unwrap_err(),
-        Error::BadValue("empty wait mask")
-    );
+}
+
+/// `*_with` names each mask by what the call does with it, whatever libfmq's argument order.
+#[test]
+fn blocking_with_waits_on_wait_and_sets_wake() {
+    const MINE: u32 = 0x10;
+    let wait_mine = Notify::new(std::num::NonZeroU32::new(MINE).unwrap(), 0x20);
+    let mut w = MessageQueue::<u8>::create(1, true).unwrap();
+    let mut r = attach(&w);
+    let flag = w.event_flag().unwrap();
+    assert_eq!(w.write(&[1]).unwrap(), DONE);
+    let waker = flag.clone();
+    let reader = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        let mut out = [0u8];
+        // Wakes `NOT_FULL`, which the writer does not wait on, then the writer's own bit.
+        r.read_blocking(&mut out, None).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        waker.wake(MINE).unwrap();
+        out
+    });
+    let started = Instant::now();
+    w.write_blocking_with(&[2], wait_mine, Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(reader.join().unwrap(), [1]);
+    assert_eq!(flag.peek() & 0x20, 0x20, "the write set `wake`");
+    assert_eq!(flag.peek() & MINE, 0, "the wait consumed `wait`");
+    assert_eq!(Notify::WRITE, Notify::new(Notify::WRITE.wait, NOT_EMPTY));
+    assert_eq!(Notify::WRITE.wait.get(), NOT_FULL);
+    assert_eq!(Notify::READ.wait.get(), NOT_EMPTY);
+    assert_eq!(Notify::READ.wake, NOT_FULL);
 }
 
 /// The writer wakes on every write, not only on empty to non-empty.
@@ -483,12 +592,12 @@ fn reader_waiting_for_several_elements_is_woken_by_each_write() {
     let writer = std::thread::spawn(move || {
         for v in 0..3u8 {
             std::thread::sleep(Duration::from_millis(40));
-            w.write_blocking(&[v], NOT_FULL, NOT_EMPTY, None).unwrap();
+            w.write_blocking(&[v], None).unwrap();
         }
     });
     let mut out = [0u8; 3];
     let started = Instant::now();
-    r.read_blocking(&mut out, NOT_EMPTY, NOT_FULL, Some(Duration::from_secs(5)))
+    r.read_blocking(&mut out, Some(Duration::from_secs(5)))
         .unwrap();
     let elapsed = started.elapsed();
     assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
@@ -557,13 +666,10 @@ fn attach_rejects_an_unsealed_memfd_when_the_policy_requires_seals() {
         bad(MessageQueue::<u32>::attach(&d, &policy(16, true))),
         "fd is neither shrink-sealed nor ashmem"
     );
-    let lax = AttachPolicy {
-        require_seal: false,
-        ..policy(16, true)
-    };
+    let lax = policy(16, true).require_seal(false);
     let mut q = MessageQueue::<u32>::attach(&d, &lax).unwrap();
     assert_eq!(q.capacity(), 16);
-    assert!(q.write(&[1]).unwrap());
+    assert_eq!(q.write(&[1]).unwrap(), DONE);
 
     // With `F_SEAL_SHRINK` added later, the strict policy accepts it.
     rustix::fs::fcntl_add_seals(&d.fds[0], rustix::fs::SealFlags::SHRINK).unwrap();
@@ -626,7 +732,9 @@ fn attach_rejects_a_capacity_above_the_policy() {
 fn attach_rejects_a_quantum_that_differs_from_the_element() {
     let (_q, d) = fresh_desc(16, true);
     match MessageQueue::<u16>::attach(&d, &policy(1 << 20, true)) {
-        Err(Error::BadValue(what)) => assert_eq!(what, "quantum differs from the element size"),
+        Err(Error::InvalidDescriptor(what)) => {
+            assert_eq!(what, "quantum differs from the element size")
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -701,9 +809,9 @@ fn attach_ignores_grantors_past_the_event_flag_word() {
         extent: 0,
     });
     let mut r = MessageQueue::<u32>::attach(&d, &policy(16, true)).unwrap();
-    assert!(w.write(&[42]).unwrap());
+    assert_eq!(w.write(&[42]).unwrap(), DONE);
     let mut out = [0u32];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert_eq!(out, [42]);
 }
 
@@ -757,10 +865,10 @@ fn attach_accepts_a_ring_on_a_second_fd() {
     let mut r = MessageQueue::<u64>::attach(&d, &policy(1024, true)).unwrap();
     assert_eq!(w.capacity(), 1024);
     let items: Vec<u64> = (0..1024).map(|i| i * 7).collect();
-    assert!(w.write(&items).unwrap());
-    assert!(!w.write(&[1]).unwrap());
+    assert_eq!(w.write(&items).unwrap(), DONE);
+    assert_eq!(w.write(&[1]).unwrap(), WOULD_BLOCK);
     let mut out = vec![0u64; 1024];
-    assert!(r.read(&mut out).unwrap());
+    assert_eq!(r.read(&mut out).unwrap(), DONE);
     assert_eq!(out, items);
 }
 
@@ -790,18 +898,20 @@ fn corrupted_counters_are_reported_on_every_operation() {
         Error::Corrupted("more bytes in flight than the ring holds")
     );
     assert_eq!(
-        w.write_blocking(&[1], NOT_FULL, NOT_EMPTY, Some(Duration::from_secs(5)))
+        w.write_blocking(&[1], Some(Duration::from_secs(5)))
             .unwrap_err(),
         Error::Corrupted("more bytes in flight than the ring holds")
     );
 
+    raw.set(0, 0);
+    let txn = w.begin_write(1).unwrap().expect("1 fits");
     raw.set(2, 6);
     assert_eq!(
         r.begin_read(1).unwrap_err(),
         Error::Corrupted("counter not a multiple of the element size")
     );
     assert_eq!(
-        w.commit_write(1).unwrap_err(),
+        txn.commit().unwrap_err(),
         Error::Corrupted("counter not a multiple of the element size")
     );
 
@@ -820,6 +930,47 @@ fn corrupted_counters_are_reported_on_every_operation() {
     raw.set(0, 16 * 4);
     assert_eq!(w.available_to_write().unwrap(), 0);
     assert_eq!(r.available_to_read().unwrap(), 16);
+}
+
+/// A counter of this side that moves between begin and commit is another party's write.
+#[test]
+fn a_commit_refuses_counters_another_party_moved_during_the_transaction() {
+    let (mut w, d) = fresh_desc(16, true);
+    let mut r = MessageQueue::<u32>::attach(&d, &policy(16, true)).unwrap();
+    let raw = Counters::map(&d);
+    let txn = w.begin_write(2).unwrap().expect("2 fit");
+    raw.set(0, 4);
+    assert_eq!(
+        txn.commit().unwrap_err(),
+        Error::Corrupted("write counter moved during the transaction")
+    );
+    raw.set(8, 16);
+    let txn = w.begin_write(14).unwrap().expect("14 fit");
+    raw.set(0, 16);
+    assert_eq!(
+        txn.commit().unwrap_err(),
+        Error::Corrupted("read counter moved back during the transaction")
+    );
+    assert_eq!(
+        raw.counter(1).load(Ordering::SeqCst),
+        16,
+        "nothing published"
+    );
+
+    let txn = r.begin_read(4).unwrap().expect("4 available");
+    raw.set(4, 16);
+    assert_eq!(
+        txn.commit().unwrap_err(),
+        Error::Corrupted("read counter moved during the transaction")
+    );
+    raw.set(0, 16);
+    let txn = r.begin_read(4).unwrap().expect("4 available");
+    raw.set(0, 8);
+    assert_eq!(
+        txn.commit().unwrap_err(),
+        Error::Corrupted("write counter moved back during the transaction")
+    );
+    assert_eq!(raw.counter(0).load(Ordering::SeqCst), 0, "nothing freed");
 }
 
 // ---- AC-12.5: pages are allocated at create ------------------------------
@@ -1042,8 +1193,8 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
     ];
     // The queue's own `read`/`write` calls, the counter's `&AtomicU64`, and pointer arithmetic.
     const ALLOWED: [&str; 13] = [
-        "if self.write(items)? {",
-        "if self.read(out)? {",
+        "self.blocking(notify, timeout, |queue| queue.write(items))",
+        "self.blocking(notify, timeout, |queue| queue.read(out))",
         "unsafe { self.ptr.as_ref() }",
         "let ptr = mapping.as_ptr().cast::<AtomicU64>();",
         "base: mapping.as_ptr(),",

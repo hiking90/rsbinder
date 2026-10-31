@@ -79,15 +79,18 @@ use crate::error::{Result, StatusCode};
 use crate::status::BinderResult;
 use crate::SIBinder;
 
-include!(concat!(env!("OUT_DIR"), "/cancellation_signal.rs"));
+// Private: the re-exports below are the one public path to the generated items.
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/cancellation_signal.rs"));
+}
 
-pub use android::os::ICancellationSignal::{
+pub use generated::android::os::ICancellationSignal::{
     BnCancellationSignal, BpCancellationSignal, ICancellationSignal, ICancellationSignalDefault,
-    ICancellationSignalDefaultRef,
+    ICancellationSignalDefaultRef, ICancellationSignalDelegate,
 };
 
 #[cfg(feature = "async")]
-pub use android::os::ICancellationSignal::{
+pub use generated::android::os::ICancellationSignal::{
     ICancellationSignalAsync, ICancellationSignalAsyncService,
 };
 

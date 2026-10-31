@@ -38,10 +38,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rsbinder::rpc::{RpcProxy, RpcServer, RpcSession};
+use rsbinder::rpc::{RpcProxy, RpcServer, RpcServerHandle, RpcSession};
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION,
+    Binder, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status, StatusCode,
+    TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IRpcScenario";
@@ -220,10 +220,10 @@ fn rpc_of(b: &SIBinder) -> &RpcProxy {
 /// `TX_CB_ECHO` on a (proxied) callback.
 fn cb_echo(cb: &SIBinder, s: &str) -> Result<String> {
     let rp = rpc_of(cb);
-    let mut d = rp.build_request(CB_DESC)?;
+    let mut d = rp.prepare_request(CB_DESC)?;
     d.write(&s)?;
     let mut r = rp
-        .transact(TX_CB_ECHO, &d, 0)?
+        .submit_transact(TX_CB_ECHO, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     read_status(&mut r)?;
     r.read::<String>()
@@ -237,81 +237,81 @@ impl ScenarioProxy {
         rpc_of(&self.0)
     }
     fn call_cb(&self, cb: &SIBinder, s: &str) -> Result<String> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(cb)?;
         d.write(&s)?;
         let mut r = self
             .rp()
-            .transact(TX_CALL_CB, &d, 0)?
+            .submit_transact(TX_CALL_CB, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<String>()
     }
     fn slow(&self, ms: i64) -> Result<()> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(&ms)?;
         let mut r = self
             .rp()
-            .transact(TX_SLOW, &d, 0)?
+            .submit_transact(TX_SLOW, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)
     }
     fn big_echo(&self, v: &[u8]) -> Result<Vec<u8>> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(&v.to_vec())?;
         let mut r = self
             .rp()
-            .transact(TX_BIG_ECHO, &d, 0)?
+            .submit_transact(TX_BIG_ECHO, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<Vec<u8>>()
     }
     fn repeat_binder(&self, b: Option<SIBinder>) -> Result<Option<SIBinder>> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(&b)?;
         let mut r = self
             .rp()
-            .transact(TX_REPEAT_BINDER, &d, 0)?
+            .submit_transact(TX_REPEAT_BINDER, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<Option<SIBinder>>()
     }
     fn hold_binder(&self, b: Option<SIBinder>) -> Result<()> {
-        let mut d = self.rp().build_request(DESC)?;
+        let mut d = self.rp().prepare_request(DESC)?;
         d.write(&b)?;
         let mut r = self
             .rp()
-            .transact(TX_HOLD_BINDER, &d, 0)?
+            .submit_transact(TX_HOLD_BINDER, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)
     }
     fn get_held(&self) -> Result<Option<SIBinder>> {
-        let d = self.rp().build_request(DESC)?;
+        let d = self.rp().prepare_request(DESC)?;
         let mut r = self
             .rp()
-            .transact(TX_GET_HELD, &d, 0)?
+            .submit_transact(TX_GET_HELD, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<Option<SIBinder>>()
     }
     fn same_binder(&self) -> Result<Option<SIBinder>> {
-        let d = self.rp().build_request(DESC)?;
+        let d = self.rp().prepare_request(DESC)?;
         let mut r = self
             .rp()
-            .transact(TX_SAME_BINDER, &d, 0)?
+            .submit_transact(TX_SAME_BINDER, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read::<Option<SIBinder>>()
     }
     fn ping_delay(&self) -> Result<()> {
-        let d = self.rp().build_request(DESC)?;
+        let d = self.rp().prepare_request(DESC)?;
         self.rp()
-            .transact(TX_PING_DELAY, &d, rsbinder::FLAG_ONEWAY)
+            .submit_transact(TX_PING_DELAY, &d, rsbinder::FLAG_ONEWAY)
             .map(|_| ())
     }
     fn raw_unknown(&self) -> Result<Option<Parcel>> {
-        let d = self.rp().build_request(DESC)?;
-        self.rp().transact(TX_UNKNOWN, &d, 0)
+        let d = self.rp().prepare_request(DESC)?;
+        self.rp().submit_transact(TX_UNKNOWN, &d, 0)
     }
 }
 
@@ -350,17 +350,15 @@ fn wait_for_sock(path: &std::path::Path) {
     panic!("server socket {path:?} never appeared");
 }
 
-/// RAII teardown: shutdown + join + remove socket on any drop path.
+/// RAII teardown: stop, join, terminate and remove the socket on any drop path.
 struct ServeCleanup {
-    server: Arc<RpcServer>,
-    bg: Option<std::thread::JoinHandle<()>>,
+    bg: Option<RpcServerHandle>,
     path: std::path::PathBuf,
 }
 impl Drop for ServeCleanup {
     fn drop(&mut self) {
-        self.server.stop_accepting();
         if let Some(h) = self.bg.take() {
-            let _ = h.join();
+            let _ = h.stop_and_join();
         }
         let _ = std::fs::remove_file(&self.path);
     }
@@ -385,9 +383,8 @@ fn boot(tag: &str) -> Booted {
             Arc::clone(&delay_done),
         ))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let cu = ServeCleanup {
-        server: Arc::clone(&server),
         bg: Some(bg),
         path: path.clone(),
     };
@@ -480,10 +477,10 @@ fn same_binder_returned_twice_is_equal() {
         .as_any()
         .downcast_ref::<RpcProxy>()
         .expect("server binder is an RpcProxy on the client");
-    let mut d = rp.build_request(CB_DESC).expect("build");
+    let mut d = rp.prepare_request(CB_DESC).expect("build");
     d.write(&"x").expect("write");
     let mut r = rp
-        .transact(TX_CB_ECHO, &d, 0)
+        .submit_transact(TX_CB_ECHO, &d, 0)
         .expect("transact")
         .expect("reply");
     read_status(&mut r).expect("status");
@@ -519,7 +516,9 @@ fn oneway_call_does_not_wait_for_handler() {
 #[test]
 fn a_nested_calls_reply_timeout_ends_the_session() {
     let b = boot("stale");
-    b.client.set_timeout(Some(Duration::from_millis(500)));
+    b.client
+        .set_reply_timeout(Some(Duration::from_millis(500)))
+        .expect("reply timeout");
     let nested = Arc::new(Mutex::new(Vec::new()));
     let cb: SIBinder = Interface::as_binder(&Binder::new(BnNestingCallback {
         target: ScenarioProxy(b.proxy.0.clone()),

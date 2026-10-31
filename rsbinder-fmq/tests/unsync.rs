@@ -26,15 +26,11 @@ use std::time::{Duration, Instant};
 
 use rsbinder_fmq::shm::{self, Access, CreateOptions, Mapping, Run, Seals};
 use rsbinder_fmq::{
-    AttachPolicy, Descriptor, Error, Flavor, Grantor, MessageQueue, UnsyncCreate, UnsyncRead,
-    UnsyncReader, UnsyncStart, UnsyncWriter,
+    AttachPolicy, Descriptor, Errno, Error, Flavor, Grantor, MessageQueue, UnsyncCreate,
+    UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriter,
 };
 
-const POLICY: AttachPolicy = AttachPolicy {
-    max_capacity: 1 << 16,
-    require_seal: true,
-    require_event_flag: false,
-};
+const POLICY: AttachPolicy = AttachPolicy::new(1 << 16);
 
 fn open() -> UnsyncCreate {
     UnsyncCreate::new()
@@ -112,7 +108,9 @@ fn read_only_readers_seals_the_fd_against_writable_mappings() {
     let fd = desc.fds[0].as_fd();
     assert_eq!(
         Mapping::map(fd, 0, 16, Access::ReadWrite).err(),
-        Some(Error::Os(rustix::io::Errno::PERM))
+        Some(Error::Os(Errno::from_raw(
+            rustix::io::Errno::PERM.raw_os_error()
+        )))
     );
     // The writer's mapping predates the seal, and a reader needs no more than `PROT_READ`.
     let mut reader = reader(&writer);
@@ -230,15 +228,12 @@ fn a_partial_commit_keeps_the_region_end() {
     assert_eq!(reader.read(&mut [0u32; 4]).unwrap(), UnsyncRead::Done);
 
     // write = 16, read = 4. Eight elements are written over elements 0 to 7; two are committed.
-    writer
-        .begin_write(8)
-        .unwrap()
-        .write_at(0, &[100; 8])
-        .unwrap();
+    let mut txn = writer.begin_write(8).unwrap();
+    txn.write_at(0, &[100; 8]).unwrap();
     assert_eq!(counters.end().load(Ordering::Acquire), 24 * 4);
-    writer.commit_write(2).unwrap();
+    txn.commit_first(2).unwrap();
     // A shorter reservation from the new write counter does not lower the end.
-    writer.begin_write(1).unwrap();
+    drop(writer.begin_write(1).unwrap());
     assert_eq!(counters.write().load(Ordering::Acquire), 18 * 4);
     assert_eq!(counters.end().load(Ordering::Acquire), 24 * 4);
     assert_eq!(writer.written(), 18);
@@ -253,14 +248,37 @@ fn a_partial_commit_keeps_the_region_end() {
     assert_eq!(reader.read(&mut rest).unwrap(), UnsyncRead::Done);
     assert_eq!(rest, [2, 3, 4, 5, 6, 7, 100, 100]);
 
-    // More than the reservation left is refused, and the end moves on with the next one.
+    // A commit is at most its transaction, and the end moves on with the next reservation.
+    let txn = writer.begin_write(6).unwrap();
+    assert_eq!(counters.end().load(Ordering::Acquire), 24 * 4);
     assert_eq!(
-        writer.commit_write(7),
+        txn.commit_first(7),
         Err(Error::BadValue("commit exceeds the elements reserved"))
     );
-    writer.commit_write(6).unwrap();
-    writer.begin_write(1).unwrap();
+    assert_eq!(writer.written(), 18, "a refused commit publishes nothing");
+    writer.begin_write(6).unwrap().commit().unwrap();
+    drop(writer.begin_write(1).unwrap());
     assert_eq!(counters.end().load(Ordering::Acquire), 25 * 4);
+}
+
+/// A dropped transaction publishes nothing; its announcement stays, as a partial commit's does.
+#[test]
+fn a_dropped_write_transaction_publishes_nothing() {
+    let mut writer = UnsyncWriter::<u32>::create(8, &open()).unwrap();
+    let desc = writer.descriptor().unwrap();
+    let counters = Counters::of(&desc);
+    let mut reader = reader(&writer);
+    {
+        let mut txn = writer.begin_write(3).unwrap();
+        txn.write_at(0, &[9, 9, 9]).unwrap();
+    }
+    assert_eq!(writer.written(), 0);
+    assert_eq!(counters.write().load(Ordering::Acquire), 0);
+    assert_eq!(counters.end().load(Ordering::Acquire), 3 * 4);
+    writer.write(&[1, 2]).unwrap();
+    let mut out = [0u32; 2];
+    assert_eq!(reader.read(&mut out).unwrap(), UnsyncRead::Done);
+    assert_eq!(out, [1, 2]);
 }
 
 #[test]
@@ -271,18 +289,9 @@ fn a_write_is_at_most_the_capacity_less_one() {
     assert_eq!(writer.write(&[0; 9]), Err(refusal));
     assert_eq!(writer.begin_write(8).err(), Some(refusal));
     assert_eq!(writer.begin_write(usize::MAX).err(), Some(refusal));
-    assert!(matches!(
-        writer.commit_write(usize::MAX),
-        Err(Error::BadValue(_))
-    ));
     assert_eq!(writer.written(), 0);
     writer.write(&[0; 7]).unwrap();
     assert_eq!(writer.written(), 7);
-    // Nothing was reserved by the refused calls.
-    assert_eq!(
-        writer.commit_write(1),
-        Err(Error::BadValue("commit exceeds the elements reserved"))
-    );
 }
 
 #[test]
@@ -330,32 +339,32 @@ fn read_latest_takes_the_newest_and_consumes_everything() {
     let mut writer = UnsyncWriter::<u32>::create(8, &sealed()).unwrap();
     let mut reader = reader(&writer);
     let mut out = [0u32; 3];
-    assert_eq!(reader.read_latest(&mut out).unwrap(), 0);
+    assert_eq!(reader.read_latest(&mut out).unwrap().copied, 0);
     writer.write(&[1, 2]).unwrap();
-    assert_eq!(reader.read_latest(&mut out).unwrap(), 2);
+    assert_eq!(reader.read_latest(&mut out).unwrap().copied, 2);
     assert_eq!(out[..2], [1, 2]);
-    assert_eq!(reader.read_latest(&mut out).unwrap(), 0);
+    assert_eq!(reader.read_latest(&mut out).unwrap().copied, 0);
 
     // 27 more through a ring of 8: lapped, and the newest three are still there.
     for value in 3..30u32 {
         writer.write(&[value]).unwrap();
     }
     assert_eq!(reader.available_to_read().unwrap(), 27);
-    assert_eq!(reader.read_latest(&mut out).unwrap(), 3);
+    assert_eq!(reader.read_latest(&mut out).unwrap().copied, 3);
     assert_eq!(out, [27, 28, 29]);
     assert_eq!(reader.available_to_read().unwrap(), 0);
 
     // A buffer of one is the current value; a buffer longer than the ring gets one ring.
     writer.write(&[30, 31, 32]).unwrap();
-    assert_eq!(reader.read_latest(&mut out[..1]).unwrap(), 1);
+    assert_eq!(reader.read_latest(&mut out[..1]).unwrap().copied, 1);
     assert_eq!(out[0], 32);
     for value in 33..60u32 {
         writer.write(&[value]).unwrap();
     }
     let mut wide = [0u32; 20];
-    assert_eq!(reader.read_latest(&mut wide).unwrap(), 8);
+    assert_eq!(reader.read_latest(&mut wide).unwrap().copied, 8);
     assert_eq!(wide[..8], [52, 53, 54, 55, 56, 57, 58, 59]);
-    assert_eq!(reader.read_latest(&mut []).unwrap(), 0);
+    assert_eq!(reader.read_latest(&mut []).unwrap().copied, 0);
 }
 
 #[test]
@@ -366,9 +375,9 @@ fn read_latest_leaves_out_what_a_write_in_progress_covers() {
         writer.write(&[value]).unwrap();
     }
     // Three elements are reserved over elements 0 to 2; libfmq's `readLatest` returns 0 here.
-    writer.begin_write(3).unwrap();
+    drop(writer.begin_write(3).unwrap());
     let mut out = [0u32; 8];
-    assert_eq!(reader.read_latest(&mut out).unwrap(), 5);
+    assert_eq!(reader.read_latest(&mut out).unwrap().copied, 5);
     assert_eq!(out[..5], [3, 4, 5, 6, 7]);
 }
 
@@ -380,14 +389,14 @@ fn each_flavor_refuses_the_others_descriptor() {
     let sync = MessageQueue::<u32>::create(8, false).unwrap();
     assert_eq!(
         MessageQueue::<u32>::attach(&unsync.descriptor().unwrap(), &POLICY).err(),
-        Some(Error::BadValue(
+        Some(Error::InvalidDescriptor(
             "descriptor is not of the synchronized flavor"
         ))
     );
     let start = UnsyncStart::Oldest;
     assert_eq!(
         UnsyncReader::<u32>::attach(&sync.descriptor().unwrap(), &POLICY, start).err(),
-        Some(Error::BadValue(
+        Some(Error::InvalidDescriptor(
             "descriptor is not of the unsynchronized flavor"
         ))
     );
@@ -399,26 +408,18 @@ fn attach_applies_the_policy_and_the_quantum() {
     let desc = writer.descriptor().unwrap();
     let start = UnsyncStart::Oldest;
     let bad = |result: Result<_, Error>| match result {
-        Err(Error::BadValue(what)) => what,
-        Err(e) => panic!("expected BadValue, got {e:?}"),
-        Ok(()) => panic!("expected BadValue, attach succeeded"),
+        Err(Error::InvalidDescriptor(what)) => what,
+        Err(e) => panic!("expected InvalidDescriptor, got {e:?}"),
+        Ok(()) => panic!("expected InvalidDescriptor, attach succeeded"),
     };
-    let small = AttachPolicy {
-        max_capacity: 63,
-        ..POLICY
-    };
+    let small = AttachPolicy::new(63);
     assert_eq!(
         bad(UnsyncReader::<u32>::attach(&desc, &small, start).map(drop)),
         "capacity above the attach policy's maximum"
     );
-    let flagged = AttachPolicy {
-        require_event_flag: true,
-        ..POLICY
-    };
-    assert_eq!(
-        bad(UnsyncReader::<u32>::attach(&desc, &flagged, start).map(drop)),
-        "no EventFlag word"
-    );
+    // A reader of this flavor never maps the word, so the policy does not ask for it.
+    let flagged = POLICY.require_event_flag(true);
+    assert!(UnsyncReader::<u32>::attach(&desc, &flagged, start).is_ok());
     assert_eq!(
         bad(UnsyncReader::<u64>::attach(&desc, &POLICY, start).map(drop)),
         "quantum differs from the element size"
@@ -485,10 +486,7 @@ impl Foreign {
     }
 
     fn reader(&self) -> UnsyncReader<u32> {
-        let policy = AttachPolicy {
-            require_event_flag: true,
-            ..POLICY
-        };
+        let policy = POLICY.require_event_flag(true);
         UnsyncReader::attach(&self.desc, &policy, UnsyncStart::Oldest).expect("attach")
     }
 }

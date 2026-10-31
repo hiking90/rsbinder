@@ -141,10 +141,10 @@ impl Remotable for R34Interop {
                     .as_any()
                     .downcast_ref::<RpcProxy>()
                     .ok_or(StatusCode::BadType)?;
-                let mut d = rp.build_request(CALLBACK_DESC)?;
+                let mut d = rp.prepare_request(CALLBACK_DESC)?;
                 d.write(&s)?;
                 let mut r = rp
-                    .transact(TX_CB_ECHO, &d, 0)?
+                    .submit_transact(TX_CB_ECHO, &d, 0)?
                     .ok_or(StatusCode::UnexpectedNull)?;
                 let st: Status = r.read()?;
                 if !st.is_ok() {
@@ -243,7 +243,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let _ = std::fs::remove_file(&sock);
     let server = RpcServer::setup_unix_server(&sock)?;
-    server.set_max_threads(max_threads);
+    server.set_max_threads(max_threads)?;
     server.set_root(Interface::as_binder(&Binder::new(R34Interop {
         server: Arc::downgrade(&server),
         oneway_log: Mutex::new(Vec::new()),

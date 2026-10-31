@@ -99,11 +99,9 @@ fn rpc_of(b: &SIBinder) -> &RpcProxy {
 
 fn echo(b: &SIBinder, s: &str) -> Result<String> {
     let rp = rpc_of(b);
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.request_parcel(DESC)?;
     d.write(&s)?;
-    let mut r = rp
-        .transact(TX_ECHO, &d, 0)?
-        .ok_or(StatusCode::UnexpectedNull)?;
+    let mut r = rp.send(TX_ECHO, &d, 0)?.ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if !st.is_ok() {
         return Err(StatusCode::from(st));
@@ -113,10 +111,10 @@ fn echo(b: &SIBinder, s: &str) -> Result<String> {
 
 fn repeat(b: &SIBinder, arg: &SIBinder) -> Result<Option<SIBinder>> {
     let rp = rpc_of(b);
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.request_parcel(DESC)?;
     d.write(&Some(arg.clone()))?;
     let mut r = rp
-        .transact(TX_REPEAT, &d, 0)?
+        .send(TX_REPEAT, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if !st.is_ok() {
@@ -127,10 +125,10 @@ fn repeat(b: &SIBinder, arg: &SIBinder) -> Result<Option<SIBinder>> {
 
 fn set_cb(b: &SIBinder, cb: &SIBinder) -> Result<()> {
     let rp = rpc_of(b);
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.request_parcel(DESC)?;
     d.write(cb)?;
     let mut r = rp
-        .transact(TX_SET_CB, &d, 0)?
+        .send(TX_SET_CB, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if st.is_ok() {
@@ -296,7 +294,7 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
     server
         .set_root(Interface::as_binder(&Binder::new(Holder::default())))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     for _ in 0..400 {
         if path.exists() {
             break;
@@ -347,7 +345,6 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    bg.stop_and_join().expect("accept loop");
     let _ = std::fs::remove_file(&path);
 }

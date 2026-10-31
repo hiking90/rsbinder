@@ -33,7 +33,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("Creating service...");
     let service = BnHello::new_binder(IHelloService {});
     // Alternative: opt into receiving the caller's SELinux security
-    // context (read via `CallingContext::default().sid` in transactions):
+    // context (read via `CallingContext::current().sid` in transactions):
     //
     //     use rsbinder::BinderFeatures;
     //     let mut features = BinderFeatures::default();

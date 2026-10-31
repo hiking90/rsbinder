@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use rsbinder_fmq::{
     AttachPolicy, Error, Flavor, Grantor, MessageQueue, UnsyncCreate, UnsyncRead, UnsyncReader,
-    UnsyncStart, UnsyncWriter, NOT_EMPTY, NOT_FULL,
+    UnsyncStart, UnsyncWriter,
 };
 
 const COUNT: u32 = 5000;
@@ -39,11 +39,7 @@ fn peer() -> Command {
 }
 
 fn policy() -> AttachPolicy {
-    AttachPolicy {
-        max_capacity: 1 << 16,
-        require_seal: true,
-        require_event_flag: true,
-    }
+    AttachPolicy::new(1 << 16).require_event_flag(true)
 }
 
 fn expected_sum() -> u64 {
@@ -59,8 +55,7 @@ fn write_all(q: &mut MessageQueue<u32>) {
             *slot = next;
             next += 1;
         }
-        q.write_blocking(&batch[..n], NOT_FULL, NOT_EMPTY, WAIT)
-            .expect("write_blocking");
+        q.write_blocking(&batch[..n], WAIT).expect("write_blocking");
     }
 }
 
@@ -70,8 +65,7 @@ fn read_all(q: &mut MessageQueue<u32>) {
     let mut sum = 0u64;
     while next < COUNT {
         let n = buf.len().min((COUNT - next) as usize);
-        q.read_blocking(&mut buf[..n], NOT_EMPTY, NOT_FULL, WAIT)
-            .expect("read_blocking");
+        q.read_blocking(&mut buf[..n], WAIT).expect("read_blocking");
         for &v in &buf[..n] {
             assert_eq!(v, next);
             sum += u64::from(v);
@@ -193,10 +187,7 @@ fn s2_libfmq_creates_rsbinder_writes() {
 // ---- The unsynchronized flavor (plan 15 AC-15.1.6) ---------------------------
 
 fn unsync_policy() -> AttachPolicy {
-    AttachPolicy {
-        require_event_flag: false,
-        ..policy()
-    }
+    policy().require_event_flag(false)
 }
 
 /// libfmq's unsynchronized queue in a child process, driven by the commands of `libfmq_peer.cpp`.
@@ -309,7 +300,7 @@ fn read_n(reader: &mut UnsyncReader<u32>, n: usize) -> (UnsyncRead, Vec<u32>) {
 
 fn latest_n(reader: &mut UnsyncReader<u32>, n: usize) -> Vec<u32> {
     let mut out = vec![0u32; n];
-    let count = reader.read_latest(&mut out).unwrap();
+    let count = reader.read_latest(&mut out).unwrap().copied;
     out.truncate(count);
     out
 }
@@ -527,7 +518,7 @@ fn u6_libfmq_reads_the_region_end_our_writer_stores() {
 
     // A reservation moves the region end alone: the count of committed elements stands.
     write_range(&mut writer, 0..64);
-    writer.begin_write(8).unwrap();
+    drop(writer.begin_write(8).unwrap());
     assert_eq!(both(&mut theirs, &mine), (64, 64));
     // The end is at element 72, more than one ring past element 0: both readers keep half a ring.
     assert_eq!(theirs.read(1), None);
@@ -536,32 +527,27 @@ fn u6_libfmq_reads_the_region_end_our_writer_stores() {
 
     // Three of the eight committed: libfmq reads on with the end five ahead of the counter.
     let reserved: Vec<u32> = (64..72).collect();
-    writer
-        .begin_write(8)
-        .unwrap()
-        .write_at(0, &reserved)
-        .unwrap();
-    writer.commit_write(3).unwrap();
+    let mut txn = writer.begin_write(8).unwrap();
+    txn.write_at(0, &reserved).unwrap();
+    txn.commit_first(3).unwrap();
     assert_eq!(both(&mut theirs, &mine), (35, 35));
     assert_eq!(theirs.read(35), Some((32..67).collect()));
     assert_eq!(
         read_n(&mut mine, 35),
         (UnsyncRead::Done, (32..67).collect())
     );
-    writer.commit_write(5).unwrap();
+    // The rest is in the ring already; a transaction over it publishes it, the end unchanged.
+    writer.begin_write(5).unwrap().commit().unwrap();
     assert_eq!(theirs.read(5), Some((67..72).collect()));
     assert_eq!(read_n(&mut mine, 5), (UnsyncRead::Done, (67..72).collect()));
 
     // Twenty written over elements 64 to 83, four committed, then a shorter reservation.
     write_range(&mut writer, 72..128);
     let reserved: Vec<u32> = (128..148).collect();
-    writer
-        .begin_write(20)
-        .unwrap()
-        .write_at(0, &reserved)
-        .unwrap();
-    writer.commit_write(4).unwrap();
-    writer.begin_write(1).unwrap();
+    let mut txn = writer.begin_write(20).unwrap();
+    txn.write_at(0, &reserved).unwrap();
+    txn.commit_first(4).unwrap();
+    drop(writer.begin_write(1).unwrap());
     assert_eq!(both(&mut theirs, &mine), (60, 60));
     // Both stand at element 72, within one ring of the counter and overwritten: the end says so.
     assert_eq!(theirs.read(1), None);
@@ -571,7 +557,7 @@ fn u6_libfmq_reads_the_region_end_our_writer_stores() {
         read_n(&mut mine, 32),
         (UnsyncRead::Done, (100..132).collect())
     );
-    writer.commit_write(16).unwrap();
+    writer.begin_write(16).unwrap().commit().unwrap();
     assert_eq!(theirs.read(16), Some((132..148).collect()));
     assert_eq!(
         read_n(&mut mine, 16),

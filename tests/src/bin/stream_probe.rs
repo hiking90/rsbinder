@@ -52,7 +52,8 @@ use std::thread;
 use std::time::Duration;
 
 use rsbinder::stream::{
-    Receiver, ReceiverPolicy, RingUse, Sink, SinkPolicy, StreamEndpoint, Token, END_RESERVE,
+    Receiver, ReceiverPolicy, RecvTimeoutError, RingUse, Sink, SinkPolicy, StreamEndpoint, Token,
+    END_RESERVE,
 };
 use rsbinder::*;
 
@@ -84,11 +85,9 @@ impl IStreamDemo for DemoSvc {
         initial_credits: i32,
         delay_micros: i32,
     ) -> BinderResult<()> {
-        let policy = SinkPolicy {
-            max_batch_bytes: max_batch_bytes as usize,
-            initial_credits: initial_credits as u32,
-            ..SinkPolicy::default()
-        };
+        let policy = SinkPolicy::default()
+            .with_max_batch_bytes(max_batch_bytes as usize)
+            .with_initial_credits(initial_credits as u32);
         let mut producer = Sink::open_with(endpoint, &policy)?;
         // Per stream, so a client polling `finished` does not see the previous stream's.
         self.finished.store(false, Ordering::SeqCst);
@@ -173,11 +172,9 @@ impl IStreamDemo for DemoSvc {
     fn r#upload(&self, producer: &SIBinder, ring_bytes: i32) -> BinderResult<StreamEndpoint<i32>> {
         let (mut rx, endpoint) = Receiver::<i32>::with_policy(
             producer,
-            &ReceiverPolicy {
-                ring_bytes: ring_bytes.max(0) as usize,
-                ring_use: self.upload_ring_use,
-                ..ReceiverPolicy::default()
-            },
+            &ReceiverPolicy::default()
+                .with_ring_bytes(ring_bytes.max(0) as usize)
+                .with_ring_use(self.upload_ring_use),
         )?;
         let uploaded = self.uploaded.clone();
         let ordered = self.upload_ordered.clone();
@@ -249,9 +246,9 @@ fn serve_rpc(path: &str, reply_timeout: Option<Duration>, ring: bool) -> Result<
     let server = rsbinder::rpc::RpcServer::setup_unix_server(path)?;
     server.set_android13plus(2);
     // Every session's deadline, and so the period of the producer's pings (plan 2-24 D9).
-    server.set_reply_timeout(reply_timeout);
+    server.set_reply_timeout(reply_timeout)?;
     // Batches, grants and cancels are oneway calls from the client; a few threads take them.
-    server.set_max_threads(4);
+    server.set_max_threads(4)?;
     let mut svc = DemoSvc::default();
     if ring {
         server.set_supported_fd_modes(&[rsbinder::rpc::FileDescriptorTransportMode::Unix]);
@@ -285,10 +282,7 @@ fn receiver_for(
 ) -> Result<(Receiver<i32>, StreamEndpoint<i32>)> {
     Receiver::with_policy(
         &demo.as_binder(),
-        &ReceiverPolicy {
-            ring_bytes,
-            ..ReceiverPolicy::default()
-        },
+        &ReceiverPolicy::default().with_ring_bytes(ring_bytes),
     )
 }
 
@@ -449,9 +443,9 @@ fn die(name: &str, take: i32, ring_bytes: usize, delay_micros: i32) -> Result<()
     let mut received = 0;
     while received < take {
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Some(_)) => received += 1,
-            Ok(None) => break,
-            Err(status) => {
+            Ok(_) => received += 1,
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Ended) => break,
+            Err(RecvTimeoutError::Failed(status)) => {
                 println!("RESULT die ERROR {status:?}");
                 return Ok(());
             }
@@ -472,9 +466,9 @@ fn cancel(name: &str, take: i32, ring_bytes: usize) -> Result<()> {
     let mut received = 0;
     while received < take {
         match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(Some(_)) => received += 1,
-            Ok(None) => break,
-            Err(status) => {
+            Ok(_) => received += 1,
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Ended) => break,
+            Err(RecvTimeoutError::Failed(status)) => {
                 println!("RESULT cancel ERROR {status:?}");
                 return Ok(());
             }
@@ -494,11 +488,13 @@ fn orphan(name: &str) -> Result<()> {
     let mut received = 0;
     let outcome = loop {
         match rx.recv_timeout(Duration::from_secs(20)) {
-            Ok(Some(_)) => received += 1,
+            Ok(_) => received += 1,
             // Impossible: the producer streams `i32::MAX` items and is killed long before.
-            Ok(None) if rx.is_finished() => break "ended-clean".to_string(),
-            Ok(None) => break "timeout".to_string(),
-            Err(status) => break format!("err:{:?}", status.transaction_error()),
+            Err(RecvTimeoutError::Ended) => break "ended-clean".to_string(),
+            Err(RecvTimeoutError::Timeout) => break "timeout".to_string(),
+            Err(RecvTimeoutError::Failed(status)) => {
+                break format!("err:{:?}", status.transaction_error())
+            }
         }
     };
     println!("RESULT orphan {received} {outcome}");

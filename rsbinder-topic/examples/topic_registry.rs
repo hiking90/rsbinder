@@ -75,8 +75,8 @@ fn subscribe(registry: &RegistryResolver) -> Result<(), Box<dyn std::error::Erro
 fn list(registry: &RegistryResolver) -> Result<(), Box<dyn std::error::Error>> {
     for topic in registry.list("example.")? {
         println!(
-            "{} uid={} pid={} {} ms, {} watcher(s)",
-            topic.name, topic.uid, topic.pid, topic.ageMillis, topic.watchers
+            "{} uid={} pid={} {:?}, {} watcher(s)",
+            topic.name, topic.uid, topic.pid, topic.age, topic.watchers
         );
     }
     Ok(())

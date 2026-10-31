@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::{AttachPolicy, MessageQueue, NOT_EMPTY, NOT_FULL};
+use rsbinder_fmq::{AttachPolicy, MessageQueue, NOT_EMPTY};
 
 const CHILD_ENV: &str = "RSBINDER_FMQ_CHILD";
 const SOCK_ENV: &str = "RSBINDER_FMQ_SOCK";
@@ -34,11 +34,7 @@ const CAPACITY: usize = 64;
 const WAIT: Option<Duration> = Some(Duration::from_secs(10));
 
 fn policy() -> AttachPolicy {
-    AttachPolicy {
-        max_capacity: 1 << 16,
-        require_seal: true,
-        require_event_flag: true,
-    }
+    AttachPolicy::new(1 << 16).require_event_flag(true)
 }
 
 fn spawn_child(test_name: &str, sock: &PathBuf) -> Child {
@@ -78,7 +74,7 @@ fn parent_creates_child_reads() {
         while next < ITEMS {
             let n = buf.len().min((ITEMS - next) as usize);
             queue
-                .read_blocking(&mut buf[..n], NOT_EMPTY, NOT_FULL, WAIT)
+                .read_blocking(&mut buf[..n], WAIT)
                 .expect("read_blocking");
             for &v in &buf[..n] {
                 assert_eq!(v, next);
@@ -108,7 +104,7 @@ fn parent_creates_child_reads() {
             next += 1;
         }
         queue
-            .write_blocking(&batch[..n], NOT_FULL, NOT_EMPTY, WAIT)
+            .write_blocking(&batch[..n], WAIT)
             .expect("write_blocking");
     }
     let out = common::finish(child);
@@ -130,9 +126,7 @@ fn child_creates_parent_reads() {
         let mut ack = [0u8; 1];
         sock.read_exact(&mut ack).expect("attach ack");
         for v in 0..ITEMS {
-            queue
-                .write_blocking(&[v], NOT_FULL, NOT_EMPTY, WAIT)
-                .expect("write_blocking");
+            queue.write_blocking(&[v], WAIT).expect("write_blocking");
         }
         // Keep the mapping alive until the parent has read everything.
         let mut done = [0u8; 1];
@@ -159,7 +153,7 @@ fn child_creates_parent_reads() {
     while next < ITEMS {
         let n = buf.len().min((ITEMS - next) as usize);
         queue
-            .read_blocking(&mut buf[..n], NOT_EMPTY, NOT_FULL, WAIT)
+            .read_blocking(&mut buf[..n], WAIT)
             .expect("read_blocking");
         for &v in &buf[..n] {
             assert_eq!(v, next);
@@ -229,7 +223,10 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    const BITS: u32 = 0x4;
+    const BITS: std::num::NonZeroU32 = match std::num::NonZeroU32::new(0x4) {
+        Some(bits) => bits,
+        None => panic!("a zero mask"),
+    };
     let limit = Duration::from_secs(10);
     let page = rustix::param::page_size() as u64;
     let word_at = |mapping: &Mapping, index: usize| {

@@ -22,14 +22,14 @@ use crate::Result;
 pub struct LogObserver;
 
 impl TransactionObserver for LogObserver {
-    fn on_transact(&self, _ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+    fn on_transact(&self, _ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
         None
     }
 
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        _tag: Option<Box<dyn Any + Send>>,
+        _tag: Option<Box<dyn Any>>,
         result: &Result<()>,
         elapsed: Duration,
     ) {

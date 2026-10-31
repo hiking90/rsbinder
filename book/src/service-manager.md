@@ -193,8 +193,12 @@ wait* and *how they encode "not registered"* — pick by what your client needs:
 | `wait_for_service` | blocks until registered | `Option<SIBinder>` | *blocks* |
 | `check_interface::<T>` | no | `Result<Strong<T>>` | `Err(NameNotFound)` |
 | `check_service` | no | `Option<SIBinder>` | `None` |
-| `try_get_interface::<T>` | no | `Result<Option<Strong<T>>>` | `Ok(None)` |
-| `try_get_service` | no | `Result<Option<SIBinder>>` | `Ok(None)` |
+| `try_get_interface::<T>` | no | `BinderResult<Option<Strong<T>>>` | `Ok(None)` |
+| `try_get_service` | no | `BinderResult<Option<SIBinder>>` | `Ok(None)` |
+
+Every `hub::try_*` call returns the service manager's `Status` as its error
+(`BinderResult`), so a refusal keeps its exception (`EX_SECURITY`, …); `?`
+turns it into a `StatusCode` where one is needed.
 
 The three awaitable ones live at the crate root rather than in `hub`, because only they
 have to be awaited (the `tokio` feature, on by default):
@@ -203,7 +207,7 @@ have to be awaited (the `tokio` feature, on by default):
 |---|---|---|---|
 | `wait_for_interface_async::<T>` | awaits until registered | `Result<Strong<T>>` | *awaits* |
 | `check_interface_async::<T>` | no | `Result<Strong<T>>` | `Err(NameNotFound)` |
-| `get_interface_async::<T>` | no | `Result<Strong<T>>` | `Err(NameNotFound)` |
+| `try_get_interface_async::<T>` | no | `BinderResult<Option<Strong<T>>>` | `Ok(None)` |
 
 > **Removed in 0.11.0**: `hub::get_service` and `hub::get_interface` are
 > gone (deprecated in 0.10.0) because their wait behavior was inconsistent
@@ -292,9 +296,9 @@ The typed counterpart `hub::check_interface` casts in one step and returns
 `check_service` folds "not registered" and "service manager unreachable"
 into the same `None`. When you must tell those apart, use
 `hub::try_get_service` (or the typed `hub::try_get_interface`), which
-returns `Result<Option<_>>`: `Ok(None)` means the service is not registered,
-while `Err(..)` means the lookup itself failed (transport or service-manager
-error):
+returns `BinderResult<Option<_>>`: `Ok(None)` means the service is not
+registered, while `Err(status)` means the lookup itself failed (a transport
+failure, or the service manager's refusal with its exception):
 
 ```rust
 match hub::try_get_service("com.example.myservice") {

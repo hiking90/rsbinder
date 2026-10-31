@@ -1,6 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use std::num::NonZeroU32;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
@@ -49,6 +50,19 @@ impl Deadline {
         let deadline = deadline.filter(|d| i32::try_from(d.tv_sec).is_ok());
         deadline.map(Deadline)
     }
+
+    /// Time left until the deadline; zero once it has passed.
+    pub(crate) fn remaining(&self) -> Duration {
+        let Some(now) = monotonic_now() else {
+            return Duration::ZERO;
+        };
+        let left = self.0.checked_sub(now).unwrap_or_default();
+        let (Ok(secs), Ok(nanos)) = (u64::try_from(left.tv_sec), u32::try_from(left.tv_nsec))
+        else {
+            return Duration::ZERO;
+        };
+        Duration::new(secs, nanos)
+    }
 }
 
 #[cfg(not(target_os = "wasi"))]
@@ -67,29 +81,26 @@ fn monotonic_now() -> Option<Timespec> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     use super::*;
-    use crate::error::Error;
-    use std::num::NonZeroU32;
+    use crate::error::{os, Error};
 
     pub fn futex_wait(
         word: &AtomicU32,
         expected: u32,
-        bits: u32,
+        bits: NonZeroU32,
         deadline: Option<&Deadline>,
     ) -> Result<()> {
         use rustix::io::Errno;
-        let bits = NonZeroU32::new(bits).ok_or(Error::BadValue("empty bit mask"))?;
         match wait_bitset(word, expected, deadline, bits) {
             Ok(()) => Ok(()),
             Err(Errno::AGAIN) | Err(Errno::INTR) => Ok(()),
             Err(Errno::TIMEDOUT) => Err(Error::TimedOut),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(os(e)),
         }
     }
 
     #[inline]
-    pub fn futex_wake(word: &AtomicU32, bits: u32) -> Result<()> {
-        let bits = NonZeroU32::new(bits).ok_or(Error::BadValue("empty bit mask"))?;
-        Ok(wake_bitset(word, bits)?)
+    pub fn futex_wake(word: &AtomicU32, bits: NonZeroU32) -> Result<()> {
+        wake_bitset(word, bits).map_err(os)
     }
 
     #[cfg(not(all(target_os = "android", target_pointer_width = "32")))]
@@ -108,6 +119,13 @@ mod imp {
     fn wake_bitset(word: &AtomicU32, bits: NonZeroU32) -> rustix::io::Result<()> {
         use rustix::thread::futex::{wake_bitset, Flags};
         wake_bitset(word, Flags::empty(), i32::MAX as u32, bits).map(drop)
+    }
+
+    /// The failed call's errno, as rustix would report it (`EIO` outside the kernel's range).
+    #[cfg(all(target_os = "android", target_pointer_width = "32"))]
+    fn last_errno() -> rustix::io::Errno {
+        let raw = crate::error::errno_of(&std::io::Error::last_os_error()).raw();
+        rustix::io::Errno::from_raw_os_error(raw)
     }
 
     // API 29's seccomp filter answers `futex_time64`, rustix's first call here, with `SIGSYS`.
@@ -139,7 +157,7 @@ mod imp {
             )
         };
         if r < 0 {
-            return Err(crate::error::errno_of(&std::io::Error::last_os_error()));
+            return Err(last_errno());
         }
         Ok(())
     }
@@ -160,7 +178,7 @@ mod imp {
             )
         };
         if r < 0 {
-            return Err(crate::error::errno_of(&std::io::Error::last_os_error()));
+            return Err(last_errno());
         }
         Ok(())
     }
@@ -174,7 +192,7 @@ mod imp {
     pub fn futex_wait(
         _word: &AtomicU32,
         _expected: u32,
-        _bits: u32,
+        _bits: NonZeroU32,
         deadline: Option<&Deadline>,
     ) -> Result<()> {
         // Reads the field, which nothing else on this target does.
@@ -182,7 +200,7 @@ mod imp {
         Err(Error::Unsupported)
     }
 
-    pub fn futex_wake(_word: &AtomicU32, _bits: u32) -> Result<()> {
+    pub fn futex_wake(_word: &AtomicU32, _bits: NonZeroU32) -> Result<()> {
         Err(Error::Unsupported)
     }
 }
@@ -204,13 +222,12 @@ mod imp {
 /// # Errors
 ///
 /// [`Error::TimedOut`](crate::Error::TimedOut) once `deadline` has passed;
-/// [`Error::BadValue`](crate::Error::BadValue) for `bits == 0`; any other
-/// failure of the system call as [`Error::Os`](crate::Error::Os);
+/// any other failure of the system call as [`Error::Os`](crate::Error::Os);
 /// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
 pub fn futex_wait(
     word: &AtomicU32,
     expected: u32,
-    bits: u32,
+    bits: NonZeroU32,
     deadline: Option<&Deadline>,
 ) -> Result<()> {
     imp::futex_wait(word, expected, bits, deadline)
@@ -226,13 +243,12 @@ pub fn futex_wait(
 ///
 /// # Errors
 ///
-/// [`Error::BadValue`](crate::Error::BadValue) for `bits == 0`; any other
-/// failure of the system call as [`Error::Os`](crate::Error::Os), which is
-/// `ENOSYS` from a kernel before Linux 5.1 on the 32-bit targets the [module
-/// documentation](super#platforms) describes;
+/// Any failure of the system call as [`Error::Os`](crate::Error::Os), which
+/// is `ENOSYS` from a kernel before Linux 5.1 on the 32-bit targets the
+/// [module documentation](super#platforms) describes;
 /// [`Error::Unsupported`](crate::Error::Unsupported) off Linux and Android.
 #[inline]
-pub fn futex_wake(word: &AtomicU32, bits: u32) -> Result<()> {
+pub fn futex_wake(word: &AtomicU32, bits: NonZeroU32) -> Result<()> {
     imp::futex_wake(word, bits)
 }
 
@@ -242,10 +258,13 @@ mod tests {
     use crate::Error;
     use std::time::Instant;
 
+    const BIT_0: NonZeroU32 = NonZeroU32::MIN;
+    const BIT_1: NonZeroU32 = BIT_0.saturating_add(1);
+
     #[test]
     fn a_wait_on_a_changed_word_returns_at_once() {
         let word = AtomicU32::new(1);
-        futex_wait(&word, 0, 1, None).unwrap();
+        futex_wait(&word, 0, BIT_0, None).unwrap();
     }
 
     #[test]
@@ -254,7 +273,7 @@ mod tests {
         let started = Instant::now();
         let deadline = Deadline::after(Duration::from_millis(50));
         assert_eq!(
-            futex_wait(&word, 0, 1, deadline.as_ref()).unwrap_err(),
+            futex_wait(&word, 0, BIT_0, deadline.as_ref()).unwrap_err(),
             Error::TimedOut
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
@@ -267,21 +286,21 @@ mod tests {
         std::thread::scope(|s| {
             let other = s.spawn(|| {
                 let deadline = Deadline::after(Duration::from_millis(300));
-                futex_wait(&word, 0, 0x2, deadline.as_ref())
+                futex_wait(&word, 0, BIT_1, deadline.as_ref())
             });
             let waiter = s.spawn(|| {
                 let deadline = Deadline::after(Duration::from_secs(10));
-                futex_wait(&word, 0, 0x1, deadline.as_ref())
+                futex_wait(&word, 0, BIT_0, deadline.as_ref())
             });
             // Repeated: the first wake may come before the waiter sleeps.
             while !waiter.is_finished() {
-                futex_wake(&word, 0x1).unwrap();
+                futex_wake(&word, BIT_0).unwrap();
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(waiter.join().unwrap(), Ok(()));
             // `other` may not have slept yet; a wake that ignored the mask would reach it here.
             for _ in 0..10 {
-                futex_wake(&word, 0x1).unwrap();
+                futex_wake(&word, BIT_0).unwrap();
                 std::thread::sleep(Duration::from_millis(5));
             }
             assert_eq!(other.join().unwrap(), Err(Error::TimedOut));
@@ -289,18 +308,19 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_mask_is_refused() {
-        let word = AtomicU32::new(0);
-        assert!(matches!(
-            futex_wait(&word, 0, 0, None),
-            Err(Error::BadValue(_))
-        ));
-        assert!(matches!(futex_wake(&word, 0), Err(Error::BadValue(_))));
-    }
-
-    #[test]
     fn a_timeout_past_the_clock_has_no_deadline() {
         assert!(Deadline::after(Duration::MAX).is_none());
         assert!(Deadline::after(Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn a_deadline_counts_down_to_zero() {
+        let deadline = Deadline::after(Duration::from_millis(200)).unwrap();
+        let left = deadline.remaining();
+        assert!(left <= Duration::from_millis(200), "{left:?}");
+        assert!(left > Duration::from_millis(100), "{left:?}");
+        let passed = Deadline::after(Duration::ZERO).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(passed.remaining(), Duration::ZERO);
     }
 }

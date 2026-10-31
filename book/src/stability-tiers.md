@@ -83,8 +83,9 @@ tweaks; wire formats are already locked.
   feature required since 0.12.0. The bytes are the IPC bytes, so only the two
   signatures may still change. See [Storing Values](./data-serialization.md).
 - **Cross-stack bridging (new in 0.11.0)** — `impl Interface for Strong<I>`
-  (a proxy publishes as a local service, so a gateway is one line) and
-  `bridge::Rewrap`. See
+  (a proxy publishes as a local service, so a gateway is one line),
+  `bridge::Rewrap`, and `bridge::Delegating` with the generated `IFooDelegate`
+  (a gateway overrides only the methods it changes). See
   [Cross-Transport Services](./cross-transport-services.md).
 - **`lazy_service` (new in 0.11.0)** — `LazyServiceRegistrar` and the AOSP
   `registerService` / client-callback lifecycle, gated against Android's own
@@ -110,7 +111,8 @@ tweaks; wire formats are already locked.
   `wait_for_interface_async`, `check_interface_async`, `death_signal` /
   `DeathSignal`. Wire behavior is that of the synchronous calls they wrap.
 - **Fast Message Queue (new in 0.12.0)** — the `rsbinder-fmq` crate
-  (`MessageQueue`, `EventFlag`, `Descriptor`, `AttachPolicy`; the synchronized
+  (`MessageQueue` with `WriteTxn`, `ReadTxn`, `Transfer` and `Notify`,
+  `EventFlag`, `Descriptor`, `AttachPolicy`, `Error` and `Errno`; the synchronized
   flavor, primitive elements, Linux and Android targets with 64-bit atomics)
   and `rsbinder::fmq`, which
   re-exports it on every platform beside the AOSP parcelables `MQDescriptor`,
@@ -134,8 +136,8 @@ tweaks; wire formats are already locked.
   See [Builtin AOSP Types](./aidl-data-types.md#builtin-aosp-types) and
   [Generic Parcelables](./aidl-parcelable.md#generic-parcelables).
 - **Fast Message Queue, unsynchronized flavor** — `UnsyncWriter` and
-  `UnsyncReader` of `rsbinder-fmq`, with `UnsyncCreate`, `UnsyncStart` and
-  `UnsyncRead`: one writer, any number of readers, a full ring overwrites its
+  `UnsyncReader` of `rsbinder-fmq`, with `UnsyncWriteTxn`, `UnsyncCreate`,
+  `UnsyncStart`, `UnsyncRead` and `UnsyncLatest`: one writer, any number of readers, a full ring overwrites its
   oldest elements. The layout and the counter discipline are `libfmq`'s as of
   `android-17.0.0_r1` (the write region end, the resume half a ring behind
   the writer, `readLatest`), so, as for the synchronized flavor, only the
@@ -162,7 +164,9 @@ tweaks; wire formats are already locked.
   only `mmap`, so it works on macOS too (on WASI `Mapping::map` returns
   `Unsupported`), and `Run` only atomics. `RoWord64` exists on the 64-bit
   architectures, on 32-bit x86 with SSE2 and on 32-bit ARM with 64-bit
-  atomics.
+  atomics. `shm::spin` (how long a side looks before it parks) is public
+  only so that `rsbinder`'s streams and `rsbinder-topic` share one limit; it
+  is hidden from the documentation and is not part of this tier.
 - **Streaming (new in 0.12.0)** — the `stream` module: `Sink`, `Receiver`,
   and the three AIDL files in `rsbinder/aidl/stream/`: the
   `rsbinder.stream.StreamEndpoint<T>` parcelable (`T` the item type; the ring's
@@ -201,7 +205,7 @@ tweaks; wire formats are already locked.
 - **Freeze notifications (new in 0.12.0)** —
   `IBinder::add_frozen_state_change_callback` /
   `remove_frozen_state_change_callback`, `FrozenStateChangeCallback`,
-  `FrozenState`, and `ProcessState::freeze_process` /
+  `FrozenState`, and `ProcessState::freeze` / `thaw` /
   `process_freeze_info`: AOSP `addFrozenStateChangeCallback` (libbinder
   android-15.0.0_r6+) over the driver's own commands, so the contract is the
   kernel UAPI rather than a libbinder wire. Validated on the Rust binder

@@ -448,7 +448,7 @@ Wrapping a non-idempotent call in a timeout and treating expiry as "it did not h
 therefore wrong. The blocking thread stays occupied until the reply arrives, so repeated
 timeouts against an unresponsive server fill the `spawn_blocking` pool (512 threads by
 default). Cap it with `Builder::max_blocking_threads`, and bound the wait at the source:
-over RPC, the session timeout (`RpcSession::set_timeout` or `ClientOptions::timeout`,
+over RPC, the session timeout (`RpcSession::set_reply_timeout` or `ClientOptions::timeout`,
 `RpcServer::set_reply_timeout` on a server), whose expiry ends the whole session — see
 [Timeouts](./rpc-transport.md#timeouts). Kernel binder has no such bound.
 
@@ -457,7 +457,10 @@ over RPC, the session timeout (`RpcSession::set_timeout` or `ClientOptions::time
 While a thread is handling a transaction, an async proxy call on that thread executes
 **at the call site**, synchronously, before the first poll. This is deliberate: the
 kernel's deadlock prevention needs the nested outbound call to come from the thread that
-is holding the inbound one, and RPC needs the same thread to keep its session pin.
+is holding the inbound one, and RPC needs the same thread to keep its session pin. The
+rule lives in the generated code, so it holds for every `BinderAsyncPool`, not only
+`Tokio`. A stream's async receive and an `rsbinder-topic` subscriber's `recv_async` follow
+it too: inside a handler their wait for the next record blocks the handler's thread.
 
 The consequence is that the usual combinators do nothing there:
 

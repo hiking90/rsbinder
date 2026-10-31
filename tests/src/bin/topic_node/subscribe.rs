@@ -468,8 +468,10 @@ impl Sub {
                 self.violation(out, format!("a record failed to decode: {code}"));
                 Flow::Next
             }
+            // An `Interrupter`'s alone: `Running::wake` asks for the requests to be looked at.
             Err(RecvError::Cancelled) => Flow::Look,
             Err(RecvError::Empty | RecvError::Timeout) => Flow::Empty,
+            // `RecvError::Runtime` among them: each receive after it fails the same way.
             Err(err) => {
                 out.fault(format!("recv {}: {err}", self.spec.topic));
                 Flow::Idle
@@ -866,7 +868,7 @@ pub fn fuse(
         finish: Box::new({
             let out = out.clone();
             move || {
-                publisher.close(&rsbinder::Status::from(rsbinder::ExceptionCode::None));
+                publisher.close();
                 if let Some(last_seq) = next.load(Ordering::Relaxed).checked_sub(1) {
                     out.send(Kind::Published {
                         topic,

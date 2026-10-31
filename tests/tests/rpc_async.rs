@@ -11,7 +11,8 @@
 //! exactly the same `spawn_blocking` bridge the kernel async path uses:
 //!
 //!   * **client**: the generated `IRpcSmokeAsync<Tokio>` calls
-//!     `P::spawn(move || as_remote()?.submit_transact(..), ..)`. For
+//!     `__spawn_transact::<P, ..>(move || __transport()?.submit_transact(..), ..)`,
+//!     which calls `P::spawn` outside a transaction. For
 //!     `Tokio`, `submit_transact` (→ `RpcProxy` → blocking
 //!     `client_transact`) runs on `tokio::task::spawn_blocking`; the
 //!     reply parse is the async continuation.

@@ -70,8 +70,8 @@
 //!
 //! # Reference counts
 //!
-//! The `IBinder` ref-count methods are no-ops on a proxy under the cache-pin
-//! model. Kernel strong refs are owned one per `Arc<ProxyHandle>` (acquired
+//! A proxy's kernel references follow the cache-pin model. Kernel strong refs
+//! are owned one per `Arc<ProxyHandle>` (acquired
 //! in `new_acquired`, released in `Drop`); the kernel weak ref is the cache pin
 //! (`process_state::HandlePin`) shared by the entry's proxies and `WIBinder`s.
 //! User-side clone and drop sends no kernel command, except the last proxy drop (`BC_RELEASE`)
@@ -86,12 +86,6 @@
 //! returns `DeadObject`, and after it, the revived proxy.
 //!
 //! # Operations without meaning on a proxy
-//!
-//! `IBinder::attempt_inc_strong` is meaningless on a proxy: a caller either
-//! already holds an `Arc<ProxyHandle>` or wants weak-to-strong promotion,
-//! which `Weak<I>::upgrade()` provides. The trait is public and `SIBinder`
-//! derefs to it, so external code can still reach it; the proxy logs a
-//! warning and honours the "succeed" contract instead of asserting.
 //!
 //! `set_extension` is a server-side operation (a service publishes its
 //! extension for clients to find via `get_extension`). A proxy cannot inform
@@ -190,7 +184,6 @@
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
-use std::mem::ManuallyDrop;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, Mutex, RwLock};
@@ -707,34 +700,6 @@ impl IBinder for ProxyHandle {
     fn is_remote(&self) -> bool {
         true
     }
-
-    // Ref-count methods are no-ops for a proxy; see module doc "Reference counts".
-
-    fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
-        Ok(())
-    }
-
-    fn attempt_inc_strong(&self) -> bool {
-        // Meaningless for a proxy yet reachable via the public `IBinder`: warn, honor "succeed".
-        log::warn!(
-            "attempt_inc_strong called on a ProxyHandle (handle {}); \
-             it is a no-op for proxies — use Weak<I>::upgrade",
-            self.handle()
-        );
-        true
-    }
-
-    fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        Ok(())
-    }
-
-    fn inc_weak(&self, _weak: &WIBinder) -> Result<()> {
-        Ok(())
-    }
-
-    fn dec_weak(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 pub trait Proxy: Sized + Interface {
@@ -1194,21 +1159,6 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             false
-        }
-        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> Result<()> {
-            Ok(())
         }
     }
 

@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::thread;
 
 use rsbinder::blob::BLOB_INPLACE_LIMIT;
-use rsbinder::rpc::{FileDescriptorTransportMode as FdMode, RpcServer, RpcSession};
+use rsbinder::rpc::{
+    FileDescriptorTransportMode as FdMode, RpcServer, RpcServerHandle, RpcSession,
+};
 use rsbinder::{
     Binder, Interface, Parcel, Remotable, Result as RsResult, TransactionCode,
     FIRST_CALL_TRANSACTION,
@@ -100,8 +102,8 @@ impl Bound {
         }
     }
 
-    fn run(&self) -> thread::JoinHandle<()> {
-        let bg = self.server.run_background();
+    fn run(&self) -> RpcServerHandle {
+        let bg = self.server.run_background().expect("run_background");
         #[cfg(not(target_os = "android"))]
         for _ in 0..400 {
             if self.path.exists() {
@@ -135,9 +137,8 @@ impl Bound {
         }
     }
 
-    fn finish(self, bg: thread::JoinHandle<()>) {
-        self.server.stop_accepting();
-        let _ = bg.join();
+    fn finish(self, bg: RpcServerHandle) {
+        let _ = bg.stop_and_join();
         #[cfg(not(target_os = "android"))]
         let _ = std::fs::remove_file(&self.path);
     }
@@ -159,7 +160,7 @@ fn fetch(session: &RpcSession, len: usize) -> (Vec<u8>, bool) {
     (blob.to_vec().expect("to_vec"), blob.inline().is_some())
 }
 
-fn serve(tag: &str, fd_mode: bool) -> (Bound, thread::JoinHandle<()>, RpcSession) {
+fn serve(tag: &str, fd_mode: bool) -> (Bound, RpcServerHandle, RpcSession) {
     let bound = Bound::new(tag);
     if fd_mode {
         bound

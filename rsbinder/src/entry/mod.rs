@@ -63,10 +63,12 @@ use crate::{FromIBinder, SIBinder, Strong};
 /// with [`Server::add`], then [`Server::run`] or [`Server::spawn`].
 ///
 /// On kernel binder this also initializes the process-wide
-/// [`ProcessState`](crate::ProcessState), so a [`KernelEndpoint`] setting
-/// that disagrees with one already initialized is
+/// [`ProcessState`](crate::ProcessState), so a [`KernelEndpoint`] driver
+/// or mapping size that disagrees with one already initialized is
 /// [`StatusCode::BadValue`](crate::StatusCode::BadValue) here rather than
-/// at [`Server::run`] — see [`Server`].
+/// at [`Server::run`]. A thread count is not fixed at init: one that
+/// differs from the ceiling in force is applied by [`Server::run`] /
+/// [`Server::spawn`] ([`ServeOptions::threads`]). See [`Server`].
 pub fn serve(uri: impl Into<Uri>) -> Result<Server> {
     server::new_server(uri.into())
 }

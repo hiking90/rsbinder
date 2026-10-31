@@ -8,6 +8,8 @@ use super::*;
 use crate::image::Got;
 use crate::ring::{Kind, Reader, Start, Writer};
 
+const EPERM: Errno = Errno::from_raw(rustix::io::Errno::PERM.raw_os_error());
+
 /// A populated, sealed memfd of `size` bytes holding the 4-byte `words` and zeros.
 fn sealed(size: u64, words: &[(usize, u32)]) -> OwnedFd {
     let fd = shm::create(size, &CreateOptions::new("forged").populate(true)).unwrap();
@@ -70,7 +72,7 @@ fn a_subscriber_can_neither_write_nor_resize_topic_memory() {
     let sealed = shm::seals(fd.as_fd()).unwrap();
     assert!(sealed.contains(Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL));
     let writable = Mapping::map(fd.as_fd(), 0, TOPIC_SIZE, Access::ReadWrite);
-    assert_eq!(writable.err(), Some(Error::Os(rustix::io::Errno::PERM)));
+    assert_eq!(writable.err(), Some(Error::Os(EPERM)));
     // What `shm::verify_received` asks of a peer's memfd is what this crate makes.
     assert_eq!(shm::verify_received(fd.as_fd()), Ok(TOPIC_SIZE));
 }
@@ -127,7 +129,7 @@ fn a_control_page_is_written_by_the_subscriber_and_read_by_the_publisher() {
 
     // The publisher's side has no way to a writable mapping.
     let writable = Mapping::map(fd.as_fd(), 0, 0x80, Access::ReadWrite);
-    assert_eq!(writable.err(), Some(Error::Os(rustix::io::Errno::PERM)));
+    assert_eq!(writable.err(), Some(Error::Os(EPERM)));
 }
 
 #[test]
@@ -213,7 +215,7 @@ fn pool_memory_is_written_through_one_mapping_and_read_through_another() {
     let sealed = shm::seals(fd.as_fd()).unwrap();
     assert!(sealed.contains(Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL));
     let writable = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite);
-    assert_eq!(writable.err(), Some(Error::Os(rustix::io::Errno::PERM)));
+    assert_eq!(writable.err(), Some(Error::Os(EPERM)));
 
     let loaded = map_pool(fd.as_fd(), 3, 64, size as usize).unwrap();
     assert_eq!(loaded.slots(), 3);

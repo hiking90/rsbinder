@@ -4,16 +4,20 @@
 //! Shared-memory primitives: the pieces a queue is built from, usable on
 //! their own.
 //!
+//! **Provisional** (`book/src/stability-tiers.md`, "Shared-memory
+//! primitives"): the module wraps system calls and has no wire or layout of
+//! its own, so the tier covers the Rust signatures only.
+//!
 //! [`MessageQueue`](crate::MessageQueue) is one protocol over memory two
 //! processes map. This module is what lies under it, without the protocol:
 //!
 //! | Need | Item |
 //! |---|---|
 //! | Make the memory | [`create`] (a memfd), [`add_seals`], [`seals`], [`Seals`] |
+//! | Make it, map it writable and seal it, in that order | [`create_mapped`] |
 //! | Map it | [`Mapping`], [`Access`] |
 //! | Copy bytes in and out without a data race | [`Run`] |
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
-//! | Decide how long to look at the memory before sleeping | [`spin`] |
 //! | Read memory this process may not write | [`RoRun`], [`RoWord32`], [`RoWord64`] |
 //! | Refuse a peer's fd whose pages the peer could take away | [`verify_received`] |
 //! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`], [`ashmem_write_protected`] |
@@ -73,12 +77,14 @@ mod futex;
 mod mapping;
 mod memfd;
 mod run;
+// Workspace-internal (`rsbinder::stream`, `rsbinder-topic`), outside the tier; see its module doc.
+#[doc(hidden)]
 pub mod spin;
 mod word;
 
 pub use futex::{futex_wait, futex_wake, Deadline};
 pub use mapping::{Access, Mapping};
-pub use memfd::{add_seals, create, seals, verify_received, CreateOptions, Seals};
+pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
 pub use run::{RoRun, Run};
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.
 pub use word::*;
@@ -141,7 +147,9 @@ fn ashmem_query(fd: BorrowedFd<'_>, request: libc::c_ulong) -> Result<u64> {
     // SAFETY: `fd` is a verified ashmem fd; the request takes no pointer (`0` fills the vararg).
     let r = unsafe { libc::ioctl(fd.as_raw_fd(), request as _, 0) };
     if r < 0 {
-        return Err(crate::error::errno_of(&std::io::Error::last_os_error()).into());
+        return Err(crate::Error::Os(crate::error::errno_of(
+            &std::io::Error::last_os_error(),
+        )));
     }
     Ok(r as u64)
 }
@@ -184,7 +192,7 @@ pub fn ashmem_write_protected(_fd: BorrowedFd<'_>) -> Result<bool> {
 /// non-zero, otherwise the ashmem size (ashmem reports `st_size == 0`).
 /// `BadValue` for an fd that is neither.
 pub fn region_size(fd: BorrowedFd<'_>) -> Result<u64> {
-    let st = rustix::fs::fstat(fd)?;
+    let st = rustix::fs::fstat(fd).map_err(crate::error::os)?;
     if st.st_size > 0 {
         return Ok(st.st_size as u64);
     }

@@ -26,11 +26,11 @@ pub struct ClientOptions {
     /// on a server session that another client session founded, with
     /// its own oneway numbering, binder addresses and lifetime (AOSP has
     /// no public entry for this either). Add a connection to a session
-    /// with `RpcSession::add_outgoing_connection_with_config` on that
+    /// with `RpcSession::add_outgoing_connection` on that
     /// session. Empty or `None` opens a new session.
     #[deprecated(
         since = "0.12.0",
-        note = "a non-empty id is refused with BadValue: open a new session, then add connections with `RpcSession::add_outgoing_connection_with_config` on it"
+        note = "a non-empty id is refused with BadValue: open a new session, then add connections with `RpcSession::add_outgoing_connection` on it"
     )]
     pub session_id: Option<Vec<u8>>,
     /// RPC (android13plus profile, every RPC transport): number of
@@ -71,7 +71,9 @@ pub struct ClientOptions {
     #[cfg(feature = "rpc")]
     pub fd_mode: Option<crate::rpc::FileDescriptorTransportMode>,
     /// RPC: how long the server may go without answering before this end
-    /// counts it as broken (`RpcSession::set_timeout`, plan 2-24 D4 and D6).
+    /// counts it as broken (`RpcSession::set_reply_timeout`, plan 2-24 D4
+    /// and D6; the server side of the same deadline is
+    /// [`ServeOptions::reply_timeout`](super::ServeOptions::reply_timeout)).
     ///
     /// - **Connecting**: it bounds each step of connecting as a whole —
     ///   `connect(2)` (for `tls://`, every address the host name resolves to
@@ -100,10 +102,10 @@ pub struct ClientOptions {
     ///
     /// `None` (default) waits forever, so a peer that accepts the socket
     /// and then writes nothing hangs `open`. Set it whenever the peer is
-    /// untrusted or merely unreliable. `Some(Duration::ZERO)` is no
-    /// deadline either, as `RpcSession::set_timeout` treats it; unlike the
-    /// deprecated `handshake_timeout` (`rpc` feature), `open` does not
-    /// refuse it.
+    /// untrusted or merely unreliable. `Some(Duration::ZERO)` is not a
+    /// deadline: `open` refuses it with [`StatusCode::BadValue`] before
+    /// connecting, as `RpcSession::set_reply_timeout` refuses it (plan 17
+    /// C-2).
     pub timeout: Option<Duration>,
     /// RPC: deadline for the connection **handshake**, in place of
     /// [`timeout`](Self::timeout) for that phase. The r34 wire (no
@@ -121,8 +123,8 @@ pub struct ClientOptions {
     /// whoever initializes `ProcessState` first, so a *different* path here
     /// is [`StatusCode::BadValue`] at
     /// [`open`](Client::open) — see
-    /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
-    /// rule on the server side.
+    /// [`ServeOptions::mmap_size`](super::ServeOptions::mmap_size) for the
+    /// same rule on the server side.
     pub driver: Option<std::path::PathBuf>,
     /// Kernel: `?mmap=` equivalent — the size of the mapping this
     /// process receives into. A client is a receiver too: the reply to
@@ -312,7 +314,7 @@ fn kernel_open(uri: Uri, o: ClientOptions) -> Result<Client> {
     deprecated,
     reason = "forwards `handshake_timeout` to the config's own deprecated setter"
 )]
-fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcClientConfig<'a>> {
+fn rpc_setup(uri: &Uri, o: &ClientOptions) -> Result<crate::rpc::RpcClientConfig> {
     if uri.service.is_some() {
         log::error!("rsbinder::Client::open: a service name is not allowed here (use connect)");
         return Err(StatusCode::BadValue);
@@ -341,7 +343,8 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
     };
 
     // Refuse zero here, where the option can be named; its downstream consumers reject it too.
-    crate::rpc::session::reject_zero_handshake_timeout(
+    crate::rpc::session::reject_zero_deadline(o.timeout, "ClientOptions::timeout")?;
+    crate::rpc::session::reject_zero_deadline(
         o.handshake_timeout,
         "ClientOptions::handshake_timeout",
     )?;
@@ -397,7 +400,7 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
         log::error!(
             "rsbinder::Client::open: session_id would open a second client session on a server \
              session another one founded; add the connection with \
-             `RpcSession::add_outgoing_connection_with_config` on that session instead"
+             `RpcSession::add_outgoing_connection` on that session instead"
         );
         return Err(StatusCode::BadValue);
     }
@@ -409,7 +412,7 @@ fn rpc_setup<'a>(uri: &'a Uri, o: &'a ClientOptions) -> Result<crate::rpc::RpcCl
 /// The I/O half of an RPC open: connect, handshake, and on r34 the fd-mode transaction.
 #[cfg(feature = "rpc")]
 fn rpc_connect(
-    cfg: crate::rpc::RpcClientConfig<'_>,
+    cfg: crate::rpc::RpcClientConfig,
     uri: &Uri,
     o: &ClientOptions,
 ) -> Result<crate::rpc::RpcSession> {
@@ -421,10 +424,9 @@ fn rpc_connect(
     }
 
     // r34 wire: no handshake, so the session is built on the connection itself.
-    let session =
-        RpcSession::new(cfg.connect_once()?, AddressSpace::Initiator).map_err(StatusCode::from)?;
+    let session = RpcSession::new(cfg.connect_once()?, AddressSpace::Initiator)?;
     // Before the negotiation below: that transaction reads this value when it runs.
-    session.set_timeout(o.timeout);
+    session.store_reply_timeout(o.timeout);
     // r34 negotiates the FD mode by a transaction after connect (versioned: in the handshake).
     if let Some(mode) = o.fd_mode {
         session.negotiate_fd_transport(mode)?;
@@ -434,11 +436,11 @@ fn rpc_connect(
 
 /// Session config offering `max_version` (ignored on r34); refuses what the build lacks early.
 #[cfg(feature = "rpc")]
-fn client_config<'a>(
-    endpoint: &'a Endpoint,
-    o: &'a ClientOptions,
+fn client_config(
+    endpoint: &Endpoint,
+    o: &ClientOptions,
     max_version: u32,
-) -> Result<crate::rpc::RpcClientConfig<'a>> {
+) -> Result<crate::rpc::RpcClientConfig> {
     use crate::rpc::RpcClientConfig;
     let unix_addr_refused = |e: std::io::Error| {
         log::error!("rsbinder::Client::open: {endpoint:?} is not a Unix socket address: {e}");
@@ -552,7 +554,7 @@ impl Client {
     /// not (yet) registered.
     pub fn try_get<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Option<Strong<T>>> {
         match &self.inner {
-            Inner::Kernel => crate::hub::try_get_interface(name),
+            Inner::Kernel => crate::hub::try_get_interface(name).map_err(StatusCode::from),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => match s.get_service(name) {
                 Ok(b) => b.into_interface_checked().map(Some),

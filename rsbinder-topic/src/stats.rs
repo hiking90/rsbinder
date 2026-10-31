@@ -7,6 +7,7 @@
 /// What a [`Publisher`](crate::Publisher) has published and who receives it:
 /// [`Publisher::stats`](crate::Publisher::stats).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PublisherStats {
     /// Records published, the end record left out.
     pub published: u64,
@@ -17,6 +18,16 @@ pub struct PublisherStats {
     /// Subscriptions a wait for room took out
     /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), each logged too.
     pub evicted: u64,
+    /// Whether the publisher holds a name now: one that
+    /// [`advertise`](crate::Publisher::advertise),
+    /// [`advertise_with`](crate::Publisher::advertise_with) or
+    /// [`advertise_on`](crate::Publisher::advertise_on) gave, which
+    /// [`close`](crate::Publisher::close) takes back.
+    ///
+    /// It says what the publisher holds, not what the resolver keeps: a registry whose host died
+    /// lost the name with it, and this stays `true`. Giving the name again through a resolver of
+    /// the new host is [`advertise_on`](crate::Publisher::advertise_on) (plan 15 D8).
+    pub advertised: bool,
 }
 
 /// One subscription as its publisher sees it.
@@ -28,6 +39,7 @@ pub struct PublisherStats {
 /// reports it wrongly loses records of its own if ahead, and is taken out after the timeout if
 /// behind.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubscriberInfo {
     /// The uid of the process that made the subscription call.
     pub uid: u32,
@@ -42,6 +54,14 @@ pub struct SubscriberInfo {
     /// Whether a wait for room took it out. It holds its place until the subscriber drops it,
     /// and the slot it pins stays pinned.
     pub evicted: bool,
+    /// The slot of the topic's pool the subscription pins now, while it holds a
+    /// [`Sample`](crate::Sample) of a lent value: the publisher lends no pinned slot. `None`
+    /// when it pins none, and on a topic without a pool.
+    ///
+    /// It is what the subscriber's pin word reads at this call, so it says what the subscriber
+    /// reports, as the fields above do, and a pin it takes or lets go of a moment later is not
+    /// seen. A subscription that ended is no longer listed, and its pin no longer keeps a slot.
+    pub pinned: Option<u32>,
 }
 
 /// What a subscriber has received: [`Subscriber::stats`](crate::Subscriber::stats) and
@@ -49,6 +69,7 @@ pub struct SubscriberInfo {
 /// object since it was made, in this process: a subscriber made again starts from zero, and two
 /// subscribers of one topic in one process count apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubscriberStats {
     /// Values returned.
     pub received: u64,

@@ -74,7 +74,8 @@
 //! [`NamedSubscriber`] watches the name and connects to whichever publisher holds it, again and
 //! again. Where a `Subscriber`'s topic ends with [`RecvError::Closed`], a `NamedSubscriber`
 //! returns [`RecvError::Disconnected`] once and waits for the next publisher, except after
-//! [`Closed::Evicted`], which ends it. Names come from a
+//! [`Closed::Evicted`] and [`Closed::ResolverDied`], which end it;
+//! [`NamedSubscriber::state`] tells which wait it is in. Names come from a
 //! [`Resolver`], the service manager by default ([`ServiceManager`]). Who may subscribe is
 //! [`PublisherPolicy::authorize`].
 //!
@@ -113,7 +114,7 @@ mod wait;
 mod wake;
 
 pub use backpressure::Backpressure;
-pub use named::NamedSubscriber;
+pub use named::{NamedState, NamedSubscriber};
 pub use payload::{Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
 pub use publish::{Authorize, PoolPolicy, PublishError, PublisherPolicy};
@@ -226,7 +227,10 @@ mod unsupported_tests {
     #[test]
     fn neither_end_of_a_topic_is_made_on_a_target_without_memfd() {
         let made = Publisher::<Bytes>::new(&PublisherPolicy::default());
-        assert_eq!(made.err(), Some(rsbinder::fmq::Error::Unsupported));
+        assert_eq!(
+            made.err().map(|status| status.exception_code()),
+            Some(ExceptionCode::UnsupportedOperation)
+        );
         let topic = crate::connect::Token::detached();
         let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
         assert_eq!(
