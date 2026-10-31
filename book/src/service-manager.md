@@ -89,7 +89,7 @@ same questions are answered by `dumpsys`, `service list` and the init/VINTF
 files:
 
 ```text
-rsb_hub 0.12.0
+rsb_hub 0.13.0
 access control: enforcing, 4 rule(s)
 declarations: 2
 death subscriptions: 3

@@ -198,7 +198,7 @@ of a span called `aidl` (target `rsbinder::aidl`, level `TRACE`).
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.12", features = ["tracing"] }
+rsbinder = { version = "0.13", features = ["tracing"] }
 ```
 
 ```rust

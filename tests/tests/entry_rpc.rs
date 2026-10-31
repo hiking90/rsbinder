@@ -267,22 +267,18 @@ fn entry_options_apply_to_rpc_server() {
     drop(keep);
 }
 
-/// `ClientOptions::handshake_timeout` is a plain public field, so a zero
-/// duration can only be caught where the options are consumed. `open`
-/// refuses it there with `BadValue` — before any connect — instead of
+/// `ClientOptions::timeout` is a plain public field, so a zero duration
+/// can only be caught where the options are consumed. `open` refuses it
+/// there with `BadValue` — before any connect — as
+/// `RpcSession::set_reply_timeout` refuses it (plan 17 C-2), instead of
 /// carrying it to a `set_read_timeout`/`connect_timeout` that rejects it
-/// as an opaque I/O error, or (worse) dropping the caller's bound.
+/// as an opaque I/O error, or dropping the caller's bound.
 ///
-/// The zero is asserted on the **versioned** endpoint, where the option
-/// does apply: without the facade's check the value reaches
-/// `HandshakeDeadline::arm`, whose refusal is an opaque I/O error
-/// (`Unknown`), so the assertion below is a real gate on the facade. The
-/// r34 wire has no connection handshake for the option to bound, so there
-/// it is refused whatever its value — `ClientOptions` promises an option
-/// that does not apply is `BadValue`, never ignored.
+/// The zero is asserted on both wires: the **versioned** one bounds its
+/// connection handshake with the value, and the r34 one makes it the
+/// session's reply deadline.
 #[test]
-#[allow(deprecated)] // The deprecated field is still honored, so its zero is still refused.
-fn entry_zero_handshake_timeout_is_refused() {
+fn entry_zero_timeout_is_refused() {
     let sock13 = SockPath::new("zerohs13");
     let _guard13 = rsbinder::serve(sock13.uri().with_wire(A13))
         .expect("serve")
@@ -291,28 +287,19 @@ fn entry_zero_handshake_timeout_is_refused() {
         .spawn()
         .expect("spawn");
 
-    let err = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
-        o.handshake_timeout = Some(std::time::Duration::ZERO)
-    })
-    .expect_err("a zero handshake deadline must be refused before any connect");
-    assert_eq!(err, rsbinder::StatusCode::BadValue);
-
-    // Control: on the same endpoint a positive deadline connects.
-    let ok = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
-        o.handshake_timeout = Some(std::time::Duration::from_secs(5))
-    })
-    .and_then(|c| c.binder("svc"));
-    assert!(ok.is_ok(), "a positive deadline still connects");
-
-    // `timeout`'s zero is refused too, as `RpcSession::set_reply_timeout` refuses it (plan 17 C-2).
     let zero = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
         o.timeout = Some(std::time::Duration::ZERO)
     })
     .expect_err("a zero timeout is not a deadline");
     assert_eq!(zero, rsbinder::StatusCode::BadValue);
 
-    // The r34 wire has no handshake phase, so the option is refused there
-    // whatever its value.
+    // Control: on the same endpoint a positive deadline connects.
+    let ok = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
+        o.timeout = Some(std::time::Duration::from_secs(5))
+    })
+    .and_then(|c| c.binder("svc"));
+    assert!(ok.is_ok(), "a positive deadline still connects");
+
     let sock = SockPath::new("zerohs");
     let _guard = rsbinder::serve(sock.uri())
         .expect("serve")
@@ -320,11 +307,6 @@ fn entry_zero_handshake_timeout_is_refused() {
         .expect("add")
         .spawn()
         .expect("spawn");
-    let err = rsbinder::Client::open_with(sock.uri(), |o, _| {
-        o.handshake_timeout = Some(std::time::Duration::from_secs(5))
-    })
-    .expect_err("handshake_timeout does not apply to the r34 wire");
-    assert_eq!(err, rsbinder::StatusCode::BadValue);
     let zero = rsbinder::Client::open_with(sock.uri(), |o, _| {
         o.timeout = Some(std::time::Duration::ZERO)
     })

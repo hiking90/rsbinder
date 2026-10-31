@@ -216,8 +216,7 @@ tweaks; wire formats are already locked.
 - **`RpcClientConfig` (new in 0.12.0)** — one android-13+ client configuration
   for every transport (`unix`, `unix_abstract`, `vsock`, `tls`, `tcp_debug`,
   `new`), with `incoming_connections` and `outgoing_connections` on all of
-  them. It replaces `RpcUnixClientConfig` and the Unix-only multi-connection
-  helpers, which are deprecated and go in the release after.
+  them. It is the only config the android-13+ multi-connection setup takes.
 - **AIDL compiler, beyond the Stable entry points** —
   `Builder::{dest_dir, hash}` and the public `render` module, the seam
   `rsbinder-macros` plugs into. Its input structs are `#[non_exhaustive]`, so

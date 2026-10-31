@@ -2516,7 +2516,7 @@ fn r34_session_nodes_are_counted() {
 
 /// A session id on an entry that builds a new `RpcSession` is `BadValue`; see module doc.
 #[test]
-#[allow(deprecated)] // Pins the deprecated id-taking entries' refusal too.
+#[expect(deprecated, reason = "only `RpcClientConfig::session_id` names an id")]
 fn a_new_session_setup_refuses_a_session_id() {
     let path = tmp_sock("newid");
     let server = RpcServer::setup_unix_server(&path).expect("bind");
@@ -2541,21 +2541,6 @@ fn a_new_session_setup_refuses_a_session_id() {
         .err(),
         Some(StatusCode::BadValue),
         "the server-minted id must not build a second client session on the server's session"
-    );
-    assert_eq!(
-        RpcSession::setup_unix_client_android13plus_with_id(&path, 1, &sid).err(),
-        Some(StatusCode::BadValue)
-    );
-    let t = rsbinder::rpc::transport::UnixTransport::connect(&path).expect("connect");
-    assert_eq!(
-        RpcSession::connect_android13plus_fd_with_id(
-            Box::new(t),
-            1,
-            rsbinder::rpc::FileDescriptorTransportMode::None,
-            &sid
-        )
-        .err(),
-        Some(StatusCode::BadValue)
     );
     assert_eq!(
         server.attached_count(),
@@ -3566,9 +3551,9 @@ fn served_slot_never_taken_by_outside_transact() {
     assert_eq!(h.root.echo("after").unwrap(), "after");
 }
 
-/// `timeout`, and the deprecated `handshake_timeout` in its place, bound a silent peer's handshake.
+/// `timeout` bounds a silent peer's handshake.
 #[test]
-#[allow(deprecated)] // The deprecated setter is still honored, so it is still checked.
+#[expect(deprecated, reason = "only the manual attach reaches the silent peer")]
 fn handshake_timeout_bounds_a_silent_peer() {
     let path = tmp_sock("hs_silent");
     // A raw listener that accepts and says nothing: the peer this deadline exists for.
@@ -3585,30 +3570,19 @@ fn handshake_timeout_bounds_a_silent_peer() {
     };
     wait_for_sock(&path);
 
-    let via_timeout: fn(&std::path::Path) -> RpcClientConfig =
-        |p| RpcClientConfig::unix(p, 2).timeout(Duration::from_millis(300));
-    let via_handshake_timeout: fn(&std::path::Path) -> RpcClientConfig =
-        |p| RpcClientConfig::unix(p, 2).handshake_timeout(Duration::from_millis(300));
-    for (name, config) in [
-        ("timeout", via_timeout),
-        ("handshake_timeout", via_handshake_timeout),
-    ] {
-        // Channel deadline: an unbounded connect must fail the test, not hang the run.
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let p = path.clone();
-        std::thread::spawn(move || {
-            let r = RpcSession::setup_client_android13plus_with_config(config(&p));
-            let _ = tx.send(r.map(|_| ()));
-        });
-        let r = rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|_| panic!("{name} must bound the handshake; still blocked"));
-        assert_eq!(
-            r,
-            Err(StatusCode::TimedOut),
-            "{name}: a silent peer's handshake"
+    // Channel deadline: an unbounded connect must fail the test, not hang the run.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let r = RpcSession::setup_client_android13plus_with_config(
+            RpcClientConfig::unix(&p, 2).timeout(Duration::from_millis(300)),
         );
-    }
+        let _ = tx.send(r.map(|_| ()));
+    });
+    let r = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("timeout must bound the handshake; still blocked");
+    assert_eq!(r, Err(StatusCode::TimedOut), "a silent peer's handshake");
 
     // A leftover handshake `SO_RCVTIMEO` would silently bound every later reply wait.
     let path2 = tmp_sock("hs_ok");
@@ -3621,10 +3595,12 @@ fn handshake_timeout_bounds_a_silent_peer() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path2.clone());
     wait_for_sock(&path2);
     let client = RpcSession::setup_client_android13plus_with_config(
-        RpcClientConfig::unix(&path2, 2).handshake_timeout(Duration::from_millis(300)),
+        RpcClientConfig::unix(&path2, 2).timeout(Duration::from_millis(300)),
     )
     .expect("connect");
     let root = EchoProxy(client.get_root().expect("root"));
+    // Unbounded reply waits: only a handshake deadline left on the transport can cut the call.
+    client.set_reply_timeout(None).expect("set_reply_timeout");
     // Longer than the handshake deadline: a leaked deadline fails here.
     assert_eq!(root.slow(500).map(|_| "ok"), Ok("ok"));
     client.close_session();
@@ -4066,16 +4042,14 @@ fn incoming_config_validation() {
     ));
 }
 
-/// Manual attach: `RpcClientConfig` calls refuse a `timeout`; released deprecated ones ignore it.
-#[allow(deprecated)]
+/// Manual attach: both `RpcClientConfig` calls refuse a `timeout`, a session-wide setting.
+#[expect(deprecated, reason = "validates the manual attach's config")]
 #[test]
 fn a_manual_attach_with_a_session_timeout() {
     let h = boot_held_cfg(
         "b_cfg_timeout",
         HeldCfg {
             a13: true,
-            // Room for the outgoing attach beside the founding slot.
-            max_threads: 2,
             ..Default::default()
         },
     );
@@ -4099,26 +4073,9 @@ fn a_manual_attach_with_a_session_timeout() {
         ),
         Err(StatusCode::BadValue)
     ));
-
-    h.client
-        .add_outgoing_connection_android13plus_with_config(
-            rsbinder::rpc::RpcUnixClientConfig::path(&path, 2)
-                .session_id(&sid)
-                .timeout(timeout),
-        )
-        .expect("the deprecated outgoing attach still ignores it");
-    h.client
-        .add_incoming_connection_android13plus_with_config(
-            rsbinder::rpc::RpcUnixClientConfig::path(&path, 2)
-                .session_id(&sid)
-                .timeout(timeout),
-        )
-        .expect("the deprecated incoming attach still ignores it");
 }
 
 /// Callback slots cap at `2 * max_threads`: on a default server two are admitted, a third refused.
-// Pins the deprecated `RpcUnixClientConfig` wrapper's delegation to `RpcClientConfig`.
-#[allow(deprecated)]
 #[test]
 fn incoming_over_server_cap_is_refused() {
     let h = boot_held_cfg(
@@ -4138,8 +4095,8 @@ fn incoming_over_server_cap_is_refused() {
         .unwrap();
     assert!(poll_until(|| h.server.session_slot_count(&sid) == Some(3)));
     let path = h.server.path().expect("unix path").to_path_buf();
-    let r = RpcSession::setup_unix_client_android13plus_with_config(
-        rsbinder::rpc::RpcUnixClientConfig::path(&path, 2).incoming_connections(3),
+    let r = RpcSession::setup_client_android13plus_with_config(
+        RpcClientConfig::unix(&path, 2).incoming_connections(3),
     );
     // If admitted, close it: its incoming threads would outlive the panic below.
     if let Ok(s) = &r {

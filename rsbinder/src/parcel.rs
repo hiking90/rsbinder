@@ -1283,17 +1283,6 @@ impl Parcel {
         false
     }
 
-    /// `true` if this parcel serializes binders/FDs the RPC way.
-    #[deprecated(
-        since = "0.11.0",
-        note = "renamed and inverted: use `!parcel.is_kernel_backed()`. The old name \
-                described one consumer of the mode rather than what the flag controls, \
-                and read fail-open at the one security branch that uses it."
-    )]
-    pub fn is_for_rpc(&self) -> bool {
-        !self.is_kernel_backed()
-    }
-
     /// Attach the RPC hooks and enter RPC mode (AOSP `Parcel::markForRpc`/`mSession`).
     #[cfg(feature = "rpc")]
     pub(crate) fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {

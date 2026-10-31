@@ -113,23 +113,6 @@ pub enum EndReason {
     /// The stream ended without the transport's close signal
     /// ([`RpcError::UncleanEndOfStream`](super::RpcError::UncleanEndOfStream)).
     UncleanEndOfStream,
-    /// Never produced. A nested call that loses track of what the peer
-    /// sends next ends the session, and the loop ends with the session's
-    /// end.
-    #[deprecated(
-        since = "0.12.0",
-        note = "never produced: a nested call that loses the stream ends the session, and the \
-                loop reports the session's end"
-    )]
-    Unreadable,
-    /// Never produced. A fault on any connection ends the whole session;
-    /// a loop whose slot is gone reports
-    /// [`SessionEnded`](Self::SessionEnded).
-    #[deprecated(
-        since = "0.12.0",
-        note = "never produced: a connection fault ends the whole session; see `SessionEnded`"
-    )]
-    Retired,
     /// The session had already ended when the loop went to pin its slot —
     /// before the first frame or between two frames — so there was nothing
     /// left to serve. Another connection's fault, a reply deadline, or this
@@ -189,10 +172,6 @@ pub struct SessionEnd {
 
 impl SessionEnd {
     /// Derives both axes from the reason, a local decision and an armed deadline; see module doc.
-    #[expect(
-        deprecated,
-        reason = "maps the never-produced variants too: the match stays exhaustive"
-    )]
     pub(crate) fn new(reason: EndReason, ended_locally: bool, deadline_armed: bool) -> Self {
         use EndReason::*;
         use StreamState::*;
@@ -207,8 +186,8 @@ impl SessionEnd {
         let stream = match reason {
             EndOfStream | Interrupted => InSync,
             Frame(StatusCode::TimedOut) if idle_eviction => InSync,
-            UncleanEndOfStream | Unreadable | DeadlineMidFrame | Frame(_) => Lost,
-            SessionEnded | Retired | Dispatch(_) => {
+            UncleanEndOfStream | DeadlineMidFrame | Frame(_) => Lost,
+            SessionEnded | Dispatch(_) => {
                 if ended_locally {
                     InSync
                 } else {

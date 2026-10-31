@@ -4,7 +4,7 @@
 `.aidl` file, no `build.rs`, no generated-code directory:
 
 ```toml
-rsbinder = { version = "0.12", features = ["macros"] }
+rsbinder = { version = "0.13", features = ["macros"] }
 ```
 
 ```rust

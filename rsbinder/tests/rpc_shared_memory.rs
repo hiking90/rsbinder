@@ -18,7 +18,6 @@
 ))]
 
 use std::sync::Arc;
-use std::thread;
 
 use rsbinder::rpc::{
     FileDescriptorTransportMode as FdMode, RpcServer, RpcServerHandle, RpcSession,
@@ -81,7 +80,7 @@ impl Bound {
             if self.path.exists() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         bg
     }

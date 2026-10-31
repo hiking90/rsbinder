@@ -5,10 +5,10 @@ This is an AIDL compiler for **rsbinder**.
 Add dependencies to Cargo.toml (check crates.io for the latest version):
 ```toml
 [dependencies]
-rsbinder = "0.12"
+rsbinder = "0.13"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.12", features = ["async"] }
+rsbinder-aidl = { version = "0.13", features = ["async"] }
 miette = "7"
 ```
 
@@ -56,10 +56,10 @@ rsbinder::include_aidl!("my_service", crate::IMyService::*);
 For environments without async runtime:
 ```toml
 [dependencies]
-rsbinder = { version = "0.12", default-features = false }
+rsbinder = { version = "0.13", default-features = false }
 
 [build-dependencies]
-rsbinder-aidl = "0.12"
+rsbinder-aidl = "0.13"
 miette = "7"
 ```
 

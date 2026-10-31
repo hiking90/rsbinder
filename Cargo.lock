@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "example-hello"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "env_logger",
@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-aidl"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "miette",
  "pest",
@@ -919,7 +919,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-fmq"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "log",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-macros"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-tools"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anstyle",
  "clap",
@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-topic"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "log",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "tests"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "env_logger",
