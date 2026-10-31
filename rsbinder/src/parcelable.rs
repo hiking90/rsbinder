@@ -1052,9 +1052,9 @@ mod tests {
         assert_eq!(p.read::<Option<i32>>(), Err(StatusCode::UnexpectedNull));
     }
 
-    /// `impl_deserialize_for_parcelable!` (the AIDL parcelable path) rejects sentinels beyond 0/1.
+    /// Structured parcelables treat only zero as null, as AOSP Rust does.
     #[test]
-    fn macro_parcelable_rejects_garbage_sentinel() {
+    fn macro_parcelable_accepts_nonzero_presence() {
         #[derive(Default, Debug, PartialEq)]
         struct Tiny {
             x: i32,
@@ -1070,16 +1070,115 @@ mod tests {
         }
         crate::impl_deserialize_for_parcelable!(Tiny);
 
-        let mut p = Parcel::new();
-        p.write(&NON_NULL_PARCELABLE_FLAG).unwrap(); // 1 → present
-        p.write(&7i32).unwrap(); //     payload
-        p.write(&NULL_PARCELABLE_FLAG).unwrap(); // 0 → None
-        p.write(&2i32).unwrap(); // garbage sentinel
-        p.set_data_position(0);
+        let sentinel = 0x1234_5678i32;
+        for presence in [0, 1, 2, -1, i32::MAX, i32::MIN] {
+            let mut p = Parcel::new();
+            p.write(&presence).unwrap();
+            if presence != 0 {
+                Tiny { x: 7 }.write_to_parcel(&mut p).unwrap();
+            }
+            p.write(&sentinel).unwrap();
 
-        assert_eq!(p.read::<Tiny>(), Ok(Tiny { x: 7 }));
-        assert_eq!(p.read::<Option<Tiny>>(), Ok(None));
-        // Any non-{0,1} flag is UNEXPECTED_NULL, as in AOSP `Parcel::readData`.
-        assert_eq!(p.read::<Option<Tiny>>(), Err(StatusCode::UnexpectedNull));
+            p.set_data_position(0);
+            assert_eq!(
+                Tiny::deserialize(&mut p),
+                if presence == 0 {
+                    Err(StatusCode::UnexpectedNull)
+                } else {
+                    Ok(Tiny { x: 7 })
+                },
+                "presence {presence}"
+            );
+            assert_eq!(p.read::<i32>(), Ok(sentinel));
+
+            p.set_data_position(0);
+            let mut value = Tiny { x: 99 };
+            assert_eq!(
+                value.deserialize_from(&mut p),
+                if presence == 0 {
+                    Err(StatusCode::UnexpectedNull)
+                } else {
+                    Ok(())
+                },
+                "presence {presence}"
+            );
+            assert_eq!(value.x, if presence == 0 { 99 } else { 7 });
+            assert_eq!(p.read::<i32>(), Ok(sentinel));
+
+            p.set_data_position(0);
+            assert_eq!(
+                Tiny::deserialize_option(&mut p),
+                Ok(if presence == 0 {
+                    None
+                } else {
+                    Some(Tiny { x: 7 })
+                }),
+                "presence {presence}"
+            );
+            assert_eq!(p.read::<i32>(), Ok(sentinel));
+
+            for mut value in [None, Some(Tiny { x: 99 })] {
+                p.set_data_position(0);
+                assert_eq!(
+                    Tiny::deserialize_option_from(&mut value, &mut p),
+                    Ok(()),
+                    "presence {presence}"
+                );
+                assert_eq!(
+                    value,
+                    if presence == 0 {
+                        None
+                    } else {
+                        Some(Tiny { x: 7 })
+                    }
+                );
+                assert_eq!(p.read::<i32>(), Ok(sentinel));
+            }
+        }
+
+        for presence in [
+            None,
+            Some(1),
+            Some(2),
+            Some(-1),
+            Some(i32::MAX),
+            Some(i32::MIN),
+        ] {
+            let mut p = Parcel::new();
+            if let Some(presence) = presence {
+                p.write(&presence).unwrap();
+            }
+            // Tiny requires its field; a sentinel here would make the body valid.
+            p.set_data_position(0);
+            assert_eq!(
+                Tiny::deserialize(&mut p),
+                Err(StatusCode::NotEnoughData),
+                "presence {presence:?}"
+            );
+
+            p.set_data_position(0);
+            let mut value = Tiny { x: 99 };
+            assert_eq!(
+                value.deserialize_from(&mut p),
+                Err(StatusCode::NotEnoughData),
+                "presence {presence:?}"
+            );
+
+            p.set_data_position(0);
+            assert_eq!(
+                Tiny::deserialize_option(&mut p),
+                Err(StatusCode::NotEnoughData),
+                "presence {presence:?}"
+            );
+
+            for mut value in [None, Some(Tiny { x: 99 })] {
+                p.set_data_position(0);
+                assert_eq!(
+                    Tiny::deserialize_option_from(&mut value, &mut p),
+                    Err(StatusCode::NotEnoughData),
+                    "presence {presence:?}"
+                );
+            }
+        }
     }
 }
