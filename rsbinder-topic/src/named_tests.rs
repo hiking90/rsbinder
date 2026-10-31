@@ -28,8 +28,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{
     wait_any, Acceptor, Advertisement, Authorize, Backpressure, Bytes, Closed, Disconnected,
-    NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver, Start, Subscriber,
-    SubscriberPolicy, Wait, Wake, Watch,
+    NamedState, NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver, Start,
+    Subscriber, SubscriberPolicy, Wait, Wake, Watch,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -280,6 +280,48 @@ fn a_publisher_whose_memory_failed_a_check_stays_remembered() {
         )))
     );
     assert_eq!(subscriber.remembered(), 1);
+    // Nothing is asked again while the name has that publisher: the state says so at each ask.
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.state(), NamedState::Corrupted);
+    assert_eq!(subscriber.state(), NamedState::Corrupted);
+}
+
+#[test]
+fn a_dead_resolver_closes_the_subscriber_once_its_connection_ends() {
+    let names = Names::default();
+    let publisher = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    subscriber.resolver_dies();
+    // The connection goes on.
+    assert_eq!(subscriber.state(), NamedState::Connected);
+    publisher.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    publisher.close(&Status::from(ExceptionCode::None));
+    let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
+    assert_eq!(recv(&mut subscriber), ended);
+    let closed = Err(RecvError::Closed(Closed::ResolverDied));
+    assert_eq!(recv(&mut subscriber), closed);
+    assert_eq!(subscriber.try_recv(), closed);
+    assert_eq!(subscriber.state(), NamedState::Closed(Closed::ResolverDied));
+    let asked = Instant::now();
+    assert!(!subscriber.wait_connected(WAIT));
+    assert!(asked.elapsed() < WAIT, "returned at once");
+}
+
+#[test]
+fn a_dead_resolver_closes_a_subscriber_without_a_connection_at_once() {
+    let names = Names::default();
+    let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
+    subscriber.resolver_dies();
+    assert!(!subscriber.prepare_wait(), "a receive returns now");
+    let closed = Err(RecvError::Closed(Closed::ResolverDied));
+    assert_eq!(recv(&mut subscriber), closed);
+    // A publisher that comes later is not connected to.
+    let publisher = advertise(&names, &policy());
+    publisher.publish(&bytes(2)).unwrap();
+    assert!(!subscriber.wait_connected(Duration::from_millis(300)));
+    assert_eq!(recv(&mut subscriber), closed);
 }
 
 /// It lives on, so it stays remembered: given the name again, it is read from `Latest`.
@@ -1490,15 +1532,23 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
         }
         other => panic!("{other:?}"),
     }
+    let refused = |state| {
+        let security = |s: &Status| s.exception_code() == ExceptionCode::Security;
+        matches!(state, NamedState::Refused(s) if security(&s))
+    };
+    assert!(refused(subscriber.state()), "{:?}", subscriber.state());
     names.give(NAME, publisher.as_binder());
     assert_eq!(
         subscriber.recv_timeout(Duration::from_millis(1500)),
         Err(RecvError::Timeout)
     );
     assert_eq!(asked.load(Ordering::SeqCst), 1);
+    // Told once by the receive, at every ask by the state.
+    assert!(refused(subscriber.state()), "{:?}", subscriber.state());
     // Another publisher of the name is asked.
     let admitting = advertise(&names, &policy());
     connected(&subscriber);
+    assert_eq!(subscriber.state(), NamedState::Connected);
     admitting.publish(&bytes(6)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
 }
@@ -1513,6 +1563,8 @@ fn a_closed_publisher_is_waited_past_without_a_notice() {
         subscriber.recv_timeout(Duration::from_millis(300)),
         Err(RecvError::Timeout)
     );
+    // An ended publisher is not a refusal of this subscriber: its successor will register.
+    assert_eq!(subscriber.state(), NamedState::Waiting);
     let next = advertise(&names, &policy());
     connected(&subscriber);
     next.publish(&bytes(7)).unwrap();

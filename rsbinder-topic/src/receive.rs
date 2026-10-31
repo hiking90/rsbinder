@@ -138,6 +138,15 @@ pub enum Closed {
     /// this one past its timeout. The records it had not read are not returned, as the publisher
     /// no longer keeps them; those before the notice arrived were.
     Evicted,
+    /// A [`NamedSubscriber`](crate::NamedSubscriber)'s resolver died: the process that held its
+    /// watch of the name is gone, so no publisher of the name will reach the subscriber again.
+    /// Only a resolver whose watch names its host reports it
+    /// ([`Watch::with_host`](crate::Watch::with_host)): a registry's does, the service manager's
+    /// does not. Returned once no connection is left: a
+    /// connection held when the resolver died goes on until it ends, and the `Disconnected` of
+    /// that end comes first. Make the subscriber again with a resolver of the new host (plan 15
+    /// D8). A [`Subscriber`](crate::Subscriber) never returns it.
+    ResolverDied,
 }
 
 impl fmt::Display for RecvError {
@@ -172,6 +181,7 @@ impl fmt::Display for Closed {
             Self::PublisherDied => f.write_str("the publisher's process died"),
             Self::Corrupted => f.write_str("the topic's memory is corrupted"),
             Self::Evicted => f.write_str("the publisher took the subscription out"),
+            Self::ResolverDied => f.write_str("the resolver of the name died"),
         }
     }
 }

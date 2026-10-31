@@ -34,8 +34,10 @@ use crate::resolve::{Advertisement, Resolver, Watch};
 ///
 /// A host that ends takes its names and watches with it. Every call of this resolver then fails
 /// with `DeadObject`, publishers and subscribers already connected go on, and a publisher does
-/// not advertise its name to the next host: make the publisher and the name subscriber again
-/// with a resolver of the new host (plan 15 D8). A refusal of a call is `DeadObject` only when
+/// not advertise its name to the next host. A [`NamedSubscriber`](crate::NamedSubscriber)
+/// returns [`Closed::ResolverDied`](crate::Closed::ResolverDied) once it has no connection left:
+/// make the publisher and the name subscriber again with a resolver of the new host (plan 15
+/// D8). A refusal of a call is `DeadObject` only when
 /// the host died: a binder of the call that is dead is `ILLEGAL_STATE`.
 #[derive(Clone)]
 pub struct RegistryResolver {
@@ -127,7 +129,7 @@ impl Resolver for RegistryResolver {
             watcher,
             newest,
         };
-        Ok(Watch::with_lookup(watching, lookup))
+        Ok(Watch::with_lookup(watching, lookup).with_host(self.registry.as_binder()))
     }
 }
 

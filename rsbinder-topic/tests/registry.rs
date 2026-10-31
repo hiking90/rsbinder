@@ -43,8 +43,8 @@ use rsbinder_topic::aidl::TopicInfo::TopicInfo;
 use rsbinder_topic::aidl::TopicRef::TopicRef;
 use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver};
 use rsbinder_topic::{
-    Bytes, Closed, Disconnected, NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver,
-    Start, SubscriberPolicy,
+    Bytes, Closed, Disconnected, NamedState, NamedSubscriber, Publisher, PublisherPolicy,
+    RecvError, Resolver, Start, SubscriberPolicy,
 };
 
 /// Where a child finds the registry.
@@ -288,6 +288,7 @@ fn a_failed_advertise_withdraws_its_name() {
 }
 
 /// AC-15.5.6, plan 15 D8: connections outlive the host; a new one knows only new publishers.
+/// A name subscriber of the dead host is closed once its connection ends.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_new_host_knows_only_the_publishers_made_again() {
@@ -304,6 +305,15 @@ fn a_new_host_knows_only_the_publishers_made_again() {
     assert_eq!(gone.transaction_error(), StatusCode::DeadObject);
     published(&mut peer, 1);
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![0])));
+    assert_eq!(subscriber.state(), NamedState::Connected);
+    peer.kill();
+    let died = Err(RecvError::Disconnected(Disconnected::Ended(
+        Closed::PublisherDied,
+    )));
+    assert_eq!(subscriber.recv_timeout(WAIT), died);
+    let closed = Err(RecvError::Closed(Closed::ResolverDied));
+    assert_eq!(subscriber.recv_timeout(WAIT), closed);
+    assert_eq!(subscriber.state(), NamedState::Closed(Closed::ResolverDied));
 
     let second_host = Peer::spawn("host", &registry);
     assert_eq!(second_host.says(), "ready");

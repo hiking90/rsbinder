@@ -145,6 +145,7 @@ pub fn closed_reason(closed: &Closed) -> &'static str {
         Closed::PublisherDied => "PublisherDied",
         Closed::Corrupted => "Corrupted",
         Closed::Evicted => "Evicted",
+        Closed::ResolverDied => "ResolverDied",
         _ => "Unknown",
     }
 }
