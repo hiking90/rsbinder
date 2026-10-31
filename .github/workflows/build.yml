@@ -588,6 +588,20 @@ jobs:
         ndk-version: r26c
         add-to-path: false
         local-cache: true
+    - name: FMQ C header on the 32-bit Android ABIs (compile only — plan 17 Q-17)
+      # The host build is 64-bit only; i686 aligns uint64_t to 4. Once, not per target.
+      if: matrix.target == 'x86_64-linux-android'
+      env:
+        NDK_BIN: ${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+      run: |
+        set -eux
+        cd rsbinder-fmq
+        for target in i686-linux-android29 armv7a-linux-androideabi29; do
+          "$NDK_BIN/clang" --target=$target -std=c11 -pedantic -Wall -Wextra -Werror \
+            -fsyntax-only -I c tests/c/rsbfmq_peer.c
+          "$NDK_BIN/clang++" --target=$target -std=c++17 -Wall -Wextra -Werror \
+            -fsyntax-only -I c tests/c/cxx_check.cpp
+        done
     - name: Install Rust stable for cargo-ndk
       uses: dtolnay/rust-toolchain@stable
       with:

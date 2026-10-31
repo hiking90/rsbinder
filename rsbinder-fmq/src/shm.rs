@@ -4,12 +4,17 @@
 //! Shared-memory primitives: the pieces a queue is built from, usable on
 //! their own.
 //!
+//! **Provisional** (`book/src/stability-tiers.md`, "Shared-memory
+//! primitives"): the module wraps system calls and has no wire or layout of
+//! its own, so the tier covers the Rust signatures only.
+//!
 //! [`MessageQueue`](crate::MessageQueue) is one protocol over memory two
 //! processes map. This module is what lies under it, without the protocol:
 //!
 //! | Need | Item |
 //! |---|---|
 //! | Make the memory | [`create`] (a memfd), [`add_seals`], [`seals`], [`Seals`] |
+//! | Make it, map it writable and seal it, in that order | [`create_mapped`] |
 //! | Map it | [`Mapping`], [`Access`] |
 //! | Copy bytes in and out without a data race | [`Run`] |
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
@@ -78,7 +83,7 @@ mod word;
 
 pub use futex::{futex_wait, futex_wake, Deadline};
 pub use mapping::{Access, Mapping};
-pub use memfd::{add_seals, create, seals, verify_received, CreateOptions, Seals};
+pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
 pub use run::{RoRun, Run};
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.
 pub use word::*;

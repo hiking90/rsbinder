@@ -331,6 +331,12 @@ Each item below changes what a 0.12.0 program observes.
   `SharedMemory::from_fd`, `Parcel::read_blob` and a received `IMemory`.
   An fd that is not a regular file (ashmem, a device) is not measured, and
   a failed `fstat` leaves the fd to `mmap` as before.
+- **`rsbinder-fmq/c/rsbinder_fmq.h`'s internal helpers are
+  `rsbfmq_internal_*`**, not `rsbfmq__*`, a name C++ reserves; the header
+  states its stability (the C API is Provisional) and defines
+  `RSBINDER_FMQ_H_VERSION` (1), raised with each change to the C API. A
+  copy of the 0.12.0 header that calls an `rsbfmq__*` helper directly
+  renames the call.
 
 ### Added
 
@@ -480,6 +486,8 @@ Each item below changes what a 0.12.0 program observes.
   than FMQ. `create` with `CreateOptions`, `add_seals`, `seals` and `Seals`
   (a memfd and its seals; `add_seals` returns the kernel's error unchanged,
   so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle);
+  `create_mapped` (create, map writable, then seal, the one order in which
+  the owner keeps a writable mapping under `FUTURE_WRITE`);
   `Mapping` with `Access` (a shared mapping at any byte offset, read-only or
   read-write, on macOS as well as Linux and Android); `Run` (copies in and
   out of shared memory through atomics); `futex_wait`, `futex_wake` and

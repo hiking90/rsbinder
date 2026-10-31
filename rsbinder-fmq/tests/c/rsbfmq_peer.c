@@ -22,6 +22,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+/* Equal on every ABI; i386 aligns plain uint64_t to 4, and its atomics would be libcalls. */
+_Static_assert(sizeof(rsbfmq_grantor) == 16, "rsbfmq_grantor is not 16 bytes");
+_Static_assert(_Alignof(rsbfmq_counter) == 8, "rsbfmq_counter is not 8-aligned");
+_Static_assert(RSBINDER_FMQ_H_VERSION >= 1, "RSBINDER_FMQ_H_VERSION is missing");
+
 #define TIMEOUT_NS (10LL * 1000 * 1000 * 1000)
 
 static void die(const char *what) {

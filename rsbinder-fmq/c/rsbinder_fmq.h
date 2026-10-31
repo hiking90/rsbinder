@@ -44,10 +44,25 @@
  * EventFlag functions may be called from any thread (a death notification
  * waking a waiter, for instance) as long as the queue is not closed under
  * them.
+ *
+ * Stability
+ *
+ * The shared-memory layout, the counters and the EventFlag protocol are
+ * libfmq's, not this header's: they change only if libfmq changes them, and
+ * a queue made by any of the three implementations keeps attaching from the
+ * other two. The C API — the rsbfmq_* names, their arguments, the structs
+ * and the errors each function returns — is in rsbinder-fmq's Provisional
+ * tier (book/src/stability-tiers.md): it may change in a minor release of
+ * the crate. RSBINDER_FMQ_H_VERSION goes up by one with every such change,
+ * so a project that keeps a copy of this file can tell which one it has.
+ * Names that start with rsbfmq_internal_ are not part of the API.
  */
 
 #ifndef RSBINDER_FMQ_H
 #define RSBINDER_FMQ_H
+
+/* The C API's version; see "Stability" above. */
+#define RSBINDER_FMQ_H_VERSION 1
 
 /* First, so that on glibc the check below sees what features.h decided. */
 #include <errno.h>
@@ -216,7 +231,7 @@ typedef struct rsbfmq_regions {
 /* ------------------------------------------------------------------ */
 
 /* The ashmem rdev as libcutils finds it: /dev/ashmem<boot_id>, then /dev/ashmem; 0 if neither. */
-static inline dev_t rsbfmq__ashmem_rdev(void) {
+static inline dev_t rsbfmq_internal_ashmem_rdev(void) {
     char path[64] = "/dev/ashmem";
     struct stat st;
     FILE *f = fopen("/proc/sys/kernel/random/boot_id", "re");
@@ -249,11 +264,11 @@ static inline int rsbfmq_is_ashmem(int fd) {
     if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode)) {
         return 0;
     }
-    rdev = rsbfmq__ashmem_rdev();
+    rdev = rsbfmq_internal_ashmem_rdev();
     return rdev != 0 && st.st_rdev == rdev;
 #else
     (void)fd;
-    (void)rsbfmq__ashmem_rdev;
+    (void)rsbfmq_internal_ashmem_rdev;
     return 0;
 #endif
 }
@@ -293,13 +308,13 @@ static inline int rsbfmq_region_size(int fd, uint64_t *size) {
  * a file shares (st_dev, st_ino), while every ashmem fd has the device
  * node's inode, so ashmem goes by fd index (as in rsbinder-fmq).
  */
-typedef struct rsbfmq__object {
+typedef struct rsbfmq_internal_object {
     int ashmem;
     uint64_t dev;
     uint64_t ino; /* the fd index for ashmem */
-} rsbfmq__object;
+} rsbfmq_internal_object;
 
-static inline int rsbfmq__object_of(int fd, uint32_t index, rsbfmq__object *o) {
+static inline int rsbfmq_internal_object_of(int fd, uint32_t index, rsbfmq_internal_object *o) {
     struct stat st;
     memset(o, 0, sizeof *o);
     if (rsbfmq_is_ashmem(fd)) {
@@ -315,7 +330,8 @@ static inline int rsbfmq__object_of(int fd, uint32_t index, rsbfmq__object *o) {
     return 0;
 }
 
-static inline int rsbfmq__same_object(const rsbfmq__object *a, const rsbfmq__object *b) {
+static inline int rsbfmq_internal_same_object(const rsbfmq_internal_object *a,
+                                              const rsbfmq_internal_object *b) {
     return a->ashmem == b->ashmem && a->dev == b->dev && a->ino == b->ino;
 }
 
@@ -323,13 +339,13 @@ static inline int rsbfmq__same_object(const rsbfmq__object *a, const rsbfmq__obj
 /* Attach and create                                                   */
 /* ------------------------------------------------------------------ */
 
-static inline uint64_t rsbfmq__align8(uint64_t x) {
+static inline uint64_t rsbfmq_internal_align8(uint64_t x) {
     return (x + 7) & ~(uint64_t)7;
 }
 
 /* Map `extent` bytes at `offset`, which need not be page-aligned. */
-static inline int rsbfmq__map(int fd, uint64_t offset, uint64_t extent,
-                              rsbfmq_mapping *m, void **at) {
+static inline int rsbfmq_internal_map(int fd, uint64_t offset, uint64_t extent,
+                                      rsbfmq_mapping *m, void **at) {
     uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
     uint64_t map_offset = offset - offset % page;
     uint64_t delta = offset - map_offset;
@@ -368,11 +384,11 @@ static inline void rsbfmq_close(rsbfmq_queue *q) {
 }
 
 /* libfmq initMemory/mapGrantorDescr checks, the policy's, and i32::MAX offsets/extents. */
-static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
-                                   const rsbfmq_policy *p, size_t *capacity) {
+static inline int rsbfmq_internal_validate(const rsbfmq_desc *d, size_t quantum,
+                                           const rsbfmq_policy *p, size_t *capacity) {
     static const uint64_t min_extent[4] = {8, 8, 1, 4};
     uint64_t sizes[4] = {0, 0, 0, 0};
-    rsbfmq__object objects[4];
+    rsbfmq_internal_object objects[4];
     size_t n, used, i, j;
     if (d->flags != RSBFMQ_SYNCHRONIZED_READ_WRITE) {
         return -EINVAL;
@@ -420,7 +436,7 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
             if (r != 0) {
                 return r;
             }
-            r = rsbfmq__object_of(fd, g->fd_index, &objects[i]);
+            r = rsbfmq_internal_object_of(fd, g->fd_index, &objects[i]);
             if (r != 0) {
                 return r;
             }
@@ -441,7 +457,7 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
         for (j = i + 1; j < used; j++) {
             const rsbfmq_grantor *a = &d->grantors[i];
             const rsbfmq_grantor *b = &d->grantors[j];
-            if (rsbfmq__same_object(&objects[i], &objects[j]) &&
+            if (rsbfmq_internal_same_object(&objects[i], &objects[j]) &&
                 a->offset < b->offset + b->extent && b->offset < a->offset + a->extent) {
                 return -EINVAL;
             }
@@ -450,32 +466,34 @@ static inline int rsbfmq__validate(const rsbfmq_desc *d, size_t quantum,
     return 0;
 }
 
-static inline int rsbfmq__open(rsbfmq_queue *q, const rsbfmq_desc *d, size_t quantum,
-                               const rsbfmq_policy *p) {
+static inline int rsbfmq_internal_open(rsbfmq_queue *q, const rsbfmq_desc *d, size_t quantum,
+                                       const rsbfmq_policy *p) {
     const rsbfmq_grantor *g = d->grantors;
     size_t capacity, i;
     uint64_t size;
     void *at;
-    int r = rsbfmq__validate(d, quantum, p, &capacity);
+    int r = rsbfmq_internal_validate(d, quantum, p, &capacity);
     if (r != 0) {
         return r;
     }
     /* The counters and the word are mapped at their own size, not the peer's extent. */
-    if ((r = rsbfmq__map(d->fds[g[0].fd_index], g[0].offset, 8, &q->maps[0], &at)) != 0) {
+    if ((r = rsbfmq_internal_map(d->fds[g[0].fd_index], g[0].offset, 8, &q->maps[0], &at)) != 0) {
         goto fail;
     }
     q->read = (rsbfmq_counter *)at;
-    if ((r = rsbfmq__map(d->fds[g[1].fd_index], g[1].offset, 8, &q->maps[1], &at)) != 0) {
+    if ((r = rsbfmq_internal_map(d->fds[g[1].fd_index], g[1].offset, 8, &q->maps[1], &at)) != 0) {
         goto fail;
     }
     q->write = (rsbfmq_counter *)at;
-    if ((r = rsbfmq__map(d->fds[g[2].fd_index], g[2].offset, g[2].extent, &q->maps[2], &at)) != 0) {
+    if ((r = rsbfmq_internal_map(d->fds[g[2].fd_index], g[2].offset, g[2].extent, &q->maps[2],
+                                 &at)) != 0) {
         goto fail;
     }
     q->ring = (uint8_t *)at;
     q->ring_bytes = (size_t)g[2].extent;
     if (d->ngrantors > RSBFMQ_EVENT_FLAG_WORD) {
-        if ((r = rsbfmq__map(d->fds[g[3].fd_index], g[3].offset, 4, &q->maps[3], &at)) != 0) {
+        if ((r = rsbfmq_internal_map(d->fds[g[3].fd_index], g[3].offset, 4, &q->maps[3],
+                                     &at)) != 0) {
             goto fail;
         }
         q->flag = (uint32_t *)at;
@@ -512,7 +530,7 @@ static inline int rsbfmq_attach(rsbfmq_queue *q, const rsbfmq_desc *d, size_t qu
                                 const rsbfmq_policy *p) {
     memset(q, 0, sizeof *q);
     q->fd = -1;
-    return rsbfmq__open(q, d, quantum, p);
+    return rsbfmq_internal_open(q, d, quantum, p);
 }
 
 /*
@@ -542,7 +560,7 @@ static inline int rsbfmq_create(rsbfmq_queue *q, size_t capacity, size_t quantum
         return -EINVAL;
     }
     data_bytes = (uint64_t)capacity * quantum;
-    if (rsbfmq__align8(16 + data_bytes) > (uint64_t)INT32_MAX ||
+    if (rsbfmq_internal_align8(16 + data_bytes) > (uint64_t)INT32_MAX ||
         data_bytes > (uint64_t)INT32_MAX - (uint64_t)sysconf(_SC_PAGESIZE)) {
         return -EINVAL;
     }
@@ -551,7 +569,7 @@ static inline int rsbfmq_create(rsbfmq_queue *q, size_t capacity, size_t quantum
     sizes[2] = data_bytes;
     sizes[3] = 4;
     for (i = 0; i < count; i++) {
-        uint64_t start = rsbfmq__align8(offset);
+        uint64_t start = rsbfmq_internal_align8(offset);
         q->layout[i].fd_index = 0;
         q->layout[i].offset = (uint32_t)start;
         q->layout[i].extent = sizes[i];
@@ -585,7 +603,7 @@ static inline int rsbfmq_create(rsbfmq_queue *q, size_t capacity, size_t quantum
     p.max_capacity = capacity;
     p.require_seal = 1;
     p.require_event_flag = event_flag;
-    r = rsbfmq__open(q, &d, quantum, &p);
+    r = rsbfmq_internal_open(q, &d, quantum, &p);
     if (r != 0) {
         close(fd);
         return r;
@@ -622,7 +640,8 @@ static inline int rsbfmq_descriptor(const rsbfmq_queue *q, rsbfmq_desc *d) {
 /* ------------------------------------------------------------------ */
 
 /* Both counters, checked against a hostile peer (order, in-flight, wrap, alignment); -EBADMSG. */
-static inline int rsbfmq__positions(const rsbfmq_queue *q, uint64_t *read, uint64_t *write) {
+static inline int rsbfmq_internal_positions(const rsbfmq_queue *q, uint64_t *read,
+                                            uint64_t *write) {
     uint64_t w = __atomic_load_n(q->write, __ATOMIC_ACQUIRE);
     uint64_t r = __atomic_load_n(q->read, __ATOMIC_ACQUIRE);
     if (r > w || w - r > q->ring_bytes || w > UINT64_MAX - q->ring_bytes ||
@@ -637,7 +656,7 @@ static inline int rsbfmq__positions(const rsbfmq_queue *q, uint64_t *read, uint6
 /* Elements that can be read now. */
 static inline int rsbfmq_available_to_read(const rsbfmq_queue *q, size_t *n) {
     uint64_t r, w;
-    int e = rsbfmq__positions(q, &r, &w);
+    int e = rsbfmq_internal_positions(q, &r, &w);
     if (e != 0) {
         return e;
     }
@@ -656,8 +675,8 @@ static inline int rsbfmq_available_to_write(const rsbfmq_queue *q, size_t *n) {
     return 0;
 }
 
-static inline void rsbfmq__regions_at(const rsbfmq_queue *q, uint64_t position, size_t n,
-                                      rsbfmq_regions *out) {
+static inline void rsbfmq_internal_regions_at(const rsbfmq_queue *q, uint64_t position, size_t n,
+                                              rsbfmq_regions *out) {
     size_t offset = (size_t)(position % q->ring_bytes);
     size_t contiguous = (q->ring_bytes - offset) / q->quantum;
     out->first = q->ring + offset;
@@ -679,20 +698,20 @@ static inline int rsbfmq_begin_write(const rsbfmq_queue *q, size_t n, rsbfmq_reg
     if (n > q->capacity) {
         return -EAGAIN;
     }
-    if ((e = rsbfmq__positions(q, &r, &w)) != 0) {
+    if ((e = rsbfmq_internal_positions(q, &r, &w)) != 0) {
         return e;
     }
     if (q->capacity - (size_t)((w - r) / q->quantum) < n) {
         return -EAGAIN;
     }
-    rsbfmq__regions_at(q, w, n, out);
+    rsbfmq_internal_regions_at(q, w, n, out);
     return 0;
 }
 
 /* Publish `n` elements written into the last begin_write's regions. */
 static inline int rsbfmq_commit_write(rsbfmq_queue *q, size_t n) {
     uint64_t r, w;
-    int e = rsbfmq__positions(q, &r, &w);
+    int e = rsbfmq_internal_positions(q, &r, &w);
     if (e != 0) {
         return e;
     }
@@ -710,20 +729,20 @@ static inline int rsbfmq_begin_read(const rsbfmq_queue *q, size_t n, rsbfmq_regi
     if (n > q->capacity) {
         return -EAGAIN;
     }
-    if ((e = rsbfmq__positions(q, &r, &w)) != 0) {
+    if ((e = rsbfmq_internal_positions(q, &r, &w)) != 0) {
         return e;
     }
     if ((size_t)((w - r) / q->quantum) < n) {
         return -EAGAIN;
     }
-    rsbfmq__regions_at(q, r, n, out);
+    rsbfmq_internal_regions_at(q, r, n, out);
     return 0;
 }
 
 /* Free `n` elements read from the last begin_read's regions. */
 static inline int rsbfmq_commit_read(rsbfmq_queue *q, size_t n) {
     uint64_t r, w;
-    int e = rsbfmq__positions(q, &r, &w);
+    int e = rsbfmq_internal_positions(q, &r, &w);
     if (e != 0) {
         return e;
     }
@@ -809,8 +828,8 @@ static inline int rsbfmq_read(rsbfmq_queue *q, void *dst, size_t n) {
 /* ------------------------------------------------------------------ */
 
 /* futex; futex_time64 (Linux 5.1+) only for a deadline whose time_t is 64 bits on 32-bit. */
-static inline long rsbfmq__futex(uint32_t *word, int op, uint32_t val,
-                                 const struct timespec *deadline, uint32_t bits) {
+static inline long rsbfmq_internal_futex(uint32_t *word, int op, uint32_t val,
+                                         const struct timespec *deadline, uint32_t bits) {
 #if defined(__NR_futex_time64) && !defined(__LP64__)
     if (deadline && sizeof(deadline->tv_sec) == 8) {
         return syscall(__NR_futex_time64, word, op, val, deadline, NULL, bits);
@@ -835,7 +854,7 @@ static inline int rsbfmq_word_wake(uint32_t *word, uint32_t bits) {
     old = __atomic_fetch_or(word, bits, __ATOMIC_SEQ_CST);
     /* A bit that was already set was already woken for. Not private: the word is shared. */
     if ((~old & bits) != 0 &&
-        rsbfmq__futex(word, FUTEX_WAKE_BITSET, (uint32_t)INT_MAX, NULL, bits) < 0) {
+        rsbfmq_internal_futex(word, FUTEX_WAKE_BITSET, (uint32_t)INT_MAX, NULL, bits) < 0) {
         return -errno;
     }
     return 0;
@@ -893,7 +912,7 @@ static inline int rsbfmq_wait_until(rsbfmq_queue *q, uint32_t bits,
             return 0;
         }
         /* Sleep only while the word reads as it did with our bits clear. */
-        if (rsbfmq__futex(q->flag, FUTEX_WAIT_BITSET, old & ~bits, deadline, bits) < 0) {
+        if (rsbfmq_internal_futex(q->flag, FUTEX_WAIT_BITSET, old & ~bits, deadline, bits) < 0) {
             if (errno == ETIMEDOUT) {
                 return -ETIMEDOUT;
             }
