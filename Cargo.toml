@@ -17,7 +17,7 @@ members = [
 exclude = ["fuzz", "bench/ipc-compare"]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Jeff Kim <hiking90@gmail.com>"]
@@ -29,7 +29,7 @@ rust-version = "1.86"
 keywords = ["android", "binder", "aidl", "linux"]
 
 [workspace.dependencies]
-rsbinder = { version = "0.12.0", path = "rsbinder" }
+rsbinder = { version = "0.13.0", path = "rsbinder" }
 log = "0.4"
 env_logger = "0.11"
 anstyle = "1.0"
@@ -40,9 +40,9 @@ async-trait = "0.1"
 # `=`: generated code and the rsbinder that runs it change in lockstep (plan 17 D-14). A
 # caret would let a build pair this rsbinder with a later patch's templates; with `=`, any
 # `rsbinder-aidl` build-dep in the graph resolves to this version. Bump with `version` above.
-rsbinder-aidl = { version = "=0.12.0", path = "rsbinder-aidl" }
-rsbinder-macros = { version = "0.12.0", path = "rsbinder-macros" }
-rsbinder-fmq = { version = "0.12.0", path = "rsbinder-fmq" }
+rsbinder-aidl = { version = "=0.13.0", path = "rsbinder-aidl" }
+rsbinder-macros = { version = "0.13.0", path = "rsbinder-macros" }
+rsbinder-fmq = { version = "0.13.0", path = "rsbinder-fmq" }
 pest = "2.8"
 pest_derive = "2.8"
 convert_case = "0.12"

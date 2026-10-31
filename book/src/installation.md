@@ -103,20 +103,20 @@ Add the following configuration to your Cargo.toml file:
 
 ```toml
 [dependencies]
-rsbinder = "0.12"
+rsbinder = "0.13"
 async-trait = "0.1"
 env_logger = "0.11"  # Optional: for logging
 
 [build-dependencies]
-rsbinder-aidl = "0.12"
+rsbinder-aidl = "0.13"
 ```
 
 ### Feature flags
 
 ```toml
-rsbinder = "0.12"                                          # default: tokio async
-rsbinder = { version = "0.12", default-features = false }   # synchronous only
-rsbinder = { version = "0.12", features = ["rpc", "macros"] }
+rsbinder = "0.13"                                          # default: tokio async
+rsbinder = { version = "0.13", default-features = false }   # synchronous only
+rsbinder = { version = "0.13", features = ["rpc", "macros"] }
 ```
 
 - `tokio` (default) — Tokio integration (implies `async`). It enables only
