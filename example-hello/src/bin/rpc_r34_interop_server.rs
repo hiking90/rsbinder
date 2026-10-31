@@ -17,7 +17,7 @@
 //! `TX_STATS`.
 
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use rsbinder::rpc::{RpcProxy, RpcServer};
@@ -71,7 +71,7 @@ struct R34Interop {
     server: Weak<RpcServer>,
     oneway_log: Mutex<Vec<i32>>,
     held: Mutex<Vec<SIBinder>>,
-    child: Mutex<Option<SIBinder>>,
+    child: OnceLock<SIBinder>,
     in_flight: AtomicI32,
 }
 
@@ -182,9 +182,7 @@ impl Remotable for R34Interop {
             TX_GET_CHILD => {
                 let child = self
                     .child
-                    .lock()
-                    .expect("child poisoned")
-                    .get_or_insert_with(|| Interface::as_binder(&Binder::new(Child)))
+                    .get_or_init(|| Interface::as_binder(&Binder::new(Child)))
                     .clone();
                 ok(reply)?;
                 reply.write(&child)
@@ -248,7 +246,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         server: Arc::downgrade(&server),
         oneway_log: Mutex::new(Vec::new()),
         held: Mutex::new(Vec::new()),
-        child: Mutex::new(None),
+        child: OnceLock::new(),
         in_flight: AtomicI32::new(0),
     })))?;
 

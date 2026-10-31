@@ -81,7 +81,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .downcast_ref::<rsbinder::rpc::RpcProxy>()
             .ok_or("root is not an RpcProxy (bridge wrap broke)")?;
         let mut data = rp.prepare_request("rsbinder.test.accessor.IInterop")?;
-        data.write(&req_str.to_string())?;
+        data.write(req_str)?;
         let mut reply = rp
             .submit_transact(FIRST_CALL_TRANSACTION, &data, 0)?
             .ok_or("TX_ECHO no reply")?;

@@ -95,7 +95,7 @@ impl Remotable for Interop {
                 // No arg. Reply: `Status::Ok` + fixed marker String.
                 eprintln!("[rsbinder-server] TX_GIVE_MARKER → {MARKER:?}");
                 reply.write(&Status::from(StatusCode::Ok))?;
-                reply.write(&MARKER.to_string())
+                reply.write(MARKER)
             }
             _ => {
                 eprintln!("[rsbinder-server] unknown txn {code:#x}");

@@ -101,7 +101,7 @@ fn call(
 }
 
 fn echo(rp: &RpcProxy, s: &str) -> Result<String> {
-    call(rp, TX_ECHO, |d| d.write(&s.to_string()))?.read()
+    call(rp, TX_ECHO, |d| d.write(s))?.read()
 }
 
 fn poll_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
@@ -128,12 +128,17 @@ fn main() -> BoxResult<()> {
     let sock = args
         .next()
         .unwrap_or_else(|| "/data/local/tmp/a12r34.sock".to_string());
-    let server_pid: i32 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
-        fail(
-            2,
-            "usage: rpc_r34_interop_client <sock> <server_pid>".into(),
-        )
-    });
+    let server_pid = args
+        .next()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+        .and_then(rustix::process::Pid::from_raw)
+        .unwrap_or_else(|| {
+            fail(
+                2,
+                "usage: rpc_r34_interop_client <sock> <server_pid>".into(),
+            )
+        });
 
     // (B1) root + echo over one connection.
     let session = RpcSession::setup_unix_client(&sock)?;
@@ -177,7 +182,7 @@ fn main() -> BoxResult<()> {
     let cb: SIBinder = Interface::as_binder(&Binder::new(Callback));
     let got: String = call(rp, TX_INVOKE_CALLBACK, |d| {
         d.write(&cb)?;
-        d.write(&"ping".to_string())
+        d.write("ping")
     })?
     .read()?;
     if got != "cb-echo:ping" {
@@ -310,17 +315,19 @@ fn main() -> BoxResult<()> {
     let rp = proxy(&root);
     let killer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
-        // SAFETY: kill(2) with a pid and a signal number; no memory is passed.
-        unsafe { libc::kill(server_pid, libc::SIGKILL) }
+        rustix::process::kill_process(server_pid, rustix::process::Signal::KILL)
     });
     let started = Instant::now();
     let res = call(rp, TX_SLOW_ECHO, |d| {
-        d.write(&"slow".to_string())?;
+        d.write("slow")?;
         d.write(&5000i32)
     });
     let elapsed = started.elapsed();
-    if killer.join().expect("killer thread") != 0 {
-        fail(25, format!("kill({server_pid}) failed"));
+    if let Err(why) = killer.join().expect("killer thread") {
+        fail(
+            25,
+            format!("kill({}) failed: {why}", server_pid.as_raw_nonzero()),
+        );
     }
     match res {
         Err(StatusCode::DeadObject) => {}
