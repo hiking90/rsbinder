@@ -95,6 +95,8 @@
 //! same `usize`. That holds when two views share one allocation, as they do in the tests that
 //! run on heap memory.
 
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -723,11 +725,11 @@ impl StoredPool {
         let slot = slots.lend(self, pins, read)?;
         let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
         Ok(LentSlot {
-            _mapping: self.mapping.clone(),
+            mapping: self.mapping.clone(),
             slot,
-            // SAFETY: inside the slot, in the mapping the value keeps alive.
-            at: unsafe { self.mapping.as_ptr().add(at) },
+            at,
             len,
+            _not_sync: PhantomData,
         })
     }
 }
@@ -740,21 +742,20 @@ impl StoredPool {
 ///
 /// # Safety
 ///
-/// Only the `NonNull` keeps the auto trait off. The slot is lent to this value alone, so no
-/// other reference to its bytes exists in this process, on this thread or another. `at` points
-/// into the mapping `_mapping` holds, which lives as long as the value wherever it moves. The
-/// value reads no thread-local state, and what is done with it on another thread
+/// `bytes` and `bytes_mut` rely on three things. The slot is lent to this value alone, so no
+/// other reference to its bytes exists in this process, on this thread or another. The bytes
+/// `at..at + len` lie inside the mapping `mapping` holds, which lives as long as the value
+/// wherever it moves. What is done with the value on another thread
 /// (`TypedWriter::publish_loan`, `TypedWriter::give_back`) takes the writer's mutex, as a call
-/// from the thread that lent it does.
+/// from the thread that lent it does, so publishing or giving the slot back is ordered after
+/// every write through the value. `_not_sync` keeps the value `!Sync` (plan 17 T-8).
 pub(crate) struct LentSlot {
-    _mapping: Arc<Mapping>,
+    mapping: Arc<Mapping>,
     slot: u32,
-    at: NonNull<u8>,
+    at: usize,
     len: usize,
+    _not_sync: PhantomData<Cell<()>>,
 }
-
-// SAFETY: a slot lent to this value alone, in a mapping it keeps; see the type's `# Safety`.
-unsafe impl Send for LentSlot {}
 
 impl LentSlot {
     pub(crate) fn slot(&self) -> u32 {
@@ -762,13 +763,15 @@ impl LentSlot {
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
-        // SAFETY: a lent slot, which nothing else in this process reaches; initialized memfd pages.
-        unsafe { std::slice::from_raw_parts(self.at.as_ptr(), self.len) }
+        // SAFETY: a lent slot inside `mapping`, which nothing else here reaches; initialized pages.
+        unsafe { std::slice::from_raw_parts(self.mapping.as_ptr().add(self.at).as_ptr(), self.len) }
     }
 
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: as `bytes`, and `&mut self` makes this the only reference.
-        unsafe { std::slice::from_raw_parts_mut(self.at.as_ptr(), self.len) }
+        unsafe {
+            std::slice::from_raw_parts_mut(self.mapping.as_ptr().add(self.at).as_ptr(), self.len)
+        }
     }
 }
 
