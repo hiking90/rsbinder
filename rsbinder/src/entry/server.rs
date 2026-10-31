@@ -54,14 +54,13 @@ pub struct ServeOptions {
     /// "leave it alone" — the setter is not called and the server keeps
     /// its 10 s default. It is *not* the setter's own `None` (deadline
     /// deliberately disabled), which this facade cannot express.
-    /// `Some(Duration::ZERO)` is passed through and refused by the
-    /// setter, which keeps the 10 s default (`idle_timeout` treats a
-    /// zero the other way — as `None`).
+    /// `Some(Duration::ZERO)` is not a deadline: [`run`](Server::run) /
+    /// [`spawn`](Server::spawn) refuse it with [`StatusCode::BadValue`],
+    /// as the setter does, and so for `idle_timeout` and `reply_timeout`.
     pub handshake_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_idle_timeout`. `None` here means "leave it
     /// alone"; the server's own default is already `None` (no idle
-    /// deadline), so the two coincide. `Some(Duration::ZERO)` is passed
-    /// through and the setter treats it as `None`.
+    /// deadline), so the two coincide.
     pub idle_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_reply_timeout` — bounds the wait for a reply
     /// to a callback this server issues to a client outside a handler of
@@ -70,7 +69,8 @@ pub struct ServeOptions {
     /// callbacks to clients it does not control (see
     /// [`ClientOptions::incoming_connections`](super::ClientOptions::incoming_connections),
     /// the client side of that path). Its expiry ends the session with
-    /// that client.
+    /// that client. The client side of the same deadline is
+    /// [`ClientOptions::timeout`](super::ClientOptions::timeout).
     pub reply_timeout: Option<Duration>,
     /// RPC: `RpcServer::set_authorizer` — accept/reject a peer by identity.
     #[cfg(feature = "rpc")]
@@ -151,10 +151,7 @@ pub struct Server {
 #[must_use = "dropping the guard stops an RPC server; bind it to a named variable"]
 pub struct ServerGuard {
     #[cfg(feature = "rpc")]
-    rpc: Option<(
-        std::sync::Arc<crate::rpc::RpcServer>,
-        std::thread::JoinHandle<()>,
-    )>,
+    rpc: Option<crate::rpc::RpcServerHandle>,
 }
 
 impl std::fmt::Debug for ServerGuard {
@@ -183,18 +180,14 @@ impl ServerGuard {
     /// counters. Mirrors [`super::Client::session`].
     #[cfg(feature = "rpc")]
     pub fn server(&self) -> Option<&std::sync::Arc<crate::rpc::RpcServer>> {
-        self.rpc.as_ref().map(|(s, _)| s)
+        self.rpc.as_ref().map(crate::rpc::RpcServerHandle::server)
     }
 
     fn stop(&mut self) {
         #[cfg(feature = "rpc")]
-        if let Some((server, jh)) = self.rpc.take() {
-            // Flag, then join, so nothing is accepted after this; then end what is connected.
-            server.stop_accepting();
-            if jh.join().is_err() {
-                log::warn!("RPC: accept loop thread panicked");
-            }
-            server.terminate();
+        if let Some(handle) = self.rpc.take() {
+            // The accept thread logged a fatal error; this caller has no use for it.
+            let _ = handle.stop_and_join();
         }
     }
 }
@@ -340,8 +333,9 @@ impl Server {
 
     /// Start serving in the background. Kernel: as [`run`](Self::run)
     /// without the join — every name is registered when this returns `Ok`
-    /// (the returned guard is inert). RPC: accept loop on its own thread;
-    /// dropping the guard shuts it down.
+    /// (the returned guard is inert). RPC: accept loop on its own thread
+    /// (`RpcServer::run_background`); dropping the guard shuts it down. A
+    /// thread the OS refuses to create is the `Err`.
     pub fn spawn(self) -> Result<ServerGuard> {
         match self.uri.endpoint {
             Endpoint::Kernel(_) => {
@@ -353,11 +347,8 @@ impl Server {
             }
             #[cfg(feature = "rpc")]
             _ => {
-                let server = self.build_rpc()?;
-                let jh = server.run_background();
-                Ok(ServerGuard {
-                    rpc: Some((server, jh)),
-                })
+                let handle = self.build_rpc()?.run_background()?;
+                Ok(ServerGuard { rpc: Some(handle) })
             }
             #[cfg(not(feature = "rpc"))]
             _ => Err(StatusCode::InvalidOperation),
@@ -493,20 +484,21 @@ impl Server {
             server.set_android13plus(v.get());
         }
         if let Some(n) = o.threads {
-            server.set_max_threads(n);
+            server.set_max_threads(n)?;
         }
         if let Some(n) = o.max_connections {
             server.set_max_connections(n);
         }
+        // A zero duration is `BadValue` from each setter, before any name is registered.
         if let Some(t) = o.handshake_timeout {
-            server.set_handshake_timeout(Some(t));
+            server.set_handshake_timeout(Some(t))?;
         }
         if let Some(t) = o.idle_timeout {
-            server.set_idle_timeout(Some(t));
+            server.set_idle_timeout(Some(t))?;
         }
         // Set before `run`: it is read once per session, when the founding connection is accepted.
         if let Some(t) = o.reply_timeout {
-            server.set_reply_timeout(Some(t));
+            server.set_reply_timeout(Some(t))?;
         }
         if let Some(f) = o.authorizer {
             server.set_authorizer(f);

@@ -270,10 +270,11 @@ fn registration_refuses_a_remote_binder() {
         StatusCode::InvalidOperation,
         "AC-22.4: RpcServer::add_service refuses a remote binder"
     );
-    // A local binder still registers.
+    // A local binder still registers; a root and a directory need a server each.
     server.set_root(local_root()).expect("local root accepted");
-    server
-        .add_service("gw", local_root())
+    let dir_path = SockPath::new("reg_dir");
+    let dir = RpcServer::setup_unix_server(&dir_path.0).expect("bind");
+    dir.add_service("gw", local_root())
         .expect("local service accepted");
 
     // A kernel proxy is refused the same way: the rule is `is_remote`, not "is an RpcProxy".

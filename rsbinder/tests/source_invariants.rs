@@ -114,8 +114,10 @@
 //! looper). `library_threads_are_made_by_builder` finds either call in the
 //! code of `rsbinder`, `rsbinder-fmq` and `rsbinder-topic`, outside a file
 //! named `*tests.rs` and outside a `mod .. {` under a `cfg` naming `test`,
-//! and allows only the sites in its list. `RpcServer::run_background` stays
-//! there until it returns a handle (plan 17 R-1).
+//! and allows only the sites in its list. The list is empty: every library
+//! thread is made by `thread::Builder`. A site that has to stay — a call
+//! whose failure no caller could receive — goes into the list with the
+//! reason, as the `Drop` exemptions above carry theirs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -555,6 +557,7 @@ fn types_whose_drop_ends_something_are_must_use() {
             "AccessorProviderHandle",
         ),
         ("rsbinder", "reconnect.rs", "Reconnecting"),
+        ("rsbinder", "rpc/server.rs", "RpcServerHandle"),
         ("rsbinder", "rt/tokio_rt.rs", "DeathSignal"),
         ("rsbinder", "stream/mod.rs", "Receiver"),
         ("rsbinder", "stream/mod.rs", "Sink"),
@@ -576,7 +579,7 @@ fn types_whose_drop_ends_something_are_must_use() {
         ("rsbinder-fmq", "shm/mapping.rs", "Mapping"),
         // Unpins a record; `recv_sample()?;` skipping one is legitimate.
         ("rsbinder-topic", "sample.rs", "Sample"),
-        // Returned in an `Arc`, which a type-level `must_use` does not reach (plan 17 R-1).
+        // Returned in an `Arc`, which a type-level `must_use` does not reach; the handle is.
         ("rsbinder", "rpc/server.rs", "RpcServer"),
     ];
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -663,10 +666,7 @@ fn drop_impls(lines: &[&str]) -> Vec<String> {
 #[test]
 fn library_threads_are_made_by_builder() {
     // (crate, file under `src/`, enclosing `fn` line prefix), one entry per call.
-    const PINNED: &[(&str, &str, &str)] = &[
-        // Fire-and-forget accept loop; plan 17 R-1 gives it a handle and a `Result`.
-        ("rsbinder", "rpc/server.rs", "pub fn run_background("),
-    ];
+    const PINNED: &[(&str, &str, &str)] = &[];
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found: Vec<(String, String, String)> = Vec::new();
     for krate in ["rsbinder", "rsbinder-fmq", "rsbinder-topic"] {

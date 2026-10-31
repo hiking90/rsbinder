@@ -51,10 +51,10 @@ use rsbinder::rpc::rustls::pki_types::pem::PemObject;
 use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rsbinder::rpc::transport::TcpDebugTransport;
-use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcSession};
+use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcServerHandle, RpcSession};
 use rsbinder::{
-    Binder, DeathRecipient, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode,
-    TransactionCode, WIBinder, FIRST_CALL_TRANSACTION, FLAG_ONEWAY,
+    Binder, DeathRecipient, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status,
+    StatusCode, TransactionCode, WIBinder, FIRST_CALL_TRANSACTION, FLAG_ONEWAY,
 };
 
 /// Set for the run inside the namespace; the `in_ns_*` tests do nothing without it.
@@ -238,6 +238,8 @@ struct Fixture {
     died: Arc<Mutex<Option<Instant>>>,
     _recipient: Arc<dyn DeathRecipient>,
     _server: Arc<RpcServer>,
+    /// The TLS server's accept loop; it serves until the fixture drops.
+    _accept: Option<RpcServerHandle>,
 }
 
 impl Drop for Fixture {
@@ -249,7 +251,7 @@ impl Drop for Fixture {
 impl Fixture {
     fn new(link: Link, port: u16, timeout: Option<Duration>) -> Fixture {
         let root_obj = Binder::new(Svc).as_binder();
-        let server = match link {
+        let (server, accept) = match link {
             Link::Tcp => {
                 // `serve_connection` needs a server object, whose own listener is never run.
                 let path = std::env::temp_dir()
@@ -271,15 +273,15 @@ impl Fixture {
                         accepting.serve_connection(Box::new(t));
                     }
                 });
-                server
+                (server, None)
             }
             Link::Tls => {
                 let server = RpcServer::setup_tcp_server_tls(("127.0.0.1", port), server_config())
                     .expect("server");
                 server.set_android13plus(2);
                 server.set_root(root_obj).expect("set_root");
-                let _ = server.run_background();
-                server
+                let accept = server.run_background().expect("run_background");
+                (server, Some(accept))
             }
         };
         let config = match link {
@@ -302,6 +304,7 @@ impl Fixture {
             died,
             _recipient: recipient,
             _server: server,
+            _accept: accept,
         };
         assert_eq!(f.echo(&[7; 16], 0), Ok(()), "a healthy session answers");
         f
@@ -315,15 +318,15 @@ impl Fixture {
     }
 
     fn echo(&self, payload: &[u8], flags: u32) -> Result<()> {
-        let mut d = self.proxy().build_request(DESC)?;
+        let mut d = self.proxy().prepare_request(DESC)?;
         d.write(&payload.to_vec())?;
-        self.proxy().transact(TX_ECHO, &d, flags).map(|_| ())
+        self.proxy().submit_transact(TX_ECHO, &d, flags).map(|_| ())
     }
 
     fn slow(&self, ms: i32) -> Result<()> {
-        let mut d = self.proxy().build_request(DESC)?;
+        let mut d = self.proxy().prepare_request(DESC)?;
         d.write(&ms)?;
-        self.proxy().transact(TX_SLOW, &d, 0).map(|_| ())
+        self.proxy().submit_transact(TX_SLOW, &d, 0).map(|_| ())
     }
 
     /// When the death recipient fired, waiting up to `wait` for it.

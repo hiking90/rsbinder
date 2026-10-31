@@ -7,7 +7,7 @@
 //! covers the cases where bytes keep moving, slowly, and checks the two
 //! deadlines whose meaning depends on how progress is counted:
 //!
-//! - **The send deadline** (`set_timeout`'s `SO_SNDTIMEO`, at most `d`
+//! - **The send deadline** (`set_reply_timeout`'s `SO_SNDTIMEO`, at most `d`
 //!   without progress) must not cut a peer that keeps taking bytes, however
 //!   slowly, and must still cut one that takes none. The kernel reports a
 //!   socket writable again only once a share of its send buffer has drained
@@ -56,10 +56,10 @@ use rsbinder::rpc::rustls::pki_types::pem::PemObject;
 use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rsbinder::rpc::transport::TcpDebugTransport;
-use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcSession};
+use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcServer, RpcServerHandle, RpcSession};
 use rsbinder::{
-    Binder, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode, TransactionCode,
-    FIRST_CALL_TRANSACTION, FLAG_ONEWAY,
+    Binder, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status, StatusCode,
+    TransactionCode, FIRST_CALL_TRANSACTION, FLAG_ONEWAY,
 };
 
 const DESC: &str = "rsbinder.test.ISlowPeer";
@@ -150,17 +150,17 @@ fn root_proxy(root: &SIBinder) -> &RpcProxy {
 
 fn echo(root: &SIBinder, payload: &[u8], flags: u32) -> Result<()> {
     let proxy = root_proxy(root);
-    let mut d = proxy.build_request(DESC)?;
+    let mut d = proxy.prepare_request(DESC)?;
     d.write(&payload.to_vec())?;
-    proxy.transact(TX_ECHO, &d, flags).map(|_| ())
+    proxy.submit_transact(TX_ECHO, &d, flags).map(|_| ())
 }
 
 fn big_reply(root: &SIBinder, len: usize) -> Result<usize> {
     let proxy = root_proxy(root);
-    let mut d = proxy.build_request(DESC)?;
+    let mut d = proxy.prepare_request(DESC)?;
     d.write(&(len as i32))?;
     let mut reply = proxy
-        .transact(TX_BIG, &d, 0)?
+        .submit_transact(TX_BIG, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let status: Status = reply.read()?;
     assert!(status.is_ok(), "{status:?}");
@@ -191,12 +191,17 @@ enum At {
 /// A server for `Svc`; dropping it stops its listener.
 struct Server {
     server: Arc<RpcServer>,
+    /// The accept loop, `None` for `tcp_debug`, whose raw loop feeds `serve_connection`.
+    accept: Option<RpcServerHandle>,
     at: At,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        self.server.terminate();
+        match self.accept.take() {
+            Some(accept) => drop(accept.stop_and_join()),
+            None => self.server.terminate(),
+        }
         if let At::Unix(path) = &self.at {
             let _ = std::fs::remove_file(path);
         }
@@ -237,13 +242,19 @@ impl ServerSpec {
             server.set_android13plus(2);
         }
         if let Some(d) = self.handshake_timeout {
-            server.set_handshake_timeout(Some(d));
+            server
+                .set_handshake_timeout(Some(d))
+                .expect("handshake timeout");
         }
-        server.set_reply_timeout(self.reply_timeout);
+        server
+            .set_reply_timeout(self.reply_timeout)
+            .expect("reply timeout");
         if let Some(n) = self.max_connections {
             server.set_max_connections(n);
         }
-        server.set_idle_timeout(self.idle_timeout);
+        server
+            .set_idle_timeout(self.idle_timeout)
+            .expect("idle timeout");
         if let Some(takes) = self.authorizer_takes {
             server.set_authorizer(move |_| {
                 thread::sleep(takes);
@@ -259,9 +270,10 @@ impl ServerSpec {
         let path = tmp_sock("srv");
         let server = RpcServer::setup_unix_server(&path).expect("unix server");
         self.apply(&server);
-        let _ = server.run_background();
+        let accept = Some(server.run_background().expect("run_background"));
         Server {
             server,
+            accept,
             at: At::Unix(path),
         }
     }
@@ -291,6 +303,7 @@ impl ServerSpec {
         });
         Server {
             server,
+            accept: None,
             at: At::Tcp(addr),
         }
     }
@@ -298,18 +311,19 @@ impl ServerSpec {
     fn tls(self) -> Server {
         let server = RpcServer::setup_tcp_server_tls("127.0.0.1:0", server_config()).expect("tls");
         self.apply(&server);
-        let _ = server.run_background();
+        let accept = Some(server.run_background().expect("run_background"));
         let at = At::Tcp(server.tcp_address().expect("tcp address"));
-        Server { server, at }
+        Server { server, accept, at }
     }
 
     fn tls_on(self, port: u16) -> Server {
         let server =
             RpcServer::setup_tcp_server_tls(("127.0.0.1", port), server_config()).expect("tls");
         self.apply(&server);
-        let _ = server.run_background();
+        let accept = Some(server.run_background().expect("run_background"));
         Server {
             server,
+            accept,
             at: At::Tcp(([127, 0, 0, 1], port).into()),
         }
     }

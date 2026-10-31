@@ -331,7 +331,7 @@ impl core::marker::Unpin for rsbinder::entry::uri::UriErrorKind
 impl core::marker::UnsafeUnpin for rsbinder::entry::uri::UriErrorKind
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::UriErrorKind
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::UriErrorKind
-pub enum rsbinder::entry::uri::WireProfile
+#[non_exhaustive] pub enum rsbinder::entry::uri::WireProfile
 pub rsbinder::entry::uri::WireProfile::Android13Plus(rsbinder::entry::uri::WireVersion)
 pub rsbinder::entry::uri::WireProfile::R34
 impl core::clone::Clone for rsbinder::entry::uri::WireProfile
@@ -559,7 +559,7 @@ impl core::marker::Unpin for rsbinder::entry::uri::UriErrorKind
 impl core::marker::UnsafeUnpin for rsbinder::entry::uri::UriErrorKind
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::entry::uri::UriErrorKind
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::entry::uri::UriErrorKind
-pub enum rsbinder::entry::WireProfile
+#[non_exhaustive] pub enum rsbinder::entry::WireProfile
 pub rsbinder::entry::WireProfile::Android13Plus(rsbinder::entry::uri::WireVersion)
 pub rsbinder::entry::WireProfile::R34
 impl core::clone::Clone for rsbinder::entry::uri::WireProfile
@@ -3359,6 +3359,28 @@ impl core::marker::Unpin for rsbinder::stream::PingPolicy
 impl core::marker::UnsafeUnpin for rsbinder::stream::PingPolicy
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::PingPolicy
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::PingPolicy
+pub enum rsbinder::stream::RecvTimeoutError
+pub rsbinder::stream::RecvTimeoutError::Ended
+pub rsbinder::stream::RecvTimeoutError::Failed(rsbinder::Status)
+pub rsbinder::stream::RecvTimeoutError::Timeout
+impl core::clone::Clone for rsbinder::stream::RecvTimeoutError
+pub fn rsbinder::stream::RecvTimeoutError::clone(&self) -> rsbinder::stream::RecvTimeoutError
+impl core::cmp::PartialEq for rsbinder::stream::RecvTimeoutError
+pub fn rsbinder::stream::RecvTimeoutError::eq(&self, &rsbinder::stream::RecvTimeoutError) -> bool
+impl core::error::Error for rsbinder::stream::RecvTimeoutError
+pub fn rsbinder::stream::RecvTimeoutError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for rsbinder::stream::RecvTimeoutError
+pub fn rsbinder::stream::RecvTimeoutError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::stream::RecvTimeoutError
+pub fn rsbinder::stream::RecvTimeoutError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for rsbinder::stream::RecvTimeoutError
+impl core::marker::Freeze for rsbinder::stream::RecvTimeoutError
+impl core::marker::Send for rsbinder::stream::RecvTimeoutError
+impl core::marker::Sync for rsbinder::stream::RecvTimeoutError
+impl core::marker::Unpin for rsbinder::stream::RecvTimeoutError
+impl core::marker::UnsafeUnpin for rsbinder::stream::RecvTimeoutError
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::RecvTimeoutError
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::RecvTimeoutError
 #[non_exhaustive] pub enum rsbinder::stream::RingUse
 pub rsbinder::stream::RingUse::AlsoUnixRpc
 pub rsbinder::stream::RingUse::KernelOnly
@@ -3380,6 +3402,28 @@ impl core::marker::Unpin for rsbinder::stream::RingUse
 impl core::marker::UnsafeUnpin for rsbinder::stream::RingUse
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::RingUse
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::RingUse
+pub enum rsbinder::stream::TryRecvError
+pub rsbinder::stream::TryRecvError::Empty
+pub rsbinder::stream::TryRecvError::Ended
+pub rsbinder::stream::TryRecvError::Failed(rsbinder::Status)
+impl core::clone::Clone for rsbinder::stream::TryRecvError
+pub fn rsbinder::stream::TryRecvError::clone(&self) -> rsbinder::stream::TryRecvError
+impl core::cmp::PartialEq for rsbinder::stream::TryRecvError
+pub fn rsbinder::stream::TryRecvError::eq(&self, &rsbinder::stream::TryRecvError) -> bool
+impl core::error::Error for rsbinder::stream::TryRecvError
+pub fn rsbinder::stream::TryRecvError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for rsbinder::stream::TryRecvError
+pub fn rsbinder::stream::TryRecvError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for rsbinder::stream::TryRecvError
+pub fn rsbinder::stream::TryRecvError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for rsbinder::stream::TryRecvError
+impl core::marker::Freeze for rsbinder::stream::TryRecvError
+impl core::marker::Send for rsbinder::stream::TryRecvError
+impl core::marker::Sync for rsbinder::stream::TryRecvError
+impl core::marker::Unpin for rsbinder::stream::TryRecvError
+impl core::marker::UnsafeUnpin for rsbinder::stream::TryRecvError
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::TryRecvError
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::stream::TryRecvError
 pub struct rsbinder::stream::Receiver<T>
 impl<T: rsbinder::Deserialize> rsbinder::stream::Receiver<T>
 pub fn rsbinder::stream::Receiver<T>::cancel(&self) -> rsbinder::Result<()>
@@ -3389,8 +3433,8 @@ pub fn rsbinder::stream::Receiver<T>::is_finished(&self) -> bool
 pub fn rsbinder::stream::Receiver<T>::new(&rsbinder::SIBinder) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint<T>)>
 pub fn rsbinder::stream::Receiver<T>::recv(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
 pub async fn rsbinder::stream::Receiver<T>::recv_async(&mut self) -> core::option::Option<rsbinder::BinderResult<T>>
-pub fn rsbinder::stream::Receiver<T>::recv_timeout(&mut self, core::time::Duration) -> rsbinder::BinderResult<core::option::Option<T>>
-pub fn rsbinder::stream::Receiver<T>::try_recv(&mut self) -> rsbinder::BinderResult<core::option::Option<T>>
+pub fn rsbinder::stream::Receiver<T>::recv_timeout(&mut self, core::time::Duration) -> core::result::Result<T, rsbinder::stream::RecvTimeoutError>
+pub fn rsbinder::stream::Receiver<T>::try_recv(&mut self) -> core::result::Result<T, rsbinder::stream::TryRecvError>
 pub fn rsbinder::stream::Receiver<T>::uses_ring(&self) -> bool
 pub fn rsbinder::stream::Receiver<T>::with_policy(&rsbinder::SIBinder, &rsbinder::stream::ReceiverPolicy) -> rsbinder::Result<(Self, rsbinder::stream::StreamEndpoint<T>)>
 impl<T: rsbinder::Deserialize> core::iter::traits::iterator::Iterator for rsbinder::stream::Receiver<T>
@@ -3407,12 +3451,18 @@ impl<T> core::marker::Unpin for rsbinder::stream::Receiver<T> where T: core::mar
 impl<T> core::marker::UnsafeUnpin for rsbinder::stream::Receiver<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::Receiver<T>
 impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Receiver<T>
-pub struct rsbinder::stream::ReceiverPolicy
+#[non_exhaustive] pub struct rsbinder::stream::ReceiverPolicy
 pub rsbinder::stream::ReceiverPolicy::credit_window: u32
 pub rsbinder::stream::ReceiverPolicy::max_opening: u32
 pub rsbinder::stream::ReceiverPolicy::ping: rsbinder::stream::PingPolicy
 pub rsbinder::stream::ReceiverPolicy::ring_bytes: usize
 pub rsbinder::stream::ReceiverPolicy::ring_use: rsbinder::stream::RingUse
+impl rsbinder::stream::ReceiverPolicy
+pub fn rsbinder::stream::ReceiverPolicy::with_credit_window(self, u32) -> Self
+pub fn rsbinder::stream::ReceiverPolicy::with_max_opening(self, u32) -> Self
+pub fn rsbinder::stream::ReceiverPolicy::with_ping(self, rsbinder::stream::PingPolicy) -> Self
+pub fn rsbinder::stream::ReceiverPolicy::with_ring_bytes(self, usize) -> Self
+pub fn rsbinder::stream::ReceiverPolicy::with_ring_use(self, rsbinder::stream::RingUse) -> Self
 impl core::clone::Clone for rsbinder::stream::ReceiverPolicy
 pub fn rsbinder::stream::ReceiverPolicy::clone(&self) -> rsbinder::stream::ReceiverPolicy
 impl core::cmp::Eq for rsbinder::stream::ReceiverPolicy
@@ -3457,12 +3507,18 @@ impl<T> core::marker::Unpin for rsbinder::stream::Sink<T> where T: ?core::marker
 impl<T> core::marker::UnsafeUnpin for rsbinder::stream::Sink<T> where T: ?core::marker::Sized
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::Sink<T>
 impl<T> !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Sink<T>
-pub struct rsbinder::stream::SinkPolicy
+#[non_exhaustive] pub struct rsbinder::stream::SinkPolicy
 pub rsbinder::stream::SinkPolicy::initial_credits: u32
 pub rsbinder::stream::SinkPolicy::max_batch_bytes: usize
 pub rsbinder::stream::SinkPolicy::max_ring_bytes: usize
 pub rsbinder::stream::SinkPolicy::ping: rsbinder::stream::PingPolicy
 pub rsbinder::stream::SinkPolicy::send_timeout: core::option::Option<core::time::Duration>
+impl rsbinder::stream::SinkPolicy
+pub fn rsbinder::stream::SinkPolicy::with_initial_credits(self, u32) -> Self
+pub fn rsbinder::stream::SinkPolicy::with_max_batch_bytes(self, usize) -> Self
+pub fn rsbinder::stream::SinkPolicy::with_max_ring_bytes(self, usize) -> Self
+pub fn rsbinder::stream::SinkPolicy::with_ping(self, rsbinder::stream::PingPolicy) -> Self
+pub fn rsbinder::stream::SinkPolicy::with_send_timeout(self, core::option::Option<core::time::Duration>) -> Self
 impl core::clone::Clone for rsbinder::stream::SinkPolicy
 pub fn rsbinder::stream::SinkPolicy::clone(&self) -> rsbinder::stream::SinkPolicy
 impl core::cmp::Eq for rsbinder::stream::SinkPolicy

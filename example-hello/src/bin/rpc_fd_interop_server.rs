@@ -233,7 +233,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let server = RpcServer::setup_unix_server(&sock)?;
     server.set_android13plus(max_version);
-    server.set_max_threads(1);
+    server.set_max_threads(1)?;
     // The handshake honours the client's `fileDescriptorTransportMode`
     // byte only because this is set; v0 stays `None` (AOSP forbids fds
     // there), v1+ carries fds over `SCM_RIGHTS`.

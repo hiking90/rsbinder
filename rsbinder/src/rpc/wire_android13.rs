@@ -1807,28 +1807,40 @@ mod tests {
             assert_eq!(srv.join().expect("server thread"), expect);
         }
 
-        // A transport that keeps the trait defaults has no raw access (additive, by type).
+        // A transport with only the required raw calls frames through the trait defaults.
         use crate::rpc::transport::{PeerIdentity, RpcTransport};
-        struct FrameOnly;
-        impl RpcTransport for FrameOnly {
-            fn send_frame(&self, _buf: &[u8]) -> RpcResult<()> {
-                Ok(())
+        struct RawOnly(UnixTransport);
+        impl RpcTransport for RawOnly {
+            fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+                self.0.send_raw(buf)
             }
-            fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-                Err(RpcError::EndOfStream)
+            fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+                self.0.recv_raw(buf)
             }
             fn peer_identity(&self) -> PeerIdentity {
                 PeerIdentity::Anonymous
             }
             fn describe(&self) -> &str {
-                "frame-only"
+                "raw-only"
             }
             fn shutdown(&self) -> RpcResult<()> {
-                Ok(())
+                self.0.shutdown()
             }
         }
-        assert!(FrameOnly.send_raw(b"x").is_err(), "no raw byte access");
-        assert!(FrameOnly.recv_raw(&mut [0u8; 4]).is_err());
+        let (a, b) = UnixTransport::pair().expect("unix pair");
+        let (a, b) = (RawOnly(a), RawOnly(b));
+        a.send_frame(b"framed").expect("default send_frame");
+        assert_eq!(b.recv_frame().expect("default recv_frame"), b"framed");
+        // The defaults speak the bundled backends' frame: a `u32` LE length, then the body.
+        a.send_frame(b"xy").expect("default send_frame");
+        let mut raw = [0u8; 6];
+        let mut got = 0;
+        while got < raw.len() {
+            got += b.recv_raw(&mut raw[got..]).expect("raw read");
+        }
+        assert_eq!(raw, [2, 0, 0, 0, b'x', b'y']);
+        a.shutdown().expect("shutdown");
+        assert!(matches!(b.recv_frame(), Err(RpcError::EndOfStream)));
     }
 
     /// Attach handshake is byte-exact to AOSP; see module doc "Mutation gates".

@@ -304,12 +304,12 @@ fn entry_zero_handshake_timeout_is_refused() {
     .and_then(|c| c.binder("svc"));
     assert!(ok.is_ok(), "a positive deadline still connects");
 
-    // `timeout`'s zero is no deadline at all, as `RpcSession::set_timeout` treats it.
+    // `timeout`'s zero is refused too, as `RpcSession::set_reply_timeout` refuses it (plan 17 C-2).
     let zero = rsbinder::Client::open_with(sock13.uri().with_wire(A13), |o, _| {
         o.timeout = Some(std::time::Duration::ZERO)
     })
-    .and_then(|c| c.binder("svc"));
-    assert!(zero.is_ok(), "a zero timeout connects with no deadline");
+    .expect_err("a zero timeout is not a deadline");
+    assert_eq!(zero, rsbinder::StatusCode::BadValue);
 
     // The r34 wire has no handshake phase, so the option is refused there
     // whatever its value.
@@ -325,6 +325,11 @@ fn entry_zero_handshake_timeout_is_refused() {
     })
     .expect_err("handshake_timeout does not apply to the r34 wire");
     assert_eq!(err, rsbinder::StatusCode::BadValue);
+    let zero = rsbinder::Client::open_with(sock.uri(), |o, _| {
+        o.timeout = Some(std::time::Duration::ZERO)
+    })
+    .expect_err("a zero timeout is not a deadline on r34 either");
+    assert_eq!(zero, rsbinder::StatusCode::BadValue);
 }
 
 /// `connect_async` (feature `tokio`) resolves through `spawn_blocking`

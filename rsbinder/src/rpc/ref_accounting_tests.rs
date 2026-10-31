@@ -269,9 +269,9 @@ impl Pair {
 
     fn call(&self, code: TransactionCode, arg: Option<&SIBinder>) -> Result<Parcel> {
         let rp = rpc_of(self.root());
-        let mut d = rp.build_request(DESC)?;
+        let mut d = rp.request_parcel(DESC)?;
         d.write(&arg.cloned())?;
-        rp.transact(code, &d, 0)?.ok_or(StatusCode::UnexpectedNull)
+        rp.send(code, &d, 0)?.ok_or(StatusCode::UnexpectedNull)
     }
 }
 
@@ -300,7 +300,7 @@ fn t1_a_twoway_target_is_paid_before_its_reply() {
         );
 
         let rp = rpc_of(p.root());
-        let d = rp.build_request(DESC).expect("request");
+        let d = rp.request_parcel(DESC).expect("request");
         p.client
             .inner
             .client_transact(addr, INTERFACE_TRANSACTION, &d, 0)
@@ -445,11 +445,9 @@ fn t4_a_holder_retry_pays_its_binder_once() {
             }))
             .unwrap();
         let rp = rpc_of(p.root());
-        let mut d = rp.build_request(DESC).unwrap();
+        let mut d = rp.request_parcel(DESC).unwrap();
         d.write(&holder).unwrap();
-        rp.transact(TX_HOLDER, &d, 0)
-            .expect("holder")
-            .expect("reply");
+        rp.send(TX_HOLDER, &d, 0).expect("holder").expect("reply");
         assert_eq!(
             dec_received(&p.client, &addr),
             (1, 1),
@@ -470,7 +468,7 @@ fn t5_a_parcel_that_was_not_received_owes_nothing() {
         let p = Pair::new(wire);
         let addr = p.root_addr();
         let rp = rpc_of(p.root());
-        let mut d = rp.build_request(DESC).unwrap();
+        let mut d = rp.request_parcel(DESC).unwrap();
         let pos = d.data_position();
         d.write(p.root()).unwrap();
         let mine = local();
@@ -595,9 +593,9 @@ fn oneways_finish(p: &Pair, cb: &SIBinder, n: usize) -> bool {
     std::thread::spawn(move || {
         let rp = rpc_of(&root);
         for _ in 0..n {
-            let mut d = rp.build_request(DESC).expect("request");
+            let mut d = rp.request_parcel(DESC).expect("request");
             d.write(&Some(cb.clone())).expect("arg");
-            rp.transact(TX_TAKE, &d, FLAG_ONEWAY).expect("oneway");
+            rp.send(TX_TAKE, &d, FLAG_ONEWAY).expect("oneway");
         }
         let _ = tx.send(());
     });
@@ -774,9 +772,9 @@ fn pay_before_a_reply(client: &RpcSession, raw: &mut RawClient, target: &RpcAddr
 fn t9_a_proxy_release_waits_for_the_owners_receipt() {
     for version in [1, PROTOCOL_V2] {
         let (client, mut raw, target, root) = raw_owner(version);
-        let d = rpc_of(&root).build_request(DESC).expect("request");
+        let d = rpc_of(&root).request_parcel(DESC).expect("request");
         rpc_of(&root)
-            .transact(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
+            .send(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
             .expect("oneway");
         drop(d);
         assert!(matches!(raw.recv(), WireMessage::Transact(t) if t.address == target));
@@ -801,10 +799,10 @@ fn t9_a_proxy_release_waits_for_the_owners_receipt() {
 fn t10_a_proxy_argument_counts_at_v2() {
     for (version, sends) in [(1, 1), (PROTOCOL_V2, 2)] {
         let (client, mut raw, target, root) = raw_owner(version);
-        let mut d = rpc_of(&root).build_request(DESC).expect("request");
+        let mut d = rpc_of(&root).request_parcel(DESC).expect("request");
         d.write(&Some(root.clone())).expect("argument");
         rpc_of(&root)
-            .transact(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
+            .send(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
             .expect("oneway");
         assert!(matches!(raw.recv(), WireMessage::Transact(t) if t.address == target));
         drop(d);
@@ -892,9 +890,9 @@ fn t11_the_release_waits_on_the_wires_that_count_targets() {
         let mut p = Pair::new(wire);
         let addr = p.root_addr();
         let root = p.root.take().expect("root");
-        let d = rpc_of(&root).build_request(DESC).expect("request");
+        let d = rpc_of(&root).request_parcel(DESC).expect("request");
         rpc_of(&root)
-            .transact(TX_TAKE, &d, FLAG_ONEWAY)
+            .send(TX_TAKE, &d, FLAG_ONEWAY)
             .expect("oneway");
         drop(d);
         drop(root);

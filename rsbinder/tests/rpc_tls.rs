@@ -79,8 +79,8 @@ use rsbinder::rpc::rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rsbinder::rpc::transport::TlsTransport;
 use rsbinder::rpc::{AddressSpace, PeerIdentity, RpcError, RpcSession, RpcTransport};
 use rsbinder::{
-    Binder, Endpoint, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode,
-    TransactionCode, Uri, FIRST_CALL_TRANSACTION,
+    Binder, Endpoint, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status,
+    StatusCode, TransactionCode, Uri, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IPing";
@@ -176,10 +176,10 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()
         .expect("RpcProxy");
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.prepare_request(DESC)?;
     d.write(&msg)?;
     let mut r = rp
-        .transact(TX_PING, &d, 0)?
+        .submit_transact(TX_PING, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if !st.is_ok() {
@@ -687,7 +687,7 @@ fn setup_tcp_server_tls_e2e() {
     let addr = server.tcp_address().expect("tcp_address");
     // Accessor gates: tcp_address Some, path None.
     assert!(server.path().is_none(), "TCP server has no fs path");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     // One-call client: TCP connect → TLS handshake → R34 session.
     let client = RpcSession::setup_tcp_client_tls(addr, "localhost", client_config_trusting(CA))
@@ -698,8 +698,7 @@ fn setup_tcp_server_tls_e2e() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }
 
 /// vsock × TLS (AVF/Microdroid) via `setup_vsock_server_tls`; ignored: CI loads no kernel module.
@@ -727,7 +726,7 @@ fn vsock_tls_loopback_e2e() {
         Some((VMADDR_CID_LOCAL, TLS_TEST_PORT))
     );
     assert!(server.path().is_none(), "vsock+TLS server has no fs path");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     // Raw `VsockStream`, not `VsockTransport`: TLS runs over it (AOSP `newTransport(fd)`).
     let vsock_stream =
@@ -755,8 +754,7 @@ fn vsock_tls_loopback_e2e() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }
 
 /// `RpcServer::setup_unix_server_tls` e2e: the TLS handshake runs over a UDS listener.
@@ -788,7 +786,7 @@ fn setup_unix_server_tls_e2e() {
         Some(path.as_path()),
         "UDS+TLS server still exposes its fs path"
     );
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     // Wait for the socket file to appear (bounded).
     for _ in 0..400 {
         if path.exists() {
@@ -813,8 +811,7 @@ fn setup_unix_server_tls_e2e() {
 
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }
 
 // ---- incoming (callback) connections over TLS ----------------------
@@ -848,10 +845,10 @@ fn hold_via(holder: &SIBinder, cb: &SIBinder) -> Result<()> {
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()
         .expect("RpcProxy");
-    let mut d = rp.build_request(HOLDER_DESC)?;
+    let mut d = rp.prepare_request(HOLDER_DESC)?;
     d.write(cb)?;
     let mut r = rp
-        .transact(TX_HOLD, &d, 0)?
+        .submit_transact(TX_HOLD, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if st.is_ok() {
@@ -889,9 +886,10 @@ fn call_back_from_outside(held: &Mutex<Option<SIBinder>>) -> (Result<String>, Re
                 .as_any()
                 .downcast_ref::<rsbinder::rpc::RpcProxy>()
                 .expect("RpcProxy");
-            let mut d = rp.build_request(DESC)?;
+            let mut d = rp.prepare_request(DESC)?;
             d.write(&"oneway")?;
-            rp.transact(TX_PING, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+            rp.submit_transact(TX_PING, &d, rsbinder::FLAG_ONEWAY)
+                .map(|_| ())
         })();
         (twoway, oneway)
     })
@@ -1009,13 +1007,14 @@ fn client_config_opens_incoming_connections_over_tls_on_unix() {
             &held,
         )))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
-    let connects = AtomicUsize::new(0);
+    let connects = Arc::new(AtomicUsize::new(0));
+    let (counted, dial) = (Arc::clone(&connects), path.clone());
     let session = RpcSession::setup_client_android13plus_with_config(
-        rsbinder::rpc::RpcClientConfig::new(2, || {
-            connects.fetch_add(1, Ordering::SeqCst);
-            let unix = UnixStream::connect(&path)?;
+        rsbinder::rpc::RpcClientConfig::new(2, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let unix = UnixStream::connect(&dial)?;
             let t = TlsTransport::connect_stream(
                 Box::new(unix),
                 "localhost",
@@ -1035,8 +1034,7 @@ fn client_config_opens_incoming_connections_over_tls_on_unix() {
     let landed = poll_until(|| calls.load(Ordering::SeqCst) == 2);
     close_within(&session, "tls over unix");
     drop(root);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
     let _ = std::fs::remove_file(&path);
 
     assert_eq!(connects.load(Ordering::SeqCst), 2, "founding + incoming");
@@ -1053,7 +1051,7 @@ fn tls_ping_server() -> (Arc<rsbinder::rpc::RpcServer>, std::net::SocketAddr) {
     )
     .expect("setup_tcp_server_tls");
     server.set_android13plus(2);
-    server.set_max_threads(2);
+    server.set_max_threads(2).expect("set_max_threads");
     server
         .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
             PingSvc,
@@ -1069,7 +1067,7 @@ fn client_config_tls_constructor_opens_a_fan_out_session() {
     use rsbinder::rpc::RpcClientConfig;
 
     let (server, addr) = tls_ping_server();
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let host = addr.ip().to_string();
     let session = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::tls(
@@ -1090,8 +1088,7 @@ fn client_config_tls_constructor_opens_a_fan_out_session() {
 
     drop(root);
     close_within(&session, "tls constructor");
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }
 
 /// Unix fd mode needs a Unix socket; `RpcClientConfig::tls` refuses it on the founding connection.
@@ -1101,7 +1098,7 @@ fn fd_mode_unix_over_tls_is_refused_at_setup() {
 
     let (server, addr) = tls_ping_server();
     server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
     let host = addr.ip().to_string();
     let refused = RpcSession::setup_client_android13plus_with_config(
         RpcClientConfig::tls(
@@ -1116,8 +1113,7 @@ fn fd_mode_unix_over_tls_is_refused_at_setup() {
     );
     assert_eq!(refused.err(), Some(StatusCode::BadValue));
 
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }
 
 // ---- handshake deadline on a hand-assembled stream (plan 17 R-17) ----
@@ -1126,11 +1122,11 @@ const HS: Duration = Duration::from_millis(300);
 /// Far above `HS`, far below a handshake with no deadline on a silent peer (never).
 const HS_SLACK: Duration = Duration::from_secs(5);
 
-fn assert_handshake_timed_out<T>(r: std::result::Result<T, RpcError>, started: Instant) {
+fn assert_handshake_timed_out<T>(r: Result<T>, started: Instant) {
     match r {
-        Err(RpcError::Timeout) => {}
-        Err(e) => panic!("expected RpcError::Timeout, got {e:?}"),
-        Ok(_) => panic!("expected RpcError::Timeout, got a completed handshake"),
+        Err(StatusCode::TimedOut) => {}
+        Err(e) => panic!("expected StatusCode::TimedOut, got {e:?}"),
+        Ok(_) => panic!("expected StatusCode::TimedOut, got a completed handshake"),
     }
     let took = started.elapsed();
     assert!(
@@ -1248,6 +1244,6 @@ fn tls_stream_with_refuses_a_zero_handshake_timeout() {
     );
     for (end, r) in [("connect", cli.err()), ("accept", srv.err())] {
         let e = r.unwrap_or_else(|| panic!("{end}: zero timeout accepted"));
-        assert_eq!(StatusCode::from(e), StatusCode::BadValue, "{end}");
+        assert_eq!(e, StatusCode::BadValue, "{end}");
     }
 }

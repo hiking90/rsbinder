@@ -490,8 +490,13 @@ impl TlsTransport {
         stream: Box<dyn TlsStream>,
         server_name: &str,
         config: Arc<rustls::ClientConfig>,
-    ) -> RpcResult<Self> {
-        Self::connect_stream_within(stream, server_name, config, None)
+    ) -> crate::Result<Self> {
+        Ok(Self::connect_stream_within(
+            stream,
+            server_name,
+            config,
+            None,
+        )?)
     }
 
     /// [`connect_stream`](Self::connect_stream) with a deadline on the
@@ -506,15 +511,14 @@ impl TlsTransport {
     /// [`socket`](TlsStream::socket) is shut down, so a peer that sends one
     /// byte at a time cannot hold the call either. A stream whose `socket`
     /// is `None` gets the per-wait bound only. A handshake cut by the
-    /// deadline is [`RpcError::Timeout`].
+    /// deadline is [`StatusCode::TimedOut`](crate::StatusCode::TimedOut).
     ///
     /// On success both stream timeouts are cleared to `None`, whatever the
     /// stream carried before. The transport arms its own deadline for each
     /// wait after the handshake (reply, idle, send); a socket timeout left
     /// on the stream would end an idle session after that long.
     ///
-    /// `Duration::ZERO` is refused before any byte is exchanged, with an
-    /// [`RpcError::Io`] carrying `EINVAL`, which projects to
+    /// `Duration::ZERO` is refused before any byte is exchanged, with
     /// [`StatusCode::BadValue`](crate::StatusCode::BadValue): a zero
     /// handshake deadline bounds nothing.
     pub fn connect_stream_with(
@@ -522,12 +526,17 @@ impl TlsTransport {
         server_name: &str,
         config: Arc<rustls::ClientConfig>,
         handshake_timeout: Duration,
-    ) -> RpcResult<Self> {
+    ) -> crate::Result<Self> {
         refuse_zero_handshake_timeout(handshake_timeout, "TlsTransport::connect_stream_with")?;
-        Self::connect_stream_within(stream, server_name, config, Some(handshake_timeout))
+        Ok(Self::connect_stream_within(
+            stream,
+            server_name,
+            config,
+            Some(handshake_timeout),
+        )?)
     }
 
-    fn connect_stream_within(
+    pub(crate) fn connect_stream_within(
         stream: Box<dyn TlsStream>,
         server_name: &str,
         config: Arc<rustls::ClientConfig>,
@@ -568,8 +577,8 @@ impl TlsTransport {
     pub fn accept_stream(
         stream: Box<dyn TlsStream>,
         config: Arc<rustls::ServerConfig>,
-    ) -> RpcResult<Self> {
-        Self::accept_stream_within(stream, config, None)
+    ) -> crate::Result<Self> {
+        Ok(Self::accept_stream_within(stream, config, None)?)
     }
 
     /// [`accept_stream`](Self::accept_stream) with a deadline on the
@@ -583,12 +592,16 @@ impl TlsTransport {
         stream: Box<dyn TlsStream>,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: Duration,
-    ) -> RpcResult<Self> {
+    ) -> crate::Result<Self> {
         refuse_zero_handshake_timeout(handshake_timeout, "TlsTransport::accept_stream_with")?;
-        Self::accept_stream_within(stream, config, Some(handshake_timeout))
+        Ok(Self::accept_stream_within(
+            stream,
+            config,
+            Some(handshake_timeout),
+        )?)
     }
 
-    fn accept_stream_within(
+    pub(crate) fn accept_stream_within(
         stream: Box<dyn TlsStream>,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: Option<Duration>,
@@ -625,14 +638,14 @@ impl TlsTransport {
         tcp: TcpStream,
         server_name: &str,
         config: Arc<rustls::ClientConfig>,
-    ) -> RpcResult<Self> {
+    ) -> crate::Result<Self> {
         tcp.set_nodelay(true)?;
         Self::connect_stream(Box::new(tcp), server_name, config)
     }
 
     /// Server side over an accepted `tcp` stream (back-compat
     /// convenience; sets `TCP_NODELAY`).
-    pub fn accept(tcp: TcpStream, config: Arc<rustls::ServerConfig>) -> RpcResult<Self> {
+    pub fn accept(tcp: TcpStream, config: Arc<rustls::ServerConfig>) -> crate::Result<Self> {
         tcp.set_nodelay(true)?;
         Self::accept_stream(Box::new(tcp), config)
     }

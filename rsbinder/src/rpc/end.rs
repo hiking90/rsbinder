@@ -137,14 +137,6 @@ pub enum EndReason {
     /// [`SessionEnd::by`] and [`SessionEnd::stream`] follow that end: this
     /// end's decision reads `Local` and `InSync`, anything else `NotLocal`
     /// and `Lost`.
-    ///
-    /// [`serve_blocking_on`](super::RpcSession::serve_blocking_on) also
-    /// returns it at once for a `slot_id` that names no connection of the
-    /// session, and leaves the session as it was. The axes then follow
-    /// whether this end had closed the session: `Local` and `InSync` if it
-    /// had, `NotLocal` and `Lost` otherwise, so a live session's wrong id
-    /// reads as [`StatusCode::DeadObject`] through
-    /// [`SessionEnd::into_result`].
     SessionEnded,
     /// This end ended the session while the loop held a frame it had
     /// just read; the frame was not dispatched.
@@ -176,9 +168,9 @@ pub enum EndReason {
 }
 
 /// Why a serve loop ended. Returned by
-/// [`RpcSession::serve_blocking`](super::RpcSession::serve_blocking),
-/// [`serve_blocking_on`](super::RpcSession::serve_blocking_on) and
-/// [`serve_blocking_clearing_deadline_after_first`](super::RpcSession::serve_blocking_clearing_deadline_after_first).
+/// [`RpcSession::serve_blocking`](super::RpcSession::serve_blocking) and
+/// the thread [`RpcSession::spawn_serve`](super::RpcSession::spawn_serve)
+/// starts.
 /// A loop's end ends the session, whichever of its connections the loop
 /// served — every remote object reachable over it is dead and its death
 /// recipients have fired (module doc "How the axes are decided"). This

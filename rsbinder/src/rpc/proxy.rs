@@ -181,9 +181,19 @@ impl RpcProxy {
 
     /// Build an RPC-mode request `Parcel` for `descriptor`, with the
     /// session's object hooks attached and the interface token written.
-    /// Hand-written typed stubs call this, write their args, then
-    /// [`RpcProxy::transact`].
+    ///
+    /// The same call as [`RemoteProxy::prepare_request`](crate::RemoteProxy::prepare_request),
+    /// which a kernel proxy answers too.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `RemoteProxy::prepare_request` (`use rsbinder::RemoteProxy;`), the same call on either stack"
+    )]
     pub fn build_request(&self, descriptor: &str) -> Result<Parcel> {
+        self.request_parcel(descriptor)
+    }
+
+    /// `prepare_request`'s body, for the crate's own callers.
+    pub(crate) fn request_parcel(&self, descriptor: &str) -> Result<Parcel> {
         let inner = &self.session;
         let mut data = Parcel::new();
         // FD policy defaults to `None`, so `ParcelFileDescriptor::serialize` rejects FDs.
@@ -214,17 +224,23 @@ impl RpcProxy {
     /// Send an outbound transaction to the remote object. Returns the
     /// reply parcel (`None` for oneway).
     ///
-    /// A parcel is sent at most once: after `Ok` the same parcel is refused
-    /// with [`StatusCode::InvalidOperation`], as is a reply received from a
-    /// session. A parcel built by another session's proxy is refused with
-    /// [`StatusCode::BadType`] (AOSP `RpcState::validateParcel`), and so is a
-    /// parcel built for no session at all, such as [`Parcel::new`]: build the
-    /// request with [`RpcProxy::build_request`] or
-    /// [`prepare_transact`](crate::RemoteProxy::prepare_transact).
-    /// After an error raised before the send (`WouldBlock`, `DeadObject`, an
-    /// encode failure) it may be sent again as is, or dropped, which releases
-    /// the binders it reserved.
+    /// The same call as [`RemoteProxy::submit_transact`](crate::RemoteProxy::submit_transact),
+    /// whose doc on this type says which parcels it refuses.
+    #[deprecated(
+        since = "0.13.0",
+        note = "use `RemoteProxy::submit_transact` (`use rsbinder::RemoteProxy;`), the same call on either stack"
+    )]
     pub fn transact(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>> {
+        self.send(code, data, flags)
+    }
+
+    /// `submit_transact`'s body, for the crate's own callers.
+    pub(crate) fn send(
         &self,
         code: TransactionCode,
         data: &Parcel,
@@ -232,7 +248,7 @@ impl RpcProxy {
     ) -> Result<Option<Parcel>> {
         // AOSP `validateParcel`; internal specials send `Parcel::new()` via `client_transact`.
         if data.rpc_session_id().is_none() {
-            log::error!("RPC: the parcel was built for no session; use `build_request`");
+            log::error!("RPC: the parcel was built for no session; use `prepare_request`");
             return Err(StatusCode::BadType);
         }
         self.session.client_transact(self.addr, code, data, flags)
@@ -245,6 +261,18 @@ impl RpcProxy {
 /// (generator emits `as_remote()`). `prepare_transact(true)` writes
 /// the remote's descriptor as the interface token, asking for it first
 /// if it is not cached (`try_descriptor`).
+///
+/// [`submit_transact`](crate::RemoteProxy::submit_transact) sends a parcel
+/// at most once: after `Ok` the same parcel is refused with
+/// [`StatusCode::InvalidOperation`], as is a reply received from a
+/// session. A parcel built by another session's proxy is refused with
+/// [`StatusCode::BadType`] (AOSP `RpcState::validateParcel`), and so is a
+/// parcel built for no session at all, such as [`Parcel::new`]: build the
+/// request with [`prepare_request`](crate::RemoteProxy::prepare_request)
+/// or [`prepare_transact`](crate::RemoteProxy::prepare_transact). After an
+/// error raised before the send (`WouldBlock`, `DeadObject`, an encode
+/// failure) it may be sent again as is, or dropped, which releases the
+/// binders it reserved.
 impl crate::binder::RemoteProxy for RpcProxy {
     fn prepare_transact(&self, write_header: bool) -> Result<Parcel> {
         let inner = &self.session;
@@ -261,7 +289,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
     }
 
     fn prepare_request(&self, interface: &str) -> Result<Parcel> {
-        self.build_request(interface)
+        self.request_parcel(interface)
     }
 
     fn submit_transact(
@@ -270,7 +298,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
         data: &Parcel,
         flags: TransactionFlags,
     ) -> Result<Option<Parcel>> {
-        RpcProxy::transact(self, code, data, flags)
+        self.send(code, data, flags)
     }
 }
 

@@ -56,10 +56,10 @@ use rsbinder::hub::android_16::{
     ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
     ERROR_UNSUPPORTED_SOCKET_FAMILY,
 };
-use rsbinder::rpc::{RpcProxy, RpcServer};
+use rsbinder::rpc::{RpcProxy, RpcServer, RpcServerHandle};
 use rsbinder::{
-    ExceptionCode, Interface, Parcel, ParcelFileDescriptor, Remotable, Result, SIBinder, Status,
-    StatusCode, Strong, TransactionCode, FIRST_CALL_TRANSACTION,
+    ExceptionCode, Interface, Parcel, ParcelFileDescriptor, Remotable, RemoteProxy, Result,
+    SIBinder, Status, StatusCode, Strong, TransactionCode, FIRST_CALL_TRANSACTION,
 };
 
 // ---- echo service (the RPC root behind the Accessor) ----------------
@@ -201,7 +201,7 @@ struct EchoServerGuard {
     path: PathBuf,
     calls: Arc<AtomicI64>,
     server: Arc<RpcServer>,
-    bg: Option<thread::JoinHandle<()>>,
+    bg: Option<RpcServerHandle>,
 }
 
 impl EchoServerGuard {
@@ -210,9 +210,9 @@ impl EchoServerGuard {
         let calls = Arc::new(AtomicI64::new(0));
         let server = RpcServer::setup_unix_server(&path).expect("bind");
         server.set_android13plus(2); // android-16 v2 ceiling
-        server.set_max_threads(2);
+        server.set_max_threads(2).expect("set_max_threads");
         server.set_root(make_echo(calls.clone())).expect("set_root");
-        let bg = server.run_background();
+        let bg = server.run_background().expect("run_background");
         wait_for_sock(&path);
         EchoServerGuard {
             path,
@@ -225,9 +225,8 @@ impl EchoServerGuard {
 
 impl Drop for EchoServerGuard {
     fn drop(&mut self) {
-        self.server.stop_accepting();
         if let Some(bg) = self.bg.take() {
-            let _ = bg.join();
+            let _ = bg.stop_and_join();
         }
         let _ = std::fs::remove_file(&self.path);
     }
@@ -239,10 +238,10 @@ fn rpc_echo(root: &SIBinder, s: &str) -> Result<String> {
         .as_any()
         .downcast_ref::<RpcProxy>()
         .ok_or(StatusCode::BadType)?;
-    let mut data = rp.build_request(ECHO_DESC)?;
+    let mut data = rp.prepare_request(ECHO_DESC)?;
     data.write(&s.to_owned())?;
     let mut reply = rp
-        .transact(TX_ECHO, &data, 0)?
+        .submit_transact(TX_ECHO, &data, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = reply.read()?;
     if !st.is_ok() {

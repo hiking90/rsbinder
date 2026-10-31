@@ -80,10 +80,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .as_any()
             .downcast_ref::<rsbinder::rpc::RpcProxy>()
             .ok_or("root is not an RpcProxy (bridge wrap broke)")?;
-        let mut data = rp.build_request("rsbinder.test.accessor.IInterop")?;
+        let mut data = rp.prepare_request("rsbinder.test.accessor.IInterop")?;
         data.write(&req_str.to_string())?;
         let mut reply = rp
-            .transact(FIRST_CALL_TRANSACTION, &data, 0)?
+            .submit_transact(FIRST_CALL_TRANSACTION, &data, 0)?
             .ok_or("TX_ECHO no reply")?;
         let st: Status = reply.read()?;
         if !st.is_ok() {
@@ -104,9 +104,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             .as_any()
             .downcast_ref::<rsbinder::rpc::RpcProxy>()
             .ok_or("root is not an RpcProxy")?;
-        let data = rp.build_request("rsbinder.test.accessor.IInterop")?;
+        let data = rp.prepare_request("rsbinder.test.accessor.IInterop")?;
         let mut reply = rp
-            .transact(FIRST_CALL_TRANSACTION + 1, &data, 0)?
+            .submit_transact(FIRST_CALL_TRANSACTION + 1, &data, 0)?
             .ok_or("TX_GIVE_MARKER no reply")?;
         let st: Status = reply.read()?;
         if !st.is_ok() {

@@ -49,7 +49,7 @@ impl IAuthz for AuthzService {
             Some(Caller::Kernel { uid, pid, .. }) => {
                 Ok(format!("kernel caller uid={uid} pid={pid}"))
             }
-            Some(Caller::Rpc(PeerIdentity::Local { uid, pid })) => {
+            Some(Caller::Rpc(PeerIdentity::Local { uid, pid, .. })) => {
                 Ok(format!("unix-rpc caller uid={uid} pid={pid}"))
             }
             other => {

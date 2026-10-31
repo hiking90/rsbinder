@@ -1191,8 +1191,8 @@ mod rpc_dispatch_tests {
             let root = client.get_root().unwrap();
             let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
             let call = |code| {
-                let data = rp.build_request(Svc::descriptor()).unwrap();
-                rp.transact(code, &data, 0).map(|_| ())
+                let data = rp.request_parcel(Svc::descriptor()).unwrap();
+                rp.send(code, &data, 0).map(|_| ())
             };
             assert_eq!(
                 call(FIRST_CALL_TRANSACTION),

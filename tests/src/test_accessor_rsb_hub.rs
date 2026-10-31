@@ -95,7 +95,7 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
             )
         });
 
-    // The accessor arm yields an `RpcProxy`; downcasting reaches `build_request` without a stub.
+    // The accessor arm yields an `RpcProxy`; downcasting reaches `prepare_request` without a stub.
     let rp = (*root)
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()
@@ -103,8 +103,8 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
 
     // 2. TX_GIVE_MARKER: no request body; the reply is `Status::Ok` + `writeString16(MARKER)`.
     let marker_reply = {
-        let data = rp.build_request(ROOT_DESC)?;
-        rp.transact(TX_GIVE_MARKER, &data, 0)?
+        let data = rp.prepare_request(ROOT_DESC)?;
+        rp.submit_transact(TX_GIVE_MARKER, &data, 0)?
             .expect("TX_GIVE_MARKER returned no reply parcel")
     };
     let mut reply = marker_reply;
@@ -119,9 +119,9 @@ fn d8b_cross_process_accessor_via_rsb_hub() -> Result<()> {
     // 3. TX_ECHO: the request body crosses the bridge too, and comes back in the reply.
     let req = "hello-d8b";
     let echo_reply = {
-        let mut data = rp.build_request(ROOT_DESC)?;
+        let mut data = rp.prepare_request(ROOT_DESC)?;
         data.write(&req.to_string())?;
-        rp.transact(TX_ECHO, &data, 0)?
+        rp.submit_transact(TX_ECHO, &data, 0)?
             .expect("TX_ECHO returned no reply parcel")
     };
     let mut reply = echo_reply;

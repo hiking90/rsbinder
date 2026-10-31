@@ -250,7 +250,12 @@ impl KernelEndpoint {
 
 /// Which RPC wire a session speaks. A kernel binder [`Uri`] takes only
 /// [`WireProfile::R34`]; any other is `BadValue` at `serve` / `connect`.
+///
+/// `#[non_exhaustive]`: a later AOSP wire that is not a version of the
+/// android-13+ one would be a variant of its own, so a `match` keeps a
+/// wildcard arm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum WireProfile {
     /// The AOSP android-12 r34 wire, without a handshake.
     #[default]

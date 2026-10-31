@@ -51,7 +51,7 @@ impl std::fmt::Debug for VsockTransport {
 
 impl VsockTransport {
     /// Connect to `(cid, port)` (client side).
-    pub fn connect(cid: u32, port: u32) -> RpcResult<Self> {
+    pub fn connect(cid: u32, port: u32) -> crate::Result<Self> {
         let stream = VsockStream::connect(&VsockAddr::new(cid, port))?;
         Self::from_stream(stream)
     }
@@ -66,13 +66,18 @@ impl VsockTransport {
     /// finds no data returns `RpcError::Timeout` at once. An Accessor fd
     /// arrives non-blocking; [`crate::rpc::RpcSession::from_preconnected_fd`]
     /// clears the flag, this does not.
-    pub fn from_owned_fd(fd: OwnedFd) -> RpcResult<Self> {
+    pub fn from_owned_fd(fd: OwnedFd) -> crate::Result<Self> {
         Self::from_stream(VsockStream::from(fd))
     }
 
     /// Wrap an accepted/connected `VsockStream`. The peer cid is
     /// resolved once here.
-    pub fn from_stream(stream: VsockStream) -> RpcResult<Self> {
+    pub fn from_stream(stream: VsockStream) -> crate::Result<Self> {
+        Ok(Self::wrap(stream)?)
+    }
+
+    /// [`from_stream`](Self::from_stream) keeping the transport layer's error, for the server.
+    pub(crate) fn wrap(stream: VsockStream) -> RpcResult<Self> {
         let peer = match stream.peer_addr() {
             Ok(a) => PeerIdentity::Vsock { cid: a.cid() },
             // No peer addr ⇒ no identity; never forge one.

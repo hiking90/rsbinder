@@ -33,8 +33,8 @@ use rsbinder::entry::{WireProfile, WireVersion};
 use rsbinder::rpc::transport::VsockTransport;
 use rsbinder::rpc::{PeerIdentity, RpcServer, RpcSession, RpcTransport};
 use rsbinder::{
-    Binder, Endpoint, Interface, Parcel, Remotable, Result, SIBinder, Status, StatusCode,
-    TransactionCode, Uri, FIRST_CALL_TRANSACTION,
+    Binder, Endpoint, Interface, Parcel, Remotable, RemoteProxy, Result, SIBinder, Status,
+    StatusCode, TransactionCode, Uri, FIRST_CALL_TRANSACTION,
 };
 
 const DESC: &str = "rsbinder.test.IVsockPing";
@@ -81,10 +81,10 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
         .as_any()
         .downcast_ref::<rsbinder::rpc::RpcProxy>()
         .expect("RpcProxy");
-    let mut d = rp.build_request(DESC)?;
+    let mut d = rp.prepare_request(DESC)?;
     d.write(&msg)?;
     let mut r = rp
-        .transact(TX_PING, &d, 0)?
+        .submit_transact(TX_PING, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if !st.is_ok() {
@@ -110,7 +110,7 @@ fn vsock_loopback_e2e() {
     // Accessor gates: vsock_address `Some`, fs path `None`.
     assert_eq!(server.vsock_address(), Some((VMADDR_CID_LOCAL, TEST_PORT)));
     assert_eq!(server.path(), None, "vsock server has no filesystem entry");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     let client_t = VsockTransport::connect(VMADDR_CID_LOCAL, TEST_PORT).expect("client connect");
     // Identity is Vsock{cid}, never Local.
@@ -123,11 +123,10 @@ fn vsock_loopback_e2e() {
     let root = client.get_root().expect("get_root over vsock");
     assert_eq!(ping_via(&root, "hi").unwrap(), "pong:hi");
 
-    // Teardown — explicit shutdown + bg.join (same shape as UDS tests).
+    // Teardown — the handle stops, joins and terminates (same shape as UDS tests).
     drop(root);
     drop(client);
-    server.stop_accepting();
-    let _ = bg.join();
+    let _ = bg.stop_and_join();
 }
 
 /// Plan 2-20: `shutdown()` on a vsock transport wakes a thread blocked in its `recv_frame`.
@@ -145,7 +144,7 @@ fn vsock_shutdown_wakes_blocked_recv() {
             PingSvc,
         )))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     let t: Arc<dyn RpcTransport> =
         Arc::new(VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect"));
@@ -171,9 +170,7 @@ fn vsock_shutdown_wakes_blocked_recv() {
     server.stop_accepting();
     // Workers first: one still serving this client would otherwise outlive the test.
     server.join_workers();
-    if let Err(p) = bg.join() {
-        std::panic::resume_unwind(p);
-    }
+    bg.stop_and_join().expect("accept loop");
 }
 
 /// Plan 2-20: `close_session` ends `serve_blocking`, fires death, and the server sees the close.
@@ -198,7 +195,7 @@ fn vsock_session_shutdown_ends_serve_thread() {
             PingSvc,
         )))))
         .expect("set_root");
-    let bg = server.run_background();
+    let bg = server.run_background().expect("run_background");
 
     let client_t = VsockTransport::connect(VMADDR_CID_LOCAL, port).expect("client connect");
     let client = RpcSession::new(Box::new(client_t), rsbinder::rpc::AddressSpace::Initiator)
@@ -227,10 +224,8 @@ fn vsock_session_shutdown_ends_serve_thread() {
     drop(client);
     server.stop_accepting();
     server.join_workers();
-    // Surface an accept-loop panic; discarding it would leave every test green.
-    if let Err(p) = bg.join() {
-        std::panic::resume_unwind(p);
-    }
+    // Surface an accept-loop failure; discarding it would leave every test green.
+    bg.stop_and_join().expect("accept loop");
 }
 
 /// Plan 10-7 Phase 0: off-handler callbacks, twoway and oneway; `WouldBlock` without incoming.
@@ -280,10 +275,10 @@ fn entry_vsock_incoming_connections_carry_callbacks() {
             .as_any()
             .downcast_ref::<rsbinder::rpc::RpcProxy>()
             .expect("RpcProxy");
-        let mut d = rp.build_request(DESC)?;
+        let mut d = rp.prepare_request(DESC)?;
         d.write(cb)?;
         let mut r = rp
-            .transact(TX_HOLD, &d, 0)?
+            .submit_transact(TX_HOLD, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         let st: Status = r.read()?;
         if st.is_ok() {
@@ -302,9 +297,10 @@ fn entry_vsock_incoming_connections_carry_callbacks() {
                 .as_any()
                 .downcast_ref::<rsbinder::rpc::RpcProxy>()
                 .expect("RpcProxy");
-            let oneway = rp.build_request(DESC).and_then(|mut d| {
+            let oneway = rp.prepare_request(DESC).and_then(|mut d| {
                 d.write(&"oneway")?;
-                rp.transact(TX_PING, &d, rsbinder::FLAG_ONEWAY).map(|_| ())
+                rp.submit_transact(TX_PING, &d, rsbinder::FLAG_ONEWAY)
+                    .map(|_| ())
             });
             (twoway, oneway)
         })

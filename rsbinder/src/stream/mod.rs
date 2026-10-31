@@ -345,7 +345,12 @@ pub enum RingUse {
 /// What a [`Receiver`] is made with: the ring on the kernel path, the
 /// credit window on the RPC path. The peer decides which applies, and
 /// [`ring_use`](Self::ring_use) whether an RPC peer may get a ring too.
+///
+/// `#[non_exhaustive]`: build it from [`Default`] and the `with_*`
+/// setters, `ReceiverPolicy::default().with_ring_bytes(1 << 20)`; the
+/// fields stay readable and assignable.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReceiverPolicy {
     /// Ring: bytes of ring the consumer allocates. Must exceed
     /// [`END_RESERVE`]` + 4`; the largest item is
@@ -419,9 +424,46 @@ impl Default for ReceiverPolicy {
     }
 }
 
+impl ReceiverPolicy {
+    /// [`ring_bytes`](Self::ring_bytes) set to `n`.
+    pub fn with_ring_bytes(mut self, n: usize) -> Self {
+        self.ring_bytes = n;
+        self
+    }
+
+    /// [`credit_window`](Self::credit_window) set to `n`.
+    pub fn with_credit_window(mut self, n: u32) -> Self {
+        self.credit_window = n;
+        self
+    }
+
+    /// [`max_opening`](Self::max_opening) set to `n`.
+    pub fn with_max_opening(mut self, n: u32) -> Self {
+        self.max_opening = n;
+        self
+    }
+
+    /// [`ping`](Self::ping) set to `ping`.
+    pub fn with_ping(mut self, ping: PingPolicy) -> Self {
+        self.ping = ping;
+        self
+    }
+
+    /// [`ring_use`](Self::ring_use) set to `ring_use`.
+    pub fn with_ring_use(mut self, ring_use: RingUse) -> Self {
+        self.ring_use = ring_use;
+        self
+    }
+}
+
 /// What a [`Sink`] is opened with: what ring it accepts on the kernel
 /// path, how it batches on the RPC path.
+///
+/// `#[non_exhaustive]`: build it from [`Default`] and the `with_*`
+/// setters, `SinkPolicy::default().with_send_timeout(Some(d))`; the fields
+/// stay readable and assignable.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SinkPolicy {
     /// Ring: the largest ring this producer maps. The ring is
     /// the consumer's memory, and a hostile consumer could describe one
@@ -462,8 +504,8 @@ pub struct SinkPolicy {
     /// deadline, the pool thread of an `*_async` call included. It bounds
     /// only waits for room or credit: the RPC transaction that carries a
     /// batch or the terminator waits under the session's own deadline
-    /// (`RpcSession::set_timeout`, or `RpcServer::set_reply_timeout` on a
-    /// server), and a batch a dropped `*_async` future left sending is
+    /// (`RpcSession::set_reply_timeout`, or `RpcServer::set_reply_timeout`
+    /// on a server), and a batch a dropped `*_async` future left sending is
     /// waited for under that deadline too.
     ///
     /// What a timeout leaves behind:
@@ -517,6 +559,38 @@ impl Default for SinkPolicy {
     }
 }
 
+impl SinkPolicy {
+    /// [`max_ring_bytes`](Self::max_ring_bytes) set to `n`.
+    pub fn with_max_ring_bytes(mut self, n: usize) -> Self {
+        self.max_ring_bytes = n;
+        self
+    }
+
+    /// [`max_batch_bytes`](Self::max_batch_bytes) set to `n`.
+    pub fn with_max_batch_bytes(mut self, n: usize) -> Self {
+        self.max_batch_bytes = n;
+        self
+    }
+
+    /// [`initial_credits`](Self::initial_credits) set to `n`.
+    pub fn with_initial_credits(mut self, n: u32) -> Self {
+        self.initial_credits = n;
+        self
+    }
+
+    /// [`send_timeout`](Self::send_timeout) set to `timeout`.
+    pub fn with_send_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.send_timeout = timeout;
+        self
+    }
+
+    /// [`ping`](Self::ping) set to `ping`.
+    pub fn with_ping(mut self, ping: PingPolicy) -> Self {
+        self.ping = ping;
+        self
+    }
+}
+
 /// Whether a stream on the RPC path checks that a peer it is waiting on
 /// is still there (plan 2-24 D9).
 ///
@@ -531,7 +605,7 @@ impl Default for SinkPolicy {
 /// stream would wait for good.
 ///
 /// With pinging on, a wait that nothing has woken for a third of the
-/// session's reply deadline (`RpcSession::set_timeout`, or
+/// session's reply deadline (`RpcSession::set_reply_timeout`, or
 /// `RpcServer::set_reply_timeout` on a server) sends the peer a
 /// `PING_TRANSACTION` — the twoway every binder object answers,
 /// rsbinder's and libbinder's alike, so the peer implements nothing — and
@@ -1383,6 +1457,77 @@ impl<T: ?Sized> std::fmt::Debug for Sink<T> {
 
 // --- Consumer ---
 
+/// Why [`Receiver::recv_timeout`] returned no item; the shape of
+/// `std::sync::mpsc::RecvTimeoutError` (plan 17 C-2 rule 3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecvTimeoutError {
+    /// The timeout elapsed with the stream still running. The stream is
+    /// usable; call again.
+    Timeout,
+    /// The stream is over and every item has been returned. Every later
+    /// call returns this too; [`Receiver::end_status`] has the status it
+    /// ended on.
+    Ended,
+    /// The stream ended with this error — the producer's error status, its
+    /// death ([`StatusCode::DeadObject`]), or this side refusing what it
+    /// read. Returned once; the call after it returns [`Ended`](Self::Ended).
+    Failed(Status),
+}
+
+impl std::fmt::Display for RecvTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecvTimeoutError::Timeout => f.write_str("timed out waiting for a stream item"),
+            RecvTimeoutError::Ended => f.write_str("the stream has ended"),
+            RecvTimeoutError::Failed(status) => write!(f, "the stream failed: {status}"),
+        }
+    }
+}
+
+impl std::error::Error for RecvTimeoutError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RecvTimeoutError::Failed(status) => Some(status),
+            _ => None,
+        }
+    }
+}
+
+/// Why [`Receiver::try_recv`] returned no item; the shape of
+/// `std::sync::mpsc::TryRecvError` (plan 17 C-2 rule 3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TryRecvError {
+    /// No item has arrived yet and the stream is still running.
+    Empty,
+    /// The stream is over and every item has been returned. Every later
+    /// call returns this too; [`Receiver::end_status`] has the status it
+    /// ended on.
+    Ended,
+    /// The stream ended with this error, as in
+    /// [`RecvTimeoutError::Failed`]. Returned once; the call after it
+    /// returns [`Ended`](Self::Ended).
+    Failed(Status),
+}
+
+impl std::fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TryRecvError::Empty => f.write_str("no stream item has arrived yet"),
+            TryRecvError::Ended => f.write_str("the stream has ended"),
+            TryRecvError::Failed(status) => write!(f, "the stream failed: {status}"),
+        }
+    }
+}
+
+impl std::error::Error for TryRecvError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TryRecvError::Failed(status) => Some(status),
+            _ => None,
+        }
+    }
+}
+
 enum ReceiverInner<T> {
     Calls(calls::Consumer<T>),
     Ring(ring::Consumer<T>),
@@ -1504,9 +1649,12 @@ impl<T: Deserialize> Receiver<T> {
 
     /// The next item if one is already here, without waiting for one.
     ///
-    /// `Ok(None)` means nothing has arrived yet and the stream is still
-    /// running; the stream being over reads as `Ok(None)` too, which
-    /// [`is_finished`](Self::is_finished) tells apart.
+    /// The shape of `std::sync::mpsc::Receiver::try_recv`:
+    /// [`TryRecvError::Empty`] when nothing has arrived yet and the stream
+    /// is still running, [`TryRecvError::Ended`] once the stream is over
+    /// and every item has been returned — on every call after that — and
+    /// [`TryRecvError::Failed`] once for a stream that ended in error, as
+    /// [`recv`](Self::recv) yields `Some(Err(..))` once before `None`.
     ///
     /// On the ring this is one look at the ring. On the RPC path it never
     /// waits for an item, but it is not free: with credit owed and
@@ -1518,17 +1666,29 @@ impl<T: Deserialize> Receiver<T> {
     /// are busy. A grant that fails here does not end the stream, as it
     /// may in [`recv`](Self::recv): this call returns, and the next one
     /// tries the grant again.
-    pub fn try_recv(&mut self) -> BinderResult<Option<T>> {
-        match &mut self.inner {
+    pub fn try_recv(&mut self) -> std::result::Result<T, TryRecvError> {
+        let next = match &mut self.inner {
             ReceiverInner::Calls(c) => c.try_recv(),
             ReceiverInner::Ring(c) => c.try_recv(),
+        };
+        match next {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) if self.is_finished() => Err(TryRecvError::Ended),
+            Ok(None) => Err(TryRecvError::Empty),
+            Err(status) => Err(TryRecvError::Failed(status)),
         }
     }
 
     /// [`recv`](Self::recv) with a bound on how long it waits.
     ///
-    /// `Ok(None)` when `timeout` elapses with the stream still running.
-    /// A timeout leaves the stream usable — call again.
+    /// The shape of `std::sync::mpsc::Receiver::recv_timeout`:
+    /// [`RecvTimeoutError::Timeout`] when `timeout` elapses with the stream
+    /// still running, which leaves the stream usable — call again;
+    /// [`RecvTimeoutError::Ended`] once the stream is over and every item
+    /// has been returned, on every call after that; and
+    /// [`RecvTimeoutError::Failed`] once for a stream that ended in error,
+    /// as [`recv`](Self::recv) yields `Some(Err(..))` once before `None`.
+    /// A loop that calls again on `Timeout` therefore stops at the end.
     ///
     /// `timeout` starts when the call does. On the RPC path the grant
     /// [`try_recv`](Self::try_recv) describes is sent within `timeout`:
@@ -1546,10 +1706,17 @@ impl<T: Deserialize> Receiver<T> {
     /// A `timeout` too long for an `Instant` to express — `Duration::MAX`
     /// — waits without a bound, and is [`recv`](Self::recv) in every
     /// respect.
-    pub fn recv_timeout(&mut self, timeout: Duration) -> BinderResult<Option<T>> {
-        match &mut self.inner {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> std::result::Result<T, RecvTimeoutError> {
+        let next = match &mut self.inner {
             ReceiverInner::Calls(c) => c.recv_timeout(timeout),
             ReceiverInner::Ring(c) => c.recv_timeout(timeout),
+        };
+        // `finished` is set only by this receiver's own calls, so no end can land in between.
+        match next {
+            Ok(Some(item)) => Ok(item),
+            Ok(None) if self.is_finished() => Err(RecvTimeoutError::Ended),
+            Ok(None) => Err(RecvTimeoutError::Timeout),
+            Err(status) => Err(RecvTimeoutError::Failed(status)),
         }
     }
 
@@ -2055,11 +2222,11 @@ mod tests {
         assert!(!sink.is_canceled());
 
         for expected in 0..fill {
-            assert_eq!(rx.try_recv().expect("no error"), Some(expected));
+            assert_eq!(rx.try_recv(), Ok(expected));
         }
         assert_eq!(
-            rx.try_recv().expect("no error"),
-            None,
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
             "the item is not in the ring"
         );
         sink.send(&fill).expect("room again");
@@ -2081,7 +2248,7 @@ mod tests {
         assert_eq!(sent.err(), Some(StatusCode::TimedOut));
 
         // One read moves every record into the consumer's batch; refill to leave room for two.
-        assert_eq!(rx.try_recv().expect("no error"), Some(0));
+        assert_eq!(rx.try_recv(), Ok(0));
         let refill: Vec<i32> = (fill..2 * fill - 2).collect();
         let (sent, _, sink) = bounded(sink, move |sink| sink.send_all(refill.iter()));
         sent.expect("room for these");

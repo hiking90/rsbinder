@@ -69,6 +69,93 @@ Each item below changes what a 0.12.0 program observes.
   rustix major release is no longer a semver break of this crate.
   `Errno::raw()` gives the number and `Errno::from_raw` builds one;
   `std::io::Error::from` takes both `Errno` and `Error`.
+- **`RpcServer::run_background` returns `Result<RpcServerHandle>`, and
+  dropping the handle stops the server.** The handle is `#[must_use]`; its
+  drop, or `stop_and_join()` (which also returns how the accept loop
+  ended), raises `stop_accepting`, joins the accept thread and calls
+  `terminate`, which ends every session and joins its workers. 0.12.0
+  returned a `JoinHandle<()>` whose drop detached the loop, and the server
+  kept accepting after its last `Arc` went. `let bg =
+  server.run_background();` becomes `let bg = server.run_background()?;`,
+  and `server.stop_accepting(); bg.join()` becomes `bg.stop_and_join()?`.
+  **`let _ = server.run_background();` still compiles without a warning
+  and now stops the server on that line**: bind the handle to a named
+  variable or keep it beside the server. A thread the OS refuses is an
+  `Err` instead of a panic; `Server::spawn` returns it too, and
+  `ServerGuard` wraps the handle.
+- **`stream::Receiver::recv_timeout` returns `Result<T, RecvTimeoutError>`
+  and `try_recv` returns `Result<T, TryRecvError>`**, the shape of
+  `std::sync::mpsc`: `Err(Timeout)` / `Err(Empty)` while the stream runs,
+  `Err(Ended)` on every call once it is over, and `Err(Failed(status))`
+  once for a stream that ended in error (where `recv` yields
+  `Some(Err(status))` once before `None`). 0.12.0 returned `Ok(None)` for
+  both a timeout and an end, so a loop that called again on `Ok(None)`
+  spun after the end. `recv`, `recv_async` and the `Iterator` are
+  unchanged.
+- **A zero RPC deadline is refused with `BadValue`.**
+  `RpcSession::set_reply_timeout` and `RpcServer::set_reply_timeout`,
+  `set_idle_timeout` and `set_handshake_timeout` return `Result<()>` and
+  refuse `Some(Duration::ZERO)`, keeping the value in force. A zero
+  `RpcClientConfig::timeout` (and the deprecated `handshake_timeout`) is
+  refused by the setup call, a zero `ClientOptions::timeout` by
+  `Client::open`, and a zero `ServeOptions` deadline by `Server::run` /
+  `spawn`, all before connecting or registering a name. 0.12.0 read a zero
+  reply or idle deadline as "no deadline" and a zero handshake deadline as
+  "keep the 10 s default". `None` is still no deadline.
+- **`RpcSession::set_timeout` is `set_reply_timeout`**, the name the server
+  gives the same deadline; `set_timeout` is a deprecated alias, also
+  returning `Result<()>`.
+- **`RpcServer::set_max_threads` returns `Result<()>`.** It, `set_root` and
+  `add_service` return `InvalidOperation` once `run` or `run_background`
+  has started (AOSP `RpcServer` aborts there), and a server has either a
+  `set_root` root or an `add_service` directory: whichever comes second is
+  `InvalidOperation`. 0.12.0 let `add_service` replace a root silently and
+  took changes that sessions already accepted never saw.
+  `set_max_connections` still changes while the server runs.
+- **`RpcClientConfig` has no lifetime parameter and owns its source**
+  (`unix(impl AsRef<Path>, ..)`, `unix_abstract(impl AsRef<[u8]>, ..)`,
+  `tls(impl Into<String>, port, impl Into<String>, ..)`), and the
+  connector of `new(.., connect)` is `'static`. The session keeps it:
+  **`RpcSession::add_outgoing_connection()` and
+  `add_incoming_connection()`** open one more connection as the founding
+  one was opened, with the session's own id, wire version and fd mode.
+  `add_outgoing_connection_with_config`,
+  `add_incoming_connection_with_config` and `RpcClientConfig::session_id`
+  are deprecated. A session built from a transport (`connect_android13plus`,
+  `from_preconnected_fd`, r34) has no connector, so the new calls return
+  `InvalidOperation` there.
+- **`RpcSession::session_id()` and `serve_blocking_on` are no longer
+  public.** The client-local id was never the one to echo; the server's is
+  `get_session_id()`.
+- **`RpcTransport::send_raw` and `recv_raw` are required; `send_frame` and
+  `recv_frame` have default implementations** (a `u32` little-endian
+  length and the body, through the raw calls). Every session moves its
+  bytes through the raw calls, so a transport that implemented only the
+  frame methods compiled in 0.12.0 and could open no session.
+- **`RpcSession::new` and the bundled transport constructors
+  (`UnixTransport`, `TcpDebugTransport`, `TlsTransport`, `VsockTransport`)
+  return `rsbinder::Result`**, not `RpcResult`; a `.map_err(StatusCode::from)`
+  after them can go, and a TLS handshake cut by its deadline is `TimedOut`.
+  The `RpcTransport` methods keep `RpcResult`.
+- **`RpcProxy::build_request` and `transact` are deprecated** in favour of
+  the `RemoteProxy` methods they duplicated, `prepare_request` and
+  `submit_transact`.
+- **`stream::ReceiverPolicy` and `stream::SinkPolicy` are
+  `#[non_exhaustive]`** with a `with_*` setter per field:
+  `ReceiverPolicy { ring_use: x, ..Default::default() }` becomes
+  `ReceiverPolicy::default().with_ring_use(x)`. `entry::WireProfile` is
+  `#[non_exhaustive]`, and so is the `PeerIdentity::Local` variant: match
+  `PeerIdentity::Local { uid, .. }`, build it with
+  `PeerIdentity::local(uid, pid)`.
+- **`rsbinder::rpc::{address, end, fd_mode, proxy, server, session}` are
+  private modules**; everything public in them is reached through
+  `rsbinder::rpc::*` (`rpc::session::RpcSession` becomes `rpc::RpcSession`).
+  `RPC_SESSION_ID_NEW`, `SpecialTransaction`, `RpcAddress::unique` and
+  `transport::insecure_warning_emitted` are gone from the API, and
+  `RpcSession::accept_android13plus`, `accept_android13plus_fd`,
+  `local_node_count` and `RpcServer::{live_session_node_count,
+  session_live_conns, session_slot_count}` are `#[doc(hidden)]` behind the
+  `test-util` feature.
 - On a 32-bit target `MessageQueue::attach` refuses, with
   `InvalidDescriptor`, a data grantor whose `extent` plus `offset` modulo the page size is more than
   `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and

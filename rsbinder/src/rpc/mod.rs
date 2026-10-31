@@ -42,7 +42,8 @@
 //! let server = RpcServer::setup_unix_server("/tmp/demo.sock").unwrap();
 //! # let root: rsbinder::SIBinder = unimplemented!();
 //! server.set_root(root).unwrap();
-//! let _bg = server.run_background();
+//! // Serves until the handle drops; `let _ =` would stop it on this line.
+//! let accepting = server.run_background().unwrap();
 //!
 //! // Client: connect, (optionally) negotiate, fetch the root object.
 //! let client = RpcSession::setup_unix_client("/tmp/demo.sock").unwrap();
@@ -55,8 +56,27 @@
 //! //     let foo: Strong<dyn IFoo> =
 //! //         <dyn IFoo as FromIBinder>::try_from(root)?;
 //! # let _ = root;
+//!
+//! // End the server: stop accepting, end every session, join the threads.
+//! accepting.stop_and_join().unwrap();
 //! # }
 //! ```
+//!
+//! # Ending a session or a server
+//!
+//! Four calls end something, and each ends a different part:
+//!
+//! | Call | Ends | Joins |
+//! |---|---|---|
+//! | `RpcSession::close_session` | one session, on every connection it has: proxies get `binder_died`, the peer's local objects are released | the threads serving this client's incoming connections |
+//! | `RpcServer::stop_accepting` | the accept loop only; sessions already accepted keep serving until their peers leave, and attaches to them are refused | nothing |
+//! | `RpcServer::terminate` | every session the server serves, as `close_session` ends one | the connection workers (the accept loop must have stopped first) |
+//! | `RpcServerHandle::stop_and_join`, or dropping the handle | the server: `stop_accepting`, a join of the accept thread, then `terminate` | the accept thread and the workers |
+//!
+//! `ServerGuard` wraps an `RpcServerHandle` and ends the server the same
+//! way. A graceful drain is `stop_accepting` and then
+//! `RpcServer::join_workers` once the clients have left; the handle is the
+//! forced end, and no drop waits for a client.
 //!
 //! A complete, runnable Unix-domain client/server pair driving a
 //! generated AIDL stub is in
@@ -103,14 +123,15 @@
 //! error kind and the `RpcError` variants respectively — so a change to the set has to be
 //! made in all three places.
 
-pub mod address;
+// Every public item of these is re-exported below: one path each, `rpc::*` (plan 17 R-9).
+pub(crate) mod address;
 pub(crate) mod deadline;
-pub mod end;
-pub mod fd_mode;
+pub(crate) mod end;
+pub(crate) mod fd_mode;
 pub(crate) mod lifecycle;
-pub mod proxy;
-pub mod server;
-pub mod session;
+pub(crate) mod proxy;
+pub(crate) mod server;
+pub(crate) mod session;
 // Codec and session bookkeeping are `pub(crate)` so the protocol can change without semver breaks.
 pub(crate) mod state;
 pub mod transport;
@@ -122,11 +143,11 @@ pub(crate) mod wire_android13;
 #[doc(hidden)]
 pub use wire::{__fuzz_decode_address, __fuzz_decode_wire, __fuzz_session_handshake};
 
-pub use address::{AddressSpace, RpcAddress, SpecialTransaction, RPC_SESSION_ID_NEW};
+pub use address::{AddressSpace, RpcAddress};
 pub use end::{EndReason, EndedBy, SessionEnd, StreamState};
 pub use fd_mode::FileDescriptorTransportMode;
 pub use proxy::RpcProxy;
-pub use server::RpcServer;
+pub use server::{RpcServer, RpcServerHandle};
 #[expect(
     deprecated,
     reason = "re-exports the deprecated config while it is honored"

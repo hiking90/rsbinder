@@ -156,10 +156,10 @@ impl Remotable for MultiConn {
                     .as_any()
                     .downcast_ref::<RpcProxy>()
                     .ok_or(StatusCode::BadType)?;
-                let mut d = rp.build_request(CALLBACK_DESC)?;
+                let mut d = rp.prepare_request(CALLBACK_DESC)?;
                 d.write(&s)?;
                 let mut r = rp
-                    .transact(TX_CALLBACK_ECHO, &d, 0)?
+                    .submit_transact(TX_CALLBACK_ECHO, &d, 0)?
                     .ok_or(StatusCode::UnexpectedNull)?;
                 let st: Status = r.read()?;
                 if !st.is_ok() {
@@ -186,18 +186,18 @@ impl Remotable for MultiConn {
                             .as_any()
                             .downcast_ref::<RpcProxy>()
                             .ok_or(StatusCode::BadType)?;
-                        let mut d = rp.build_request(CALLBACK_DESC)?;
+                        let mut d = rp.prepare_request(CALLBACK_DESC)?;
                         d.write(&s)?;
                         let mut r = rp
-                            .transact(TX_CALLBACK_ECHO, &d, 0)?
+                            .submit_transact(TX_CALLBACK_ECHO, &d, 0)?
                             .ok_or(StatusCode::UnexpectedNull)?;
                         let st: Status = r.read()?;
                         if !st.is_ok() {
                             return Err(StatusCode::from(st));
                         }
                         let echoed: String = r.read()?;
-                        let d2 = rp.build_request(CALLBACK_DESC)?;
-                        rp.transact(TX_CALLBACK_NOTIFY, &d2, rsbinder::FLAG_ONEWAY)?;
+                        let d2 = rp.prepare_request(CALLBACK_DESC)?;
+                        rp.submit_transact(TX_CALLBACK_NOTIFY, &d2, rsbinder::FLAG_ONEWAY)?;
                         Ok(echoed)
                     })();
                     let text = match outcome {
@@ -255,7 +255,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // + 1 attached). Default 1 would silently reject the launcher's
     // second connection (the per-session cap), so this is the
     // load-bearing setting that wires the multi-conn code path.
-    server.set_max_threads(max_threads);
+    server.set_max_threads(max_threads)?;
     server.set_root(Interface::as_binder(&Binder::new(MultiConn {
         oneway_log: Mutex::new(Vec::new()),
         in_flight: AtomicI32::new(0),

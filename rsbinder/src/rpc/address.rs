@@ -21,7 +21,7 @@ pub(crate) const RPC_ADDR_LEN: usize = 32;
 
 /// New-session sentinel for the raw `int32` session-id preamble
 /// (`RPC_SESSION_ID_NEW = -1` in android-12 r34).
-pub const RPC_SESSION_ID_NEW: i32 = -1;
+pub(crate) const RPC_SESSION_ID_NEW: i32 = -1;
 
 /// Opaque RPC object address. ABI is hidden: no public field, no public
 /// length constant, `Debug` shows only a short fingerprint.
@@ -33,7 +33,7 @@ pub struct RpcAddress {
 impl RpcAddress {
     /// The reserved all-zero address. In r34 this is the special
     /// server channel target for `GET_ROOT`/`GET_MAX_THREADS`/
-    /// `GET_SESSION_ID` (see [`SpecialTransaction`]).
+    /// `GET_SESSION_ID`.
     pub fn zero() -> Self {
         RpcAddress {
             bytes: [0u8; RPC_ADDR_LEN],
@@ -64,7 +64,7 @@ impl RpcAddress {
     /// it must already be in the local table, never a fresh remote. The shape, not the tag alone, decides: an
     /// android-12 r34 libbinder peer fills all 32 bytes at random (`RpcAddress::unique`), so its
     /// byte 8 equals our tag one time in 256.
-    pub fn unique(counter: &mut u64, space: AddressSpace) -> Self {
+    pub(crate) fn unique(counter: &mut u64, space: AddressSpace) -> Self {
         *counter = counter.wrapping_add(1);
         let mut bytes = [0u8; RPC_ADDR_LEN];
         bytes[..8].copy_from_slice(&counter.to_le_bytes());
@@ -128,7 +128,11 @@ impl AddressSpace {
 /// [`RpcAddress::zero`] and whose `code` is one of these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum SpecialTransaction {
+#[expect(
+    clippy::enum_variant_names,
+    reason = "AOSP's names: GET_ROOT, GET_MAX_THREADS, GET_SESSION_ID"
+)]
+pub(crate) enum SpecialTransaction {
     /// Fetch the server's root object.
     GetRoot = 0,
     /// Negotiate the server's max thread count.
@@ -146,12 +150,12 @@ pub enum SpecialTransaction {
 
 impl SpecialTransaction {
     /// The raw `code` value carried on the wire.
-    pub fn code(self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         self as u32
     }
 
     /// Decode a zero-address transaction `code`.
-    pub fn from_code(code: u32) -> Option<Self> {
+    pub(crate) fn from_code(code: u32) -> Option<Self> {
         match code {
             0 => Some(SpecialTransaction::GetRoot),
             1 => Some(SpecialTransaction::GetMaxThreads),

@@ -127,7 +127,7 @@ fi
 echo "==> cross-compiling the rsbinder half"
 ( cd "$REPO_ROOT" && ANDROID_NDK_HOME="$NDK" \
     cargo ndk -t "$TRIPLE" --platform "$API" build --release -p example-hello \
-        --features rpc --bin rpc_r34_interop_server --bin rpc_r34_interop_client )
+        --features rpc,test-util --bin rpc_r34_interop_server --bin rpc_r34_interop_client )
 
 adb -s "$DEVICE" root >/dev/null
 adb -s "$DEVICE" wait-for-device

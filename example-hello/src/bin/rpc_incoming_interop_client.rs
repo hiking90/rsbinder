@@ -71,10 +71,10 @@ impl Cb {
             .as_any()
             .downcast_ref::<RpcProxy>()
             .ok_or(StatusCode::BadType)?;
-        let mut d = rp.build_request(ROOT_DESC)?;
+        let mut d = rp.prepare_request(ROOT_DESC)?;
         d.write(&arg)?;
         let mut r = rp
-            .transact(TX_ECHO, &d, 0)?
+            .submit_transact(TX_ECHO, &d, 0)?
             .ok_or(StatusCode::UnexpectedNull)?;
         read_status(&mut r)?;
         r.read()
@@ -204,9 +204,11 @@ fn reply_deadline_ends_both_sessions(
 
     // The server links to a binder of ours: its obituary says the server's session ended too.
     let watched: SIBinder = Interface::as_binder(&Binder::new(Watched));
-    let mut d = rp.build_request(ROOT_DESC)?;
+    let mut d = rp.prepare_request(ROOT_DESC)?;
     d.write(&watched)?;
-    let mut r = rp.transact(TX_WATCH, &d, 0)?.ok_or("watch: no reply")?;
+    let mut r = rp
+        .submit_transact(TX_WATCH, &d, 0)?
+        .ok_or("watch: no reply")?;
     read_status(&mut r)?;
     let linked: i32 = r.read()?;
     if linked != 0 {
@@ -216,11 +218,11 @@ fn reply_deadline_ends_both_sessions(
         );
     }
 
-    session.set_timeout(Some(Duration::from_secs(1)));
-    let mut d = rp.build_request(ROOT_DESC)?;
+    session.set_reply_timeout(Some(Duration::from_secs(1)))?;
+    let mut d = rp.prepare_request(ROOT_DESC)?;
     d.write(&3000i32)?;
     let started = Instant::now();
-    match rp.transact(TX_SLOW, &d, 0) {
+    match rp.submit_transact(TX_SLOW, &d, 0) {
         Err(StatusCode::TimedOut) => {}
         other => fail(
             17,
@@ -235,9 +237,9 @@ fn reply_deadline_ends_both_sessions(
         started.elapsed()
     );
 
-    let mut d = rp.build_request(ROOT_DESC)?;
+    let mut d = rp.prepare_request(ROOT_DESC)?;
     d.write(&"after")?;
-    match rp.transact(TX_ECHO, &d, 0) {
+    match rp.submit_transact(TX_ECHO, &d, 0) {
         Err(StatusCode::DeadObject) => {}
         other => fail(
             18,
@@ -258,9 +260,9 @@ fn reply_deadline_ends_both_sessions(
     let mut server_died = 0;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(5) {
-        let d = prp.build_request(ROOT_DESC)?;
+        let d = prp.prepare_request(ROOT_DESC)?;
         let mut r = prp
-            .transact(TX_GET_DIED, &d, 0)?
+            .submit_transact(TX_GET_DIED, &d, 0)?
             .ok_or("get_died: no reply")?;
         read_status(&mut r)?;
         server_died = r.read()?;
@@ -303,7 +305,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let session = connect(&sock)?;
     // Bound every reply wait from here on (the default is to block forever).
-    session.set_timeout(Some(Duration::from_secs(10)));
+    session.set_reply_timeout(Some(Duration::from_secs(10)))?;
     eprintln!(
         "[rsbinder-client] session up: wire v{:?}, slots={}, incoming threads={}",
         session.wire_protocol_version(),
@@ -318,9 +320,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // Sanity.
     {
-        let mut d = rp.build_request(ROOT_DESC)?;
+        let mut d = rp.prepare_request(ROOT_DESC)?;
         d.write(&"sanity")?;
-        let mut r = rp.transact(TX_ECHO, &d, 0)?.ok_or("echo: no reply")?;
+        let mut r = rp
+            .submit_transact(TX_ECHO, &d, 0)?
+            .ok_or("echo: no reply")?;
         read_status(&mut r)?;
         let got: String = r.read()?;
         if got != "sanity" {
@@ -342,11 +346,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         nested: Arc::clone(&nested_result),
     }));
     {
-        let mut d = rp.build_request(ROOT_DESC)?;
+        let mut d = rp.prepare_request(ROOT_DESC)?;
         d.write(&cb)?;
         d.write(&"later")?;
         let mut r = rp
-            .transact(TX_SCHEDULE_CALLBACK, &d, 0)?
+            .submit_transact(TX_SCHEDULE_CALLBACK, &d, 0)?
             .ok_or("schedule: no reply")?;
         read_status(&mut r)?;
     }
@@ -369,9 +373,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // The server's own view of the outcome.
     let mut outcome = String::from("pending");
     for _ in 0..100 {
-        let d = rp.build_request(ROOT_DESC)?;
+        let d = rp.prepare_request(ROOT_DESC)?;
         let mut r = rp
-            .transact(TX_GET_SCHED, &d, 0)?
+            .submit_transact(TX_GET_SCHED, &d, 0)?
             .ok_or("get_sched: no reply")?;
         read_status(&mut r)?;
         outcome = r.read()?;

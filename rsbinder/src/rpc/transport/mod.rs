@@ -78,7 +78,7 @@
 //! # A slow peer
 //!
 //! A deadline this end arms on a bundled socket transport (the session's
-//! `set_timeout`, a server's idle and reply deadlines) expires only once the
+//! `set_reply_timeout`, a server's idle and reply deadlines) expires only once the
 //! peer has gone that long without progress. For a read deadline progress is
 //! the peer sending this end a byte or taking one of this end's; for a send
 //! deadline it is only the second, so a peer that keeps sending but takes
@@ -146,7 +146,7 @@ mod vsock;
 
 pub use mem::MemTransport;
 #[cfg(feature = "rpc-tcp-debug")]
-pub use tcp_debug::{insecure_warning_emitted, TcpDebugTransport};
+pub use tcp_debug::TcpDebugTransport;
 #[cfg(feature = "rpc-tls")]
 pub use tls::{TlsStream, TlsTransport};
 pub use unix::UnixTransport;
@@ -169,16 +169,33 @@ pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// both support that without a deadlock. Implementations must keep
 /// the send and receive methods independently callable from two threads.
 ///
+/// # Implementing
+///
 /// An [`RpcSession`](super::RpcSession) moves its bytes through
 /// [`send_raw`](Self::send_raw) / [`recv_raw`](Self::recv_raw) (and their
 /// fd and draining forms) on both wire profiles: AOSP frames each message
-/// by its own header, with no length prefix. A transport for a session
-/// must override those; their defaults refuse. `send_frame` / `recv_frame`
-/// are a separate length-prefixed message API that no session calls.
+/// by its own header, with no length prefix. The required methods are the
+/// ones every session calls: `send_raw`, `recv_raw`, [`shutdown`](Self::shutdown)
+/// (the session's end runs it on every connection), `peer_identity` and
+/// `describe`. A transport that implements only those opens a session.
+///
+/// [`send_frame`](Self::send_frame) / [`recv_frame`](Self::recv_frame) are a
+/// separate length-prefixed message API that no session calls. Their
+/// defaults frame on top of the raw calls (`u32` little-endian length, then
+/// the body; see the module doc); a transport with its own message
+/// boundary, such as a channel, overrides them.
 pub trait RpcTransport: Send + Sync {
-    /// Send exactly one logical frame. The implementation guarantees
-    /// framing (length prefix or channel message boundary).
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()>;
+    /// Send exactly one logical frame: a `u32` little-endian length and
+    /// the body.
+    ///
+    /// The default builds both into one buffer and hands it to one
+    /// [`send_raw`](Self::send_raw), so a frame stays whole under the
+    /// one-writer-per-connection rule (module doc). A body longer than
+    /// [`MAX_FRAME_LEN`] is [`RpcError::FrameTooLarge`] before anything
+    /// is sent.
+    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
+        self.send_raw(&encode_frame(buf)?)
+    }
 
     /// Receive exactly one logical frame.
     ///
@@ -186,7 +203,15 @@ pub trait RpcTransport: Send + Sync {
     /// [`RpcError::EndOfStream`]; a header received but body short is
     /// [`RpcError::Truncated`]. Never panics or loops forever on a
     /// hostile peer.
-    fn recv_frame(&self) -> RpcResult<Vec<u8>>;
+    ///
+    /// The default reads the frame [`send_frame`](Self::send_frame)'s
+    /// default writes through [`recv_raw`](Self::recv_raw), classifying
+    /// short reads as the module doc's "Short reads and writes" says, and
+    /// refuses a declared length above [`MAX_FRAME_LEN`] before
+    /// allocating.
+    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
+        read_frame(&mut RawCalls(self))
+    }
 
     /// The other end's identity, as established by this transport.
     ///
@@ -247,7 +272,7 @@ pub trait RpcTransport: Send + Sync {
 
     /// Arm the kernel's own check that the peer's host still answers, sized
     /// to `timeout` — the session's
-    /// [`set_timeout`](super::RpcSession::set_timeout), which calls this on
+    /// [`set_reply_timeout`](super::RpcSession::set_reply_timeout), which calls this on
     /// every connection. The default is a no-op: `unix`, `vsock` and `mem`
     /// have no such check, and a caller's own transport gets the default
     /// until it overrides this. `tcp_debug` and `tls` over TCP implement it.
@@ -472,26 +497,24 @@ pub trait RpcTransport: Send + Sync {
         Ok((self.recv_frame()?, Vec::new()))
     }
 
-    /// Send raw bytes with **no framing**. The real android RPC wire
-    /// has no length prefix (`RpcState::rpcSend` writes the
-    /// `RpcWireHeader` + body directly) — a session drives framing
-    /// itself via `wire_android13`, on both profiles. The default is
-    /// **unsupported**: a session over a backend that does not override
-    /// it fails at its first byte (an r34 client's session-id preamble in
-    /// `RpcSession::new`, an android-13+ handshake). Every bundled backend
-    /// (`unix`, `tcp_debug`, `vsock`, `tls`, and `mem`, which keeps the
-    /// unread rest of a message for the next read) overrides both this and
-    /// [`recv_raw`](Self::recv_raw).
-    fn send_raw(&self, _buf: &[u8]) -> RpcResult<()> {
-        Err(RpcError::Protocol("this transport has no raw byte access"))
-    }
+    /// Send all of `buf` as raw bytes, with **no framing**. The real
+    /// android RPC wire has no length prefix (`RpcState::rpcSend` writes
+    /// the `RpcWireHeader` + body directly) — a session drives framing
+    /// itself via `wire_android13`, on both profiles. Every bundled
+    /// backend (`unix`, `tcp_debug`, `vsock`, `tls`, and `mem`, which
+    /// keeps the unread rest of a message for the next read) implements
+    /// it over its stream.
+    ///
+    /// A deadline of this end's that expires before the first byte is
+    /// [`RpcError::Timeout`]; any other failure, at any position, is the
+    /// transport error (module doc "Short reads and writes").
+    fn send_raw(&self, buf: &[u8]) -> RpcResult<()>;
 
     /// Read up to `buf.len()` raw bytes (one `read`; `Ok(0)` = peer
-    /// closed). Pairs with [`RpcTransport::send_raw`]. Default:
-    /// unsupported (see [`RpcTransport::send_raw`]).
-    fn recv_raw(&self, _buf: &mut [u8]) -> RpcResult<usize> {
-        Err(RpcError::Protocol("this transport has no raw byte access"))
-    }
+    /// closed). Pairs with [`RpcTransport::send_raw`]. A read deadline of
+    /// this end's that expires with nothing read is
+    /// [`RpcError::Timeout`].
+    fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize>;
 
     /// Send raw bytes with **no framing**, passing `fds` out-of-band via
     /// `SCM_RIGHTS` (the android-13+ v1+ `Unix` FD-over-RPC path). This
@@ -605,6 +628,11 @@ pub enum PeerIdentity {
     /// A local peer whose credentials the kernel vouches for
     /// (`SO_PEERCRED` over a Unix domain socket, or the current
     /// process for the in-memory test transport).
+    ///
+    /// `#[non_exhaustive]`: a further credential (a gid, a security
+    /// context) may be added, so match it with `..` and build it with
+    /// [`PeerIdentity::local`].
+    #[non_exhaustive]
     Local {
         /// Peer process effective UID.
         uid: u32,
@@ -681,6 +709,13 @@ impl fmt::Debug for CertId {
 }
 
 impl PeerIdentity {
+    /// A [`PeerIdentity::Local`] with these credentials, for a transport
+    /// of your own whose peer the kernel vouches for. `pid` is `-1` when
+    /// the platform does not report one.
+    pub fn local(uid: u32, pid: i32) -> Self {
+        PeerIdentity::Local { uid, pid }
+    }
+
     /// `true` for [`PeerIdentity::Local`].
     pub fn is_local(&self) -> bool {
         matches!(self, PeerIdentity::Local { .. })
@@ -732,6 +767,30 @@ impl fmt::Display for PeerIdentity {
 
 // --- Length-prefix framing shared by stream backends (module doc) ---
 
+/// A transport's `recv_raw` as `Read`, for the default `recv_frame`.
+struct RawCalls<'a, T: RpcTransport + ?Sized>(&'a T);
+
+impl<T: RpcTransport + ?Sized> Read for RawCalls<'_, T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Kind-preserving, so `read_header`/`read_body` see a deadline as `is_timeout`.
+        self.0.recv_raw(buf).map_err(std::io::Error::from)
+    }
+}
+
+/// `buf` behind its `u32` little-endian length; `FrameTooLarge` past [`MAX_FRAME_LEN`].
+fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
+    if buf.len() > MAX_FRAME_LEN {
+        return Err(RpcError::FrameTooLarge {
+            declared: buf.len(),
+            max: MAX_FRAME_LEN,
+        });
+    }
+    let mut framed = Vec::with_capacity(4 + buf.len());
+    framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+    framed.extend_from_slice(buf);
+    Ok(framed)
+}
+
 /// Write one length-prefixed frame to a blocking stream.
 #[cfg(any(
     test,
@@ -739,16 +798,8 @@ impl fmt::Display for PeerIdentity {
     all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
 ))]
 pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
-    if buf.len() > MAX_FRAME_LEN {
-        return Err(RpcError::FrameTooLarge {
-            declared: buf.len(),
-            max: MAX_FRAME_LEN,
-        });
-    }
     // One buffer, one `write_all`; the slot's single writer keeps the frame whole (module doc).
-    let mut framed = Vec::with_capacity(4 + buf.len());
-    framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
-    framed.extend_from_slice(buf);
+    let framed = encode_frame(buf)?;
     w.write_all(&framed)?;
     w.flush()?;
     Ok(())

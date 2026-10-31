@@ -126,7 +126,27 @@ consumer needs one more `twoway` call to hand it over.
 
 `Receiver<T>` is an `Iterator<Item = BinderResult<T>>` that ends when the
 producer does; `recv`, `try_recv` and `recv_timeout` are the same thing one item
-at a time, differing only in how long they wait for one. Items are encoded with
+at a time, differing only in how long they wait for one. `recv` returns
+`Option<BinderResult<T>>` as the iterator does; `try_recv` and
+`recv_timeout` have the shape of `std::sync::mpsc`'s: `Err(Empty)` /
+`Err(Timeout)` while the stream runs, `Err(Ended)` once it is over — on
+every call after that — and `Err(Failed(status))` once for a stream that
+ended in error:
+
+```rust
+use rsbinder::stream::RecvTimeoutError;
+
+loop {
+    match rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(line) => println!("{line:?}"),
+        Err(RecvTimeoutError::Timeout) => continue, // still running
+        Err(RecvTimeoutError::Ended) => break,
+        Err(RecvTimeoutError::Failed(status)) => return Err(status),
+    }
+}
+```
+
+Items are encoded with
 the codec [`to_bytes`](./data-serialization.md) uses, so **an item may hold
 neither a binder nor a file descriptor**; `send` refuses one that does.
 
@@ -234,8 +254,11 @@ connection on the session, see [Over RPC](#over-rpc).
 ## Credit, batches and the two policies
 
 Flow control is set on each side when the stream is made:
-`Receiver::with_policy(&peer, &ReceiverPolicy { .. })` on the consumer and
-`Sink::open_with(&endpoint, &SinkPolicy { .. })` on the producer. Each policy
+`Receiver::with_policy(&peer, &policy)` on the consumer and
+`Sink::open_with(&endpoint, &policy)` on the producer. Both policies are
+`#[non_exhaustive]`, so a policy is built from its default and the
+`with_*` setter of each field, `SinkPolicy::default().with_initial_credits(8)`;
+the fields stay readable. Each policy
 has fields for both paths; the ones for the path not in use are
 ignored. A ring over a Unix session takes the ring fields and `ping`; the
 credit and batch fields do not apply to it. `Receiver::new` and `Sink::open`
@@ -407,7 +430,7 @@ with `DeadObject` through its death link: a peer that vanished is noticed
 within about four thirds of the deadline. A stream whose items flow never
 pings.
 
-The deadline is the session's: `RpcSession::set_timeout` or
+The deadline is the session's: `RpcSession::set_reply_timeout` or
 `ClientOptions::timeout` on a client, `RpcServer::set_reply_timeout` or
 `ServeOptions::reply_timeout` on a server. A session without one — the
 default — never pings, and `PingPolicy::Off` in either policy turns it off for
@@ -512,7 +535,7 @@ have the stream run on a ring instead of calls:
 ```rust
 use rsbinder::stream::{Receiver, ReceiverPolicy, RingUse};
 
-let policy = ReceiverPolicy { ring_use: RingUse::AlsoUnixRpc, ..Default::default() };
+let policy = ReceiverPolicy::default().with_ring_use(RingUse::AlsoUnixRpc);
 let (mut rx, endpoint) = Receiver::<LogLine>::with_policy(&service.as_binder(), &policy)?;
 if !rx.uses_ring() {
     // The session could not carry one; the stream runs on calls as usual.

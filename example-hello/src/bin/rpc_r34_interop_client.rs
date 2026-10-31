@@ -88,10 +88,10 @@ fn call(
     code: TransactionCode,
     fill: impl FnOnce(&mut Parcel) -> Result<()>,
 ) -> Result<Parcel> {
-    let mut d = rp.build_request(ROOT_DESC)?;
+    let mut d = rp.prepare_request(ROOT_DESC)?;
     fill(&mut d)?;
     let mut r = rp
-        .transact(code, &d, 0)?
+        .submit_transact(code, &d, 0)?
         .ok_or(StatusCode::UnexpectedNull)?;
     let st: Status = r.read()?;
     if !st.is_ok() {
@@ -217,9 +217,9 @@ fn main() -> BoxResult<()> {
     // (B8) oneway order (android-12 checks asyncNumber per node).
     const N: i32 = 20;
     for i in 0..N {
-        let mut d = rp.build_request(ROOT_DESC)?;
+        let mut d = rp.prepare_request(ROOT_DESC)?;
         d.write(&i)?;
-        rp.transact(TX_ONEWAY, &d, FLAG_ONEWAY)?;
+        rp.submit_transact(TX_ONEWAY, &d, FLAG_ONEWAY)?;
     }
     let mut log: Vec<i32> = Vec::new();
     let full = poll_until(Duration::from_secs(3), || {

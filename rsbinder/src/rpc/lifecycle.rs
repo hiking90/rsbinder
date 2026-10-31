@@ -102,6 +102,7 @@ impl SessionLifecycle {
     }
 
     /// Current live count (`Live(n) → n`, `Dying`/`Dead → 0`).
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn live_count(&self) -> usize {
         let v = self.inner.load(Ordering::SeqCst);
         if v >> STATE_SHIFT == STATE_LIVE_TAG {

@@ -539,6 +539,7 @@ impl RpcState {
     }
 
     /// Test/diagnostic: number of live local nodes (leak check).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn local_node_count(&self) -> usize {
         self.local_nodes.len()
     }
