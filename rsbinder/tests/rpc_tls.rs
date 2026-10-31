@@ -56,6 +56,12 @@
 //!   sends the accepted `TcpStream` down the plain branch, which refuses it
 //!   ("plain-text TCP server is not exposed"); the worker exits without
 //!   serving and the client's TLS handshake fails or times out.
+//! - `tls_stream_with_leaves_no_deadline_after_the_handshake`: leaving the handshake bound on
+//!   the stream after `connect_stream_with` / `accept_stream_with` keeps `SO_RCVTIMEO` set, and
+//!   the socket-option assertions fail. The idle-gap read after them checks the effect.
+//! - `tls_accept_stream_with_bounds_a_trickling_client_as_a_whole`: with only the per-wait
+//!   bound, each one-byte read restarts `SO_RCVTIMEO`; the handshake runs until the feeder
+//!   closes at `HS_SLACK` and ends `EndOfStream`, not `Timeout`.
 
 #![cfg(feature = "rpc-tls")]
 
@@ -1112,4 +1118,136 @@ fn fd_mode_unix_over_tls_is_refused_at_setup() {
 
     server.stop_accepting();
     let _ = bg.join();
+}
+
+// ---- handshake deadline on a hand-assembled stream (plan 17 R-17) ----
+
+const HS: Duration = Duration::from_millis(300);
+/// Far above `HS`, far below a handshake with no deadline on a silent peer (never).
+const HS_SLACK: Duration = Duration::from_secs(5);
+
+fn assert_handshake_timed_out<T>(r: std::result::Result<T, RpcError>, started: Instant) {
+    match r {
+        Err(RpcError::Timeout) => {}
+        Err(e) => panic!("expected RpcError::Timeout, got {e:?}"),
+        Ok(_) => panic!("expected RpcError::Timeout, got a completed handshake"),
+    }
+    let took = started.elapsed();
+    assert!(
+        took >= HS - Duration::from_millis(50),
+        "cut early: {took:?}"
+    );
+    assert!(took < HS_SLACK, "not cut by the deadline: {took:?}");
+}
+
+/// A server that never answers the ClientHello: `connect_stream_with` ends at the deadline.
+#[test]
+fn tls_connect_stream_with_times_out_on_a_silent_server() {
+    let (silent, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let started = Instant::now();
+    let r = TlsTransport::connect_stream_with(
+        Box::new(s_cli),
+        "localhost",
+        client_config_trusting(CA),
+        HS,
+    );
+    assert_handshake_timed_out(r, started);
+    drop(silent);
+}
+
+/// A client that connects and sends nothing: `accept_stream_with` ends at the deadline.
+#[test]
+fn tls_accept_stream_with_times_out_on_a_silent_client() {
+    let (s_srv, silent) = UnixStream::pair().expect("unix socketpair");
+    let started = Instant::now();
+    let r = TlsTransport::accept_stream_with(Box::new(s_srv), server_config(SRV_CRT, SRV_KEY), HS);
+    assert_handshake_timed_out(r, started);
+    drop(silent);
+}
+
+/// One byte per wait never trips the per-read bound; the whole-handshake bound ends it.
+#[test]
+fn tls_accept_stream_with_bounds_a_trickling_client_as_a_whole() {
+    use std::io::Write;
+
+    let (s_srv, mut trickle) = UnixStream::pair().expect("unix socketpair");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder = {
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            // A handshake record header announcing 16 KiB, then its body a byte at a time.
+            let _ = trickle.write_all(&[0x16, 0x03, 0x01, 0x40, 0x00]);
+            let fed = Instant::now();
+            // Closing after `HS_SLACK` ends an unbounded handshake with an error, not a hang.
+            while !stop.load(Ordering::Relaxed) && fed.elapsed() < HS_SLACK {
+                if trickle.write_all(&[0x01]).is_err() {
+                    break;
+                }
+                thread::sleep(HS / 4);
+            }
+        })
+    };
+    let started = Instant::now();
+    let r = TlsTransport::accept_stream_with(Box::new(s_srv), server_config(SRV_CRT, SRV_KEY), HS);
+    stop.store(true, Ordering::Relaxed);
+    assert_handshake_timed_out(r, started);
+    feeder.join().unwrap();
+}
+
+/// After a bounded handshake no socket deadline is left: an idle wait past it still reads.
+#[test]
+fn tls_stream_with_leaves_no_deadline_after_the_handshake() {
+    let (s_srv, s_cli) = UnixStream::pair().expect("unix socketpair");
+    let srv_sock = s_srv.try_clone().expect("dup server socket");
+    let cli_sock = s_cli.try_clone().expect("dup client socket");
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let server = thread::spawn(move || {
+        let t = TlsTransport::accept_stream_with(Box::new(s_srv), srv_cfg, HS)
+            .expect("server handshake");
+        let left = (
+            srv_sock.read_timeout().unwrap(),
+            srv_sock.write_timeout().unwrap(),
+        );
+        // Blocks across the client's idle gap; a leftover `HS` read timeout would cut it.
+        (left, t.recv_frame())
+    });
+    let client = TlsTransport::connect_stream_with(
+        Box::new(s_cli),
+        "localhost",
+        client_config_trusting(CA),
+        HS,
+    )
+    .expect("client handshake");
+    assert_eq!(cli_sock.read_timeout().unwrap(), None, "client SO_RCVTIMEO");
+    assert_eq!(
+        cli_sock.write_timeout().unwrap(),
+        None,
+        "client SO_SNDTIMEO"
+    );
+    thread::sleep(HS * 3);
+    client.send_frame(b"after-idle").expect("send after idle");
+    let (left, got) = server.join().unwrap();
+    assert_eq!(left, (None, None), "server SO_RCVTIMEO / SO_SNDTIMEO");
+    assert_eq!(got.expect("server read across the idle gap"), b"after-idle");
+}
+
+/// `Duration::ZERO` bounds nothing and is refused with `BadValue` before any byte moves.
+#[test]
+fn tls_stream_with_refuses_a_zero_handshake_timeout() {
+    let (a, b) = UnixStream::pair().expect("unix socketpair");
+    let cli = TlsTransport::connect_stream_with(
+        Box::new(a),
+        "localhost",
+        client_config_trusting(CA),
+        Duration::ZERO,
+    );
+    let srv = TlsTransport::accept_stream_with(
+        Box::new(b),
+        server_config(SRV_CRT, SRV_KEY),
+        Duration::ZERO,
+    );
+    for (end, r) in [("connect", cli.err()), ("accept", srv.err())] {
+        let e = r.unwrap_or_else(|| panic!("{end}: zero timeout accepted"));
+        assert_eq!(StatusCode::from(e), StatusCode::BadValue, "{end}");
+    }
 }

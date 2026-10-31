@@ -14,8 +14,8 @@
 //! - `ServiceWithMetadata(swm)` with `swm.service.is_none()` (the servicemanager has no entry):
 //!   try the process-local fallback (AOSP `getInjectedAccessor`); on a miss return the
 //!   original null `swm` so callers can still observe the metadata.
-//! - `Accessor(accessor)`: run the consume-side bridge (`accessor_16::resolve_accessor`); on a
-//!   miss, also try the process-local fallback.
+//! - `Accessor(accessor)`: run the consume-side bridge (`accessor_16::try_resolve_accessor`); on
+//!   an error, also try the process-local fallback.
 //!
 //! The process-local fallback lets a vendor process that registered a provider via
 //! `add_accessor_provider` supply an `IAccessor` binder for its own instances without
@@ -56,7 +56,10 @@ fn resolve_accessor_arm(
         log::warn!("Service {name} returned a null Accessor binder");
         return None;
     };
-    super::accessor_16::resolve_accessor(name, accessor)
+    // The error is logged where it arises; this arm's miss falls back (module doc).
+    super::accessor_16::try_resolve_accessor(name, accessor)
+        .ok()
+        .map(super::accessor_16::accessor_service_with_metadata)
 }
 
 #[cfg(not(feature = "rpc"))]
@@ -76,9 +79,9 @@ fn resolve_accessor_arm(
 fn try_process_local_fallback(
     name: &str,
 ) -> Option<android::os::ServiceWithMetadata::ServiceWithMetadata> {
-    let out = super::accessor_register::resolve_via_process_local(name)?;
+    let root = super::accessor_register::try_resolve_via_process_local(name).ok()??;
     log::debug!("servicemanager_16 fallback: {name} resolved via process-local AccessorProvider");
-    Some(out)
+    Some(super::accessor_16::accessor_service_with_metadata(root))
 }
 
 #[cfg(not(feature = "rpc"))]
@@ -296,7 +299,7 @@ mod tests {
     //! directly so the AOSP-faithful fallback choice (process-local
     //! provider on `ServiceWithMetadata(service: None)` AND
     //! `Accessor(None)`) is *exercised* — not just the
-    //! `resolve_via_process_local` primitive it delegates to. A mutant
+    //! `try_resolve_via_process_local` primitive it delegates to. A mutant
     //! that removes the `or_else`/`or` in [`dispatch_typed_service`]
     //! flips these tests; a fallback wired to only the `Accessor` arm
     //! is caught by

@@ -15,7 +15,7 @@ license = { workspace = true }
 #   cargo run -p example-hello --features rpc --bin rpc_hello_client
 rpc = ["rsbinder/rpc"]
 # Subplan 2-13 — opt in to the android-16 accessor bridge symbols
-# (`hub::android_16::resolve_accessor`); only used by the STAGE3
+# (`hub::android_16::try_resolve_accessor`); only used by the STAGE3
 # interop client.
 android_16 = ["rsbinder/android_16"]
 # `rpc_incoming_interop_client` asserts on connection-slot and

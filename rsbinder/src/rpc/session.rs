@@ -944,29 +944,14 @@ fn connect_tls(
             t
         }
     };
-    // Bound the TLS handshake too: a peer that never sends ServerHello would hang setup.
-    if let Some(d) = handshake_timeout {
-        tcp.set_read_timeout(Some(d))?;
-        tcp.set_write_timeout(Some(d))?;
+    use super::transport::TlsTransport;
+    tcp.set_nodelay(true)?;
+    // A deadline cut is `RpcError::Timeout`, which projects to `TimedOut`.
+    let t = match handshake_timeout {
+        Some(d) => TlsTransport::connect_stream_with(Box::new(tcp), server_name, config.clone(), d),
+        None => TlsTransport::connect_stream(Box::new(tcp), server_name, config.clone()),
     }
-    // Each wait above; the whole handshake here, against a peer that sends a byte at a time.
-    let mut whole = PhaseDeadline::arm_with(handshake_timeout, || {
-        use std::os::fd::AsFd;
-        super::transport::socket_shutdown_handle(tcp.as_fd())
-    });
-    let t = match super::transport::TlsTransport::connect(tcp, server_name, config.clone()) {
-        Ok(t) => t,
-        Err(_) if whole.fired() => return Err(StatusCode::TimedOut),
-        Err(e) => return Err(StatusCode::from(e)),
-    };
-    if !whole.disarm() {
-        return Err(StatusCode::TimedOut);
-    }
-    if handshake_timeout.is_some() {
-        // Later traffic arms its own deadlines; a sticky one here would cut an idle session.
-        t.set_read_timeout(None).map_err(StatusCode::from)?;
-        t.set_write_timeout(None).map_err(StatusCode::from)?;
-    }
+    .map_err(StatusCode::from)?;
     Ok(Box::new(t))
 }
 

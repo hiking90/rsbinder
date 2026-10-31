@@ -24,7 +24,7 @@
 //!      `ABinderRpc_Accessor` binder (registered as a regular service —
 //!      see launcher; the `Service::accessor` arm needs a VINTF entry
 //!      which the stock emulator's read-only /system blocks).
-//!   4. `accessor_16::resolve_accessor(name, accessor_binder)` drives
+//!   4. `accessor_16::try_resolve_accessor(name, accessor_binder)` drives
 //!      the bridge **end-to-end**: BpAccessor wire (real libbinder) →
 //!      `addConnection()` → fd adopt → v2 handshake (real libbinder
 //!      RPC server peer) → `get_root()` → real RPC root.
@@ -69,15 +69,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     // Step 4: name check, `addConnection` fd, v2 handshake on it, then `get_root`.
-    let swm2 = hub::android_16::resolve_accessor(&instance, accessor_binder)
-        .ok_or("resolve_accessor returned None — bridge failed (check launcher log + dmesg)")?;
-    assert!(
-        !swm2.r#isLazyService,
-        "bridge yielded isLazyService=true (AOSP setSessionSpecificRoot is never lazy)"
-    );
-    let root = swm2
-        .service
-        .ok_or("bridge ServiceWithMetadata.service is None — get_root() yielded null")?;
+    let root = hub::android_16::try_resolve_accessor(&instance, accessor_binder)
+        .map_err(|st| format!("try_resolve_accessor failed: {st} (check launcher log + dmesg)"))?;
     eprintln!("[rsbinder-client] RPC root acquired via bridge");
 
     // Step 5a: TX_ECHO carries a request body each way across the bridge.

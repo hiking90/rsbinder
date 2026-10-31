@@ -422,11 +422,17 @@ pub mod android_16 {
     pub use super::accessor_16::__fuzz_accessor_error_decode;
     #[cfg(feature = "rpc")]
     pub use super::accessor_16::{
-        accessor_error_name, resolve_accessor, BnAccessor, BpAccessor, IAccessor, IAccessorDefault,
-        IAccessorDefaultRef, ERROR_CONNECTION_INFO_NOT_FOUND, ERROR_FAILED_TO_CONNECT_EACCES,
-        ERROR_FAILED_TO_CONNECT_TO_SOCKET, ERROR_FAILED_TO_CREATE_SOCKET,
-        ERROR_UNSUPPORTED_SOCKET_FAMILY,
+        accessor_error_name, try_resolve_accessor, BnAccessor, BpAccessor, IAccessor,
+        IAccessorDefault, IAccessorDefaultRef, ERROR_CONNECTION_INFO_NOT_FOUND,
+        ERROR_FAILED_TO_CONNECT_EACCES, ERROR_FAILED_TO_CONNECT_TO_SOCKET,
+        ERROR_FAILED_TO_CREATE_SOCKET, ERROR_UNSUPPORTED_SOCKET_FAMILY,
     };
+    #[cfg(feature = "rpc")]
+    #[expect(
+        deprecated,
+        reason = "re-exports the deprecated Option forms while they are kept"
+    )]
+    pub use super::{accessor_16::resolve_accessor, accessor_register::resolve_via_process_local};
     // Same `async` gate as the codegen re-export in `accessor_16`.
     #[cfg(all(feature = "rpc", feature = "async"))]
     pub use super::accessor_16::IAccessorAsyncService;
@@ -434,8 +440,8 @@ pub mod android_16 {
     #[cfg(feature = "rpc")]
     pub use super::accessor_register::{
         add_accessor_provider, create_accessor, remove_accessor_provider,
-        resolve_via_process_local, AccessorAddrProvider, AccessorConnectError, AccessorProviderFn,
-        AccessorProviderHandle, AccessorSockAddr, LocalAccessor,
+        try_resolve_via_process_local, AccessorAddrProvider, AccessorConnectError,
+        AccessorProviderFn, AccessorProviderHandle, AccessorSockAddr, LocalAccessor,
     };
     pub use super::servicemanager_16::*;
 }

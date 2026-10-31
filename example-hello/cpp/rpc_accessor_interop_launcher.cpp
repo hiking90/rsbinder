@@ -11,9 +11,9 @@
 //   1. `hub::get_service("rsbinder.test.acc")` over kernel binder ⇒
 //      ServiceWithMetadata arm (no VINTF entry, so servicemanager
 //      stays out of the `Service::accessor` arm — the bridge being
-//      tested is `accessor_16::resolve_accessor`, which is profile-
+//      tested is `accessor_16::try_resolve_accessor`, which is profile-
 //      independent of the arm dispatch);
-//   2. calls `resolve_accessor(name, accessor_binder)` directly →
+//   2. calls `try_resolve_accessor(name, accessor_binder)` directly →
 //      `BpAccessor::addConnection()` (real-libbinder wire) → fd adopt
 //      → `RpcSession::from_preconnected_fd` → 2-8 v2 handshake →
 //      `get_root()` → full data-bearing transact.

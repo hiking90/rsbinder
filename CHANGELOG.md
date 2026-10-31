@@ -360,6 +360,20 @@ Each item below changes what a 0.12.0 program observes.
   unit-test a `TransactionObserver` without a transaction.
 - **`bridge::Rewrap::remote_of(&wrapper)`**: the remote a wrapper was made
   for, for an upstream that hands a wrapper back.
+- **`rpc::TlsTransport::connect_stream_with` / `accept_stream_with`**
+  (`rpc-tls`): the hand-assembled TLS handshake with a deadline, set for
+  the handshake as a whole and cleared after it, as the built-in `tls`
+  client path sets one. `connect_stream` / `accept_stream` keep no
+  deadline; a zero one is `BadValue`.
+- **`pub use rsbinder::rpc::vsock`** (`rpc-vsock`): the `vsock` crate that
+  `VsockTransport::from_stream` and the `TlsStream` impl name.
+- **`hub::android_16::try_resolve_accessor` and
+  `try_resolve_via_process_local`** return why a resolve failed: `BadType`
+  for a binder that is not an `IAccessor`, `NameNotFound` for one serving
+  another instance, `addConnection`'s status, the handshake's error; a
+  name no provider claims is `Ok(None)`. The `Option` forms
+  `resolve_accessor` and `resolve_via_process_local`, which logged each
+  failure and returned `None`, are deprecated.
 - **`fmq::MQDescriptor::try_from_sized(descriptor)`**: `TryFrom<Descriptor>`
   that also refuses a queue whose element size is not `size_of::<T>()`,
   which the untyped conversion leaves for the peer's libfmq to refuse.

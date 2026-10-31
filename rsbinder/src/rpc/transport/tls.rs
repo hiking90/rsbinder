@@ -426,6 +426,44 @@ fn drive_handshake(conn: &mut Connection, stream: &dyn TlsStream) -> RpcResult<(
     Ok(())
 }
 
+/// `drive_handshake` bounded per wait and as a whole by `deadline`; both bounds cleared after.
+fn drive_handshake_within(
+    conn: &mut Connection,
+    stream: &dyn TlsStream,
+    deadline: Option<Duration>,
+) -> RpcResult<()> {
+    let Some(d) = deadline else {
+        return drive_handshake(conn, stream);
+    };
+    stream.set_read_timeout(Some(d))?;
+    stream.set_write_timeout(Some(d))?;
+    // Each wait above; the whole handshake here, against a peer that sends a byte at a time.
+    let mut whole = crate::rpc::deadline::PhaseDeadline::arm_with(Some(d), || {
+        stream.socket().and_then(super::socket_shutdown_handle)
+    });
+    match drive_handshake(conn, stream) {
+        Ok(()) => {}
+        Err(_) if whole.fired() => return Err(RpcError::Timeout),
+        Err(e) => return Err(e),
+    }
+    if !whole.disarm() {
+        return Err(RpcError::Timeout);
+    }
+    // Later traffic arms its own deadlines; a sticky one here would cut an idle session.
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(())
+}
+
+/// `BadValue` (via `EINVAL`) for a zero handshake deadline, which bounds nothing.
+fn refuse_zero_handshake_timeout(d: Duration, what: &str) -> RpcResult<()> {
+    if d.is_zero() {
+        log::error!("{what}: a zero handshake_timeout is refused; pass a nonzero bound");
+        return Err(RpcError::Io(std::io::Error::from(rustix::io::Errno::INVAL)));
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for TlsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsTransport")
@@ -444,17 +482,63 @@ impl TlsTransport {
     /// verifying the server per `config`. Returns only after a
     /// successful handshake; a bad/untrusted server certificate is an
     /// `Err` here, with **no RPC bytes exchanged**.
+    ///
+    /// The handshake has no deadline here: a server that never answers
+    /// holds this call until the stream itself fails. Use
+    /// [`connect_stream_with`](Self::connect_stream_with) to bound it.
     pub fn connect_stream(
         stream: Box<dyn TlsStream>,
         server_name: &str,
         config: Arc<rustls::ClientConfig>,
+    ) -> RpcResult<Self> {
+        Self::connect_stream_within(stream, server_name, config, None)
+    }
+
+    /// [`connect_stream`](Self::connect_stream) with a deadline on the
+    /// handshake, as the built-in `tls` client path
+    /// ([`RpcClientConfig::tls`](crate::rpc::RpcClientConfig::tls) with
+    /// its handshake bound) sets one.
+    ///
+    /// `handshake_timeout` bounds each read and write of the handshake
+    /// (the stream's [`set_read_timeout`](TlsStream::set_read_timeout) and
+    /// [`set_write_timeout`](TlsStream::set_write_timeout)) and the
+    /// handshake as a whole: when it passes, the stream's
+    /// [`socket`](TlsStream::socket) is shut down, so a peer that sends one
+    /// byte at a time cannot hold the call either. A stream whose `socket`
+    /// is `None` gets the per-wait bound only. A handshake cut by the
+    /// deadline is [`RpcError::Timeout`].
+    ///
+    /// On success both stream timeouts are cleared to `None`, whatever the
+    /// stream carried before. The transport arms its own deadline for each
+    /// wait after the handshake (reply, idle, send); a socket timeout left
+    /// on the stream would end an idle session after that long.
+    ///
+    /// `Duration::ZERO` is refused before any byte is exchanged, with an
+    /// [`RpcError::Io`] carrying `EINVAL`, which projects to
+    /// [`StatusCode::BadValue`](crate::StatusCode::BadValue): a zero
+    /// handshake deadline bounds nothing.
+    pub fn connect_stream_with(
+        stream: Box<dyn TlsStream>,
+        server_name: &str,
+        config: Arc<rustls::ClientConfig>,
+        handshake_timeout: Duration,
+    ) -> RpcResult<Self> {
+        refuse_zero_handshake_timeout(handshake_timeout, "TlsTransport::connect_stream_with")?;
+        Self::connect_stream_within(stream, server_name, config, Some(handshake_timeout))
+    }
+
+    fn connect_stream_within(
+        stream: Box<dyn TlsStream>,
+        server_name: &str,
+        config: Arc<rustls::ClientConfig>,
+        handshake_timeout: Option<Duration>,
     ) -> RpcResult<Self> {
         let name = ServerName::try_from(server_name.to_string())
             .map_err(|_| RpcError::Protocol("invalid TLS server name"))?;
         let cc = ClientConnection::new(config, name)
             .map_err(|_| RpcError::Protocol("rustls ClientConnection::new failed"))?;
         let mut conn: Connection = cc.into();
-        drive_handshake(&mut conn, &*stream)?;
+        drive_handshake_within(&mut conn, &*stream, handshake_timeout)?;
         let peer = PeerIdentity::Certificate(cert_identity(conn.peer_certificates(), server_name)?);
         Ok(TlsTransport {
             conn: Mutex::new(conn),
@@ -477,14 +561,42 @@ impl TlsTransport {
     /// [`PeerIdentity::Anonymous`] connection — encrypted but with no
     /// authenticated peer. Authorization of such peers must be enforced
     /// by the caller's `set_authorizer` chokepoint.
+    ///
+    /// The handshake has no deadline here: a client that connects and
+    /// stays silent holds this call until the stream itself fails. Use
+    /// [`accept_stream_with`](Self::accept_stream_with) to bound it.
     pub fn accept_stream(
         stream: Box<dyn TlsStream>,
         config: Arc<rustls::ServerConfig>,
     ) -> RpcResult<Self> {
+        Self::accept_stream_within(stream, config, None)
+    }
+
+    /// [`accept_stream`](Self::accept_stream) with a deadline on the
+    /// handshake, as `RpcServer`'s own TLS accept path sets one
+    /// ([`RpcServer::set_handshake_timeout`](crate::rpc::RpcServer::set_handshake_timeout)).
+    ///
+    /// The deadline, its clearing on success and the refusal of
+    /// `Duration::ZERO` are those of
+    /// [`connect_stream_with`](Self::connect_stream_with).
+    pub fn accept_stream_with(
+        stream: Box<dyn TlsStream>,
+        config: Arc<rustls::ServerConfig>,
+        handshake_timeout: Duration,
+    ) -> RpcResult<Self> {
+        refuse_zero_handshake_timeout(handshake_timeout, "TlsTransport::accept_stream_with")?;
+        Self::accept_stream_within(stream, config, Some(handshake_timeout))
+    }
+
+    fn accept_stream_within(
+        stream: Box<dyn TlsStream>,
+        config: Arc<rustls::ServerConfig>,
+        handshake_timeout: Option<Duration>,
+    ) -> RpcResult<Self> {
         let sc = ServerConnection::new(config)
             .map_err(|_| RpcError::Protocol("rustls ServerConnection::new failed"))?;
         let mut conn: Connection = sc.into();
-        drive_handshake(&mut conn, &*stream)?;
+        drive_handshake_within(&mut conn, &*stream, handshake_timeout)?;
         let peer = match conn.peer_certificates() {
             Some(c) if !c.is_empty() => {
                 PeerIdentity::Certificate(cert_identity(Some(c), "<mtls-client>")?)

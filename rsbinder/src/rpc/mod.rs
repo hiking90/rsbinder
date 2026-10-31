@@ -141,6 +141,15 @@ pub use transport::{CertId, PeerIdentity, RpcTransport};
 #[cfg(feature = "rpc-tls")]
 pub use rustls;
 
+/// Re-export of the exact `vsock` crate the `vsock` backend links, so a
+/// caller builds the `vsock::VsockStream` it hands to
+/// [`VsockTransport::from_stream`](transport::VsockTransport::from_stream)
+/// (or, with `rpc-tls`, to TLS as a `TlsStream`) from the version
+/// rsbinder's signatures name, without a direct `vsock` dependency
+/// pinned to match it.
+#[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
+pub use vsock;
+
 use std::fmt;
 
 /// Refuses a proxy at registration, not late at write (AOSP `RpcState::onBinderLeaving`).

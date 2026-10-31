@@ -2102,6 +2102,8 @@ pub fn rsbinder::hub::android_16::remove_accessor_provider(rsbinder::hub::androi
 pub fn rsbinder::hub::android_16::resolve_accessor(&str, rsbinder::SIBinder) -> core::option::Option<rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata>
 pub fn rsbinder::hub::android_16::resolve_via_process_local(&str) -> core::option::Option<rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata>
 pub fn rsbinder::hub::android_16::try_get_service(&rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager, &str) -> rsbinder::Result<core::option::Option<rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata>>
+pub fn rsbinder::hub::android_16::try_resolve_accessor(&str, rsbinder::SIBinder) -> rsbinder::BinderResult<rsbinder::SIBinder>
+pub fn rsbinder::hub::android_16::try_resolve_via_process_local(&str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
 pub fn rsbinder::hub::android_16::try_unregister_service(&rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager, &str, &rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::hub::android_16::unregister_for_notifications(&rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::Result<()>
 pub type rsbinder::hub::android_16::AccessorAddrProvider = alloc::boxed::Box<(dyn core::ops::function::Fn(&str) -> rsbinder::Result<rsbinder::hub::android_16::AccessorSockAddr> + core::marker::Send + core::marker::Sync)>
