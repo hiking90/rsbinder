@@ -146,6 +146,7 @@ impl Default for SubscriberPolicy {
 /// publisher lent is read ([`Sample`]). `request` makes an [`Untrusted`] subscriber; on a topic of
 /// [`Bytes`], `unsafe` [`trust_publisher`](Subscriber::trust_publisher) makes it
 /// [`Trusted`](crate::Trusted).
+#[must_use = "dropping the subscriber at once ends the subscription at once"]
 pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     /// Raises `ABANDON` on drop, first of the fields: a pool wait lets go of the memory now.
     _abandon: Abandon,

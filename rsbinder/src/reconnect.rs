@@ -356,6 +356,7 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
 ///
 /// Not `Clone`: dropping it ends the helper. Share it behind an `Arc`, and
 /// give callback objects a [`WeakReconnecting`].
+#[must_use = "dropping the helper at once closes it at once"]
 pub struct Reconnecting<T: FromIBinder + ?Sized + 'static> {
     shared: Arc<Shared<T>>,
 }

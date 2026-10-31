@@ -135,6 +135,7 @@ const DRAIN_STALLS: u32 = 2;
 /// call into it, and without the pool the subscriber never connects.
 ///
 /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
+#[must_use = "dropping the subscriber at once ends the subscription at once"]
 pub struct NamedSubscriber<T: Payload> {
     named: Arc<Named<T>>,
     current: Option<Connection<T>>,

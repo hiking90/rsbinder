@@ -120,6 +120,7 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 ///   boundary — a silently wrong table is worse than none.
 ///
 /// [`purge_dead`]: Self::purge_dead
+#[must_use = "dropping the table unlinks the death links of every wrapper it made"]
 pub struct Rewrap<I: FromIBinder + ?Sized> {
     // `Box<dyn Fn>`, not a fn pointer, so a capturing closure is accepted too.
     make_local: Box<dyn Fn(Strong<I>) -> Strong<I> + Send + Sync>,

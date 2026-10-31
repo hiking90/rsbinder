@@ -906,6 +906,7 @@ enum SinkInner<T: ?Sized> {
 /// for room is given up; the terminator's message says how many. It does
 /// wait for a batch a dropped future left on the pool on the RPC path,
 /// which is bounded by that one send rather than by the consumer.
+#[must_use = "dropping the sink ends the stream as failed (`EX_ILLEGAL_STATE`); call `end`"]
 pub struct Sink<T: ?Sized> {
     inner: SinkInner<T>,
     /// [`SinkPolicy::send_timeout`]; each call turns it into a deadline.
@@ -1398,6 +1399,7 @@ enum ReceiverInner<T> {
 /// Consume with [`recv`](Self::recv), or by iterating: `Receiver`
 /// implements [`Iterator`] over `BinderResult<T>`, ending when the
 /// producer's terminator arrives.
+#[must_use = "dropping the receiver cancels the stream at the producer"]
 pub struct Receiver<T> {
     inner: ReceiverInner<T>,
     /// The peer, kept for the unlink in `Drop`.

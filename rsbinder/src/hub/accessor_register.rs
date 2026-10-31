@@ -535,8 +535,11 @@ pub fn remove_accessor_provider(
 
 /// RAII handle returned by
 /// [`add_accessor_provider`]. Dropping the handle un-registers the
-/// provider; ignore the handle (`_handle`) only if you want the
-/// provider to live for the whole process lifetime.
+/// provider, and so does `let _ = add_accessor_provider(..)` at once;
+/// `let _handle = ..` keeps it until the end of the scope.
+/// [`keep_for_process`](Self::keep_for_process) keeps it until the
+/// process exits, which is what AOSP's `addAccessorProvider` does when
+/// its caller discards the returned weak pointer.
 ///
 /// The handle carries a `Weak` reference to the provider entry's
 /// `Arc<AccessorProviderFn>` so its lifetime tracks the registry
@@ -548,6 +551,7 @@ pub fn remove_accessor_provider(
 /// `Debug` is implemented so callers can `.expect()`/`.expect_err()`
 /// against `Result<AccessorProviderHandle, _>`; the body deliberately
 /// omits the inner `Weak` pointer value (only liveness is meaningful).
+#[must_use = "dropping the handle at once un-registers the provider; see `keep_for_process`"]
 pub struct AccessorProviderHandle {
     provider: Weak<AccessorProviderFn>,
 }
@@ -561,6 +565,14 @@ impl std::fmt::Debug for AccessorProviderHandle {
 }
 
 impl AccessorProviderHandle {
+    /// Keep the provider registered until the process exits.
+    ///
+    /// The handle is consumed, so [`remove_accessor_provider`] can no
+    /// longer remove this provider.
+    pub fn keep_for_process(self) {
+        std::mem::forget(self);
+    }
+
     /// Test-only: `true` while the provider entry is still in the registry.
     #[cfg(test)]
     fn is_live(&self) -> bool {
@@ -1120,6 +1132,18 @@ mod tests {
             lookup_accessor_provider(&instance).is_none(),
             "after explicit remove, lookup must be None"
         );
+    }
+
+    /// A kept provider stays registered: adding its instance again is refused.
+    #[test]
+    fn a_kept_provider_outlives_its_handle() {
+        let instance = unique_instance("kept");
+        let none: fn() -> AccessorProviderFn = || Box::new(|_: &str| None);
+        add_accessor_provider(HashSet::from([instance.clone()]), none())
+            .expect("add")
+            .keep_for_process();
+        let again = add_accessor_provider(HashSet::from([instance]), none());
+        assert_eq!(again.err(), Some(crate::error::StatusCode::AlreadyExists));
     }
 
     /// Concurrent register + lookup: no panic or deadlock; a lookup finds its provider or `None`.

@@ -336,6 +336,9 @@ Each item below changes what a 0.12.0 program observes.
 
 - **`ProcessState::try_start_thread_pool()`**: `start_thread_pool` that
   returns the failure to create the first worker.
+- **`AccessorProviderHandle::keep_for_process()`**: keeps the provider
+  registered until the process exits, as AOSP's `addAccessorProvider` does
+  when its caller discards the returned weak pointer.
 
 - **`[[service]] accessor` in `rsb_hub`'s configuration**: the name the
   `IAccessor` of an instance is registered under, AOSP's VINTF `<accessor>`
@@ -547,6 +550,14 @@ Each item below changes what a 0.12.0 program observes.
   `AsyncFd::register_with_interest`; the constructors it replaces are
   deprecated there as unsound (tokio #8587). `rsbinder` itself makes no new
   call; the workspace shares one floor.
+- **Types whose drop ends something are `#[must_use]`**: `stream::Sink`
+  (ends the stream as failed), `stream::Receiver` (cancels it),
+  `DeathSignal` (unregisters the notification), `hub::AccessorProviderHandle`
+  (un-registers the provider), `reconnect::Reconnecting` (closes the helper)
+  and `bridge::Rewrap` (unlinks its wrappers). A value of one of them left
+  unused, `add_accessor_provider(set, f)?;` for one, now warns; the
+  attribute reaches through `?`. A provider meant to stay registered calls
+  `keep_for_process`.
 
 ### Fixed
 

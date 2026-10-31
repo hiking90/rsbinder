@@ -1653,6 +1653,8 @@ impl core::marker::UnsafeUnpin for rsbinder::hub::android_16::AccessorSockAddr
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::AccessorSockAddr
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::AccessorSockAddr
 pub struct rsbinder::hub::android_16::AccessorProviderHandle
+impl rsbinder::hub::android_16::AccessorProviderHandle
+pub fn rsbinder::hub::android_16::AccessorProviderHandle::keep_for_process(self)
 impl core::fmt::Debug for rsbinder::hub::android_16::AccessorProviderHandle
 pub fn rsbinder::hub::android_16::AccessorProviderHandle::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::drop::Drop for rsbinder::hub::android_16::AccessorProviderHandle

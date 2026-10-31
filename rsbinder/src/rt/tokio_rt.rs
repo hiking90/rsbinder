@@ -249,6 +249,7 @@ pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// `talk_with_driver`, which panics if the driver under-consumes. The unlink
 /// therefore runs under `catch_unwind` (as `bridge::unlink_all` does); a
 /// caught panic is logged and leaves the death link registered.
+#[must_use = "dropping the signal at once unregisters the death notification at once"]
 pub struct DeathSignal {
     rx: tokio::sync::oneshot::Receiver<()>,
     /// Strong: the link keeps only a `Weak`, so without this the notification would never fire.

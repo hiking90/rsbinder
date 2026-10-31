@@ -58,6 +58,7 @@ use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, Publ
 /// subscribers learn of it through binder and read what was written before.
 ///
 /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
+#[must_use = "dropping the publisher ends the topic at once: it writes the end record"]
 pub struct Publisher<T: Payload> {
     shared: Arc<Shared<T>>,
     binder: SIBinder,
@@ -287,6 +288,7 @@ impl Publisher<Bytes> {
 ///
 /// It dereferences to the value's bytes. [`publish`](Self::publish) hands it to the subscribers;
 /// dropping it unpublished gives the slot back. No subscriber reads the slot while it is lent.
+#[must_use = "dropping the loan gives the slot back unpublished; call `publish`"]
 pub struct LoanMut<'a> {
     writer: &'a TypedWriter<Bytes, Stored<Mapping>>,
     /// `None` once published.

@@ -894,7 +894,10 @@ mod pool {
     #[test]
     fn an_interrupt_ends_a_receive_after_a_wait_taken_back_from_a_busy_pool() {
         let interrupt = |interrupter: &Interrupter, _: &_| interrupter.interrupt();
-        a_receive_after_a_wait_taken_back_ends_at(interrupt, RecvError::Cancelled);
+        drop(a_receive_after_a_wait_taken_back_ends_at(
+            interrupt,
+            RecvError::Cancelled,
+        ));
     }
 
     #[test]
@@ -910,7 +913,7 @@ mod pool {
             local.raise(DIED);
         };
         let ends = RecvError::Closed(Closed::PublisherDied);
-        a_receive_after_a_wait_taken_back_ends_at(died, ends);
+        drop(a_receive_after_a_wait_taken_back_ends_at(died, ends));
     }
 
     /// Records behind a leaked wait the pool has not run: receives with no bound get them at once.
