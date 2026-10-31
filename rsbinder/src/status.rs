@@ -208,6 +208,13 @@ impl Status {
         }
     }
 
+    /// The success status (`EX_NONE`), for which [`is_ok`](Self::is_ok) is
+    /// `true`; AOSP Rust binder `Status::ok()`. The same as
+    /// `Status::from(ExceptionCode::None)`.
+    pub fn ok() -> Self {
+        Self::from(ExceptionCode::None)
+    }
+
     pub fn new_service_specific_error(err: i32, message: Option<String>) -> Self {
         Self::new(
             ExceptionCode::ServiceSpecific,
@@ -887,6 +894,12 @@ mod tests {
         let status = Status::deserialize(&mut parcel).expect("deserialize");
         assert_eq!(status.exception_code(), ExceptionCode::None);
         assert!(status.is_ok());
+    }
+
+    #[test]
+    fn ok_is_the_none_exception() {
+        assert!(Status::ok().is_ok());
+        assert_eq!(Status::ok(), Status::from(ExceptionCode::None));
     }
 
     /// AppOps header → reply header (-128) collapses to `EX_NONE` (`Status.cpp::readFromParcel`).

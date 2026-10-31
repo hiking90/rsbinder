@@ -4529,6 +4529,7 @@ pub fn rsbinder::Status::exception_code(&self) -> rsbinder::ExceptionCode
 pub fn rsbinder::Status::is_ok(&self) -> bool
 pub fn rsbinder::Status::message(&self) -> core::option::Option<&str>
 pub fn rsbinder::Status::new_service_specific_error(i32, core::option::Option<alloc::string::String>) -> Self
+pub fn rsbinder::Status::ok() -> Self
 pub fn rsbinder::Status::service_error<E: rsbinder::ServiceSpecificError>(&self) -> core::option::Option<E>
 pub fn rsbinder::Status::service_specific<E: rsbinder::ServiceSpecificError>(E, core::option::Option<&str>) -> Self
 pub fn rsbinder::Status::service_specific_error(&self) -> i32

@@ -391,6 +391,8 @@ Each item below changes what a 0.12.0 program observes.
 
 ### Added
 
+- **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
+  has it.
 - **`ProcessState::try_start_thread_pool()`**: `start_thread_pool` that
   returns the failure to create the first worker.
 - **`AccessorProviderHandle::keep_for_process()`**: keeps the provider
