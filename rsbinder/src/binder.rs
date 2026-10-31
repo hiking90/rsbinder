@@ -1464,9 +1464,11 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
     /// When the handle is a **local** binder that was published as a
     /// sync-only service (`Bn*::new_binder` rather than
     /// `new_async_binder`): its adapter has no async view, and the cast
-    /// is refused as `BadType`. Use [`try_into_async`](Self::try_into_async)
-    /// where that is a possibility (a service looked up from the same
-    /// process, for instance). Remote proxies always convert.
+    /// is refused as `BadType`. Remote proxies always convert, so whether a
+    /// handle from a lookup panics here depends on which process the service
+    /// was deployed in; AOSP's Rust binder converts this case too, through a
+    /// proxy over the local binder, which rsbinder does not have. Use
+    /// [`try_into_async`](Self::try_into_async) for a handle from a lookup.
     pub fn into_async<P>(self) -> Strong<<I as ToAsyncInterface<P>>::Target>
     where
         I: ToAsyncInterface<P>,

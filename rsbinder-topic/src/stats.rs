@@ -45,7 +45,9 @@ pub struct SubscriberInfo {
 }
 
 /// What a subscriber has received: [`Subscriber::stats`](crate::Subscriber::stats) and
-/// [`NamedSubscriber::stats`](crate::NamedSubscriber::stats). Counted in this process.
+/// [`NamedSubscriber::stats`](crate::NamedSubscriber::stats). Counted by the one subscriber
+/// object since it was made, in this process: a subscriber made again starts from zero, and two
+/// subscribers of one topic in one process count apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubscriberStats {
     /// Values returned.

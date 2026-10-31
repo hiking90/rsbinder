@@ -213,7 +213,7 @@ pub fn get_binder_proxy_counts_by_uid() -> Vec<(u32, u64)> {
         .collect()
 }
 
-/// Configure the warning / high / low watermarks. AOSP
+/// Configure the high / low / warning watermarks, in that argument order. AOSP
 /// `BpBinder::setBinderProxyCountWatermarks(high, low, warning)`.
 ///
 /// `warning` must be in `[low, high]` for the debounce logic to produce

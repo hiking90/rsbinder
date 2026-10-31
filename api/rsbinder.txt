@@ -4269,6 +4269,7 @@ pub fn rsbinder::ProcessState::set_call_restriction(&self, rsbinder::CallRestric
 pub fn rsbinder::ProcessState::start_thread_pool()
 pub fn rsbinder::ProcessState::strong_proxy_for_handle(&self, u32) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::ProcessState::strong_ref_count_for_node(&self, &rsbinder::ProxyHandle) -> rsbinder::Result<usize>
+pub fn rsbinder::ProcessState::try_start_thread_pool() -> rsbinder::Result<()>
 impl core::ops::drop::Drop for rsbinder::ProcessState
 pub fn rsbinder::ProcessState::drop(&mut rsbinder::ProcessState)
 impl !core::marker::Freeze for rsbinder::ProcessState

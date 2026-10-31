@@ -298,9 +298,10 @@ impl Server {
 
     /// Start serving and block. Kernel: checks the options, starts the
     /// thread pool, registers the [`add`](Self::add)ed names in order, then
-    /// joins the pool (never returns normally). RPC: runs the accept loop
-    /// until `RpcServer::stop_accepting` is called from another thread
-    /// (reachable via [`spawn`](Self::spawn)'s guard instead).
+    /// joins the pool (never returns normally). RPC: runs the accept loop on
+    /// this thread and returns only when accepting fails for good; nothing
+    /// outside can stop it, since `run` keeps the `RpcServer`. A server that
+    /// must be stopped uses [`spawn`](Self::spawn), whose guard stops it.
     ///
     /// Kernel: if registering a name fails, the error is returned and the
     /// names registered before it stay published — and served, since the
@@ -355,7 +356,7 @@ impl Server {
     /// Pool before names: a registered name always has a looper, even when a later one fails.
     fn start_kernel(self) -> Result<()> {
         self.apply_kernel_options()?;
-        ProcessState::start_thread_pool();
+        ProcessState::try_start_thread_pool()?;
         for (name, binder) in self.pending {
             crate::hub::add_service(&name, binder).map_err(|e| {
                 log::error!("rsbinder::serve: registering {name:?} failed: {e:?}");

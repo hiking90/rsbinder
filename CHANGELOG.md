@@ -281,8 +281,61 @@ Each item below changes what a 0.12.0 program observes.
 - `example-hello`'s `rpc_accessor_register_interop_server` takes an
   optional fourth argument, the name to register the accessor under; it
   registers under the instance name without one, as before.
+- **`permission_controller::check_permission` decides kernel or RPC from
+  `calling_caller()`, not from the parcel** (see Security). Its `reader`
+  argument is no longer consulted. Inside an RPC transaction the check
+  denies whatever parcel it is given; inside a kernel transaction it asks
+  `PermissionManagerService` about that transaction's caller. Generated
+  `@EnforcePermission` code is not affected: it passes the inbound parcel.
+- **`clear_calling_identity()` outside a kernel transaction, and during an
+  RPC dispatch, returns the token of this process's own uid and pid**, as
+  AOSP does, instead of `0` (see Security). It still changes nothing there.
+  Code that compared the token with `0` to tell whether it cleared
+  anything compares `has_explicit_identity()` instead.
+- **The `Binder` constructors panic on a scheduler floor AOSP refuses.**
+  `BinderFeatures::min_sched_policy` must be `SCHED_NORMAL` (0),
+  `SCHED_FIFO` (1) or `SCHED_RR` (2), and `min_priority` within `-20..=19`
+  for `SCHED_NORMAL` or `1..=99` for the two real-time policies; `None`
+  stands for `SCHED_NORMAL` and `0`. AOSP `BBinder::setMinSchedulerPolicy`
+  aborts on the same values. 0.12.0 masked the policy to two bits and the
+  priority to one byte, so `SCHED_IDLE` (5) reached the driver as
+  `SCHED_FIFO` and a priority of 300 as 44; `SCHED_BATCH`, which the
+  0.12.0 documentation allowed, is now refused.
+- **A call from another thread on an RPC session whose every outgoing
+  connection is held by a serve loop fails at once with `WouldBlock`.**
+  That is a client session served with `serve_blocking` or `spawn_serve`
+  and no fan-out connections. 0.12.0 waited for the slot under the session
+  timeout, without end when none was set, although the loop gives the slot
+  up only after a frame from the peer. A nested call from inside a handler
+  still uses the serve loop's connection. A client that keeps calling opens
+  incoming connections (`RpcClientConfig::incoming_connections`,
+  `ClientOptions::incoming_connections`); the `link_to_death` refusal
+  message now says when `spawn_serve` fits.
+- **`ProcessState::start_thread_pool` leaves the pool unstarted when its
+  first worker cannot be created**, so a later call tries again; 0.12.0
+  marked the pool started and every later call did nothing. Opening a
+  `binder://` `Client` and starting a kernel `Server` now return the
+  failure as an `Err` (`try_start_thread_pool`, see Added) instead of
+  succeeding with no pool.
+- **`MessageQueue::write`, `read`, `begin_write` and `begin_read` refuse
+  more elements than the capacity with `BadValue`**, as the blocking calls
+  and the unsync flavor already did; `begin_write_cached` refuses more than
+  its `limit` (capped at the capacity) the same way. 0.12.0 returned
+  `Ok(false)` / `Ok(None)`, the answer for "not now", and a loop that
+  polled until the transfer fit never ended. libfmq returns `false` there;
+  only the Rust signalling changes.
+- **`shm::Mapping::map` refuses, with `BadValue`, a range that reaches past
+  the end of a regular file** (a memfd is one). 0.12.0 mapped it, and the
+  first access past the end raised `SIGBUS`; the refusal reaches whatever
+  maps through it: `MessageQueue::attach`, `MappedHeap::from_fd` and so
+  `SharedMemory::from_fd`, `Parcel::read_blob` and a received `IMemory`.
+  An fd that is not a regular file (ashmem, a device) is not measured, and
+  a failed `fstat` leaves the fd to `mmap` as before.
 
 ### Added
+
+- **`ProcessState::try_start_thread_pool()`**: `start_thread_pool` that
+  returns the failure to create the first worker.
 
 - **`[[service]] accessor` in `rsb_hub`'s configuration**: the name the
   `IAccessor` of an instance is registered under, AOSP's VINTF `<accessor>`
@@ -531,6 +584,18 @@ Each item below changes what a 0.12.0 program observes.
 
 ### Security
 
+- **`check_permission` no longer grants an RPC peer through a kernel
+  parcel.** An RPC handler that passed `check_permission` a
+  kernel-marshalled parcel (a fresh `Parcel::new()`, or an outer kernel
+  reader it captured) got past the RPC deny, and `PermissionManagerService`
+  was asked about the RPC peer's uid; a Unix peer running as root was
+  granted unconditionally. The transport is now taken from
+  `calling_caller()`.
+- **A calling-identity token taken outside a transaction no longer makes
+  the caller root.** `clear_calling_identity()` returned `0` there, which
+  decodes to uid 0; restored inside a later kernel transaction, it made
+  every following `get_calling_uid()` check see root. The token now names
+  this process.
 - **The `rustls` floor is 0.23.46** for RUSTSEC-2026-0346 (client session
   `Debug` impls print TLS secrets), RUSTSEC-2026-0347 (application data
   sent to the outer server after an ECH rejection), RUSTSEC-2026-0348

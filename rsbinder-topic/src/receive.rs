@@ -53,7 +53,14 @@ pub enum RecvError {
 #[non_exhaustive]
 pub enum Disconnected {
     /// The topic of the connection ended, as [`Closed`] says. Every record before the end was
-    /// returned.
+    /// returned, but for [`Closed::Corrupted`], which ends the connection at the check that
+    /// failed.
+    ///
+    /// After [`Closed::End`], [`Closed::Status`] or [`Closed::PublisherDied`] the subscriber
+    /// forgets that publisher, looks the name up once, and connects to the next binder the name
+    /// is given to. After `Corrupted` it keeps the publisher and does not connect again until the
+    /// name is registered anew, to the same binder or another: while that publisher holds the
+    /// name, a receive waits with nothing more to report.
     Ended(Closed),
     /// The publisher refused the subscription with this status. Refusals that a retry cannot
     /// change (`EX_SECURITY`, `EX_UNSUPPORTED_OPERATION`, `BadType`, `InvalidOperation`,
@@ -99,6 +106,11 @@ pub enum Disconnected {
     /// receive of the drain makes at most two reads, so a publisher that keeps lapping it holds
     /// no receive; one that breaks the protocol to hold the drain where it is ends it the same
     /// way after two receives in a row that read nothing new.
+    ///
+    /// A drain that finds the previous publisher's memory failing a check stops there: the
+    /// records after that point are neither returned nor counted, since a corrupt ring gives no
+    /// index to count them by, and `Replaced` follows with no `Lagged` and no
+    /// [`Closed::Corrupted`] before it.
     ///
     /// [`try_latest`](crate::NamedSubscriber::try_latest) and
     /// [`recv_latest`](crate::NamedSubscriber::recv_latest) skip records without counting them,

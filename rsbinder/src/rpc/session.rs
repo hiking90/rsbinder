@@ -48,7 +48,10 @@
 //!    guard's drop release it.
 //! 3. **No `Outgoing` slot at all.** Fail at once with `WouldBlock` (AOSP `WOULD_BLOCK`,
 //!    "Session has no outgoing connections"): only a peer attach can add one, so waiting would
-//!    never end.
+//!    never end. The same holds when every `Outgoing` slot is held by a serve loop
+//!    (`serve_blocking`, `spawn_serve`, marked `serving`): the loop keeps its slot while the
+//!    peer is quiet, so the wait would end only on the peer's next frame. AOSP never reaches
+//!    this, since its `join` serves incoming connections only.
 //! 4. **Pool exhausted.** Wait on `slot_cv` (AOSP `mAvailableConnectionCv`), bounded by the
 //!    session timeout (then `WouldBlock`). Every wake-up re-checks the lifecycle and an empty
 //!    pool and returns `DeadObject`, since no attach refills a dead session.
@@ -1802,6 +1805,8 @@ mod slot_pool {
         pub(super) role: SlotRole,
         /// AOSP `allowNested`: set only while a twoway dispatched here runs; the peer reads then.
         pub(super) allow_nested: bool,
+        /// Held by a serve loop (`find_conn_pinned`), which keeps it while the peer is quiet.
+        pub(super) serving: bool,
         /// `DEC_STRONG`s held for this slot's next `REPLY`; module doc "Deferred `DEC_STRONG`".
         pub(super) pending_dec: std::collections::HashMap<RpcAddress, u32>,
         /// Private: only `SlotPool::push` builds a slot, so none can overwrite a pooled one.
@@ -1850,6 +1855,7 @@ mod slot_pool {
                 id,
                 role,
                 allow_nested: false,
+                serving: false,
                 pending_dec: std::collections::HashMap::new(),
                 _pooled: (),
             });
@@ -1966,6 +1972,7 @@ impl Drop for ConnGuard<'_> {
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
             if let Some(s) = st.slots.iter_mut().find(|s| s.id == self.slot_id) {
                 s.exclusive_tid = None;
+                s.serving = false;
             }
             drop(st);
             self.inner.slot_cv.notify_all();
@@ -2365,6 +2372,22 @@ impl RpcSessionInner {
                 }
                 return Err(StatusCode::WouldBlock);
             }
+            // (3) Serve loops hold every `Outgoing` slot until the peer speaks: module doc.
+            if st
+                .slots
+                .iter()
+                .filter(|s| s.role == SlotRole::Outgoing)
+                .all(|s| s.serving)
+            {
+                log::error!(
+                    "RPC: every outgoing connection of this session is held by a serve loop \
+                     (RpcSession::serve_blocking / spawn_serve), so only a nested call from \
+                     inside a handler can transact here; a client that keeps calling opens \
+                     incoming connections (RpcClientConfig::incoming_connections / \
+                     ClientOptions::incoming_connections) instead"
+                );
+                return Err(StatusCode::WouldBlock);
+            }
             // (4) Pool exhausted: wait under the session deadline; only the peer frees serve slots.
             let deadline = *self.shared.timeout.lock().expect("timeout poisoned");
             // Absolute: unrelated `slot_cv` wakes would re-arm a per-wake deadline.
@@ -2512,6 +2535,7 @@ impl RpcSessionInner {
                 return Err(StatusCode::DeadObject);
             };
             if slot.exclusive_tid.is_none() || slot.exclusive_tid == Some(tid) {
+                slot.serving = true;
                 return Ok(self.claim_slot(slot, tid));
             }
             #[cfg(test)]
@@ -4988,7 +5012,8 @@ impl RpcSession {
     ///
     /// The loop holds the founding connection while it waits, so a
     /// single-connection session makes no further calls of its own once it
-    /// is served — only nested ones from inside a handler. A client that
+    /// is served — only nested ones from inside a handler; a call from any
+    /// other thread fails at once with [`StatusCode::WouldBlock`]. A client that
     /// keeps calling and also wants death notification opens incoming
     /// connections instead
     /// ([`RpcClientConfig::incoming_connections`]).
@@ -6959,6 +6984,42 @@ mod tests {
         drop(slot_transport);
         let _ = peer_dup.shutdown(std::net::Shutdown::Both);
         peer_thread.join().expect("peer thread");
+    }
+
+    /// A call from another thread while a serve loop holds the only `Outgoing` slot fails at once.
+    #[test]
+    fn a_call_beside_the_serve_loop_on_the_only_outgoing_slot_does_not_wait() {
+        let (a, _b) = super::super::transport::UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        session.set_timeout(None);
+        let server_tid = std::thread::spawn(current_tid).join().expect("tid thread");
+        {
+            let mut st = session.inner.conn_state.lock().expect("conn_state");
+            let slot = &mut st.slots[0];
+            // As `serve_blocking` leaves a client's founding slot while the peer is quiet.
+            slot.role = SlotRole::Outgoing;
+            slot.exclusive_tid = Some(server_tid);
+            slot.serving = true;
+        }
+        let started = Instant::now();
+        let refused = session.inner.find_conn().err();
+        assert_eq!(refused, Some(StatusCode::WouldBlock));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no wait on slot_cv"
+        );
+
+        // A slot held by a call, not a serve loop, is still waited for (here: bounded).
+        session.inner.conn_state.lock().expect("conn_state").slots[0].serving = false;
+        session.set_timeout(Some(Duration::from_millis(50)));
+        assert_eq!(
+            session.inner.find_conn().err(),
+            Some(StatusCode::WouldBlock)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the pool-exhausted wait ran"
+        );
     }
 
     /// plans/10-7b-streaming-over-fmq.md §13.3: a twoway still nests, a oneway is `WouldBlock`.

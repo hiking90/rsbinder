@@ -58,7 +58,7 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 #[cfg(not(loom))]
 use std::thread::yield_now;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// `stop`: an [`Interrupter`](crate::Interrupter) asked, raised with [`KICK`]. A receive's wait
 /// ends at it and takes both ([`Local::cancelled`]); a wait on the pool ends at it and leaves it to
@@ -98,6 +98,33 @@ const RECHECKS: u32 = 64;
 /// Under loom one: every yield is a branch point of the model, and one is enough to reach both.
 #[cfg(loom)]
 const RECHECKS: u32 = 1;
+
+/// A raise's first sleep between wakes, once a round of yields has not seen the wait out.
+const FIRST_NAP: Duration = Duration::from_micros(50);
+/// The longest: a wake lost at most this long ago is sent again.
+const LAST_NAP: Duration = Duration::from_millis(1);
+
+/// Yield once, then sleep `FIRST_NAP` doubling to `LAST_NAP`: a sleep frees the core, a yield may not.
+fn pause(nap: &mut Duration) {
+    if nap.is_zero() {
+        yield_now();
+        *nap = FIRST_NAP;
+    } else {
+        sleep(*nap);
+        *nap = (*nap * 2).min(LAST_NAP);
+    }
+}
+
+#[cfg(not(loom))]
+fn sleep(nap: Duration) {
+    std::thread::sleep(nap);
+}
+
+/// Under loom a sleep is one more branch point, as a yield is.
+#[cfg(loom)]
+fn sleep(_nap: Duration) {
+    yield_now();
+}
 
 /// What a wait sleeps on: the topic's `seq` and the subscriber's `state`.
 pub(crate) trait Words: Send + Sync {
@@ -261,9 +288,12 @@ impl<W: Words> Local<W> {
     /// With an fd, a send that queues no byte for want of memory (`ENOBUFS`, `ENOMEM`) does not
     /// end the raise: a byte already on the fd makes no new edge for a poll registered
     /// edge-triggered, which may have taken that byte's edge already, and a byte sent makes one.
-    /// So while the wait is parked and sends fail so, the raise sends again, a yield apart, until
-    /// one is queued or the wait ends. A send that finds the send buffer full (`EAGAIN`) or the
-    /// socket shut down (`EPIPE`) ends it with no byte sent, and so with no new edge.
+    /// So while the wait is parked and sends fail so, the raise sends again, a [`pause`] apart,
+    /// until one is queued or the wait ends. A send that finds the send buffer full (`EAGAIN`) or
+    /// the socket shut down (`EPIPE`) ends it with no byte sent, and so with no new edge.
+    ///
+    /// With a futex, the wake is sent again after `RECHECKS` yields and then a [`pause`] apart,
+    /// for as long as the wait stays parked: only the waiter's thread running ends the raise.
     pub(crate) fn raise(&self, bit: u32) -> usize {
         self.stop.fetch_or(bit, Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -278,6 +308,7 @@ impl<W: Words> Local<W> {
         let waiting =
             || self.stop.load(Ordering::SeqCst) & watch != 0 && self.parked.load(Ordering::SeqCst);
         let mut wakes = 0;
+        let mut nap = Duration::ZERO;
         if words.latched() {
             // A byte stays until the wait, `parked` down, drains it: one that lands will do.
             while waiting() {
@@ -285,13 +316,17 @@ impl<W: Words> Local<W> {
                 if words.wake() {
                     break;
                 }
-                yield_now();
+                pause(&mut nap);
             }
             return wakes;
         }
         while waiting() {
             words.wake();
             wakes += 1;
+            if !nap.is_zero() {
+                pause(&mut nap);
+                continue;
+            }
             // A woken thread takes a while to run; wake again only if this one may have been lost.
             for _ in 0..RECHECKS {
                 yield_now();
@@ -299,6 +334,7 @@ impl<W: Words> Local<W> {
                     return wakes;
                 }
             }
+            nap = FIRST_NAP;
         }
         wakes
     }
@@ -772,6 +808,58 @@ mod pool {
             assert!(joined);
             assert!(took < Duration::from_secs(3), "missed the wake: {took:?}");
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod raise_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::{Local, Words, DIED};
+
+    /// Words whose wake reaches no one: only the waiter's own `disarm` ends a raise.
+    struct Unheard(AtomicUsize);
+
+    impl Words for Unheard {
+        fn seq(&self) -> u32 {
+            0
+        }
+        fn begin_wait(&self, _seen: u32) {}
+        fn end_wait(&self) -> bool {
+            false
+        }
+        fn sleep(&self, _seen: u32, _deadline: Option<Instant>) -> bool {
+            true
+        }
+        fn wake(&self) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        fn latched(&self) -> bool {
+            false
+        }
+    }
+
+    /// A waiter that stays asleep 50 ms gets wakes a sleep apart, not one per round of yields.
+    #[test]
+    fn a_raise_at_a_waiter_that_does_not_run_sleeps_between_wakes() {
+        let local = Arc::new(Local::new());
+        local.set_words(Unheard(AtomicUsize::new(0)));
+        assert_eq!(local.arm(0), 0);
+        let waiter = {
+            let local = local.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                local.disarm();
+            })
+        };
+        let wakes = local.raise(DIED);
+        waiter.join().unwrap();
+        assert_eq!(wakes, local.words().0.load(Ordering::Relaxed));
+        // 50 µs doubling to 1 ms is about 55 wakes in 50 ms; rounds of yields send hundreds.
+        assert!((1..=80).contains(&wakes), "{wakes} wakes");
     }
 }
 

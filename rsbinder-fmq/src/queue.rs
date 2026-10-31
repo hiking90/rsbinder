@@ -414,13 +414,14 @@ impl<T: Element> MessageQueue<T> {
         unsafe { Regions::over(self.ring.base, self.ring.bytes, position, n, false) }
     }
 
-    /// Reserve `n` elements to write. `None` when fewer are free (or `n`
-    /// exceeds the capacity); the reservation is made real by
+    /// Reserve `n` elements to write. `None` when fewer are free now;
+    /// [`BadValue`](Error::BadValue) when `n` exceeds the capacity, which no
+    /// wait can make room for. The reservation is made real by
     /// [`commit_write`](Self::commit_write). The two regions of the result
     /// are the part before the ring's end and the part after its wrap.
     pub fn begin_write(&mut self, n: usize) -> Result<Option<Regions<'_, T>>> {
         if n > self.capacity {
-            return Ok(None);
+            return Err(Error::BadValue("more items than the queue holds"));
         }
         let (read, write) = self.positions()?;
         let free = self.capacity - ((write - read) / size_of::<T>() as u64) as usize;
@@ -453,7 +454,8 @@ impl<T: Element> MessageQueue<T> {
     /// [`begin_write`](Self::begin_write) for a writer that relies on being
     /// the queue's only one, keeping at most `limit` elements in flight once
     /// these `n` are in (`limit` is capped at the capacity). `None` when they
-    /// do not fit.
+    /// do not fit now; [`BadValue`](Error::BadValue) when `n` exceeds that
+    /// capped `limit`, which they never fit.
     ///
     /// The write counter is this handle's own: it is loaded on the first
     /// call, then taken from what
@@ -481,7 +483,7 @@ impl<T: Element> MessageQueue<T> {
     pub fn begin_write_cached(&mut self, n: usize, limit: usize) -> Result<Option<Regions<'_, T>>> {
         let limit = limit.min(self.capacity);
         if n > limit {
-            return Ok(None);
+            return Err(Error::BadValue("more items than the limit in flight"));
         }
         let (read, write) = match self.writer_view {
             Some(view) => view,
@@ -540,12 +542,13 @@ impl<T: Element> MessageQueue<T> {
         Ok(())
     }
 
-    /// The next `n` unread elements, or `None` when fewer are available (or
-    /// `n` exceeds the capacity). Copy them out, then
+    /// The next `n` unread elements, or `None` when fewer are available now;
+    /// [`BadValue`](Error::BadValue) when `n` exceeds the capacity, which
+    /// never holds that many. Copy them out, then
     /// [`commit_read`](Self::commit_read) to free the space.
     pub fn begin_read(&mut self, n: usize) -> Result<Option<Regions<'_, T>>> {
         if n > self.capacity {
-            return Ok(None);
+            return Err(Error::BadValue("more items than the queue holds"));
         }
         let (read, write) = self.positions()?;
         let available = ((write - read) / size_of::<T>() as u64) as usize;
@@ -569,7 +572,8 @@ impl<T: Element> MessageQueue<T> {
         Ok(())
     }
 
-    /// Write all of `items`, or none: `Ok(false)` when they do not fit now.
+    /// Write all of `items`, or none: `Ok(false)` when they do not fit now,
+    /// [`BadValue`](Error::BadValue) when there are more than the capacity.
     pub fn write(&mut self, items: &[T]) -> Result<bool> {
         {
             let Some(mut regions) = self.begin_write(items.len())? else {
@@ -582,7 +586,8 @@ impl<T: Element> MessageQueue<T> {
     }
 
     /// Fill all of `out`, or nothing: `Ok(false)` when fewer elements are
-    /// available.
+    /// available now, [`BadValue`](Error::BadValue) when `out` is longer than
+    /// the capacity.
     pub fn read(&mut self, out: &mut [T]) -> Result<bool> {
         {
             let Some(regions) = self.begin_read(out.len())? else {
@@ -609,6 +614,14 @@ impl<T: Element> MessageQueue<T> {
     /// `writeBlocking` ignores it. An `Err` there would invite a retry that
     /// writes the items twice. The bits are set before the futex call, so a
     /// waiter that has not yet slept still sees them.
+    ///
+    /// Only the transfer or the deadline ends the call, as in libfmq. A bit
+    /// another thread or process sets wakes it only when the bit is in
+    /// `wait_bits`; the wait then takes the bit off the word and tries the
+    /// transfer again, so the bit is not seen by anyone else. To stop a
+    /// blocked writer from outside, give it a deadline, or wait on the
+    /// [`EventFlag`](crate::EventFlag) yourself and transfer with
+    /// [`write`](Self::write).
     pub fn write_blocking(
         &mut self,
         items: &[T],
@@ -648,8 +661,8 @@ impl<T: Element> MessageQueue<T> {
     /// (normally [`NOT_EMPTY`](crate::NOT_EMPTY)) while too few elements are
     /// available, and setting `wake_bits` (normally
     /// [`NOT_FULL`](crate::NOT_FULL); `0` for none) once they are out.
-    /// libfmq `readBlocking`; the failures are those of
-    /// [`write_blocking`](Self::write_blocking).
+    /// libfmq `readBlocking`; the failures, and what ends the wait, are those
+    /// of [`write_blocking`](Self::write_blocking).
     pub fn read_blocking(
         &mut self,
         out: &mut [T],

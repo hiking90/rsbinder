@@ -25,11 +25,11 @@
 //! [`crate::permission_controller::PermissionAuthority`] installed, the
 //! [`crate::permission_controller::check_permission`] convenience
 //! returns `false` (fail-closed) on each path it can take **as long as
-//! nothing is registered under that name**: a parcel that
-//! does not use kernel marshalling is denied by the marshalling-mode gate
-//! before the lookup is reached, a kernel-marshalling parcel outside a
-//! transaction is denied by the `is_handling_transaction` gate, and a
-//! lookup that yields `Ok(None)` or `Err` denies as well. The Linux
+//! nothing is registered under that name**: a check inside an RPC
+//! transaction and a check outside any transaction are denied before the
+//! lookup is reached, and a lookup that yields `Ok(None)` or `Err` denies
+//! as well. The lookup is reached only inside a kernel transaction, so
+//! kernel binder is initialized whenever it runs. The Linux
 //! `hub` is a general-purpose service manager: a process allowed to
 //! register can [`crate::hub::add_service`] a binder under the name
 //! `"permission"`, and if its descriptor matches, the lookup
@@ -42,16 +42,6 @@
 //! under another binder or restarting the service manager does not change
 //! which process answers, and the kept strong reference counts as a client
 //! of the registered service, so its `tryUnregisterService` is refused.
-//!
-//! With nothing registered under that name, the `ProcessState` panic is
-//! the one outcome that is not a `false`.
-//! Reaching it takes a kernel-marshalling parcel *and* an in-flight
-//! transaction *and* a process with no kernel binder — a combination only
-//! an RPC dispatch handed some parcel other than its own inbound one can
-//! produce, since `is_handling_transaction` is otherwise false there.
-//! Generated `@EnforcePermission` code always passes the inbound RPC
-//! parcel, which stops at the first gate, so this is reachable only from
-//! a hand-written handler.
 
 include!(concat!(env!("OUT_DIR"), "/permission_controller.rs"));
 
@@ -171,37 +161,21 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// become a **silent grant to any RPC peer that runs as root**; a peer on
 /// a transport that carries no uid (`Vsock`, TLS `Certificate`,
 /// `Anonymous`) reads the `u32::MAX` sentinel, which PMS knows nothing
-/// about. To prevent this, a `reader` that does not use kernel
-/// marshalling ([`Parcel::is_kernel_backed`] is `false`) returns `false`
-/// **before any uid read or PMS lookup**, regardless of process shape,
-/// and emits a one-time `warn`. Gating on the marshalling mode rather
-/// than on one named transport is what denies a mode added later by
-/// default. The deny does not depend on what uid an RPC transport
-/// carries — no uid makes an RPC parcel kernel-backed.
+/// about. To prevent this, a check made while an RPC transaction is the
+/// innermost one on this thread ([`crate::calling_caller`] is
+/// `Caller::Rpc`) returns `false` **before any PMS lookup**, whatever uid
+/// the transport carries, and emits a one-time `warn`.
 ///
-/// [`Parcel::is_kernel_backed`] answers only *which marshalling the
-/// parcel uses* — it is **not** a statement that a live kernel
-/// transaction vouched for the caller; a freshly constructed
-/// [`Parcel::new`] reports `true` as well. Whether a transaction is in
-/// flight is a second question, which this function asks separately via
-/// [`crate::is_handling_transaction`]. Nesting is handled: while an RPC
-/// dispatch is on the stack, a nested kernel `BR_TRANSACTION` dispatched
-/// on the same thread hands the handler a kernel-marshalled `reader`, and
-/// the outer RPC calling context is suspended for the duration of that
-/// inner dispatch, so [`crate::get_calling_uid`] /
-/// [`crate::get_calling_pid`] answer for the **kernel** caller. PMS is
-/// therefore asked about the kernel caller's uid, not the suspended RPC
-/// peer's.
-///
-/// The other direction is not symmetric. While a kernel dispatch calls out
-/// over RPC, the peer's inbound dispatch is the innermost frame and its
-/// calling context stays installed, so an RPC handler that passes a
-/// kernel-marshalled parcel — a fresh [`Parcel::new`], or the outer kernel
-/// `reader` it captured — gets past both gates above and PMS is asked about
-/// the **RPC peer's** uid. A Unix peer running as root is granted
-/// unconditionally there. Producing that combination takes a hand-written
-/// handler that hands this function a parcel other than the one it was
-/// dispatched with.
+/// The transport is decided by [`crate::calling_caller`] alone, the
+/// calling context the dispatcher installed for the innermost transaction
+/// on this thread. `reader` is not consulted: generated code passes the
+/// inbound parcel, but a parcel's marshalling mode says nothing about who
+/// is calling, and a handler can hand this function any parcel. Nesting
+/// follows the innermost frame in both directions: a kernel
+/// `BR_TRANSACTION` dispatched inside an RPC handler suspends the RPC
+/// calling context, so PMS is asked about the kernel caller; an RPC
+/// dispatch inside a kernel handler is the innermost frame, so the check
+/// denies.
 ///
 /// RPC services needing authorization must use transport-native means
 /// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
@@ -210,10 +184,9 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// # Fail-closed semantics
 ///
 /// **With no [`PermissionAuthority`] installed**, returns `false` when:
-/// - `reader` does not use kernel marshalling (see above) — a property of
-///   the parcel, not of how the transaction was dispatched.
+/// - The innermost transaction on this thread is an RPC one (see above).
 /// - The current thread is not handling a binder transaction (explicit
-///   deny before uid/pid are read or PMS is consulted).
+///   deny before PMS is consulted).
 /// - The `permission` service is unreachable (`system_server` absent) —
 ///   the lookup error denies.
 /// - The remote `checkPermission` call returns an error.
@@ -235,16 +208,6 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// lookup. Unlike AOSP, a missing service is not waited for: the check
 /// denies at once.
 ///
-/// # Panics
-///
-/// Panics if the [`default()`] lookup is reached in a process where
-/// kernel binder was never initialized (`ProcessState::as_self`). That
-/// takes a kernel-marshalling `reader` *and* an in-flight transaction
-/// *and* an uninitialized `ProcessState` — see the [module
-/// docs](crate::permission_controller) for the one path that produces all
-/// three. An installed [`PermissionAuthority`] returns before the lookup,
-/// so it cannot panic here.
-///
 /// # Injected authority (Plan 2-16 Phase C)
 ///
 /// If a [`PermissionAuthority`] is installed via
@@ -254,32 +217,29 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// ([`crate::calling_caller`] returns `None`) the check fails closed
 /// without consulting it. With no authority installed (the default), the
 /// kernel→PMS / RPC→deny behavior applies unchanged.
-pub fn check_permission(reader: &Parcel, permission_name: &str) -> bool {
+pub fn check_permission(_reader: &Parcel, permission_name: &str) -> bool {
     // Clone the Arc out so the read lock is released before the (re-entrant) policy runs.
     let authority = AUTHORITY
         .read()
         .expect("permission authority poisoned")
         .clone();
+    // No caller (not in a transaction) ⇒ fail closed on either path.
+    let caller = crate::calling_caller();
     if let Some(authority) = authority {
-        // No caller (not in a transaction) ⇒ fail closed.
-        return crate::calling_caller()
-            .is_some_and(|caller| authority.check(permission_name, &caller));
+        return caller.is_some_and(|caller| authority.check(permission_name, &caller));
     }
-
-    // Deny before uid is read: an RPC uid is not a PMS uid (see rustdoc).
-    if !reader.is_kernel_backed() {
-        warn_enforce_permission_over_rpc();
-        return false;
+    match caller {
+        Some(Caller::Kernel { uid, pid, .. }) => ask_controller(&CONTROLLER, default, |pc| {
+            pc.checkPermission(permission_name, pid, uid as i32)
+        }),
+        // An RPC uid is not a PMS uid (see rustdoc).
+        #[cfg(feature = "rpc")]
+        Some(Caller::Rpc(_)) => {
+            warn_enforce_permission_over_rpc();
+            false
+        }
+        None => false,
     }
-    // Outside a transaction there is no caller: uid/pid would name this process itself.
-    if !crate::is_handling_transaction() {
-        return false;
-    }
-    let calling_pid = crate::get_calling_pid() as i32;
-    let calling_uid = crate::get_calling_uid() as i32;
-    ask_controller(&CONTROLLER, default, |pc| {
-        pc.checkPermission(permission_name, calling_pid, calling_uid)
-    })
 }
 
 type ControllerSlot = Mutex<Option<Arc<Strong<dyn IPermissionController>>>>;
@@ -316,6 +276,7 @@ fn ask_controller(
 }
 
 /// Warn once per process (not per interface) when `@EnforcePermission` first denies over RPC.
+#[cfg(feature = "rpc")]
 fn warn_enforce_permission_over_rpc() {
     use std::sync::Once;
     static WARNED: Once = Once::new();
@@ -438,7 +399,7 @@ mod tests {
         ));
     }
 
-    /// Plan 2-16 Phase A: an RPC parcel, or a kernel one outside a transaction, is denied pre-PMS.
+    /// Plan 2-16 Phase A: inside an RPC transaction, or outside any, the check denies pre-PMS.
     // `serial(authority)`: `AUTHORITY` is process-global and the delegation test sets it.
     #[cfg(feature = "rpc")]
     #[serial_test::serial(authority)]
@@ -450,21 +411,23 @@ mod tests {
 
         let mut rpc_parcel = Parcel::new();
         rpc_parcel.set_for_rpc(true).unwrap();
-        // In a simulated RPC transaction only the kernel-backing gate can produce the denial.
-        let _g = RpcCallingGuard::install(
-            Arc::new(PeerIdentity::Local { uid: 1000, pid: 7 }),
-            UNIX_CAPS,
-        );
+        let kernel_parcel = Parcel::new();
+        assert!(kernel_parcel.is_kernel_backed());
+        // A root peer: the uid PMS grants unconditionally, were it ever asked.
+        let _g =
+            RpcCallingGuard::install(Arc::new(PeerIdentity::Local { uid: 0, pid: 7 }), UNIX_CAPS);
         assert!(crate::is_handling_transaction());
         assert!(
             !check_permission(&rpc_parcel, "android.permission.INTERNET"),
             "RPC parcel must fail-closed regardless of uid/PMS"
         );
+        // The transport comes from the calling context, not from the parcel handed in.
+        assert!(
+            !check_permission(&kernel_parcel, "android.permission.INTERNET"),
+            "a kernel-marshalled parcel inside an RPC transaction must fail-closed too"
+        );
 
-        // Dropping the guard first keeps `default()` (and its `ProcessState`) out of reach.
         drop(_g);
-        let kernel_parcel = Parcel::new();
-        assert!(kernel_parcel.is_kernel_backed());
         // Without this the denial could come from `default()` failing, not from the gate.
         assert!(!crate::is_handling_transaction());
         assert!(

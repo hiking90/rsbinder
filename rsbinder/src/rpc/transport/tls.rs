@@ -213,6 +213,11 @@ pub trait TlsStream: Send + Sync {
     /// Flush the underlying stream.
     fn flush(&self) -> std::io::Result<()>;
     /// Set the read deadline for subsequent `read`s (`None` = blocking).
+    ///
+    /// A `read` that reaches the deadline fails with
+    /// [`ErrorKind::WouldBlock`](std::io::ErrorKind::WouldBlock), as std's
+    /// Unix sockets do: the session reads only that kind as a deadline, and
+    /// any other error, `TimedOut` included, as a lost connection.
     fn set_read_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
     /// Set the write deadline for subsequent `write`s (`None` = blocking).
     fn set_write_timeout(&self, t: Option<Duration>) -> std::io::Result<()>;
@@ -487,8 +492,10 @@ impl TlsTransport {
     }
 
     /// Client side over an established `tcp` stream (back-compat
-    /// convenience; sets `TCP_NODELAY`). Equivalent to boxing the
-    /// stream into [`TlsTransport::connect_stream`].
+    /// convenience). Sets `TCP_NODELAY`, then boxes the stream into
+    /// [`TlsTransport::connect_stream`], which does not set it: a
+    /// `TcpStream` passed there directly keeps Nagle's algorithm, so a
+    /// small frame can wait for the peer's delayed ACK.
     pub fn connect(
         tcp: TcpStream,
         server_name: &str,

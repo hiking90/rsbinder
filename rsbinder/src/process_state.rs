@@ -1683,8 +1683,14 @@ impl ProcessState {
     /// notification, an event-driven [`crate::hub::wait_for_service`]
     /// registration, or a [`crate::DeathRecipient`]. Only a fire-and-forget
     /// client that makes synchronous outbound calls and receives nothing back
-    /// can safely skip it. Idempotent — the first call wins, later calls are
-    /// no-ops.
+    /// can safely skip it. Idempotent — the first call that starts the pool
+    /// wins, later calls are no-ops.
+    ///
+    /// When the first worker cannot be created (the system refuses the thread,
+    /// e.g. `EAGAIN` under `RLIMIT_NPROC`), this logs the error and leaves the
+    /// pool unstarted, so a later call tries again. AOSP
+    /// `ProcessState::spawnPooledThread` ignores the same failure. Use
+    /// [`try_start_thread_pool`](Self::try_start_thread_pool) to see it.
     ///
     /// # Panics
     ///
@@ -1706,23 +1712,46 @@ impl ProcessState {
     /// receiving a transaction, then a late `start_thread_pool()`. This
     /// function itself is CAS-idempotent.
     pub fn start_thread_pool() {
+        if let Err(e) = Self::try_start_thread_pool() {
+            log::error!("start_thread_pool: the first pooled binder thread was not created: {e}");
+        }
+    }
+
+    /// [`start_thread_pool`](Self::start_thread_pool), returning the failure
+    /// to create the first worker instead of logging it.
+    ///
+    /// `Ok(())` once the pool is started, by this call or an earlier one. An
+    /// `Err` carries the `errno` the thread creation failed with, and leaves
+    /// the pool unstarted, so a later call tries again; until one succeeds the
+    /// process serves inbound transactions only on threads that
+    /// [`join_thread_pool`](Self::join_thread_pool) themselves.
+    ///
+    /// # Panics
+    ///
+    /// As [`start_thread_pool`](Self::start_thread_pool): if the process
+    /// state has not been initialized.
+    pub fn try_start_thread_pool() -> Result<()> {
         let this = Self::as_self();
         if this
             .thread_pool_started
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .is_err()
         {
-            // Mirror of AOSP `checkExpectingThreadPoolStart` (pool sized but never started).
-            if this.max_threads == 0 {
-                log::warn!(
-                    "start_thread_pool() with max_threads = 0: one worker is spawned, but the \
-                     kernel will never ask for another, so the pool cannot grow under load. \
-                     Pass DEFAULT_MAX_BINDER_THREADS (or any non-zero ceiling) to \
-                     ProcessState::init if this process serves incoming transactions."
-                );
-            }
-            this.spawn_pooled_thread(true);
+            return Ok(());
         }
+        // Mirror of AOSP `checkExpectingThreadPoolStart` (pool sized but never started).
+        if this.max_threads == 0 {
+            log::warn!(
+                "start_thread_pool() with max_threads = 0: one worker is spawned, but the \
+                 kernel will never ask for another, so the pool cannot grow under load. \
+                 Pass DEFAULT_MAX_BINDER_THREADS (or any non-zero ceiling) to \
+                 ProcessState::init if this process serves incoming transactions."
+            );
+        }
+        this.spawn_pooled_thread(true).inspect_err(|_| {
+            // No worker reads the driver for the pool: let a later call start it.
+            this.thread_pool_started.store(false, Ordering::Release);
+        })
     }
 
     fn make_binder_thread_name(&self) -> String {
@@ -1736,30 +1765,33 @@ impl ProcessState {
         format!("{driver_name}:{pid}_{seq:X}")
     }
 
-    pub(crate) fn spawn_pooled_thread(&self, is_main: bool) {
-        if self.thread_pool_started.load(Ordering::Relaxed) {
-            let name = self.make_binder_thread_name();
-            log::info!("Spawning new pooled thread, name={name}");
-            match thread::Builder::new().name(name).spawn(move || {
+    /// `Err` only when the thread could not be created; before the pool starts, a no-op.
+    pub(crate) fn spawn_pooled_thread(&self, is_main: bool) -> Result<()> {
+        // Dropped before the pool starts, as in AOSP; see `start_thread_pool` rustdoc.
+        if !self.thread_pool_started.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let name = self.make_binder_thread_name();
+        log::info!("Spawning new pooled thread, name={name}");
+        thread::Builder::new()
+            .name(name)
+            .spawn(move || {
                 // The `JoinHandle` is dropped, so a looper's exit error is only visible here.
                 if let Err(e) = thread_state::join_thread_pool(is_main) {
                     log::error!("pooled binder thread exited with {e}");
                 }
-            }) {
-                Ok(_) => {
-                    // Count only real spawns, per origin (see `main_thread_spawned` docs).
-                    if is_main {
-                        self.main_thread_spawned.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
-                    }
-                }
-                Err(e) => {
-                    log::error!("failed to spawn pooled binder thread: {e}");
-                }
-            }
+            })
+            .map_err(|e| {
+                log::error!("failed to spawn pooled binder thread: {e}");
+                StatusCode::from(e)
+            })?;
+        // Count only real spawns, per origin (see `main_thread_spawned` docs).
+        if is_main {
+            self.main_thread_spawned.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.kernel_started_threads.fetch_add(1, Ordering::SeqCst);
         }
-        // Dropped before the pool starts, as in AOSP; see `start_thread_pool` rustdoc.
+        Ok(())
     }
 
     pub fn strong_ref_count_for_node(&self, node: &ProxyHandle) -> Result<usize> {

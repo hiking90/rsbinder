@@ -132,10 +132,13 @@ impl Mapping {
     /// the `fstatfs` that looks for hugetlbfs is not an error of this call:
     /// the fd goes on to `mmap`.
     ///
-    /// A range that reaches past the end of the file maps without error on
-    /// Linux and faults on first touch; check the size
-    /// ([`region_size`](super::region_size)) before trusting an offset and
-    /// extent that came from a peer.
+    /// [`Error::BadValue`] too when `fd` is a regular file (a memfd is one)
+    /// and the range reaches past its end: `mmap` maps such a range, and the
+    /// first access past the end raises `SIGBUS`, so an offset and extent
+    /// from a peer would otherwise crash this process. Other fds are not
+    /// measured: ashmem's own `mmap` refuses a range past the region, and a
+    /// device's size is not its file size. A failure of the `fstat` that
+    /// measures the file is not an error of this call either.
     pub fn map(fd: BorrowedFd<'_>, offset: u64, extent: u64, access: Access) -> Result<Self> {
         let page = rustix::param::page_size() as u64;
         let map_offset = offset - offset % page;
@@ -153,6 +156,11 @@ impl Mapping {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if is_hugetlbfs(fd) {
             return Err(Error::BadValue("mapping of a hugetlbfs file"));
+        }
+        if regular_file_size(fd)
+            .is_some_and(|size| offset.checked_add(extent).is_none_or(|end| end > size))
+        {
+            return Err(Error::BadValue("mapping reaches past the end of the file"));
         }
         let base = mmap_shared(fd, len, access, map_offset)?;
         Ok(Self { base, len, delta })
@@ -245,6 +253,21 @@ fn mmap_shared(
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const HUGETLBFS_MAGIC: i128 = 0x9584_58f6;
 
+/// `fd`'s size when it is a regular file, whose pages past the end fault; `None` otherwise.
+#[cfg(unix)]
+fn regular_file_size(fd: BorrowedFd<'_>) -> Option<u64> {
+    let st = rustix::fs::fstat(fd).ok()?;
+    let regular =
+        rustix::fs::FileType::from_raw_mode(st.st_mode as _) == rustix::fs::FileType::RegularFile;
+    regular.then_some(st.st_size as u64)
+}
+
+/// No `mmap` to fault past the end there (`map` returns `Unsupported`).
+#[cfg(not(unix))]
+fn regular_file_size(_fd: BorrowedFd<'_>) -> Option<u64> {
+    None
+}
+
 /// Whether the kernel reports `fd`'s filesystem as hugetlbfs; `false` when `fstatfs` fails.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn is_hugetlbfs(fd: BorrowedFd<'_>) -> bool {
@@ -302,6 +325,28 @@ mod tests {
         assert_eq!(
             byte(whole.as_ptr(), offset + 7).load(Ordering::Relaxed),
             0xa5
+        );
+    }
+
+    /// A range past a regular file's end is refused: its first touch would be a `SIGBUS`.
+    #[test]
+    fn a_range_past_the_end_of_a_file_is_refused() {
+        let (file, page) = two_pages(&read_write());
+        let page = page as u64;
+        assert!(Mapping::map(file.as_fd(), 0, 2 * page, Access::ReadWrite).is_ok());
+        assert!(Mapping::map(file.as_fd(), 2 * page - 8, 8, Access::ReadWrite).is_ok());
+        let past = Some(Error::BadValue("mapping reaches past the end of the file"));
+        assert_eq!(
+            Mapping::map(file.as_fd(), 0, 2 * page + 1, Access::ReadWrite).err(),
+            past
+        );
+        assert_eq!(
+            Mapping::map(file.as_fd(), 2 * page, 8, Access::ReadWrite).err(),
+            past
+        );
+        assert_eq!(
+            Mapping::map(file.as_fd(), u64::MAX - 7, 8, Access::ReadWrite).err(),
+            past
         );
     }
 
