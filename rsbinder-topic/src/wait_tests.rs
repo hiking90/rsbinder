@@ -375,6 +375,59 @@ fn an_interrupt_before_the_wait_ends_the_next_one() {
     interrupter.interrupt();
 }
 
+/// Plan 17 T-11: two subscribers asleep on the topic's one `seq` word with different futex bits.
+/// A raise for one ends its sleep alone; a wake of every bit, as the publisher's, ends both, with
+/// `seq` as it was, so the masks alone decide.
+#[test]
+fn a_raise_wakes_its_own_subscribers_bit_and_a_wake_of_every_bit_ends_every_sleep() {
+    use std::num::NonZeroU32;
+
+    use crate::wait::{Local, Parts, Slept, Until, Words, INTERRUPTED};
+
+    let publisher = topic(64 << 10);
+    let first = subscriber(&publisher);
+    // The count that deals the bits is shared with the other tests: the next one may repeat it.
+    let mut second = subscriber(&publisher);
+    while second.local().bit() == first.local().bit() {
+        second = subscriber(&publisher);
+    }
+    let (a, b) = (first.local().clone(), second.local().clone());
+    let park = |local: &Arc<Local<Parts>>, within: Duration| {
+        let local = local.clone();
+        thread::spawn(move || {
+            let seen = local.words().seq();
+            local.park(seen, Some(&Until::new(Instant::now() + within)))
+        })
+    };
+
+    let woken = park(&a, Duration::from_secs(10));
+    let unwoken = park(&b, Duration::from_millis(500));
+    eventually("both sleep", || a.is_parked() && b.is_parked());
+    // Time to reach the kernel: a wait not yet in it would sleep through a stray wake too.
+    thread::sleep(Duration::from_millis(20));
+    a.raise(INTERRUPTED);
+    assert_eq!(joined(woken), Slept::Woke);
+    assert!(
+        b.is_parked(),
+        "a raise for one subscriber ended another's sleep"
+    );
+    assert_eq!(joined(unwoken), Slept::TimedOut);
+
+    assert!(a.take(INTERRUPTED));
+    let sleeping = [
+        park(&a, Duration::from_secs(10)),
+        park(&b, Duration::from_secs(10)),
+    ];
+    eventually("both sleep", || a.is_parked() && b.is_parked());
+    eventually("a wake of every bit ends both sleeps", || {
+        a.words().wake(NonZeroU32::MAX);
+        !a.is_parked() && !b.is_parked()
+    });
+    for sleeping in sleeping {
+        assert_eq!(joined(sleeping), Slept::Woke);
+    }
+}
+
 /// A wake that lands before a wait on that commit's `seq` sleeps: the next commit still wakes it.
 #[test]
 fn a_wake_sent_before_the_wait_sleeps_does_not_stand_for_the_next_commit() {

@@ -25,6 +25,20 @@
 //! raises `parked` and then loads `stop`, so either it sees the bit and does not sleep, or the
 //! waker sees `parked` and keeps waking until the waiter is out.
 //!
+//! Every subscription of a topic sleeps on the one `seq` word, so a futex wake reaches the
+//! waiters of every subscriber, in every process, whose futex bit it names (plan 17 T-11). Each
+//! subscriber's `Local` holds one bit of the 32, `getpid()` plus a count of the subscribers this
+//! process made, so a forked child does not repeat its parent's choices. Its wait sleeps on that
+//! bit and a raise in this process wakes that bit alone; the publisher wakes every bit, so a
+//! commit still ends every wait. A raise that keeps waking a wait that does not run (one wake
+//! per `pause`, up to a thousand a second) ends the sleeps of the other subscribers that hold its
+//! bit, about one in 32 of them across every process, and not those of every subscriber of the
+//! topic. The bit does not change how many wakes the raise sends. Two subscribers that hold one
+//! bit wake each other's waits for nothing, and a waiter woken for nothing looks at the ring and
+//! sleeps again: a shared bit costs wakes, never a lost one. The bit is kept by the kernel's futex
+//! alone, in no word of the topic memory or the control page, so the layout and its `VERSION`
+//! stay as they are.
+//!
 //! A subscription woken through an fd (plan 15 §5.5a) keeps the protocol and changes what sleeps
 //! and what wakes: the waiter loads `seq` once more after the fence and then polls its socket, and
 //! a wake from this process is a byte sent to that socket while the bit is up (an interrupt's
@@ -49,6 +63,7 @@ use loom::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 use loom::sync::Mutex;
 #[cfg(loom)]
 use loom::thread::yield_now;
+use std::num::NonZeroU32;
 #[cfg(not(loom))]
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
 #[cfg(all(feature = "tokio", not(loom)))]
@@ -154,10 +169,12 @@ pub(crate) trait Words: Send + Sync {
     fn begin_wait(&self, seen: u32);
     /// Drain an fd wake, then lower `WAITING` alone; `true` when the publisher's socket hung up.
     fn end_wait(&self) -> bool;
-    /// Sleep while `seq` holds `seen`; `false` when `deadline` passed first.
-    fn sleep(&self, seen: u32, deadline: Option<&Until>) -> bool;
-    /// Wake the sleeper; `false` when an fd wake queued no byte, which a later one may.
-    fn wake(&self) -> bool;
+    /// Sleep while `seq` holds `seen`, until a futex wake whose mask meets `bit`; `false` when
+    /// `deadline` passed first. An fd wait has no bits.
+    fn sleep(&self, seen: u32, deadline: Option<&Until>, bit: NonZeroU32) -> bool;
+    /// Wake the futex sleepers whose bit `mask` meets, or the fd wait; `false` when an fd wake
+    /// queued no byte, which a later one may.
+    fn wake(&self, mask: NonZeroU32) -> bool;
     /// Whether a wake sent before the sleep still ends it (a byte on the wake socket).
     fn latched(&self) -> bool;
 }
@@ -177,6 +194,8 @@ pub(crate) enum Slept {
 pub(crate) struct Local<W> {
     parked: AtomicBool,
     stop: AtomicU32,
+    /// The futex bit the wait sleeps on and a raise wakes (plan 17 T-11).
+    bit: NonZeroU32,
     /// Set once the topic memory is mapped; a death before that has nothing to wake.
     words: OnceLock<W>,
     /// A test's pause after a wait lowers `parked`, before it lowers `WAITING`.
@@ -190,11 +209,22 @@ pub(crate) struct Local<W> {
     pub(crate) arms: std::sync::atomic::AtomicUsize,
 }
 
+/// A subscriber's futex bit: `getpid()` plus the subscribers made before it here, mod 32.
+fn next_bit() -> NonZeroU32 {
+    // Not loom's: the choice of a bit is no step of the protocol, and a static outlives a model.
+    static MADE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // The pid each time, not once: a forked child counts on from another seed.
+    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let seed = std::process::id().wrapping_add(made);
+    NonZeroU32::new(1 << (seed % 32)).unwrap_or(NonZeroU32::MAX)
+}
+
 impl<W: Words> Local<W> {
     pub(crate) fn new() -> Self {
         Self {
             parked: AtomicBool::new(false),
             stop: AtomicU32::new(0),
+            bit: next_bit(),
             words: OnceLock::new(),
             #[cfg(all(test, not(loom)))]
             after_sleep: std::sync::Mutex::new(None),
@@ -226,7 +256,7 @@ impl<W: Words> Local<W> {
         }
         let slept = if stopped {
             Slept::Stopped
-        } else if self.words().sleep(seen, deadline) {
+        } else if self.words().sleep(seen, deadline, self.bit) {
             Slept::Woke
         } else {
             Slept::TimedOut
@@ -312,8 +342,9 @@ impl<W: Words> Local<W> {
     /// until one is queued or the wait ends. A send that finds the send buffer full (`EAGAIN`) or
     /// the socket shut down (`EPIPE`) ends it with no byte sent, and so with no new edge.
     ///
-    /// With a futex, the wake is sent again after `RECHECKS` yields and then a [`pause`] apart,
-    /// for as long as the wait stays parked: only the waiter's thread running ends the raise.
+    /// With a futex, the wake names this subscriber's futex bit alone, and is sent again after
+    /// `RECHECKS` yields and then a [`pause`] apart, for as long as the wait stays parked: only
+    /// the waiter's thread running ends the raise.
     pub(crate) fn raise(&self, bit: u32) -> usize {
         self.stop.fetch_or(bit, Ordering::SeqCst);
         fence(Ordering::SeqCst);
@@ -333,7 +364,7 @@ impl<W: Words> Local<W> {
             // A byte stays until the wait, `parked` down, drains it: one that lands will do.
             while waiting() {
                 wakes += 1;
-                if words.wake() {
+                if words.wake(self.bit) {
                     break;
                 }
                 pause(&mut nap);
@@ -341,7 +372,7 @@ impl<W: Words> Local<W> {
             return wakes;
         }
         while waiting() {
-            words.wake();
+            words.wake(self.bit);
             wakes += 1;
             if !nap.is_zero() {
                 pause(&mut nap);
@@ -376,6 +407,12 @@ impl<W: Words> Local<W> {
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn is_parked(&self) -> bool {
         self.parked.load(Ordering::SeqCst)
+    }
+
+    /// The futex bit the wait sleeps on.
+    #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn bit(&self) -> NonZeroU32 {
+        self.bit
     }
 
     /// Whether any bit is up: a spin before a wait stops at it.
@@ -607,7 +644,7 @@ mod real {
             hung_up
         }
 
-        fn sleep(&self, seen: u32, deadline: Option<&Until>) -> bool {
+        fn sleep(&self, seen: u32, deadline: Option<&Until>, bit: NonZeroU32) -> bool {
             if let Some(fd) = &self.fd {
                 // What the futex's compare does in the kernel: after `WAITING`, `seq` once more.
                 return self.seq() != seen || fd.sleep(deadline.map(|until| until.at));
@@ -617,18 +654,15 @@ mod real {
             }
             let futex = deadline.and_then(|until| until.futex.as_ref());
             // Any other error is a sleep that did not happen: the caller looks and comes back.
-            !matches!(
-                self.seq.word().wait(seen, NonZeroU32::MAX, futex),
-                Err(Error::TimedOut)
-            )
+            !matches!(self.seq.word().wait(seen, bit, futex), Err(Error::TimedOut))
         }
 
-        fn wake(&self) -> bool {
+        fn wake(&self, mask: NonZeroU32) -> bool {
             match &self.fd {
                 Some(fd) => fd.poke(),
                 // Fails only where the system call does not exist, and then nobody sleeps on it.
                 None => {
-                    let _ = self.seq.word().wake(NonZeroU32::MAX);
+                    let _ = self.seq.word().wake(mask);
                     true
                 }
             }
@@ -828,6 +862,7 @@ mod pool {
 
 #[cfg(all(test, not(loom)))]
 mod raise_tests {
+    use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -845,10 +880,10 @@ mod raise_tests {
         fn end_wait(&self) -> bool {
             false
         }
-        fn sleep(&self, _seen: u32, _deadline: Option<&Until>) -> bool {
+        fn sleep(&self, _seen: u32, _deadline: Option<&Until>, _bit: NonZeroU32) -> bool {
             true
         }
-        fn wake(&self) -> bool {
+        fn wake(&self, _mask: NonZeroU32) -> bool {
             self.0.fetch_add(1, Ordering::Relaxed);
             true
         }
@@ -875,6 +910,14 @@ mod raise_tests {
         assert_eq!(wakes, local.words().0.load(Ordering::Relaxed));
         // 50 µs doubling to 1 ms is about 55 wakes in 50 ms; rounds of yields send hundreds.
         assert!((1..=80).contains(&wakes), "{wakes} wakes");
+    }
+
+    /// Each subscriber's futex bit is one bit (plan 17 T-11).
+    #[test]
+    fn a_futex_bit_is_one_bit_of_the_32() {
+        for _ in 0..64 {
+            assert!(super::next_bit().is_power_of_two());
+        }
     }
 }
 

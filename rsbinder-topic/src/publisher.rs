@@ -373,6 +373,18 @@ impl Publisher<Bytes> {
 ///
 /// It dereferences to the value's bytes. [`publish`](Self::publish) hands it to the subscribers;
 /// dropping it unpublished gives the slot back. No subscriber reads the slot while it is lent.
+///
+/// A loan is `Send` (not `Sync`): it may be published or dropped on another thread than the one
+/// that took it, and a future that holds one across an `.await` can be given to
+/// `tokio::spawn`.
+///
+/// **The calls block.** With [`PublisherPolicy::backpressure`], [`Publisher::loan_slice`] waits
+/// for a free slot and [`publish`](Self::publish) for room in the ring, each up to
+/// [`publish_timeout`](crate::Backpressure::publish_timeout), holding the topic's lock, which
+/// blocks the thread they run on; on an async executor, that is one of its worker threads.
+/// Dropping the loan takes the same lock, so it waits behind a call that holds it. In async code
+/// with backpressure, make these calls where blocking is allowed, as `tokio::task::spawn_blocking`
+/// or `tokio::task::block_in_place` gives.
 #[must_use = "dropping the loan gives the slot back unpublished; call `publish`"]
 pub struct LoanMut<'a> {
     writer: &'a TypedWriter<Bytes, Stored<Mapping>>,

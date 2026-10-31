@@ -4,14 +4,19 @@
 //! The wait protocol of `wait.rs` under loom (plan 15 AC-15.2.12, AC-15.2.41): [`Local::park`] and
 //! [`Local::raise`] as they are, over a model of the two shared words and of the futex. The futex
 //! compares `seq` under a lock its wake takes too, as the kernel's hash bucket lock does, so a
-//! wake is lost only when it comes before the sleeper takes the lock. A test that does not
-//! finish is a deadlock, which loom reports. The flawed models show the checks are not vacuous:
-//! a publisher without its fence, a waker that wakes once, a new wait that does not join, an fd
-//! wait that polls without loading `seq` again, a publisher that takes as woken a wait that saw
-//! its commit, a lapped wait that sleeps once `write` stays, one that loads `seq` after its look
-//! in place of before it, a pool thread that runs a wait its future took back, a dropped future
-//! that settles a wait a thread runs, one that keeps a wait it took back out, one that does not
-//! wake the wait a thread runs, a poll that takes an interrupt. A wait decides with [`decide`]
+//! wake is lost only when it comes before the sleeper takes the lock. It keeps a count of wakes
+//! per bit, and a sleep ends only at a wake whose mask meets the sleeper's bit, as the kernel's
+//! `FUTEX_WAIT_BITSET` does (plan 17 T-11): the bit the sleep and the raise pass is the one
+//! `Local` holds. A test that does not finish is a deadlock, which loom reports, and a raise that
+//! wakes until a wait no wake reaches is out exceeds loom's branch bound, which loom reports as
+//! well. The flawed models show the checks are not vacuous: a publisher without its fence, a
+//! waker that wakes once, a raise that wakes a bit its wait does not sleep on, a new wait that
+//! does not join, an fd wait that polls without loading `seq` again, a publisher that takes as
+//! woken a wait that saw its commit, a lapped wait that sleeps once `write` stays, one that loads
+//! `seq` after its look in place of before it, a pool thread that runs a wait its future took
+//! back, a dropped future that settles a wait a thread runs, one that keeps a wait it took back
+//! out, one that does not wake the wait a thread runs, a poll that takes an interrupt. A wait
+//! decides with [`decide`]
 //! itself, on the record of each look as `Subscriber::settle` keeps it, and a receive ends as
 //! cancelled by [`Local::cancelled`] itself. A wait handed to the pool is `Handed` in its `Hand`,
 //! run by `serve` and taken back or woken by the drop of `GiveBack`, as `on_pool` does. The
@@ -22,6 +27,7 @@
 //! reactor's wait starts with [`Local::arm_reactor`], as `Subscriber::recv_on_reactor` does.
 //! Run: see `Cargo.toml` (`--cfg loom`).
 
+use std::num::NonZeroU32;
 // The std `Arc`: one of loom's dropped while a deadlock unwinds calls into loom and aborts.
 use std::sync::Arc;
 
@@ -40,6 +46,9 @@ enum Flaw {
     NoFence,
     /// A waker in this process wakes once instead of until the wait is out.
     WakeOnce,
+    /// A raise in this process wakes the bit after its wait's, as one that named another
+    /// subscriber's bit would; the publisher's wake of every bit is as it is.
+    OtherBit,
     /// A new wait starts without joining the one a dropped future left on the pool.
     NoJoin,
     /// An fd wait polls without loading `seq` once more after raising `WAITING`.
@@ -88,6 +97,14 @@ struct Model {
 struct Fds {
     bytes: u32,
     count: u32,
+    /// The futex wakes that named each bit: a sleep ends when the count of its bit moves.
+    wakes: [u32; 32],
+}
+
+impl Fds {
+    fn wakes_of(&self, bit: NonZeroU32) -> u32 {
+        self.wakes[bit.trailing_zeros() as usize]
+    }
 }
 
 impl Words for Arc<Model> {
@@ -108,12 +125,14 @@ impl Words for Arc<Model> {
     }
 
     fn end_wait(&self) -> bool {
-        *self.futex.lock().unwrap() = Fds::default();
+        let mut fds = self.futex.lock().unwrap();
+        (fds.bytes, fds.count) = (0, 0);
+        drop(fds);
         self.state.fetch_and(!WAITING, Ordering::SeqCst);
         false
     }
 
-    fn sleep(&self, seen: u32, _: Option<&Until>) -> bool {
+    fn sleep(&self, seen: u32, _: Option<&Until>, bit: NonZeroU32) -> bool {
         if self.fd {
             if self.flaw != Flaw::NoSecondLook && self.seq() != seen {
                 return true;
@@ -124,14 +143,17 @@ impl Words for Arc<Model> {
             }
             return true;
         }
-        let futex = self.futex.lock().unwrap();
+        let mut futex = self.futex.lock().unwrap();
         if self.seq.load(Ordering::SeqCst) == seen {
-            drop(self.woken.wait(futex).unwrap());
+            let before = futex.wakes_of(bit);
+            while futex.wakes_of(bit) == before {
+                futex = self.woken.wait(futex).unwrap();
+            }
         }
         true
     }
 
-    fn wake(&self) -> bool {
+    fn wake(&self, mask: NonZeroU32) -> bool {
         let mut fds = self.futex.lock().unwrap();
         if self.fd {
             if self.failing_sends.load(Ordering::Relaxed) > 0 {
@@ -139,6 +161,18 @@ impl Words for Arc<Model> {
                 return false;
             }
             fds.count += 1;
+        } else {
+            let mask = match self.flaw {
+                Flaw::OtherBit if mask != NonZeroU32::MAX => {
+                    NonZeroU32::new(mask.get().rotate_left(1)).unwrap()
+                }
+                _ => mask,
+            };
+            for (at, wakes) in fds.wakes.iter_mut().enumerate() {
+                if mask.get() & 1 << at != 0 {
+                    *wakes = wakes.wrapping_add(1);
+                }
+            }
         }
         self.woken.notify_all();
         true
@@ -216,7 +250,8 @@ fn publish(model: &Arc<Model>) {
         model.futex.lock().unwrap().bytes += 1;
         model.woken.notify_all();
     } else {
-        model.wake();
+        // `wake_seq`: every bit.
+        model.wake(NonZeroU32::MAX);
     }
 }
 
@@ -229,7 +264,7 @@ fn raise(model: &Arc<Model>, local: &Local<Arc<Model>>, bit: u32) {
     local.stop.fetch_or(bit, Ordering::SeqCst);
     fence(Ordering::SeqCst);
     if local.parked.load(Ordering::SeqCst) {
-        model.wake();
+        model.wake(local.bit);
     }
 }
 
@@ -389,6 +424,13 @@ fn loom_wait_an_eviction_ends_a_wait() {
 #[should_panic(expected = "deadlock")]
 fn loom_wait_a_waker_that_wakes_once_loses_the_wait() {
     a_bit_from_this_process_ends_a_wait(Flaw::WakeOnce, INTERRUPTED, Received::Cancelled);
+}
+
+/// No wake reaches the wait, which sleeps on; the raise wakes for as long, past loom's bound.
+#[test]
+#[should_panic(expected = "maximum number of branches")]
+fn loom_wait_a_raise_that_wakes_another_bit_loses_the_wait() {
+    a_bit_from_this_process_ends_a_wait(Flaw::OtherBit, INTERRUPTED, Received::Cancelled);
 }
 
 /// `Leftover`: whether a wait is out on the pool, the condvar its end signals, and who settled.

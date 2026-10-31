@@ -488,6 +488,26 @@ fn pinned_slots_are_not_lent_however_many_values_follow() {
     assert!((0..5).any(|n| lend(&publisher, &[n; 8]) == pinned));
 }
 
+/// Plan 17 T-8: a loan moves between threads, as `LentSlot` does and the writer's reference does.
+#[test]
+fn a_loan_is_send() {
+    fn is_send<T: Send>() {}
+    is_send::<crate::LoanMut<'static>>();
+}
+
+/// A loan taken on one thread is published on another, and its value arrives.
+#[test]
+fn a_loan_published_on_another_thread_reaches_the_subscriber() {
+    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let mut subscriber = subscribe(&publisher);
+    let mut loan = publisher.loan_slice(64).unwrap();
+    loan.copy_from_slice(&pattern(5, 64));
+    std::thread::scope(|scope| {
+        scope.spawn(move || loan.publish().unwrap());
+    });
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(5, 64))));
+}
+
 /// Samples received by an async caller, on the blocking pool and on the reactor.
 #[cfg(feature = "tokio")]
 mod async_samples {
@@ -595,5 +615,25 @@ mod async_samples {
         moved(&trusted.recv_sample_async());
         movable::<Sample<'static, Untrusted>>();
         movable::<Sample<'static, Trusted>>();
+    }
+
+    /// Plan 17 T-8: a spawned future holds a loan across an `.await`, then publishes it.
+    #[test]
+    fn a_spawned_future_holds_a_loan_across_an_await() {
+        let runtime = runtime();
+        let publisher = std::sync::Arc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+        let mut subscriber = subscribe(&publisher);
+        let spawned = {
+            let publisher = publisher.clone();
+            runtime.spawn(async move {
+                let mut loan = publisher.loan_slice(64).unwrap();
+                tokio::task::yield_now().await;
+                loan.copy_from_slice(&pattern(3, 64));
+                tokio::task::yield_now().await;
+                loan.publish()
+            })
+        };
+        assert_eq!(runtime.block_on(spawned).unwrap(), Ok(()));
+        assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(3, 64))));
     }
 }

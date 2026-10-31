@@ -282,6 +282,12 @@ poll: one thread waits for several subscriptions with `wait_any` or an event
 loop, and `recv_async` holds no thread while it waits. An `Interrupter` ends a
 wait from another thread.
 
+Each futex subscriber sleeps on one of 32 futex bits, chosen when it is made.
+A wake this process sends for it (an interrupt, the publisher's death, a
+dropped `recv_async`) names that bit alone, so it also wakes the other
+subscribers of the topic that hold the same bit, about one in 32, and not
+every one; those look at the ring and sleep again. A publish wakes every bit.
+
 ## Large values: loans and samples
 
 A value too large to copy twice goes through a pool. With
@@ -291,6 +297,11 @@ second memfd, and the ring carries only a record that names the slot:
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_frames.rs:lend}}
 ```
+
+A loan (`LoanMut`) is `Send`, so a spawned task can hold one across an
+`.await` and publish it from whichever worker thread it resumes on. With
+backpressure, `loan_slice` and `publish` wait under the topic's lock as a
+publish does, up to the timeout, and block that worker thread meanwhile.
 
 A `Bytes` subscriber receives a lent value as any other, or where it lies with
 `recv_sample`, `try_recv_sample`, `try_latest_sample` and `recv_sample_async`;

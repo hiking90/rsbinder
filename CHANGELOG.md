@@ -738,12 +738,21 @@ Each item below changes what a 0.12.0 program observes.
     subscription (`Wake::Fd`, with `Wait` and `wait_any` for event loops);
     `recv_async` with the `tokio` feature, `RecvError::Runtime` when the
     runtime cannot run a wait; `Interrupter`, the only source of
-    `RecvError::Cancelled`; `recv_latest_timeout`.
+    `RecvError::Cancelled`; `recv_latest_timeout`. Each futex subscriber
+    sleeps on one of 32 futex bits, and a wake this process sends for it
+    (an interrupt, a death, an eviction) names that bit alone, so it ends
+    about 1 in 32 of the topic's other futex sleeps instead of all of them;
+    a publish still wakes every bit. The layout and `VERSION` do not change.
   - Loans (`PoolPolicy`, `Publisher::loan_slice`, `LoanMut`): a `Bytes` value
     written straight into a slot of a second memfd and received in place as
     a `Sample` (`recv_sample`, `try_latest_sample`, `recv_sample_async`).
     An `Untrusted` subscriber copies a slot with atomic loads; `unsafe`
     `trust_publisher` makes a `Trusted` one, whose samples deref to `[u8]`.
+    `LoanMut` is `Send` (not `Sync`): a loan can be published on another
+    thread or held across an `.await` in a spawned future. With
+    backpressure, `loan_slice` and `LoanMut::publish` wait up to
+    `publish_timeout` holding the topic's lock, which blocks the thread they
+    run on.
   - `PublisherPolicy::authorize` and `Acceptor` decide who may subscribe;
     `Publisher::stats` and `Subscriber::stats` count what went through, and
     `Publisher::stats` reports each subscription's pinned pool slot

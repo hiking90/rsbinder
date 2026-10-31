@@ -734,12 +734,27 @@ impl StoredPool {
 
 /// The bytes of a slot the publisher lent: `Slots` lends it to this value alone until the slot
 /// is published or given back, which takes the value.
+///
+/// `Send`, not `Sync` (plan 17 T-8): the value may move to another thread, and `bytes_mut` hands
+/// out the slot's bytes only through `&mut self`.
+///
+/// # Safety
+///
+/// Only the `NonNull` keeps the auto trait off. The slot is lent to this value alone, so no
+/// other reference to its bytes exists in this process, on this thread or another. `at` points
+/// into the mapping `_mapping` holds, which lives as long as the value wherever it moves. The
+/// value reads no thread-local state, and what is done with it on another thread
+/// (`TypedWriter::publish_loan`, `TypedWriter::give_back`) takes the writer's mutex, as a call
+/// from the thread that lent it does.
 pub(crate) struct LentSlot {
     _mapping: Arc<Mapping>,
     slot: u32,
     at: NonNull<u8>,
     len: usize,
 }
+
+// SAFETY: a slot lent to this value alone, in a mapping it keeps; see the type's `# Safety`.
+unsafe impl Send for LentSlot {}
 
 impl LentSlot {
     pub(crate) fn slot(&self) -> u32 {
