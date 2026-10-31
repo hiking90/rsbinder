@@ -738,8 +738,6 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
     target_arch = "arm"
 ))]
 fn a_receive_held_in_a_page_fault_holds_no_publish() {
-    use std::os::fd::{FromRawFd, OwnedFd};
-
     // `_IOWR(0xAA, nr, size)` of `linux/userfaultfd.h`, in the encoding of these architectures.
     const UFFDIO_API: u32 = 0xC018_AA3F;
     const UFFDIO_REGISTER: u32 = 0xC020_AA00;
@@ -757,18 +755,17 @@ fn a_receive_held_in_a_page_fault_holds_no_publish() {
         ioctls: u64,
     }
 
-    // SAFETY: a system call that takes flags alone.
-    let uffd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC) };
-    if uffd < 0 {
-        let why = std::io::Error::last_os_error();
-        println!(
-            "skipped: holding a fault in kernel mode needs root or \
-             vm.unprivileged_userfaultfd=1 ({why})"
-        );
-        return;
-    }
-    // SAFETY: the system call returned this fd and nothing else owns it.
-    let uffd = unsafe { OwnedFd::from_raw_fd(uffd as i32) };
+    // SAFETY: the fd is registered only on the private page this test maps and unmaps below.
+    let uffd = match unsafe { rustix::mm::userfaultfd(rustix::mm::UserfaultfdFlags::CLOEXEC) } {
+        Ok(fd) => fd,
+        Err(why) => {
+            println!(
+                "skipped: holding a fault in kernel mode needs root or \
+                 vm.unprivileged_userfaultfd=1 ({why})"
+            );
+            return;
+        }
+    };
     let mut api = Api {
         api: 0xAA,
         features: 0,
