@@ -35,6 +35,7 @@ macro_rules! __declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
         }
     } => {
         $(
@@ -77,7 +78,7 @@ macro_rules! __declare_binder_interface {
                     {
                         fn as_sync(&self) -> &dyn $interface { &self._inner }
                         fn as_async(&self) -> &dyn $native_async {
-                            // Reachable: `Binder::<Bn*>::try_from`, then a generated `*Async` impl.
+                            // Reachable from `*Async` code generated without `local_transport` only.
                             panic!("{} was published sync-only; it has no async interface", stringify!($interface))
                         }
                         fn try_as_async(&self) -> ::core::option::Option<&dyn $native_async> { ::core::option::Option::None }
@@ -126,19 +127,37 @@ macro_rules! __declare_binder_interface {
                 fn try_from(ibinder: $crate::SIBinder) -> ::std::result::Result<$crate::Strong<dyn $async_interface<P>>, $crate::StatusCode> {
                     match <$proxy as $crate::Proxy>::from_binder(ibinder.clone()) {
                         ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
-                        ::core::option::Option::None => {
-                            match $crate::Binder::<$native>::try_from(ibinder) {
-                                ::core::result::Result::Ok(native) => {
-                                    // Sync-only native: BadType (AOSP proxies the local binder instead).
-                                    if native.0.try_as_async().is_some() {
+                        ::core::option::Option::None => $crate::__if_local_transport! {
+                            $local_transport
+                            {
+                                // Code generated without the in-process transport: a sync-only native is BadType.
+                                match $crate::Binder::<$native>::try_from(ibinder) {
+                                    ::core::result::Result::Ok(native) => {
+                                        if native.0.try_as_async().is_some() {
+                                            ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
+                                        } else {
+                                            ::core::result::Result::Err($crate::StatusCode::BadType)
+                                        }
+                                    }
+                                    ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+                                }
+                            }
+                            {
+                                // AOSP: a local binder without an async service is proxied in-process.
+                                match $crate::__local_binder::<$native>(&ibinder)? {
+                                    ::core::option::Option::Some(native) if native.0.try_as_async().is_some() => {
                                         ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
-                                    } else {
-                                        ::core::result::Result::Err($crate::StatusCode::BadType)
+                                    }
+                                    ::core::option::Option::Some(_) => {
+                                        $crate::__local_transport_ready()?;
+                                        ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(ibinder))))
+                                    }
+                                    ::core::option::Option::None => {
+                                        ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(ibinder))))
                                     }
                                 }
-                                ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -191,6 +210,7 @@ macro_rules! __declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            local_transport: $local_transport:tt,
         }
     } => {
         #[doc = $native_doc]
@@ -264,9 +284,30 @@ macro_rules! __transaction_names {
     };
 }
 
+/// The first block for code generated without `local_transport`, the second with it (plan 17 D-14).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_local_transport {
+    ([] $without:block $with:block) => {
+        $without
+    };
+    ([$marker:ident] $without:block $with:block) => {
+        $with
+    };
+}
+
 /// Declare a binder interface.
 ///
 /// This is mainly used internally by the AIDL compiler.
+///
+/// `local_transport: enabled,` (last, optional) is what `rsbinder-aidl`
+/// writes for interface code whose proxy drives a local binder through the
+/// in-process transport (plan 17 K-4). With it, an async cast of a
+/// sync-only local service, and a cast of a local binder of another
+/// `Remotable` with the same descriptor, give the generated proxy over that
+/// binder. Without it the proxy can reach a remote binder only, so those
+/// casts fail: `BadType` for the async cast of a sync-only service, the
+/// `Binder::try_from` error for the other.
 #[macro_export]
 macro_rules! declare_binder_interface {
     {
@@ -279,6 +320,7 @@ macro_rules! declare_binder_interface {
             proxy: $proxy:ident,
             $(r#async: $async_interface:ident,)?
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -292,6 +334,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $crate::Stability::default(),
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -307,6 +350,7 @@ macro_rules! declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -320,6 +364,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $stability,
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -336,6 +381,7 @@ macro_rules! declare_binder_interface {
             },
             $(r#async: $async_interface:ident,)?
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -351,6 +397,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $crate::Stability::default(),
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -368,6 +415,7 @@ macro_rules! declare_binder_interface {
             $(r#async: $async_interface:ident,)?
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         $crate::declare_binder_interface! {
@@ -378,13 +426,18 @@ macro_rules! declare_binder_interface {
                     $(adapter: $native_adapter,)?
                     $(r#async: $native_async,)?
                 },
-                @doc[concat!("A binder `Proxy` that holds an [`", stringify!($interface), "`] remote interface.")]
+                @doc[concat!(
+                    "A binder `Proxy` for an [`", stringify!($interface), "`]: a remote interface, ",
+                    "or a local binder called through the in-process transport (a sync-only service ",
+                    "reached through its async view; see `rsbinder::Strong::into_async`)."
+                )]
                 proxy: $proxy {
                     $($fname: $fty = $finit),*
                 },
                 $(r#async: $async_interface,)?
                 stability: $stability,
                 $(function_names: $function_names,)?
+                $(local_transport: $local_transport,)?
             }
         }
     };
@@ -405,12 +458,21 @@ macro_rules! declare_binder_interface {
 
             stability: $stability:expr,
             $(function_names: $function_names:tt,)?
+            $(local_transport: $local_transport:ident,)?
         }
     } => {
         #[doc = $proxy_doc]
         pub struct $proxy {
             binder: $crate::SIBinder,
             $($fname: $fty,)*
+        }
+
+        impl $proxy {
+            /// A proxy over a local binder, driven through its in-process transport (plan 17 K-4).
+            #[allow(dead_code, reason = "called only by code generated with `local_transport`")]
+            fn __rsb_local(binder: $crate::SIBinder) -> Self {
+                Self { binder, $($fname: $finit),* }
+            }
         }
 
         impl $crate::Interface for $proxy {
@@ -451,6 +513,7 @@ macro_rules! declare_binder_interface {
                 $(r#async: $async_interface,)?
                 stability: $stability,
                 $(function_names: $function_names,)?
+                local_transport: [$($local_transport)?],
             }
         }
 
@@ -462,12 +525,22 @@ macro_rules! declare_binder_interface {
             fn try_from(binder: $crate::SIBinder) -> $crate::Result<$crate::Strong<dyn $interface>> {
                 match <$proxy as $crate::Proxy>::from_binder(binder.clone()) {
                     ::core::option::Option::Some(proxy) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(proxy))),
-                    ::core::option::Option::None => {
-                        match $crate::Binder::<$native>::try_from(binder) {
-                            ::core::result::Result::Ok(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
-                            ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+                    ::core::option::Option::None => $crate::__if_local_transport! {
+                        [$($local_transport)?]
+                        {
+                            match $crate::Binder::<$native>::try_from(binder) {
+                                ::core::result::Result::Ok(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
+                                ::core::result::Result::Err(err) => ::core::result::Result::Err(err),
+                            }
                         }
-                    }
+                        {
+                            // Another `Remotable` of this descriptor is proxied in-process (plan 17 D-13).
+                            match $crate::__local_binder::<$native>(&binder)? {
+                                ::core::option::Option::Some(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
+                                ::core::option::Option::None => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(binder)))),
+                            }
+                        }
+                    },
                 }
             }
         }

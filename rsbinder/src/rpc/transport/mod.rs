@@ -651,7 +651,7 @@ pub enum PeerIdentity {
     Certificate(CertId),
     /// No identity is available. **ACL is not possible** against an
     /// anonymous peer; this must be surfaced in logs and never treated
-    /// as trusted. The debug-only plaintext TCP backend always reports it,
+    /// as trusted. The plaintext TCP backend (`rpc-tcp-debug`) always reports it,
     /// and so does a TLS server whose rustls config asks no client
     /// certificate (`with_no_client_auth()`).
     Anonymous,

@@ -326,7 +326,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -683,7 +683,10 @@ unsafe impl Sync for MemoryMap {}
 unsafe impl Send for MemoryMap {}
 
 pub struct ProcessState {
-    max_threads: u32,
+    /// The ceiling last given to `BINDER_SET_MAX_THREADS`; written only under `max_threads_set`.
+    max_threads: AtomicU32,
+    /// Serializes `set_max_threads`, so the driver and `max_threads` agree after racing calls.
+    max_threads_set: Mutex<()>,
     driver_name: PathBuf,
     driver: Arc<File>,
     mmap: MemoryMap,
@@ -824,7 +827,8 @@ impl ProcessState {
         })?;
 
         Ok(ProcessState {
-            max_threads,
+            max_threads: AtomicU32::new(max_threads),
+            max_threads_set: Mutex::new(()),
             driver_name,
             driver: driver.into(),
             mmap: MemoryMap {
@@ -874,8 +878,11 @@ impl ProcessState {
     /// existing state; a call with any of them different returns
     /// [`StatusCode::BadValue`] and leaves the state as it is (AOSP
     /// `ProcessState::initWithDriver` aborts on a different driver).
-    /// [`driver_name`](Self::driver_name), [`max_threads`](Self::max_threads)
-    /// and [`mmap_size`](Self::mmap_size) read what the first call set.
+    /// [`driver_name`](Self::driver_name) and [`mmap_size`](Self::mmap_size)
+    /// read what the first call set; [`max_threads`](Self::max_threads)
+    /// reads the ceiling in force, which only
+    /// [`set_max_threads`](Self::set_max_threads) changes after init, and a
+    /// later `init` is compared against that.
     ///
     /// # Errors
     ///
@@ -1702,11 +1709,55 @@ impl ProcessState {
         &self.driver_name
     }
 
-    /// The `max_threads` the process was initialized with: the ceiling given
-    /// to `BINDER_SET_MAX_THREADS`, `0` meaning the kernel never asks for a
-    /// pooled thread. See [`init`](Self::init).
+    /// The kernel thread-pool ceiling in force: the `max_threads` the
+    /// process was initialized with, or the last value
+    /// [`set_max_threads`](Self::set_max_threads) applied. `0` means the
+    /// kernel never asks for a pooled thread. See [`init`](Self::init).
     pub fn max_threads(&self) -> u32 {
-        self.max_threads
+        self.max_threads.load(Ordering::Acquire)
+    }
+
+    /// Change the kernel thread-pool ceiling: `BINDER_SET_MAX_THREADS`
+    /// with `max_threads` as written, as AOSP
+    /// `ProcessState::setThreadPoolMaxThreadCount` does. On success
+    /// [`max_threads`](Self::max_threads) returns the new value.
+    ///
+    /// Before [`start_thread_pool`](Self::start_thread_pool) any value is
+    /// accepted. After it, the ceiling may stay or grow but not shrink:
+    /// threads the kernel already asked for are running and are not taken
+    /// back. AOSP aborts the process on a shrink after the pool started;
+    /// here it is [`StatusCode::InvalidOperation`], logged, with the
+    /// ceiling unchanged.
+    ///
+    /// Unlike the receive mapping ([`mmap_size`](Self::mmap_size)), which
+    /// is mapped once at init and cannot be resized, the ceiling is a
+    /// driver setting and may change while the process runs.
+    ///
+    /// # Errors
+    ///
+    /// - [`StatusCode::InvalidOperation`]: a value below the ceiling in
+    ///   force after the pool started.
+    /// - The status of the failed `ioctl`; the ceiling is unchanged.
+    pub fn set_max_threads(&self, max_threads: u32) -> Result<()> {
+        let _serial = self
+            .max_threads_set
+            .lock()
+            .expect("max_threads_set poisoned");
+        let in_force = self.max_threads();
+        if self.thread_pool_started() && max_threads < in_force {
+            log::error!(
+                "ProcessState::set_max_threads({max_threads}): the binder thread pool has \
+                 started with a ceiling of {in_force} and cannot be shrunk"
+            );
+            return Err(StatusCode::InvalidOperation);
+        }
+        binder::set_max_threads(&self.driver, max_threads).map_err(|e| {
+            log::error!("Binder ioctl to set max threads failed: {e}");
+            errno_status(e)
+        })?;
+        self.max_threads.store(max_threads, Ordering::Release);
+        Self::log_max_threads(max_threads);
+        Ok(())
     }
 
     /// Whether [`start_thread_pool`](Self::start_thread_pool) ran (AOSP `mThreadPoolStarted`).
@@ -1801,7 +1852,7 @@ impl ProcessState {
             return Ok(());
         }
         // Mirror of AOSP `checkExpectingThreadPoolStart` (pool sized but never started).
-        if this.max_threads == 0 {
+        if this.max_threads() == 0 {
             log::warn!(
                 "start_thread_pool() with max_threads = 0: one worker is spawned, but the \
                  kernel will never ask for another, so the pool cannot grow under load. \
@@ -1942,7 +1993,7 @@ impl std::fmt::Debug for ProcessState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessState")
             .field("driver", &self.driver_name)
-            .field("max_threads", &self.max_threads)
+            .field("max_threads", &self.max_threads())
             .field("mmap_size", &self.mmap.size)
             .field("thread_pool_started", &self.thread_pool_started())
             .finish_non_exhaustive()
@@ -2115,7 +2166,7 @@ mod tests {
     fn assert_process_state_initialized() {
         let process = ProcessState::init_default().expect("init_default");
         // `init_default` passes the default explicitly; no sentinel is rewritten into it.
-        assert_eq!(process.max_threads, DEFAULT_MAX_BINDER_THREADS);
+        assert_eq!(process.max_threads(), DEFAULT_MAX_BINDER_THREADS);
         assert_eq!(
             process.driver_name,
             PathBuf::from(ProcessState::default_driver_path())

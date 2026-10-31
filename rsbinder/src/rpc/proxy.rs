@@ -10,11 +10,10 @@
 //! `variant<BinderHandle, RpcHandle>`; because rsbinder's `IBinder` is
 //! a trait, a separate type is cleaner.
 //!
-//! The generator emits `as_remote().ok_or(BadType)?` (a
-//! [`RemoteProxy`](crate::RemoteProxy) trait object) instead of the
-//! kernel-only `as_proxy().unwrap()`, so the **generated** `Bp*` stub
-//! drives this proxy directly — the same single stub also drives the
-//! kernel `ProxyHandle`.
+//! The generated `Bp*` stub calls through a
+//! [`RemoteProxy`](crate::RemoteProxy) trait object (`as_remote()`)
+//! rather than the kernel-only `as_proxy()`, so it drives this proxy
+//! directly — the same single stub also drives the kernel `ProxyHandle`.
 //!
 //! # Descriptor
 //!
@@ -257,7 +256,7 @@ impl RpcProxy {
 /// The RPC proxy implements the same generalized
 /// [`RemoteProxy`](crate::RemoteProxy) trait as the kernel
 /// `ProxyHandle`, so the one generated `Bp*` stub drives either stack
-/// (generator emits `as_remote()`). `prepare_transact(true)` writes
+/// (through `as_remote()`). `prepare_transact(true)` writes
 /// the remote's descriptor as the interface token, asking for it first
 /// if it is not cached (`try_descriptor`).
 ///

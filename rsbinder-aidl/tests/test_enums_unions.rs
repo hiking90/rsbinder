@@ -385,11 +385,12 @@ pub mod ITestService {
                 BnTestService(on_transact),
             },
             proxy: BpTestService,
+            local_transport: enabled,
         }
     }
     impl BpTestService {
         fn build_parcel_RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::Result<rsbinder::Parcel> {
-            let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
             data.write(&_arg_token)?;
             ::core::result::Result::Ok(data)
         }
@@ -409,7 +410,7 @@ pub mod ITestService {
     impl ITestService for BpTestService {
         fn r#RepeatByteEnum(&self, _arg_token: super::ByteEnum::ByteEnum) -> rsbinder::BinderResult<super::ByteEnum::ByteEnum> {
             let _aidl_data = self.build_parcel_RepeatByteEnum(_arg_token)?;
-            let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatByteEnum, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#RepeatByteEnum, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
             self.read_response_RepeatByteEnum(_arg_token, _aidl_reply)
         }
     }

@@ -132,14 +132,17 @@ fn test_check_interface_resolves_running_service() {
     assert_eq!(service.RepeatString("check"), Ok("check".to_string()));
 }
 
-/// Casting a *sync-only* local service to its async interface view must fail
-/// with `BadType` at cast time — not succeed and then panic (`unreachable!`)
-/// at the first method call. A local `Binder<BnOldName>` published from a sync
-/// `new_binder` has no async server behind it, so the async `FromIBinder` gates
-/// on the adapter's `try_as_async()` and rejects the cast (AOSP returns
-/// `BadType` for the same sync/async mismatch). Hermetic — no `/dev/binder`.
+/// A *sync-only* local service casts to its async interface view, as AOSP's
+/// Rust backend does: the cast gives the generated proxy over the local
+/// binder, and each call runs the service in-process (plan 17 K-4). The
+/// in-process transport needs kernel binder, which `init_test` opens;
+/// `tests/local_async_no_kernel.rs` covers a process without it.
 #[test]
-fn sync_only_service_cannot_cast_to_async_interface() {
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "requires /dev/binder"
+)]
+fn sync_only_service_casts_to_async_interface_through_the_local_binder() {
     struct OldName;
     impl rsbinder::Interface for OldName {}
     impl IOldName::IOldName for OldName {
@@ -148,11 +151,21 @@ fn sync_only_service_cannot_cast_to_async_interface() {
         }
     }
 
+    init_test();
     let sync: rsbinder::Strong<dyn IOldName::IOldName> = IOldName::BnOldName::new_binder(OldName);
     let cast = sync
         .as_binder()
-        .into_interface::<dyn IOldName::IOldNameAsync<rsbinder::Tokio>>();
-    assert_eq!(cast.err(), Some(rsbinder::StatusCode::BadType));
+        .into_interface::<dyn IOldName::IOldNameAsync<rsbinder::Tokio>>()
+        .expect("a sync-only local service casts to its async view");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .expect("a Tokio runtime");
+    // Called inside the runtime: `Tokio` hands the transact to `spawn_blocking` at the call.
+    assert_eq!(
+        rt.block_on(async { cast.RealName().await }),
+        Ok("OldName".to_string())
+    );
 }
 
 #[test]

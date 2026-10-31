@@ -281,8 +281,19 @@ impl<T: FromIBinder + ?Sized + 'static> ReconnectBuilder<T> {
     /// the service manager refuses to watch ([`StatusCode::BadValue`] for an
     /// invalid name, [`StatusCode::PermissionDenied`] for an SELinux `find`
     /// denial; Android 10's service manager watches no name, so there the
-    /// helper polls and neither is a build error), or [`ConnectError::stop`]
-    /// from `on_connect`.
+    /// helper polls and neither is a build error), a TLS certificate refused
+    /// as untrusted or revoked, by either end (`StatusCode::Errno(-EKEYREJECTED)`,
+    /// `Errno(-EKEYREVOKED)`; Linux and Android, see `From<rpc::RpcError> for
+    /// StatusCode`), or
+    /// [`ConnectError::stop`] from `on_connect`.
+    ///
+    /// A certificate refusal ends only `build`. Once the helper is running,
+    /// the reconnect thread retries one like any failed attempt and reports
+    /// it in [`last_error`](Reconnecting::last_error): the server may be
+    /// redeployed with another certificate while this process runs. An
+    /// expired or not-yet-valid certificate (`Errno(-EKEYEXPIRED)`) is never
+    /// permanent, at `build` either: a device that has just booted can run
+    /// with its clock at the epoch until the network sets it.
     ///
     /// Anything else — the server not up yet, the name not registered yet —
     /// returns a helper that keeps connecting in the background, so a
@@ -992,15 +1003,17 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         let client =
             open_staged(self.cfg.uri.clone(), options).map_err(|(stage, code)| Failure {
                 code,
-                permanent: stage == OpenStage::Setup,
+                permanent: stage == OpenStage::Setup || refused_at_build(mode, code),
             })?;
         #[cfg(feature = "rpc")]
         let opened = client.session().cloned();
         let binder = match self.lookup(&client, mode) {
             Ok(b) => b,
-            Err(f) => {
+            Err(mut f) => {
                 #[cfg(feature = "rpc")]
                 end_if_live(opened.as_ref());
+                // A TLS 1.3 client-certificate refusal arrives on the first call: the lookup.
+                f.permanent |= refused_at_build(mode, f.code);
                 return Err(f);
             }
         };
@@ -1332,6 +1345,19 @@ fn end_if_live(session: Option<&RpcSession>) {
         if !s.is_ended() {
             s.close_session();
         }
+    }
+}
+
+/// `build` stops on a refused or revoked TLS certificate; the reconnect thread retries it.
+fn refused_at_build(mode: Mode, code: StatusCode) -> bool {
+    #[cfg(feature = "rpc")]
+    {
+        mode == Mode::Build && crate::rpc::certificate_refused(code)
+    }
+    #[cfg(not(feature = "rpc"))]
+    {
+        let _ = (mode, code);
+        false
     }
 }
 

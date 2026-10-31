@@ -197,7 +197,11 @@ impl From<KernelEndpoint> for Endpoint {
 /// Every setting left unset means the default. The settings apply to the
 /// process-wide [`ProcessState`](crate::ProcessState), so
 /// [`serve`](super::serve) / [`Client::open`](super::Client::open) refuse
-/// one that disagrees with a `ProcessState` already initialized.
+/// a driver or mmap size that disagrees with a `ProcessState` already
+/// initialized. The thread ceiling is the exception on the server side: a
+/// server's `run` / `spawn` applies a different one to the running process
+/// ([`ProcessState::set_max_threads`](crate::ProcessState::set_max_threads)),
+/// while a client still refuses it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct KernelEndpoint {

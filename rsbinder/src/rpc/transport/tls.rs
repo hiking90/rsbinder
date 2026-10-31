@@ -9,10 +9,19 @@
 //! A failed certificate check is rejected at the handshake, before a
 //! single RPC payload byte is exchanged.
 //!
+//! A rustls failure leaves as `RpcError::Io(InvalidData)` carrying the
+//! `rustls::Error` (rustls's own convention), from the handshake and from
+//! record processing alike, so the `StatusCode` projection can classify
+//! certificate refusals. A server whose handshake failed half-closes and
+//! reads the client's bytes before closing (`linger_for_alert`): a TLS 1.3
+//! client has finished its handshake by then, and an immediate close with
+//! its bytes unread resets the connection and discards the alert.
+//!
 //! The peer identity is the leaf certificate: subject label + SHA-256
 //! fingerprint ([`super::CertId`]). There is deliberately **no
-//! plaintext-network backend** — `tcp_debug` is debug-only and
-//! `Anonymous`; real networks must use this.
+//! plaintext-network backend** for production — `tcp_debug` exists only
+//! with the `rpc-tcp-debug` feature and is `Anonymous`; real networks must
+//! use this.
 //!
 //! ## Decoupled from TCP and from framing
 //!
@@ -126,6 +135,12 @@ const CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Bound on `shutdown`'s wait for the in-flight send's `wlock`; see module doc "Shutdown".
 const CLOSE_NOTIFY_WLOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// `linger_for_alert`'s whole wait: as `CLOSE_NOTIFY_TIMEOUT`, the other wait only for an alert.
+const REJECT_LINGER: Duration = CLOSE_NOTIFY_TIMEOUT;
+
+/// `linger_for_alert`'s read cap: four full records, past a client's first flight of frames.
+const REJECT_LINGER_BYTES: usize = 4 * TLS_READ_CHUNK;
 
 /// `wlock`: a mutex with a bounded acquire; every release signals `freed` (no poll tick).
 struct WriteLock {
@@ -373,6 +388,22 @@ impl Write for IoAdapter<'_> {
 
 /// A framed-or-raw transport over a completed TLS connection, decoupled
 /// from the socket kind and from the wire profile.
+///
+/// A rustls failure, in the handshake or after it, is
+/// [`RpcError::Io`](crate::rpc::RpcError::Io) of kind `InvalidData` with
+/// the `rustls::Error` as its payload. A refused certificate projects to
+/// `StatusCode::Errno(-EKEYREJECTED)`, `-EKEYREVOKED` or `-EKEYEXPIRED`
+/// on Linux and Android; `From<RpcError> for StatusCode` has the table and
+/// says when each side sees the refusal.
+///
+/// When [`accept_stream`](Self::accept_stream) (or its variants) fails
+/// on an error rustls sent an alert for, it shuts the stream's write half
+/// and reads what the client sent until the client closes — up to 500 ms
+/// and 64 KiB — before it returns. A TLS 1.3 client sends its first RPC
+/// bytes before the server has judged its certificate; closing with them
+/// unread would reset the connection and the client would never read the
+/// alert. A stream whose [`socket`](TlsStream::socket) is `None` is
+/// dropped at once.
 pub struct TlsTransport {
     /// rustls crypto state (both directions); held for in-memory work only, never over socket I/O.
     conn: Mutex<Connection>,
@@ -453,6 +484,55 @@ fn drive_handshake_within(
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     Ok(())
+}
+
+/// rustls's own convention (`conn.rs` `complete_io`): `InvalidData` carrying the `rustls::Error`.
+fn tls_error(e: rustls::Error) -> RpcError {
+    RpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// The `rustls::Error` an io error carries as its payload, if it is one.
+fn rustls_payload(io: &std::io::Error) -> Option<&rustls::Error> {
+    io.get_ref()?.downcast_ref::<rustls::Error>()
+}
+
+/// After a failed server handshake: FIN behind the alert, then read until the client closes.
+///
+/// Closing at once with the client's bytes unread makes the kernel answer
+/// with RST, and the client loses the alert (TLS 1.3 clients write right
+/// after their `Finished`, before the server has judged their certificate).
+/// Bounded by `REJECT_LINGER` and `REJECT_LINGER_BYTES`: a client that does
+/// not close gets the cut it would have got anyway.
+fn linger_for_alert(conn: &mut Connection, stream: &dyn TlsStream) {
+    let Some(sock) = stream.socket() else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(REJECT_LINGER));
+    let mut io = IoAdapter(stream);
+    while conn.wants_write() {
+        match conn.write_tls(&mut io) {
+            Ok(n) if n > 0 => {}
+            _ => break,
+        }
+    }
+    if rustix::net::shutdown(sock, rustix::net::Shutdown::Write).is_err() {
+        return;
+    }
+    let until = std::time::Instant::now() + REJECT_LINGER;
+    let mut left = REJECT_LINGER_BYTES;
+    let mut buf = [0u8; TLS_READ_CHUNK];
+    while left > 0 {
+        let now = std::time::Instant::now();
+        if now >= until || stream.set_read_timeout(Some(until - now)).is_err() {
+            return;
+        }
+        match stream.read(&mut buf[..left.min(TLS_READ_CHUNK)]) {
+            Ok(0) => return,
+            Ok(n) => left = left.saturating_sub(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 /// `BadValue` (via `EINVAL`) for a zero handshake deadline, which bounds nothing.
@@ -609,7 +689,13 @@ impl TlsTransport {
         let sc = ServerConnection::new(config)
             .map_err(|_| RpcError::Protocol("rustls ServerConnection::new failed"))?;
         let mut conn: Connection = sc.into();
-        drive_handshake_within(&mut conn, &*stream, handshake_timeout)?;
+        if let Err(e) = drive_handshake_within(&mut conn, &*stream, handshake_timeout) {
+            // rustls queued an alert only for its own errors; a deadline or a cut has none.
+            if matches!(&e, RpcError::Io(io) if rustls_payload(io).is_some()) {
+                linger_for_alert(&mut conn, &*stream);
+            }
+            return Err(e);
+        }
         let peer = match conn.peer_certificates() {
             Some(c) if !c.is_empty() => {
                 PeerIdentity::Certificate(cert_identity(Some(c), "<mtls-client>")?)
@@ -767,10 +853,7 @@ impl TlsTransport {
         loop {
             {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
-                let io = c.process_new_packets().map_err(|e| {
-                    log::warn!("TLS record processing failed: {e}");
-                    RpcError::Protocol("TLS record processing failed")
-                })?;
+                let io = c.process_new_packets().map_err(tls_error)?;
                 if io.plaintext_bytes_to_read() > 0 || io.peer_has_closed() {
                     return Ok(true);
                 }
@@ -859,11 +942,8 @@ impl TlsTransport {
             if n == 0 {
                 break;
             }
-            let io = c.process_new_packets().map_err(|e| {
-                // The rustls detail is otherwise lost; a queued fatal alert drains best-effort.
-                log::warn!("TLS record processing failed: {e}");
-                RpcError::Protocol("TLS record processing failed")
-            })?;
+            // A queued fatal alert drains best-effort.
+            let io = c.process_new_packets().map_err(tls_error)?;
             if io.plaintext_bytes_to_read() > 0 {
                 pending.extend_from_slice(src);
                 break;

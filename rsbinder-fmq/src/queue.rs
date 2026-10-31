@@ -814,9 +814,9 @@ pub struct WriteTxn<'a, T: Element> {
 }
 
 impl<T: Element> WriteTxn<'_, T> {
-    /// Copy `src` into the reserved elements starting at `start`:
-    /// [`Regions::write_at`]. `BadValue` when `start + src.len()` exceeds
-    /// [`len`](Regions::len).
+    /// Copy `src` into the reserved elements starting at `start`, the index
+    /// running across the wrap as [`Regions`] describes. `BadValue` when
+    /// `start + src.len()` exceeds [`len`](Regions::len).
     pub fn write_at(&mut self, start: usize, src: &[T]) -> Result<()> {
         self.regions.write_at(start, src)
     }
@@ -1047,10 +1047,12 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// [`UnsyncWriteTxn`](crate::UnsyncWriteTxn) deref to one, shared only:
 /// `first_len` elements up to the ring's end, then `second_len` from its
 /// start (libfmq `MemTransaction`). An element is never split between the
-/// two. A write transaction copies in through its own `write_at`, which is
-/// this type's [`write_at`](Self::write_at).
+/// two. Only a write transaction copies in, through its own
+/// [`WriteTxn::write_at`] or
+/// [`UnsyncWriteTxn::write_at`](crate::UnsyncWriteTxn::write_at): the copy
+/// into the ring is not reachable through a shared `Regions`.
 ///
-/// Indices in [`write_at`](Self::write_at) and [`read_at`](Self::read_at)
+/// Indices in those `write_at`s and in [`read_at`](Self::read_at)
 /// run over both parts as one sequence, so a caller lays out a record
 /// without knowing where the wrap falls. Every access is a copy; there is
 /// no way to hold a reference into the ring.
@@ -1209,7 +1211,7 @@ impl<T: Element> Regions<'_, T> {
 
     /// Copy `src` into the elements starting at `start`. `BadValue` when
     /// `start + src.len()` exceeds [`len`](Self::len).
-    pub fn write_at(&mut self, start: usize, src: &[T]) -> Result<()> {
+    pub(crate) fn write_at(&mut self, start: usize, src: &[T]) -> Result<()> {
         if start
             .checked_add(src.len())
             .is_none_or(|end| end > self.len())

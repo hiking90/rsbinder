@@ -216,6 +216,68 @@ Each item below changes what a 0.12.0 program observes.
   serving thread, so the tag may be a thread-bound guard; a
   `Box<dyn Any + Send>` still coerces. `TracingObserver` keeps the entered
   span as its tag.
+- **A sync-only local service converts to its async view.** `into_async`,
+  `try_into_async` and the async `FromIBinder` cast of a binder published
+  with `Bn*::new_binder` give the generated async proxy over the local
+  binder, as AOSP's Rust backend does: each call is serialized into a
+  parcel and runs the service's dispatch in this process. 0.12.0 refused
+  the cast with `BadType` and `into_async` panicked. In a process without
+  kernel binder (`ProcessState` not initialized) the cast is
+  `InvalidOperation` and `into_async` panics saying so. A local binder of
+  another `Remotable` that answers with the interface's descriptor gets
+  the same in-process proxy, sync or async, where 0.12.0 refused it with
+  `BadValue`. Off any transaction such a call has the new caller
+  `Caller::InProcess { uid, pid }`, this process's own, and
+  `@EnforcePermission` decides it for that identity; inside a handler it
+  keeps the outer caller. The calling thread's strict-mode policy and work
+  source are restored after the dispatch. `Strong::into_async` lists the
+  four call semantics of one local object and what the in-process path
+  does not do (no `DeadObject` mapping, no observer, `link_to_death` is
+  `InvalidOperation`).
+- **A generated async proxy runs its transact inline on a thread that is
+  handling a transaction, whatever its `BinderAsyncPool`**, and
+  `Tokio::spawn` always hands off to `spawn_blocking`. A pool written as
+  the trait doc says keeps the kernel's deadlock avoidance and the RPC
+  nested-call pin. Code that called `<Tokio as BinderAsyncPool>::spawn`
+  directly inside a handler and relied on it running inline checks
+  `is_handling_transaction()` itself.
+- **`rsbinder` requires `rsbinder-aidl` with `=`.** Generated code calls
+  hidden items of the `rsbinder` it was generated for, so another
+  `rsbinder-aidl` patch in the same build no longer resolves. Interface
+  code from an older generator keeps 0.12.0's `BadType` for the async cast
+  of a sync-only local service.
+- **A refused TLS certificate has its own status code** on Linux and
+  Android: `StatusCode::Errno(-EKEYREJECTED)` (untrusted issuer, bad
+  signature, wrong name, no certificate; the peer's `unknown_ca`,
+  `access_denied`, `certificate_required` or `unsupported_certificate`
+  alert), `-EKEYREVOKED` (revoked) or `-EKEYEXPIRED` (expired, not yet
+  valid, an expired CRL; `certificate_expired`), where 0.12.0 returned
+  `Unknown`, as AOSP still does. Other TLS failures stay `Unknown`. A rustls
+  failure after the handshake is `RpcError::Io(InvalidData)` carrying the
+  `rustls::Error`, as a handshake failure is, not `RpcError::Protocol`. An
+  rsbinder TLS server half-closes and drains the client (at most 500 ms and
+  64 KiB) after a failed handshake, so a TLS 1.3 client whose certificate
+  was refused reads the alert instead of `DeadObject`. `Reconnecting::build`
+  fails on a rejected or revoked certificate; the background thread keeps
+  retrying it and reports it in `last_error()`; an expired one is never
+  permanent.
+- **With `rpc-tcp-debug`, an `IAccessor` connection that is an inet socket
+  is refused with `BadType`** unless the process calls
+  `rpc::set_accessor_plaintext_inet(true)`. The feature is unified across
+  the build, so a debug feature enabled anywhere changed what a plain
+  `get_service` accepted. `RpcSession::from_preconnected_fd` called
+  directly is unaffected: its caller picked the socket.
+- **`ServeOptions::threads` and `binder://?threads=` take effect on a
+  running process**: `run` / `spawn` apply a ceiling that differs from the
+  one in force through the new `ProcessState::set_max_threads`
+  (`BINDER_SET_MAX_THREADS`, AOSP `setThreadPoolMaxThreadCount`), where
+  0.12.0 returned `BadValue`. A started pool may grow but not shrink
+  (`InvalidOperation`), and the two given with different values is
+  `BadValue`. `ServeOptions::mmap_size` is still compared only, as a
+  mapping cannot be resized.
+- **`rsbinder_fmq::Regions::write_at` is no longer public**; write through
+  `WriteTxn::write_at` / `UnsyncWriteTxn::write_at`. No transaction hands
+  out a `&mut Regions`, so it could not be called.
 - On a 32-bit target `MessageQueue::attach` refuses, with
   `InvalidDescriptor`, a data grantor whose `extent` plus `offset` modulo the page size is more than
   `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and
@@ -540,6 +602,9 @@ Each item below changes what a 0.12.0 program observes.
 
 - **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
   has it.
+- **`Caller::InProcess`**, **`ProcessState::set_max_threads`**, and with
+  `rpc-tcp-debug` **`rpc::set_accessor_plaintext_inet` /
+  `accessor_plaintext_inet`**: see Migrating.
 - **`ProcessState::try_start_thread_pool()`**: `start_thread_pool` that
   returns the failure to create the first worker.
 - **`AccessorProviderHandle::keep_for_process()`**: keeps the provider

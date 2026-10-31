@@ -217,6 +217,14 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 17 K-4: `tests/local_async_kernel.rs` and `tests/local_async_no_kernel.rs`.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/localasync/ILocalSvc.aidl"))
+        .source(PathBuf::from("aidl/localasync/ILocalOuter.aidl"))
+        .output(PathBuf::from("local_async.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-7: `stream_rpc.rs` and the kernel `stream_probe` share it, so not behind `rpc`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))

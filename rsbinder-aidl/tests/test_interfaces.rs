@@ -92,6 +92,7 @@ pub mod ArrayOfInterfaces {
                     BnEmptyInterface(on_transact),
                 },
                 proxy: BpEmptyInterface,
+                local_transport: enabled,
             }
         }
         impl BpEmptyInterface {
@@ -143,11 +144,12 @@ pub mod ArrayOfInterfaces {
                     BnMyInterface(on_transact),
                 },
                 proxy: BpMyInterface,
+                local_transport: enabled,
             }
         }
         impl BpMyInterface {
             fn build_parcel_methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::Result<rsbinder::Parcel> {
-                let mut data = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
+                let mut data = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.prepare_request(<Self as rsbinder::Proxy>::descriptor())?;
                 data.write(_arg_iface)?;
                 data.write(&_arg_nullable_iface)?;
                 data.write(_arg_iface_array_in)?;
@@ -178,7 +180,7 @@ pub mod ArrayOfInterfaces {
         impl IMyInterface for BpMyInterface {
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 let _aidl_data = self.build_parcel_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)?;
-                let _aidl_reply = self.binder.as_remote().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#methodWithInterfaces, &_aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
+                let _aidl_reply = self.binder.__transport().ok_or(rsbinder::StatusCode::BadType)?.submit_transact(transactions::r#methodWithInterfaces, _aidl_data, rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL);
                 self.read_response_methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout, _aidl_reply)
             }
         }

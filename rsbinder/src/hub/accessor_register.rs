@@ -100,9 +100,15 @@ pub enum AccessorSockAddr {
     /// returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
     Vsock { cid: u32, port: u32 },
     /// AF_INET v4 address. Only usable when the binary was built with
-    /// the `rpc-tcp-debug` feature (debug builds only — see
-    /// `rpc::transport::tcp_debug`); otherwise the connect
-    /// helper returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
+    /// the `rpc-tcp-debug` feature (the plaintext `rpc::transport::TcpDebugTransport`);
+    /// otherwise the connect helper returns `ERROR_UNSUPPORTED_SOCKET_FAMILY`.
+    /// The feature is not tied to debug builds: Cargo unifies features, so
+    /// any crate in the graph that enables it enables it for the release
+    /// build too.
+    ///
+    /// The consuming side refuses the resulting socket with `BadType`
+    /// unless that process called `rpc::set_accessor_plaintext_inet(true)`:
+    /// the connection is unencrypted and its peer anonymous.
     Inet(SocketAddrV4),
 }
 
@@ -264,7 +270,7 @@ fn connect_vsock_owned_fd(
     Err(AccessorConnectError::UnsupportedFamily)
 }
 
-/// AF_INET v4 connect, behind debug-only `rpc-tcp-debug`; the stub returns `UnsupportedFamily`.
+/// AF_INET v4 connect, behind the `rpc-tcp-debug` feature; the stub returns `UnsupportedFamily`.
 #[cfg(feature = "rpc-tcp-debug")]
 fn connect_inet_owned_fd(addr: SocketAddrV4) -> std::result::Result<OwnedFd, AccessorConnectError> {
     connected(std::net::TcpStream::connect(addr))

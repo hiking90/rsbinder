@@ -484,6 +484,39 @@ before a single RPC byte is exchanged. rsbinder never invents crypto —
 all key / cert / root management and verification are your `rustls`
 config and rustls itself.
 
+### What a refused certificate returns
+
+On Linux and Android a refused certificate comes back as an errno of the
+kernel's key-management family, so it is not mistaken for a lost
+connection or for an `EPERM` denial:
+
+| Cause | `StatusCode` |
+|-------|--------------|
+| untrusted issuer, bad signature, wrong host name, no certificate presented; or the peer's `unknown_ca` / `access_denied` / `certificate_required` / `unsupported_certificate` alert | `Errno(-EKEYREJECTED)` |
+| revoked; or the peer's `certificate_revoked` alert | `Errno(-EKEYREVOKED)` |
+| expired or not yet valid (an expired CRL too); or the peer's `certificate_expired` alert | `Errno(-EKEYEXPIRED)` |
+
+Anything else rustls reports — a malformed certificate, the
+`bad_certificate` alert, a non-certificate failure — stays
+`StatusCode::Unknown`, which is also what AOSP libbinder returns for every
+TLS failure. The `rustls::Error` itself is the payload of the
+`RpcError::Io` behind the status. Apple platforms have no `EKEY*` errnos and
+get `Unknown` for all of these.
+
+When the client learns of a refused **client** certificate depends on the TLS
+version. In TLS 1.2 its handshake fails. In TLS 1.3 the client has finished
+its handshake before the server judges its certificate, so the server's
+alert arrives on the client's first read — the connect on the android-13+
+profile, the first call on r34. An rsbinder server keeps the connection
+half-open after a failed handshake (up to 500 ms or 64 KiB of client data)
+so that alert reaches the client; a server that closes at once, as AOSP
+libbinder does, resets the connection and the client sees `DeadObject`.
+
+[`Reconnecting`](./reconnecting.md) treats `EKEYREJECTED` and `EKEYREVOKED`
+as permanent at `build` and keeps retrying them once it runs (a server can be
+redeployed with a new certificate); `EKEYEXPIRED` is never permanent, since a
+device that has just booted may still have its clock at the epoch.
+
 ## Security
 
 > **RPC is not a drop-in for kernel binder's security model.** Kernel
@@ -802,6 +835,16 @@ rsbinder implements **both sides** of this pattern:
   `addConnection()`, adopts the fd, runs the v2 handshake, and gives
   you back the RPC root. Your client code looks identical to a
   regular `hub::check_service` call.
+
+  The accessor, not your process, picks the socket. A Unix or vsock fd
+  is always accepted; an `AF_INET`/`AF_INET6` fd would run the plaintext
+  `rpc-tcp-debug` transport (no encryption, anonymous peer), so it is
+  refused with `BadType` unless the process calls
+  `rsbinder::rpc::set_accessor_plaintext_inet(true)` first. The feature
+  alone is not the switch because Cargo unifies features: any crate in
+  the dependency graph that enables `rpc-tcp-debug` enables it for the
+  whole build, release builds included. Without the feature an inet fd is
+  always `BadType`. AOSP accepts any family here.
 
 - **Register side** — `hub::android_16::create_accessor(instance,
   addr_provider)` builds a `LocalAccessor` `BnAccessor` you can

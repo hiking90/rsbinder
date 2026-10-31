@@ -219,9 +219,9 @@ pub struct UnsyncWriteTxn<'a, T: Element> {
 }
 
 impl<T: Element> UnsyncWriteTxn<'_, T> {
-    /// Copy `src` into the reserved elements starting at `start`:
-    /// [`Regions::write_at`]. `BadValue` when `start + src.len()` exceeds
-    /// [`len`](Regions::len).
+    /// Copy `src` into the reserved elements starting at `start`, the index
+    /// running across the wrap as [`Regions`] describes. `BadValue` when
+    /// `start + src.len()` exceeds [`len`](Regions::len).
     pub fn write_at(&mut self, start: usize, src: &[T]) -> Result<()> {
         self.regions.write_at(start, src)
     }

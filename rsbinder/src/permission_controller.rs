@@ -28,8 +28,10 @@
 //! nothing is registered under that name**: a check inside an RPC
 //! transaction and a check outside any transaction are denied before the
 //! lookup is reached, and a lookup that yields `Ok(None)` or `Err` denies
-//! as well. The lookup is reached only inside a kernel transaction, so
-//! kernel binder is initialized whenever it runs. The Linux
+//! as well. The lookup is reached only inside a kernel transaction or an
+//! in-process call through a generated proxy (`Caller::InProcess`, which
+//! needs kernel binder too), so kernel binder is initialized whenever it
+//! runs. The Linux
 //! `hub` is a general-purpose service manager: a process allowed to
 //! register can [`crate::hub::add_service`] a binder under the name
 //! `"permission"`, and if its descriptor matches, the lookup
@@ -76,8 +78,11 @@ pub const SERVICE_NAME: &str = "permission";
 /// [`Caller::Kernel`]; a uid ACL, TLS-certificate allowlist, or token
 /// scope for `Caller::Rpc`). With no transaction in flight
 /// ([`crate::calling_caller`] returns `None`) the check fails closed
-/// without consulting it, so an authority never sees an in-process call
-/// and cannot log or allow one.
+/// without consulting it. An in-process call through a generated proxy
+/// over a local binder made outside any transaction reaches it as
+/// [`Caller::InProcess`] (see [`crate::Strong::into_async`]); a direct call
+/// on a local service's sync handle never reaches `on_transact`, so no
+/// check runs for it at all.
 ///
 /// The core crate ships only this **slot**, never a policy: token/JWT
 /// formats, certificate→permission tables, and uid→permission maps are
@@ -213,12 +218,21 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// (`PeerIdentity` + `RpcServer::set_authorizer`, or hand-rolled uid ACLs
 /// via [`crate::get_calling_uid`] over Unix RPC).
 ///
+/// # In-process calls
+///
+/// A local binder called through a generated proxy while no transaction
+/// is in flight on the thread ([`Caller::InProcess`], the async view of a
+/// sync-only service on a pool thread) is decided for this process's own
+/// uid and pid, as AOSP Java's `checkCallingOrSelfPermission` checks a
+/// call made outside a transaction. Inside a kernel or RPC handler the
+/// same call is decided for that handler's caller, by the rules above.
+///
 /// # Fail-closed semantics
 ///
 /// **With no [`PermissionAuthority`] installed**, returns `false` when:
 /// - The innermost transaction on this thread is an RPC one (see above).
-/// - The current thread is not handling a binder transaction (explicit
-///   deny before PMS is consulted).
+/// - The current thread is neither handling a binder transaction nor
+///   running an in-process call (explicit deny before PMS is consulted).
 /// - The `permission` service is unreachable (`system_server` absent) —
 ///   the lookup error denies.
 /// - The remote `checkPermission` call returns an error.
@@ -245,10 +259,10 @@ pub fn default() -> Result<Strong<dyn IPermissionController>> {
 /// If a [`PermissionAuthority`] is installed via
 /// [`set_permission_authority`], it **replaces** the default decision for
 /// every transport and receives the transport-tagged [`Caller`] — but
-/// only while a transaction is in flight; with none
-/// ([`crate::calling_caller`] returns `None`) the check fails closed
-/// without consulting it. With no authority installed (the default), the
-/// kernel→PMS / RPC→deny behavior applies unchanged.
+/// only while a transaction or an in-process call is in flight; with
+/// neither ([`crate::calling_caller`] returns `None`) the check fails
+/// closed without consulting it. With no authority installed (the
+/// default), the kernel→PMS / RPC→deny behavior applies unchanged.
 pub fn check_permission(_reader: &Parcel, permission_name: &str) -> bool {
     // Clone the Arc out so the read lock is released before the (re-entrant) policy runs.
     let authority = permission_authority();
@@ -258,9 +272,11 @@ pub fn check_permission(_reader: &Parcel, permission_name: &str) -> bool {
         return caller.is_some_and(|caller| authority.check(permission_name, &caller));
     }
     match caller {
-        Some(Caller::Kernel { uid, pid, .. }) => ask_controller(&CONTROLLER, default, |pc| {
-            pc.checkPermission(permission_name, pid, uid as i32)
-        }),
+        Some(Caller::Kernel { uid, pid, .. } | Caller::InProcess { uid, pid }) => {
+            ask_controller(&CONTROLLER, default, |pc| {
+                pc.checkPermission(permission_name, pid, uid as i32)
+            })
+        }
         // An RPC uid is not a PMS uid (see rustdoc).
         #[cfg(feature = "rpc")]
         Some(Caller::Rpc(_)) => {

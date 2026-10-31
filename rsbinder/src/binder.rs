@@ -595,10 +595,10 @@ pub(crate) mod sealed {
 }
 
 /// An outbound-transaction-issuing proxy, abstract over the kernel
-/// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks. The AIDL
-/// generator emits `as_remote().ok_or(BadType)?` so one generated
-/// `Bp*` drives either stack via this trait + the
-/// `<dyn IBinder>::as_remote()` accessor; the kernel-only `as_proxy()`
+/// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks, returned by
+/// `<dyn IBinder>::as_remote()`. One generated `Bp*` drives either stack
+/// through this trait; it reaches it through a hidden accessor that also
+/// covers a local binder called in-process. The kernel-only `as_proxy()`
 /// is retained for any direct callers.
 ///
 /// The signatures are exactly `ProxyHandle`'s existing inherent
@@ -630,10 +630,109 @@ pub trait RemoteProxy {
     ) -> Result<Option<Parcel>>;
 }
 
+/// Where a generated proxy sends a call: a remote binder through its
+/// [`RemoteProxy`], or a local binder of this process through its
+/// [`Transactable`] (plan 17 K-4). Returned by `<dyn IBinder>::__transport`;
+/// generated code only.
+///
+/// The local arm is AOSP `BBinder::transact` reached from an in-process
+/// `BpBinder`-shaped caller, as AOSP's Rust backend does when it proxies a
+/// local binder: the request is a kernel-mode [`Parcel`] with the interface
+/// token, and [`Transactable::transact`] runs on the calling thread. The
+/// differences from a call that crosses a process are listed on
+/// [`Strong::into_async`].
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum Transport<'a> {
+    /// A kernel or RPC proxy.
+    Remote(&'a dyn RemoteProxy),
+    /// A local binder, called in-process.
+    Local(&'a dyn Transactable),
+}
+
+impl std::fmt::Debug for Transport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Transport::Remote(_) => f.write_str("Transport::Remote"),
+            Transport::Local(_) => f.write_str("Transport::Local"),
+        }
+    }
+}
+
+impl Transport<'_> {
+    /// The request parcel with the interface token for `interface`.
+    ///
+    /// The local arm refuses with [`StatusCode::InvalidOperation`] in a
+    /// process without kernel binder, before any argument is written: a
+    /// local binder argument is published through `ProcessState`, and the
+    /// kernel-mode parcel the local dispatcher reads needs it too.
+    pub fn prepare_request(&self, interface: &str) -> Result<Parcel> {
+        match self {
+            Transport::Remote(remote) => remote.prepare_request(interface),
+            Transport::Local(_) => {
+                crate::native::__local_transport_ready()?;
+                let mut data = Parcel::new();
+                data.write_interface_token(interface)?;
+                Ok(data)
+            }
+        }
+    }
+
+    /// Submit `data` and return the reply (`None` for oneway).
+    ///
+    /// `data` is taken by value so the local arm can hand it to
+    /// [`Transactable::transact`] without a copy.
+    pub fn submit_transact(
+        &self,
+        code: TransactionCode,
+        data: Parcel,
+        flags: TransactionFlags,
+    ) -> Result<Option<Parcel>> {
+        match self {
+            Transport::Remote(remote) => remote.submit_transact(code, &data, flags),
+            Transport::Local(local) => local_transact(*local, code, data, flags),
+        }
+    }
+}
+
+/// AOSP `BBinder::transact` for an in-process caller; see [`Transport`].
+pub(crate) fn local_transact(
+    target: &dyn Transactable,
+    code: TransactionCode,
+    mut data: Parcel,
+    flags: TransactionFlags,
+) -> Result<Option<Parcel>> {
+    crate::native::__local_transport_ready()?;
+    let mut reply = Parcel::new();
+    let result = {
+        let _restore = crate::thread_state::LocalCallGuard::enter();
+        target.transact(code, &mut data, &mut reply)
+    };
+    // A binder argument may hold the last reference; its user `Drop` runs here, no borrow held.
+    drop(data);
+    result?;
+    if flags & FLAG_ONEWAY != 0 {
+        return Ok(None);
+    }
+    reply.set_data_position(0);
+    Ok(Some(reply))
+}
+
 impl dyn IBinder {
     /// Convert this binder object into a proxy binder object.
     pub fn as_proxy(&self) -> Option<&proxy::ProxyHandle> {
         self.as_any().downcast_ref::<proxy::ProxyHandle>()
+    }
+
+    /// The transport a generated proxy drives this binder through:
+    /// [`as_remote`](Self::as_remote) first, else the local
+    /// [`as_transactable`](IBinder::as_transactable). Generated code only.
+    #[doc(hidden)]
+    pub fn __transport(&self) -> Option<Transport<'_>> {
+        if let Some(remote) = self.as_remote() {
+            return Some(Transport::Remote(remote));
+        }
+        self.as_transactable().map(Transport::Local)
     }
 
     /// Generalized proxy dispatch: a kernel
@@ -1441,27 +1540,97 @@ impl<I: FromIBinder + ?Sized> Strong<I> {
 
     /// Convert this synchronous binder handle into an asynchronous one.
     ///
+    /// A remote proxy, kernel or RPC, converts to the generated async proxy.
+    /// A local binder published with `Bn*::new_async_binder` converts to
+    /// itself, and its async methods call the async service directly.
+    ///
+    /// # A local binder published sync-only
+    ///
+    /// A local binder published with `Bn*::new_binder` has no async service
+    /// behind it. As in AOSP's Rust backend ("fall back to treating it as a
+    /// remote service"), the cast gives the generated async proxy over the
+    /// same local binder: each call writes its arguments into a kernel-mode
+    /// [`Parcel`] on the calling thread and runs the service's dispatch
+    /// (`check_interface`, then `on_transact`) in-process. The same applies,
+    /// sync or async, to a local binder of another `Remotable` type that
+    /// answers with the interface's descriptor (an interface declared both
+    /// in `.aidl` and with `#[rsbinder::interface]`).
+    ///
+    /// Where that dispatch runs, and what it sees as its caller, depends on
+    /// where the call is made from. One local object therefore has four
+    /// call semantics:
+    ///
+    /// | The call | Runs on | `calling_caller()` in the service | `@EnforcePermission` decided for |
+    /// |---|---|---|---|
+    /// | through the sync handle | the calling thread, as a direct method call | the caller's, unchanged (`None` outside a transaction) | nobody: a direct call does not reach `on_transact`, so no check runs |
+    /// | through the async view, outside any transaction | a thread of the pool `P` (`spawn_blocking` for `Tokio`) | [`Caller::InProcess`](crate::Caller::InProcess): this process's uid and pid | this process, as AOSP Java checks a call made outside a transaction |
+    /// | through the async view, inside a kernel binder handler | the handler's thread, inline | the outer kernel caller | the outer kernel caller |
+    /// | through the async view, inside an RPC handler | the handler's thread, inline | the outer RPC peer | nobody: `@EnforcePermission` denies over RPC |
+    ///
+    /// [`is_handling_transaction`](crate::is_handling_transaction) reports
+    /// only the outer transaction, so it is `false` in the second row.
+    ///
+    /// The in-process dispatch differs from a call that crosses a process
+    /// in these ways:
+    ///
+    /// - It needs kernel binder in this process
+    ///   ([`ProcessState`](crate::ProcessState) initialized). Without it the
+    ///   cast fails with [`StatusCode::InvalidOperation`] and this function
+    ///   panics.
+    /// - A handler's `Err` is returned unchanged; `DeadObject` is not
+    ///   rewritten to `FailedTransaction` ([`Transactable`] "Handler
+    ///   errors"), and a panic in the handler is not caught.
+    /// - Transaction observers ([`observe`](crate::observe)) are not called,
+    ///   and `FLAG_CLEAR_BUF` has no effect.
+    /// - A oneway method returns once the service's method has returned.
+    /// - The thread's [`CallRestriction`](crate::CallRestriction) does not
+    ///   apply, as in AOSP, whose restriction is checked in
+    ///   `IPCThreadState::transact`.
+    /// - A binder argument is marked parceled
+    ///   ([`IBinder::was_parceled`]), and an RPC binder argument is refused,
+    ///   as in AOSP.
+    /// - The strict-mode policy and work source that the service's dispatch
+    ///   installs on the running thread are restored when it returns.
+    /// - [`link_to_death`](IBinder::link_to_death) on the handle's binder
+    ///   is [`StatusCode::InvalidOperation`], as for every local binder, so
+    ///   `death_signal` and `Reconnecting` cannot watch it.
+    ///
     /// # Panics
     ///
-    /// When the handle is a **local** binder that was published as a
-    /// sync-only service (`Bn*::new_binder` rather than
-    /// `new_async_binder`): its adapter has no async view, and the cast
-    /// is refused as `BadType`. Remote proxies always convert, so whether a
-    /// handle from a lookup panics here depends on which process the service
-    /// was deployed in; AOSP's Rust binder converts this case too, through a
-    /// proxy over the local binder, which rsbinder does not have. Use
-    /// [`try_into_async`](Self::try_into_async) for a handle from a lookup.
+    /// Where [`try_into_async`](Self::try_into_async) returns `Err`: with
+    /// [`StatusCode::InvalidOperation`] for a local binder in a process
+    /// without kernel binder, and with [`StatusCode::BadType`] for a
+    /// sync-only local service whose interface code was generated by an
+    /// `rsbinder-aidl` without the in-process transport. Use
+    /// `try_into_async` for a handle whose process shape is not known.
     pub fn into_async<P>(self) -> Strong<<I as ToAsyncInterface<P>>::Target>
     where
         I: ToAsyncInterface<P>,
     {
-        self.try_into_async()
-            .expect("into_async on a sync-only local service; use try_into_async")
+        match self.try_into_async() {
+            Ok(strong) => strong,
+            Err(StatusCode::InvalidOperation) => panic!(
+                "into_async on a local binder in a process without kernel binder: its async view \
+                 calls the service in-process, which needs ProcessState; use try_into_async"
+            ),
+            Err(StatusCode::BadType) => panic!(
+                "into_async on a sync-only local service whose code has no in-process transport \
+                 (generated by an older rsbinder-aidl); use try_into_async"
+            ),
+            Err(err) => panic!("into_async failed with {err:?}; use try_into_async"),
+        }
     }
 
-    /// Fallible [`into_async`](Self::into_async): `Err(BadType)` when the
-    /// binder is a sync-only local service that cannot back the async
-    /// view, `Err` for any other cast failure.
+    /// Fallible [`into_async`](Self::into_async), which describes the
+    /// conversions and the in-process semantics.
+    ///
+    /// # Errors
+    ///
+    /// - [`StatusCode::InvalidOperation`]: a local binder that would be
+    ///   called in-process, in a process without kernel binder.
+    /// - [`StatusCode::BadType`]: a sync-only local service whose interface
+    ///   code was generated without the in-process transport.
+    /// - Any other cast failure, as [`FromIBinder::try_from`] reports it.
     pub fn try_into_async<P>(self) -> Result<Strong<<I as ToAsyncInterface<P>>::Target>>
     where
         I: ToAsyncInterface<P>,

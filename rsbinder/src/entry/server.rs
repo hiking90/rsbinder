@@ -23,16 +23,21 @@ pub type Authorizer = Box<dyn Fn(&crate::rpc::PeerIdentity) -> bool + Send + Syn
 pub struct ServeOptions {
     /// RPC: `RpcServer::set_max_threads`.
     ///
-    /// Kernel: **[`KernelEndpoint::with_threads`](super::KernelEndpoint::with_threads)
-    /// (`binder://?threads=`) is the only form that takes effect.**
-    /// [`serve`](super::serve) initializes the
-    /// process-wide `ProcessState` — where the kernel pool size is
-    /// fixed, once, for the life of the process — before this option
-    /// can be read, so a value set here is only compared against the
-    /// pool already in force, and a *different* one is
-    /// [`StatusCode::BadValue`] at [`run`](Server::run) /
-    /// [`spawn`](Server::spawn). A value equal to the pool in force is
-    /// accepted (it asks for what is already true).
+    /// Kernel: the binder thread-pool ceiling, applied at
+    /// [`run`](Server::run) / [`spawn`](Server::spawn) with
+    /// [`ProcessState::set_max_threads`] (`BINDER_SET_MAX_THREADS`, AOSP
+    /// `setThreadPoolMaxThreadCount`) when it differs from the ceiling in
+    /// force. [`KernelEndpoint::with_threads`](super::KernelEndpoint::with_threads)
+    /// (`binder://?threads=`) is the same setting: it sizes the pool when
+    /// [`serve`](super::serve) is the call that initializes `ProcessState`,
+    /// and is otherwise applied at `run` / `spawn` the same way. Both given
+    /// and different is [`StatusCode::BadValue`].
+    ///
+    /// The ceiling is process-wide, so the last server to start sets it.
+    /// Once the pool has started (the first kernel `run` / `spawn`, or
+    /// [`ProcessState::start_thread_pool`]) it may grow but not shrink: a
+    /// smaller value is [`StatusCode::InvalidOperation`] and leaves the
+    /// ceiling as it was.
     pub threads: Option<u32>,
     /// Kernel: the size of the mapping this process receives
     /// transactions into — [`ProcessState::init_with_mmap_size`], where
@@ -41,12 +46,13 @@ pub struct ServeOptions {
     /// default.
     ///
     /// **[`KernelEndpoint::with_mmap_size`](super::KernelEndpoint::with_mmap_size)
-    /// (`binder://?mmap=`) is the only form that takes effect**, for the
-    /// same reason as [`threads`](Self::threads): the mapping is made when [`serve`](super::serve) initializes
-    /// `ProcessState`, before this option is read. A value set here is
-    /// only compared against the mapping already in force, and a
-    /// *different* one (after page rounding) is [`StatusCode::BadValue`]
-    /// at [`run`](Server::run) / [`spawn`](Server::spawn).
+    /// (`binder://?mmap=`) is the only form that takes effect.** The
+    /// mapping is made once, when [`serve`](super::serve) initializes
+    /// `ProcessState`, before this option is read, and a mapped region
+    /// cannot be resized. A value set here is only compared against the
+    /// mapping in force: a *different* one (after page rounding) is
+    /// [`StatusCode::BadValue`] at [`run`](Server::run) /
+    /// [`spawn`](Server::spawn), the same one is accepted.
     pub mmap_size: Option<usize>,
     /// RPC: `RpcServer::set_max_connections`.
     pub max_connections: Option<usize>,
@@ -124,8 +130,9 @@ impl std::fmt::Debug for ServeOptions {
 /// Kernel (`binder://`): construction initializes the process-wide
 /// [`ProcessState`] (idempotently — a second kernel server in the same
 /// process reuses it, and is refused with [`StatusCode::BadValue`] if it
-/// asked for a different driver, thread count or mapping size, which the
-/// process cannot give it). RPC: the listener is bound at `run`/`spawn` so
+/// asked for a different driver or mapping size, which are fixed at init).
+/// A different thread count is applied at `run`/`spawn` instead
+/// ([`ServeOptions::threads`]). RPC: the listener is bound at `run`/`spawn` so
 /// [`ServeOptions`] (TLS config, limits) can be applied first.
 ///
 /// On either transport, names given to [`add`](Self::add) are registered
@@ -201,7 +208,8 @@ impl Drop for ServerGuard {
 pub(super) fn new_server(uri: Uri) -> Result<Server> {
     uri.validate()?;
     if let Endpoint::Kernel(k) = &uri.endpoint {
-        kernel_init(k.driver(), k.threads(), k.mmap_size())?;
+        // `?threads=` sizes a first init here; on a state that exists, `run`/`spawn` applies it.
+        kernel_state(k.driver(), k.threads(), k.mmap_size())?;
     }
     #[cfg(not(feature = "rpc"))]
     if !uri.endpoint.is_kernel() {
@@ -218,12 +226,33 @@ pub(super) fn new_server(uri: Uri) -> Result<Server> {
     })
 }
 
-/// Idempotent kernel `ProcessState` init; `None` asks for nothing, a mismatch is `BadValue`.
+/// `kernel_state` with the thread count compared too: the client path, which never resizes.
 pub(super) fn kernel_init(
     driver: Option<&std::path::Path>,
     max_threads: Option<u32>,
     mmap_size: Option<usize>,
 ) -> Result<()> {
+    let ps = kernel_state(driver, max_threads, mmap_size)?;
+    if max_threads.is_some_and(|n| n != ps.max_threads()) {
+        log::error!(
+            "rsbinder: ProcessState is already initialized with max_threads={}; requested \
+             max_threads={max_threads:?} cannot be applied by a client — initialize once, or \
+             omit the option",
+            ps.max_threads()
+        );
+        return Err(StatusCode::BadValue);
+    }
+    Ok(())
+}
+
+/// Idempotent kernel `ProcessState` init; `max_threads` sizes a first init only.
+///
+/// `None` asks for nothing; a driver or mapping mismatch is `BadValue`.
+pub(super) fn kernel_state(
+    driver: Option<&std::path::Path>,
+    max_threads: Option<u32>,
+    mmap_size: Option<usize>,
+) -> Result<&'static ProcessState> {
     // Normalize first: a bad size is `BadValue` (not `NoInit`) and compares as the kernel maps it.
     let mmap_size = mmap_size
         .map(ProcessState::normalized_mmap_size)
@@ -247,20 +276,19 @@ pub(super) fn kernel_init(
     })?;
     // Check what `init` returned: a pre-init `is_initialized()` sample misses a racing init.
     let driver_mismatch = driver.is_some_and(|d| d != ps.driver_name());
-    let threads_mismatch = max_threads.is_some_and(|n| n != ps.max_threads());
     let mmap_mismatch = mmap_size.is_some_and(|n| n != ps.mmap_size());
-    if driver_mismatch || threads_mismatch || mmap_mismatch {
+    if driver_mismatch || mmap_mismatch {
         log::error!(
-            "rsbinder: ProcessState is already initialized with driver={:?} max_threads={} \
-             mmap_size={}; requested driver={driver:?} max_threads={max_threads:?} \
-             mmap_size={mmap_size:?} cannot be applied — initialize once, or omit the option",
+            "rsbinder: ProcessState is already initialized with driver={:?} mmap_size={}; \
+             requested driver={driver:?} mmap_size={mmap_size:?} cannot be applied — the \
+             device and the receive mapping are fixed at init; initialize once, or omit the \
+             option",
             ps.driver_name(),
-            ps.max_threads(),
             ps.mmap_size()
         );
         return Err(StatusCode::BadValue);
     }
-    Ok(())
+    Ok(ps)
 }
 
 impl Server {
@@ -394,9 +422,29 @@ impl Server {
         if o.tls.is_some() {
             return Err(self.reject("tls"));
         }
-        if o.threads.is_some() || o.mmap_size.is_some() {
-            // Both are fixed at init; re-running init makes a mismatch `BadValue`, as in a URI.
-            kernel_init(None, o.threads, o.mmap_size)?;
+        if o.mmap_size.is_some() {
+            // Fixed at init; re-running init makes a mismatch `BadValue`, as in a URI.
+            kernel_state(None, None, o.mmap_size)?;
+        }
+        let from_uri = match &self.uri.endpoint {
+            Endpoint::Kernel(k) => k.threads(),
+            _ => None,
+        };
+        let threads = match (o.threads, from_uri) {
+            (Some(opt), Some(uri)) if opt != uri => {
+                log::error!(
+                    "rsbinder::serve: ServeOptions::threads={opt} conflicts with the URI's \
+                     ?threads={uri} — give the value once"
+                );
+                return Err(StatusCode::BadValue);
+            }
+            (opt, uri) => opt.or(uri),
+        };
+        if let Some(n) = threads {
+            let ps = ProcessState::as_self();
+            if n != ps.max_threads() {
+                ps.set_max_threads(n)?;
+            }
         }
         if let Some(cr) = o.call_restriction {
             ProcessState::as_self().set_call_restriction(cr);

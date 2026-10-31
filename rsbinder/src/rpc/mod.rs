@@ -50,8 +50,8 @@
 //! let _negotiated = client.negotiate(4).unwrap();
 //! let root = client.get_root().unwrap();
 //! // Drive `root` with the **same generated stub** as the kernel path
-//! // — the AIDL generator emits `as_remote().ok_or(BadType)?`, so one
-//! // `Bp*` resolves either stack:
+//! // — the generated `Bp*` reaches either stack through `RemoteProxy`,
+//! // so one `Bp*` resolves both:
 //! //
 //! //     let foo: Strong<dyn IFoo> =
 //! //         <dyn IFoo as FromIBinder>::try_from(root)?;
@@ -155,6 +155,9 @@ pub use server::{RpcServer, RpcServerHandle};
 pub use session::RpcUnixClientConfig;
 pub use session::{RpcClientConfig, RpcSession};
 pub use transport::{CertId, PeerIdentity, RpcTransport};
+// Defined beside the accessor connect that reads it; the opt-in is about an RPC transport.
+#[cfg(feature = "rpc-tcp-debug")]
+pub use crate::hub::accessor_16::{accessor_plaintext_inet, set_accessor_plaintext_inet};
 
 /// Re-export of the exact `rustls` the `tls` backend links, so callers
 /// build `ClientConfig`/`ServerConfig` against a matching version
@@ -270,6 +273,15 @@ pub enum RpcError {
     /// `singleSocketConnection` returns `-connErrno`). A serve loop records
     /// it as a lost connection, not an idle eviction
     /// ([`EndReason::Frame`]).
+    ///
+    /// A failure rustls reports — in the handshake or in a record after
+    /// it, a received alert included — is this variant too, of kind
+    /// `InvalidData` with the `rustls::Error` as its payload
+    /// (`io.get_ref()` downcasts to it), the convention rustls's own
+    /// `complete_io` uses. The payload survives the trip through
+    /// `std::io::Error` and back, so the certificate refusals that
+    /// `From<RpcError> for StatusCode` classifies are told apart however
+    /// the error reached it.
     Io(std::io::Error),
     /// A protocol-level violation (used by the wire codec).
     Protocol(&'static str),
@@ -408,7 +420,50 @@ impl From<RpcError> for crate::StatusCode {
     /// `rsbinder::Result`. Specific, actionable mappings where they
     /// help a caller; the catch-all [`StatusCode::RpcError`] otherwise.
     ///
+    /// # TLS certificate refusals
+    ///
+    /// An [`RpcError::Io`] carrying a `rustls::Error` projects to an errno
+    /// of the kernel's key-management family when the error says a
+    /// certificate was refused, so a caller can tell "the peer is not who
+    /// it should be" from a lost connection:
+    ///
+    /// | rustls error | status |
+    /// |---|---|
+    /// | this end's verifier: `UnknownIssuer`, `BadSignature`, `UnknownRevocationStatus`, `NotValidForName*`, `InvalidPurpose*`, `ApplicationVerificationFailure`; `NoCertificatesPresented` | `Errno(-EKEYREJECTED)` |
+    /// | this end's verifier: `Revoked` | `Errno(-EKEYREVOKED)` |
+    /// | this end's verifier: `Expired*`, `NotValidYet*`, `ExpiredRevocationList*` | `Errno(-EKEYEXPIRED)` |
+    /// | alert from the peer: `unknown_ca`, `access_denied`, `certificate_required`, `unsupported_certificate` | `Errno(-EKEYREJECTED)` |
+    /// | alert from the peer: `certificate_revoked` | `Errno(-EKEYREVOKED)` |
+    /// | alert from the peer: `certificate_expired` | `Errno(-EKEYEXPIRED)` |
+    ///
+    /// Everything else keeps the projection of the io error, `Unknown` for
+    /// a rustls payload: `BadEncoding`, `UnhandledCriticalExtension`, the
+    /// `bad_certificate` and `certificate_unknown` alerts (each of which
+    /// more than one cause produces), and every non-certificate failure. A
+    /// peer's alert says what the peer decided, so an expired CRL on the
+    /// peer arrives as `unknown_ca` (rustls sends that alert for it).
+    /// These errnos are distinct from [`StatusCode::PermissionDenied`]
+    /// (`EPERM`), which a packet filter or an SELinux denial produces.
+    /// AOSP libbinder returns `UNKNOWN_ERROR` for every TLS handshake
+    /// failure (`RpcTransportTls.cpp`); the classification is rsbinder's.
+    /// Apple platforms have no `EKEY*` errnos and classify nothing.
+    ///
+    /// When each side sees a refusal depends on the TLS version. A
+    /// refused *server* certificate fails the client's handshake, in both
+    /// versions. A refused *client* certificate fails the server's
+    /// handshake; in TLS 1.2 the client is still in its handshake and reads
+    /// the alert there. In TLS 1.3 the client has already finished and sent
+    /// its first RPC bytes, so the alert arrives on its first read: the
+    /// connect or the first call, depending on the wire profile. An
+    /// rsbinder server half-closes after a failed handshake and reads what
+    /// the client sent until it closes (bounded in time and bytes), so that
+    /// alert reaches the client. A server that closes at once with the
+    /// client's bytes unread makes the kernel send a reset that discards
+    /// the alert, and the client sees
+    /// [`StatusCode::DeadObject`](crate::StatusCode::DeadObject).
+    ///
     /// [`StatusCode::RpcError`]: crate::StatusCode::RpcError
+    /// [`StatusCode::PermissionDenied`]: crate::StatusCode::PermissionDenied
     fn from(e: RpcError) -> Self {
         match e {
             RpcError::EndOfStream => crate::StatusCode::DeadObject,
@@ -416,10 +471,70 @@ impl From<RpcError> for crate::StatusCode {
             RpcError::Truncated => crate::StatusCode::NotEnoughData,
             RpcError::DeadlineMidFrame => crate::StatusCode::TimedOut,
             RpcError::FrameTooLarge { .. } => crate::StatusCode::BadValue,
-            RpcError::Io(io) => crate::StatusCode::from(io),
+            RpcError::Io(io) => certificate_refusal(&io).unwrap_or_else(|| io.into()),
             RpcError::Protocol(_) => crate::StatusCode::RpcError,
             RpcError::Timeout => crate::StatusCode::TimedOut,
         }
+    }
+}
+
+/// The `EKEY*` status of a rustls certificate refusal; see `From<RpcError> for StatusCode`.
+#[cfg(all(feature = "rpc-tls", any(target_os = "linux", target_os = "android")))]
+fn certificate_refusal(io: &std::io::Error) -> Option<crate::StatusCode> {
+    use rustix::io::Errno;
+    use rustls::{AlertDescription as A, CertificateError as C, Error as E};
+    let errno = match io.get_ref()?.downcast_ref::<rustls::Error>()? {
+        E::NoCertificatesPresented => Errno::KEYREJECTED,
+        E::InvalidCertificate(c) => match c {
+            C::UnknownIssuer
+            | C::UnknownRevocationStatus
+            | C::BadSignature
+            | C::NotValidForName
+            | C::NotValidForNameContext { .. }
+            | C::InvalidPurpose
+            | C::InvalidPurposeContext { .. }
+            | C::ApplicationVerificationFailure => Errno::KEYREJECTED,
+            C::Revoked => Errno::KEYREVOKED,
+            C::Expired
+            | C::ExpiredContext { .. }
+            | C::NotValidYet
+            | C::NotValidYetContext { .. }
+            | C::ExpiredRevocationList
+            | C::ExpiredRevocationListContext { .. } => Errno::KEYEXPIRED,
+            _ => return None,
+        },
+        E::AlertReceived(a) => match a {
+            A::UnknownCA | A::AccessDenied | A::CertificateRequired | A::UnsupportedCertificate => {
+                Errno::KEYREJECTED
+            }
+            A::CertificateRevoked => Errno::KEYREVOKED,
+            A::CertificateExpired => Errno::KEYEXPIRED,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(crate::error::errno_status(errno))
+}
+
+/// No rustls, or no `EKEY*` errnos on this host: nothing to classify.
+#[cfg(not(all(feature = "rpc-tls", any(target_os = "linux", target_os = "android"))))]
+fn certificate_refusal(_io: &std::io::Error) -> Option<crate::StatusCode> {
+    None
+}
+
+/// Whether `code` is a certificate refusal that retrying cannot fix: rejected or revoked.
+pub(crate) fn certificate_refused(code: crate::StatusCode) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use rustix::io::Errno;
+        [Errno::KEYREJECTED, Errno::KEYREVOKED]
+            .iter()
+            .any(|e| crate::error::errno_status(*e) == code)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = code;
+        false
     }
 }
 

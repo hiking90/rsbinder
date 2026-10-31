@@ -465,18 +465,19 @@ pub mod {{mod}} {
                 {%- endfor %}
             ],
             {%- endif %}
+            local_transport: enabled,
         }
     }
     impl {{ bp_name }} {
         {%- for member in fn_members %}
         fn build_parcel_{{ member.identifier }}({{ member.args }}) -> {{crate}}::Result<{{crate}}::Parcel> {
             {%- if member.write_funcs|length > 0 %}
-            let mut data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let mut data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- for func in member.write_funcs %}
             {{ func }}
             {%- endfor %}
             {%- else %}
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             {%- endif %}
             ::core::result::Result::Ok(data)
         }
@@ -509,7 +510,7 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
         fn build_parcel_getInterfaceVersion(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceVersion(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<i32> {
@@ -523,7 +524,7 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
         fn build_parcel_getInterfaceHash(&self) -> {{crate}}::Result<{{crate}}::Parcel> {
-            let data = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
+            let data = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.prepare_request(<Self as {{crate}}::Proxy>::descriptor())?;
             ::core::result::Result::Ok(data)
         }
         fn read_response_getInterfaceHash(&self, _aidl_reply: {{crate}}::Result<::core::option::Option<{{crate}}::Parcel>>) -> {{crate}}::BinderResult<::std::string::String> {
@@ -542,9 +543,9 @@ pub mod {{mod}} {
             let _aidl_data = self.build_parcel_{{ member.identifier }}({{ member.func_call_params }})?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }})
-                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL));
+                .in_scope(|| self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL));
             {%- else %}
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL);
+            let _aidl_reply = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL);
             {%- endif %}
             {%- if member.func_call_params|length > 0 %}
             self.read_response_{{ member.identifier }}({{ member.func_call_params }}, _aidl_reply)
@@ -560,9 +561,9 @@ pub mod {{mod}} {
             let _aidl_data = self.build_parcel_getInterfaceVersion()?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion)
-                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
+                .in_scope(|| self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
             {%- else %}
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
             {%- endif %}
             self.read_response_getInterfaceVersion(_aidl_reply)
         }
@@ -575,9 +576,9 @@ pub mod {{mod}} {
             let _aidl_data = self.build_parcel_getInterfaceHash()?;
             {%- if function_names is iterable %}
             let _aidl_reply = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash)
-                .in_scope(|| self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
+                .in_scope(|| self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF));
             {%- else %}
-            let _aidl_reply = self.binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
+            let _aidl_reply = self.binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF);
             {%- endif %}
             self.read_response_getInterfaceHash(_aidl_reply)
         }
@@ -594,11 +595,11 @@ pub mod {{mod}} {
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "{{ member.identifier }}", transactions::r#{{ member.identifier }});
-            __RsbPool::spawn(
-                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || _aidl_span.in_scope(|| binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL)),
             {%- else %}
-            __RsbPool::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, &_aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#{{ member.identifier }}, _aidl_data, {% if oneway or member.oneway %}{{crate}}::FLAG_ONEWAY | {% endif %}{{crate}}::FLAG_CLEAR_BUF | {{crate}}::FLAG_PRIVATE_LOCAL),
             {%- endif %}
                 move |_aidl_reply| async move {
                     {%- if member.func_call_params|length > 0 %}
@@ -621,11 +622,11 @@ pub mod {{mod}} {
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceVersion", transactions::r#getInterfaceVersion);
-            __RsbPool::spawn(
-                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || _aidl_span.in_scope(|| binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
             {%- else %}
-            __RsbPool::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceVersion, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
             {%- endif %}
                 move |_aidl_reply| async move {
                     self.read_response_getInterfaceVersion(_aidl_reply)
@@ -645,11 +646,11 @@ pub mod {{mod}} {
             let binder = self.binder.clone();
             {%- if function_names is iterable %}
             let _aidl_span = {{crate}}::observe::__trace_client("{{ namespace }}", "getInterfaceHash", transactions::r#getInterfaceHash);
-            __RsbPool::spawn(
-                move || _aidl_span.in_scope(|| binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || _aidl_span.in_scope(|| binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF)),
             {%- else %}
-            __RsbPool::spawn(
-                move || binder.as_remote().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, &_aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
+            {{crate}}::__spawn_transact::<__RsbPool, _, _, _, _, _, _>(
+                move || binder.__transport().ok_or({{crate}}::StatusCode::BadType)?.submit_transact(transactions::r#getInterfaceHash, _aidl_data, {{crate}}::FLAG_PRIVATE_LOCAL | {{crate}}::FLAG_CLEAR_BUF),
             {%- endif %}
                 move |_aidl_reply| async move {
                     self.read_response_getInterfaceHash(_aidl_reply)
@@ -662,7 +663,16 @@ pub mod {{mod}} {
     {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}<'a>({{ member.args_async }}) -> {{crate}}::BoxFuture<'a, {{crate}}::BinderResult<{{ member.return_type }}>> {
-            self.0.as_async().r#{{ member.identifier }}({{ member.func_call_params }})
+            match self.0.try_as_async() {
+                ::core::option::Option::Some(_aidl_service) => _aidl_service.r#{{ member.identifier }}({{ member.func_call_params }}),
+                // Sync-only: the in-process transport, as the async cast gives (plan 17 D-24).
+                ::core::option::Option::None => {
+                    let _aidl_proxy = {{ bp_name }}::__rsb_local({{crate}}::Interface::as_binder(self));
+                    ::std::boxed::Box::pin(async move {
+                        <{{ bp_name }} as {{name}}Async<__RsbPool>>::r#{{ member.identifier }}(&_aidl_proxy{% if member.func_call_params|length > 0 %}, {{ member.func_call_params }}{% endif %}).await
+                    })
+                }
+            }
         }
         {%- endfor %}
     }

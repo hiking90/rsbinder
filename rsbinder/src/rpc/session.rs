@@ -5519,7 +5519,12 @@ impl RpcSession {
     /// R34 wire. Establishes the TCP connection, completes the
     /// TLS handshake to `server_name` (verified per `config` — a
     /// bad/untrusted server certificate fails **here**, before any RPC
-    /// payload byte is exchanged), then builds an R34 session. The
+    /// payload byte is exchanged), then builds an R34 session. A refused
+    /// certificate is `StatusCode::Errno(-EKEYREJECTED)`, `-EKEYREVOKED` or
+    /// `-EKEYEXPIRED` on Linux and Android (`From<RpcError> for StatusCode`
+    /// has the table). Over TLS 1.3 a server's refusal of *this* client's
+    /// certificate arrives only with the first reply, so this returns `Ok`
+    /// and the first call returns the refusal. The
     /// android-13+ variant is
     /// [`setup_tcp_client_tls_android13plus`](RpcSession::setup_tcp_client_tls_android13plus).
     ///
@@ -6376,7 +6381,11 @@ impl RpcSession {
     /// transport — `AF_UNIX` → [`super::transport::UnixTransport`],
     /// `AF_VSOCK` → `VsockTransport` (feature `rpc-vsock`, Linux only),
     /// `AF_INET`/`AF_INET6` → `TcpDebugTransport`
-    /// (feature `rpc-tcp-debug`). Any other family is rejected as
+    /// (feature `rpc-tcp-debug`, which Cargo enables for the whole build when
+    /// any crate in the graph asks for it — release builds too). This call
+    /// reads no run-time opt-in: its caller picked the socket. The accessor
+    /// path, where a peer picks it, refuses an inet socket unless
+    /// `rpc::set_accessor_plaintext_inet(true)` was called. Any other family is rejected as
     /// [`StatusCode::BadType`], paralleling AOSP's
     /// `IAccessor::ERROR_UNSUPPORTED_SOCKET_FAMILY`. The handshake then
     /// runs through [`RpcSession::connect_android13plus_fd`] with

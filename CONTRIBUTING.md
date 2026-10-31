@@ -235,6 +235,11 @@ one can resolve it:
    `rsbinder-aidl`.
 6. `rsbinder-tools`
 
+The workspace requires `rsbinder-aidl` with `=` (generated code calls
+hidden items of the `rsbinder` it was generated for), so a version bump
+changes that requirement in the root `Cargo.toml` together with
+`workspace.package.version`.
+
 `source envsetup.sh` and then `publish_dry_run` / `publish` run
 `cargo publish` in this order (`publish_dirs` there); a crate added to the
 workspace is added to that list in its place. `tests`, `example-hello`,

@@ -664,7 +664,7 @@ mod pool {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Instant;
 
-    use rsbinder::{BinderAsyncPool, StatusCode};
+    use rsbinder::StatusCode;
 
     use super::{serve, GiveBack, Hand, Handed, Local, Parts, Settle};
 
@@ -776,7 +776,7 @@ mod pool {
             seen,
         }));
         let mut give_back = GiveBack::new(&hand, local);
-        let ran = <rsbinder::Tokio as BinderAsyncPool>::spawn(
+        let ran = rsbinder::__spawn_transact::<rsbinder::Tokio, _, _, _, _, _, _>(
             move || serve(&hand),
             |()| async { Ok(()) },
         )

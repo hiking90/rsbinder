@@ -85,6 +85,13 @@
 //! - **`dispatch_transact_caught`** is called with no `THREAD_STATE` or
 //!   `BINDER_DEREFS` borrow held: `Transactable::transact` is user code that
 //!   may make nested binder calls into this module.
+//! - **`binder::local_transact`** (the in-process transport of a generated
+//!   proxy over a local binder) calls `Transactable::transact` with no borrow
+//!   held. `LocalCallGuard` saves the caller's strict-mode policy, work source
+//!   and in-process frame as values in the guard on the stack (P3) and writes
+//!   them back on drop, each under its own short borrow. The request parcel is
+//!   dropped after the guard, outside any borrow, because a binder it holds
+//!   may run a user `Inner<T>::drop`.
 //! - **`talk_with_driver`** holds a mutable `THREAD_STATE` borrow across the
 //!   `BINDER_WRITE_READ` ioctl: the ioctl reads `out_parcel`'s bytes and
 //!   fills `in_parcel`'s buffer, both lent as slices out of that borrow. This
@@ -458,12 +465,33 @@ pub enum Caller {
     /// An RPC caller, identified by its transport peer identity.
     #[cfg(feature = "rpc")]
     Rpc(crate::rpc::transport::PeerIdentity),
+    /// This process, calling one of its own local binders through a
+    /// generated proxy while no transaction is in flight on the thread (a
+    /// sync-only service reached through its async view, see
+    /// [`Strong::into_async`](crate::Strong::into_async)). `uid` and `pid`
+    /// are this process's own, as [`get_calling_uid`] and
+    /// [`get_calling_pid`] report outside a transaction.
+    ///
+    /// `@EnforcePermission` decides such a call for this process, as AOSP
+    /// Java checks a call made outside a transaction. Inside a kernel or RPC
+    /// handler the same call reports that handler's caller instead.
+    InProcess {
+        /// This process's uid (`getuid(2)`).
+        uid: binder::uid_t,
+        /// This process's pid (`getpid(2)`).
+        pid: binder::pid_t,
+    },
 }
 
 /// The caller of the current in-flight binder transaction, tagged by
 /// transport ([`Caller`]), or `None` when this thread is not dispatching
 /// one. Pure-RPC safe (never forces the kernel `THREAD_STATE` /
 /// `ProcessState`).
+///
+/// A local binder called in-process through a generated proxy with no
+/// transaction in flight reports [`Caller::InProcess`] while its dispatch
+/// runs; [`is_handling_transaction`](crate::is_handling_transaction) stays
+/// `false` there.
 ///
 /// This is the transport-aware basis for handler-side authorization: a
 /// service `match`es on the [`Caller`] arm and applies the right check
@@ -481,14 +509,62 @@ pub fn calling_caller() -> Option<Caller> {
     if !ProcessState::is_initialized() {
         return None;
     }
-    THREAD_STATE.with(|thread_state| {
+    let kernel = THREAD_STATE.with(|thread_state| {
         let thread_state = thread_state.borrow();
         thread_state.transaction.as_ref().map(|tr| Caller::Kernel {
             uid: tr.calling_uid,
             pid: tr.calling_pid,
             sid: tr.calling_sid.clone(),
         })
+    });
+    kernel.or_else(|| {
+        IN_PROCESS_CALL.with(Cell::get).then(|| Caller::InProcess {
+            uid: rustix::process::getuid().as_raw(),
+            pid: rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t,
+        })
     })
+}
+
+thread_local! {
+    // Set by `LocalCallGuard` for an in-process call made outside any transaction.
+    static IN_PROCESS_CALL: Cell<bool> = const { Cell::new(false) };
+}
+
+/// One in-process transact through a generated proxy (plan 17 K-4, D-11, D-12).
+///
+/// The service's `check_interface` installs the request header's strict-mode
+/// policy and work source on the running thread; this restores the caller's
+/// values when the dispatch returns or unwinds, so a reused pool thread does
+/// not keep them. When no transaction is in flight it also opens the
+/// in-process frame that [`calling_caller`] reports as [`Caller::InProcess`].
+/// The saved values live in this guard on the caller's stack and no
+/// `THREAD_STATE` borrow is held across the dispatch (R1, pattern P3).
+pub(crate) struct LocalCallGuard {
+    strict_mode_policy: i32,
+    work_source: WorkSource,
+    in_process_call: bool,
+}
+
+impl LocalCallGuard {
+    pub(crate) fn enter() -> Self {
+        let strict_mode_policy = get_strict_mode_policy();
+        let work_source = work_source();
+        let opens_frame = !is_handling_transaction();
+        let in_process_call = IN_PROCESS_CALL.with(|c| c.replace(c.get() || opens_frame));
+        LocalCallGuard {
+            strict_mode_policy,
+            work_source,
+            in_process_call,
+        }
+    }
+}
+
+impl Drop for LocalCallGuard {
+    fn drop(&mut self) {
+        set_strict_mode_policy(self.strict_mode_policy);
+        replace_work_source(self.work_source);
+        IN_PROCESS_CALL.with(|c| c.set(self.in_process_call));
+    }
 }
 
 /// What the in-flight transaction arrived over, as a

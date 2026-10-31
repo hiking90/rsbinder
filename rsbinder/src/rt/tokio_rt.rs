@@ -79,7 +79,7 @@ pub async fn try_get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> BinderResult<Option<Strong<T>>> {
     if crate::is_handling_transaction() {
-        // See comment in the BinderAsyncPool impl.
+        // The rule of `__spawn_transact`: a nested call stays on the handler's thread.
         return hub::try_get_interface::<T>(name);
     }
 
@@ -227,7 +227,7 @@ pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
     }
 
     if crate::is_handling_transaction() {
-        // See comment in the BinderAsyncPool impl.
+        // The rule of `__spawn_transact`: a nested call stays on the handler's thread.
         return lookup::<T>(name);
     }
 
@@ -406,6 +406,11 @@ pub fn death_signal(binder: &SIBinder) -> Result<DeathSignal, StatusCode> {
 }
 
 /// Use the Tokio `spawn_blocking` pool with AIDL.
+///
+/// [`spawn`](BinderAsyncPool::spawn) always hands the work to
+/// `tokio::task::spawn_blocking`; a generated proxy keeps a transact made
+/// inside a transaction on the handler's thread itself (see
+/// [`BinderAsyncPool`]).
 pub enum Tokio {}
 
 impl BinderAsyncPool for Tokio {
@@ -421,20 +426,13 @@ impl BinderAsyncPool for Tokio {
         B: Send + 'a,
         E: From<crate::StatusCode>,
     {
-        // Inline: kernel deadlock prevention and RPC's thread-local `DRIVING` pin need this thread.
-        if crate::is_handling_transaction() {
-            // Blocking is harmless: `block_on` runs only this one task.
-            let result = spawn_me();
-            Box::pin(after_spawn(result))
-        } else {
-            let handle = tokio::task::spawn_blocking(spawn_me);
-            Box::pin(async move {
-                match handle.await {
-                    Ok(res) => after_spawn(res).await,
-                    Err(e) => Err(join_error_status(e).into()),
-                }
-            })
-        }
+        let handle = tokio::task::spawn_blocking(spawn_me);
+        Box::pin(async move {
+            match handle.await {
+                Ok(res) => after_spawn(res).await,
+                Err(e) => Err(join_error_status(e).into()),
+            }
+        })
     }
 }
 

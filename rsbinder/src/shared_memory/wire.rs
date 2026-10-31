@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::heap::MappedHeap;
 use super::{IMemory, IMemoryHeap};
-use crate::binder::{Interface, Remotable, SIBinder, TransactionCode, FIRST_CALL_TRANSACTION};
+use crate::binder::{
+    Interface, Remotable, SIBinder, TransactionCode, Transport, FIRST_CALL_TRANSACTION,
+};
 use crate::error::{Result, StatusCode};
 use crate::native::Binder;
 use crate::parcel::Parcel;
@@ -33,7 +35,8 @@ pub const GET_MEMORY: TransactionCode = FIRST_CALL_TRANSACTION;
 
 /// Token-only transaction: a remote binder via the proxy path, a local `Binder<T>` in-process.
 fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Parcel> {
-    if let Some(remote) = binder.as_remote() {
+    let transport = binder.__transport().ok_or(StatusCode::BadType)?;
+    if let Transport::Remote(_) = transport {
         // A cached other interface is refused unasked; the server's token check does the rest.
         if let Some(actual) = binder.cached_descriptor() {
             if actual != descriptor {
@@ -41,22 +44,12 @@ fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Pa
                 return Err(StatusCode::BadType);
             }
         }
-        let data = remote.prepare_request(descriptor)?;
-        return remote
-            .submit_transact(code, &data, crate::FLAG_CLEAR_BUF)?
-            .ok_or(StatusCode::UnexpectedNull);
     }
-    let local = binder.as_transactable().ok_or(StatusCode::BadType)?;
-    // A kernel-mode interface token needs the kernel `ProcessState`; RPC-only has none.
-    if !crate::process_state::ProcessState::is_initialized() {
-        return Err(StatusCode::InvalidOperation);
-    }
-    let mut data = Parcel::new();
-    data.write_interface_token(descriptor)?;
-    let mut reply = Parcel::new();
-    local.transact(code, &mut data, &mut reply)?;
-    reply.set_data_position(0);
-    Ok(reply)
+    // Local: `InvalidOperation` without kernel binder, from the shared in-process transport.
+    let data = transport.prepare_request(descriptor)?;
+    transport
+        .submit_transact(code, data, crate::FLAG_CLEAR_BUF)?
+        .ok_or(StatusCode::UnexpectedNull)
 }
 
 // --- IMemoryHeap ---

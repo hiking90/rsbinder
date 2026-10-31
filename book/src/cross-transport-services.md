@@ -103,12 +103,21 @@ tls://<host>:<port>[#<service>]             feature rpc-tls; IPv6 host in [ ]
 
 Kernel `serve(Uri::kernel())` initializes the process-wide `ProcessState`
 idempotently; a second kernel server in the same process reuses it, and is
-refused with `StatusCode::BadValue` if it asked for a different driver,
-thread count, or mapping size — the process cannot give it one. The refusal
-lands where the option is read: `serve()` itself for the `KernelEndpoint`
-settings (`?driver=` / `?threads=` / `?mmap=`), `run`/`spawn` for `ServeOptions::threads` and
+refused with `StatusCode::BadValue` if it asked for a different driver or
+mapping size — both are fixed at init and the process cannot give it
+another. The refusal lands where the option is read: `serve()` itself for the
+`KernelEndpoint` settings (`?driver=` / `?mmap=`), `run`/`spawn` for
 `ServeOptions::mmap_size`, and `open` for `ClientOptions::driver` and
-`ClientOptions::mmap_size`. RPC
+`ClientOptions::mmap_size`.
+
+The thread count is different: the kernel pool ceiling is a driver setting
+that can change while the process runs. `?threads=` sizes the pool when
+`serve()` is the call that initializes `ProcessState`; otherwise it, or
+`ServeOptions::threads`, is applied at `run`/`spawn` with
+`ProcessState::set_max_threads` (AOSP `setThreadPoolMaxThreadCount`). Giving
+both with different values is `BadValue`. Once the pool has started the
+ceiling may grow but not shrink: a smaller value is
+`StatusCode::InvalidOperation`. RPC
 servers bind their listener at `run`/`spawn`, so options (TLS config, limits)
 set via `with` apply first.
 
@@ -194,12 +203,13 @@ rsbinder::serve(KernelEndpoint::default().with_mmap_size(4 << 20))?   // 4 MB, t
   rest so an async flood cannot starve synchronous calls.
 - Only address space is reserved; pages are faulted in as they are used.
 - Process-wide and fixed at the first `serve` / `Client::open`, like
-  the driver and thread count. `ProcessState::init_with_mmap_size` is the
+  the driver. `ProcessState::init_with_mmap_size` is the
   direct form, and `ProcessState::mmap_size()` reports what is in force.
 - `ServeOptions::mmap_size` cannot make the mapping: `serve` initializes
-  `ProcessState` before the option is read, so the field can only agree with
-  the size already in force and a different one is `BadValue` at
-  `run`/`spawn` — the same rule as `ServeOptions::threads`. What sets the
+  `ProcessState` before the option is read, and a mapping cannot be resized,
+  so the field can only agree with the size already in force and a different
+  one is `BadValue` at `run`/`spawn` (unlike `ServeOptions::threads`, which
+  is applied there). What sets the
   size on a kernel server is `KernelEndpoint::with_mmap_size`
   (`binder://?mmap=`), or `ProcessState::init_with_mmap_size` called before
   `serve`.

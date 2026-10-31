@@ -14,9 +14,9 @@
 //! [`on_pool`] hands the task over when it is called, not when the future is
 //! polled, so dropping the future detaches the task. Its `Err` says only that
 //! the pool did not run the task; what the task did is the token's to report.
-//! It goes through [`Tokio`](crate::Tokio) rather than `spawn_blocking`
-//! directly, because inside a transaction handler the work has to stay on the
-//! current thread and that rule lives there.
+//! It goes through `__spawn_transact` with [`Tokio`](crate::Tokio) rather
+//! than `spawn_blocking` directly, because inside a transaction handler the
+//! work has to stay on the current thread and that rule lives there.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -77,7 +77,7 @@ where
     F: FnOnce(R) -> Result<()> + Send + 'static,
 {
     carry(token, run, |task| {
-        <crate::Tokio as crate::BinderAsyncPool>::spawn(
+        crate::__spawn_transact::<crate::Tokio, _, _, _, _, _, _>(
             move || task.run(),
             |result| async move { result },
         )

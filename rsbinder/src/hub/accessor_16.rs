@@ -47,8 +47,8 @@
 //! `Service::Accessor` to a log line and `None`
 //! ([`super::servicemanager_16`] cfg guards the whole resolve path).
 //!
-//! Process-wide state: **none**. There is no global registry, no
-//! `OnceLock<Mutex<Vec<RpcSession>>>`; the session
+//! Process-wide state: one switch, `rpc-tcp-debug` only (`set_accessor_plaintext_inet`, plan 17
+//! R-23). There is no global registry, no `OnceLock<Mutex<Vec<RpcSession>>>`; the session
 //! lives exactly as long as the wrapper the caller holds.
 
 // cfg lives on the mod decl in super; repeating it trips clippy::duplicated_attributes.
@@ -190,10 +190,27 @@ impl IBinder for AccessorRoot {
 ///   codes ([`accessor_error_name`] names it). AOSP turns
 ///   `ERROR_FAILED_TO_CONNECT_TO_SOCKET` into a null service so the
 ///   caller retries; here it is this `Err`, and the retry is the caller's.
+/// - The connection is an `AF_INET`/`AF_INET6` socket:
+///   [`StatusCode::BadType`](crate::StatusCode::BadType), unless
+///   `rpc::set_accessor_plaintext_inet(true)` was called (feature
+///   `rpc-tcp-debug`). Without that feature every inet socket is `BadType`,
+///   as any family with no backend is.
 /// - The RPC handshake, the root request, or the wrapper fails: the
 ///   [`StatusCode`](crate::StatusCode) of that failure as a `Status`.
 ///
 /// Every failure is also logged at `warn` with the instance name.
+///
+/// # Plaintext inet
+///
+/// AOSP accepts any family here and runs it in plaintext
+/// (`IServiceManager.cpp`, android-16.0.0_r4). rsbinder has a plaintext
+/// inet transport only with `rpc-tcp-debug`, and Cargo turns that feature
+/// on for the whole build as soon as any crate in the dependency graph asks
+/// for it. So the feature alone does not let an accessor hand this process
+/// an unencrypted, unauthenticated TCP connection: that also needs the
+/// process-wide opt-in, off by default. A direct
+/// [`RpcSession::from_preconnected_fd`] call is not affected: its caller
+/// chose the socket.
 pub fn try_resolve_accessor(name: &str, accessor: SIBinder) -> BinderResult<SIBinder> {
     let bp = validate_accessor(name, accessor)?;
     connect_accessor(name, &bp)
@@ -241,6 +258,8 @@ pub(crate) fn connect_accessor(
         status
     })?;
     let fd: std::os::fd::OwnedFd = pfd.into();
+    #[cfg(feature = "rpc-tcp-debug")]
+    refuse_plaintext_inet(name, std::os::fd::AsFd::as_fd(&fd))?;
 
     // Versioned handshake capped at android-16's v2; an older peer may pick v0/v1.
     let session = RpcSession::from_preconnected_fd(fd, 2).map_err(|e| {
@@ -255,6 +274,63 @@ pub(crate) fn connect_accessor(
         log::warn!("AccessorRoot wrap failed for {name}: {e}");
         Status::from(e)
     })
+}
+
+#[cfg(feature = "rpc-tcp-debug")]
+static ACCESSOR_PLAINTEXT_INET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Let an `IAccessor` connection be a plaintext `AF_INET`/`AF_INET6`
+/// socket, process-wide; returns the value it replaces. Off by default.
+///
+/// The switch is read by the accessor path only
+/// ([`try_resolve_accessor`](crate::hub::android_16::try_resolve_accessor),
+/// [`try_resolve_via_process_local`](crate::hub::android_16::try_resolve_via_process_local)
+/// and a service manager lookup that resolves an accessor). There the
+/// accessor, not this process, picks the socket, and an inet socket runs
+/// the `rpc-tcp-debug` transport: no encryption, no peer identity
+/// ([`PeerIdentity::Anonymous`](crate::rpc::PeerIdentity::Anonymous)).
+/// With the switch off such a socket is refused with
+/// [`StatusCode::BadType`](crate::StatusCode::BadType) and an `error` log
+/// that names this function.
+///
+/// The `rpc-tcp-debug` feature is not enough by itself because Cargo
+/// unifies features: one crate in the graph that enables it enables it for
+/// every crate, release builds included. This switch is the decision of the
+/// program that runs.
+/// [`RpcSession::from_preconnected_fd`](crate::rpc::RpcSession::from_preconnected_fd)
+/// called directly does not read it.
+#[cfg(feature = "rpc-tcp-debug")]
+pub fn set_accessor_plaintext_inet(allow: bool) -> bool {
+    ACCESSOR_PLAINTEXT_INET.swap(allow, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether [`set_accessor_plaintext_inet`] last allowed plaintext inet
+/// accessor connections (`false` until it is called).
+#[cfg(feature = "rpc-tcp-debug")]
+pub fn accessor_plaintext_inet() -> bool {
+    ACCESSOR_PLAINTEXT_INET.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `BadType` for an inet accessor socket unless the opt-in is on; other families pass through.
+#[cfg(feature = "rpc-tcp-debug")]
+fn refuse_plaintext_inet(name: &str, fd: std::os::fd::BorrowedFd<'_>) -> BinderResult<()> {
+    if accessor_plaintext_inet() {
+        return Ok(());
+    }
+    // A failed `getsockname` is `from_preconnected_fd`'s to report.
+    let Ok(local) = rustix::net::getsockname(fd) else {
+        return Ok(());
+    };
+    let family = local.address_family();
+    if family == rustix::net::AddressFamily::INET || family == rustix::net::AddressFamily::INET6 {
+        log::error!(
+            "IAccessor for {name} returned a plaintext inet socket; refusing it. Call \
+             rsbinder::rpc::set_accessor_plaintext_inet(true) to accept one (feature rpc-tcp-debug)"
+        );
+        return Err(StatusCode::BadType.into());
+    }
+    Ok(())
 }
 
 /// The `ServiceWithMetadata` an accessor-resolved root is returned in: never lazy.

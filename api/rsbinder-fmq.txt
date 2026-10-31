@@ -502,7 +502,6 @@ pub fn rsbinder_fmq::Regions<'_, T>::is_empty(&self) -> bool
 pub fn rsbinder_fmq::Regions<'_, T>::len(&self) -> usize
 pub fn rsbinder_fmq::Regions<'_, T>::read_at(&self, usize, &mut [T]) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::Regions<'_, T>::second_len(&self) -> usize
-pub fn rsbinder_fmq::Regions<'_, T>::write_at(&mut self, usize, &[T]) -> rsbinder_fmq::Result<()>
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::Regions<'_, T>
 pub fn rsbinder_fmq::Regions<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a, T> core::marker::Freeze for rsbinder_fmq::Regions<'a, T>

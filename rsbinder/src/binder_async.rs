@@ -37,6 +37,24 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `BinderAsyncPool` provides an abstraction over different async runtime
 /// implementations (like Tokio) for spawning binder operations on background
 /// threads while maintaining async compatibility.
+///
+/// # Which thread a transact runs on
+///
+/// A generated async proxy does not always call [`spawn`](Self::spawn). On a
+/// thread that is handling a transaction
+/// ([`is_handling_transaction`](crate::is_handling_transaction)), it runs the
+/// transact inline on that thread and returns a future of its result. Two
+/// things need the nested call made from that thread: the kernel binder
+/// driver routes the callbacks of a nested call back to the thread that
+/// waits for it, which is what keeps a call back into the caller from
+/// deadlocking, and an RPC session drives a nested call on the thread that
+/// holds the outer one. The rule is fixed in the library, so a pool cannot
+/// lose it, and `spawn` is reached only from a thread that is not handling a
+/// transaction.
+///
+/// The strict-mode policy and work source of the calling thread are written
+/// into the request header before `spawn` is called, so the pool thread that
+/// runs `spawn_me` carries them without help from the implementation.
 pub trait BinderAsyncPool {
     /// This function should conceptually behave like this:
     ///
@@ -48,16 +66,20 @@ pub trait BinderAsyncPool {
     /// If the spawning fails for some reason, the method may also skip the `after_spawn` closure
     /// and immediately return an error.
     ///
-    /// The only difference between different implementations should be which
-    /// `spawn_thread` method is used. For Tokio, it would be `tokio::task::spawn_blocking`.
+    /// An implementation always hands `spawn_me` to another thread; the only
+    /// difference between implementations is which `spawn_thread` method is
+    /// used. For Tokio, it is `tokio::task::spawn_blocking`. It does not check
+    /// for a transaction in flight: see the trait doc for who does.
     ///
-    /// The returned future is **not cancel-safe**, and an implementation may
-    /// run `spawn_me` eagerly (the Tokio one does, on a binder thread that is
-    /// already handling a transaction). Dropping the future — a `timeout`
-    /// or `select!` losing — does not cancel a transaction that has already
-    /// been issued: the remote side still executes it and only the reply is
-    /// discarded. Callers wrapping a non-idempotent call in a timeout must
-    /// not assume "timed out" means "did not happen".
+    /// The returned future is **not cancel-safe**, and `spawn_me` may start
+    /// before the future is first polled: the Tokio implementation hands it to
+    /// the pool when `spawn` is called, and a generated proxy inside a
+    /// transaction has run it before the future is returned. Dropping the
+    /// future — a `timeout` or `select!` losing — does not cancel a
+    /// transaction that has already been issued: the remote side still
+    /// executes it and only the reply is discarded. Callers wrapping a
+    /// non-idempotent call in a timeout must not assume "timed out" means
+    /// "did not happen".
     ///
     /// This method has the design it has because the only way to define a trait that
     /// allows the return type of the spawn to be chosen by the caller is to return a
@@ -78,6 +100,35 @@ pub trait BinderAsyncPool {
         A: Send + 'static,
         B: Send + 'a,
         E: From<crate::StatusCode>;
+}
+
+/// Run a transact for generated async code: inline on a thread that is
+/// handling a transaction, through `P::spawn` otherwise. The one place the
+/// rule in [`BinderAsyncPool`]'s trait doc is applied (plan 17 K-20).
+#[doc(hidden)]
+pub fn __spawn_transact<'a, P, F1, F2, Fut, A, B, E>(
+    spawn_me: F1,
+    after_spawn: F2,
+) -> BoxFuture<'a, Result<B, E>>
+where
+    P: BinderAsyncPool,
+    F1: FnOnce() -> A,
+    F2: FnOnce(A) -> Fut,
+    Fut: Future<Output = Result<B, E>>,
+    F1: Send + 'static,
+    F2: Send + 'a,
+    Fut: Send + 'a,
+    A: Send + 'static,
+    B: Send + 'a,
+    E: From<crate::StatusCode>,
+{
+    if crate::is_handling_transaction() {
+        // Blocking is harmless here: the handler's `block_on` drives only this one future.
+        let result = spawn_me();
+        Box::pin(after_spawn(result))
+    } else {
+        P::spawn(spawn_me, after_spawn)
+    }
 }
 
 /// A runtime for executing an async binder server.

@@ -686,6 +686,44 @@ impl<B: Remotable + 'static> TryFrom<SIBinder> for Binder<B> {
     }
 }
 
+/// `Ok` when a local binder can be called through the in-process transport
+/// (plan 17 K-4): it needs kernel binder, `InvalidOperation` without it.
+#[doc(hidden)]
+pub fn __local_transport_ready() -> Result<()> {
+    if crate::process_state::ProcessState::is_initialized() {
+        Ok(())
+    } else {
+        log::error!(
+            "a local binder is called in-process through a kernel-mode parcel, \
+             and this process has no kernel binder (ProcessState is not initialized)"
+        );
+        Err(StatusCode::InvalidOperation)
+    }
+}
+
+/// The local side of a generated cast to `B`'s interface (plan 17 K-4, D-13).
+///
+/// `Ok(Some)` for a `Binder<B>`; `Ok(None)` for a local binder of another
+/// `Remotable` with `B`'s descriptor, which a generated proxy then drives
+/// through the in-process transport; `Err(InvalidOperation)` for that case
+/// without kernel binder; otherwise the error of `Binder::<B>::try_from`.
+#[doc(hidden)]
+pub fn __local_binder<B: Remotable + 'static>(binder: &SIBinder) -> Result<Option<Binder<B>>> {
+    let arc: Arc<dyn IBinder> = Arc::clone(binder.as_arc());
+    let any: Arc<dyn Any + Send + Sync> = arc;
+    if let Ok(inner) = any.downcast::<Inner<B>>() {
+        return Ok(Some(Binder { inner }));
+    }
+    let local_of_b = binder.as_remote().is_none()
+        && binder.as_transactable().is_some()
+        && binder.descriptor() == B::descriptor();
+    if local_of_b {
+        __local_transport_ready()?;
+        return Ok(None);
+    }
+    Binder::<B>::try_from(binder.clone()).map(Some)
+}
+
 /// Determine whether the current thread is currently executing an incoming
 /// transaction.
 pub fn is_handling_transaction() -> bool {

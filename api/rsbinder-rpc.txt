@@ -3973,6 +3973,9 @@ impl core::marker::UnsafeUnpin for rsbinder::CallRestriction
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::CallRestriction
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::CallRestriction
 #[non_exhaustive] pub enum rsbinder::Caller
+pub rsbinder::Caller::InProcess
+pub rsbinder::Caller::InProcess::pid: std::os::raw::c_int
+pub rsbinder::Caller::InProcess::uid: std::os::raw::c_uint
 pub rsbinder::Caller::Kernel
 pub rsbinder::Caller::Kernel::pid: std::os::raw::c_int
 pub rsbinder::Caller::Kernel::sid: core::option::Option<alloc::ffi::c_str::CString>
@@ -4674,6 +4677,7 @@ pub fn rsbinder::ProcessState::max_threads(&self) -> u32
 pub fn rsbinder::ProcessState::mmap_size(&self) -> usize
 pub fn rsbinder::ProcessState::process_freeze_info(&self, i32) -> rsbinder::Result<rsbinder::ProcessFreezeInfo>
 pub fn rsbinder::ProcessState::set_call_restriction(&self, rsbinder::CallRestriction)
+pub fn rsbinder::ProcessState::set_max_threads(&self, u32) -> rsbinder::Result<()>
 pub fn rsbinder::ProcessState::start_thread_pool()
 pub fn rsbinder::ProcessState::strong_proxy_for_handle(&self, u32) -> rsbinder::Result<rsbinder::SIBinder>
 pub fn rsbinder::ProcessState::strong_ref_count_for_node(&self, &rsbinder::ProxyHandle) -> rsbinder::Result<usize>

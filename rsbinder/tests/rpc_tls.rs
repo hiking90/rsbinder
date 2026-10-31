@@ -62,6 +62,10 @@
 //! - `tls_accept_stream_with_bounds_a_trickling_client_as_a_whole`: with only the per-wait
 //!   bound, each one-byte read restarts `SO_RCVTIMEO`; the handshake runs until the feeder
 //!   closes at `HS_SLACK` and ends `EndOfStream`, not `Timeout`.
+//! - `refusals::refused_client_certificate_reaches_the_client`: without `linger_for_alert`
+//!   after a failed server handshake, the TLS 1.3 case closes with the client's first RPC bytes
+//!   unread, the kernel resets the connection, and the client gets `DeadObject`, not
+//!   `EKEYREJECTED`.
 
 #![cfg(feature = "rpc-tls")]
 
@@ -1245,5 +1249,337 @@ fn tls_stream_with_refuses_a_zero_handshake_timeout() {
     for (end, r) in [("connect", cli.err()), ("accept", srv.err())] {
         let e = r.unwrap_or_else(|| panic!("{end}: zero timeout accepted"));
         assert_eq!(e, StatusCode::BadValue, "{end}");
+    }
+}
+
+// ---- certificate refusals (plan 17 R-18) ------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod refusals {
+    use super::*;
+    use rsbinder::rpc::rustls::server::WebPkiClientVerifier;
+    use rsbinder::rpc::rustls::version::{TLS12, TLS13};
+    use rsbinder::rpc::rustls::SupportedProtocolVersion;
+    use rsbinder::rpc::RpcServer;
+
+    const EXPIRED_CA: &str = include_str!("tls_fixtures/expired_ca.crt");
+    const EXPIRED_CRT: &str = include_str!("tls_fixtures/expired.crt");
+    const EXPIRED_KEY: &str = include_str!("tls_fixtures/expired.key");
+
+    /// Repeats of each racy case: one pass could hide a reset that loses the alert.
+    const ROUNDS: usize = 20;
+
+    fn errno(e: i32) -> StatusCode {
+        StatusCode::from(std::io::Error::from_raw_os_error(e))
+    }
+
+    fn roots(ca_pem: &str) -> RootCertStore {
+        let mut roots = RootCertStore::empty();
+        for c in certs(ca_pem) {
+            roots.add(c).expect("add ca");
+        }
+        roots
+    }
+
+    fn client(
+        ca_pem: &str,
+        version: &'static SupportedProtocolVersion,
+        auth: Option<(&str, &str)>,
+    ) -> Arc<ClientConfig> {
+        let b = ClientConfig::builder_with_protocol_versions(&[version])
+            .with_root_certificates(roots(ca_pem));
+        Arc::new(match auth {
+            Some((crt, k)) => b
+                .with_client_auth_cert(certs(crt), key(k))
+                .expect("client cert"),
+            None => b.with_no_client_auth(),
+        })
+    }
+
+    /// Server presenting `SRV_CRT`, requiring a client certificate issued by `client_ca_pem`.
+    fn mtls_server(
+        client_ca_pem: &str,
+        version: &'static SupportedProtocolVersion,
+    ) -> Arc<ServerConfig> {
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots(client_ca_pem)))
+            .build()
+            .expect("client verifier");
+        Arc::new(
+            ServerConfig::builder_with_protocol_versions(&[version])
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs(SRV_CRT), key(SRV_KEY))
+                .expect("mtls server config"),
+        )
+    }
+
+    /// One handshake against a raw `accept`; returns the client's result.
+    fn client_handshake(srv: Arc<ServerConfig>, cli: Arc<ClientConfig>) -> Result<TlsTransport> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            if let Ok((tcp, _)) = listener.accept() {
+                let _ = TlsTransport::accept(tcp, srv);
+            }
+        });
+        let tcp = TcpStream::connect(addr).expect("tcp connect");
+        let r = TlsTransport::connect(tcp, "localhost", cli);
+        server.join().unwrap();
+        r
+    }
+
+    /// A server certificate from an issuer the client does not trust: `EKEYREJECTED`, both versions.
+    #[test]
+    fn untrusted_server_certificate_is_key_rejected() {
+        for version in [&TLS12, &TLS13] {
+            // `ROGUE_CRT` is a CA here, so `SRV_CRT` is a well-formed chain to an unknown issuer.
+            let r = client_handshake(
+                server_config(SRV_CRT, SRV_KEY),
+                client(ROGUE_CRT, version, None),
+            );
+            assert_eq!(
+                r.err(),
+                Some(errno(libc::EKEYREJECTED)),
+                "{version:?}: the client's verifier refuses an unknown issuer"
+            );
+        }
+    }
+
+    /// A server certificate past its `notAfter`: `EKEYEXPIRED`, apart from the trust failures.
+    #[test]
+    fn expired_server_certificate_is_key_expired() {
+        for version in [&TLS12, &TLS13] {
+            let r = client_handshake(
+                server_config(EXPIRED_CRT, EXPIRED_KEY),
+                client(EXPIRED_CA, version, None),
+            );
+            assert_eq!(
+                r.err(),
+                Some(errno(libc::EKEYEXPIRED)),
+                "{version:?}: an expired certificate is a time failure"
+            );
+        }
+    }
+
+    /// The payload survives `RpcError` → `io::Error` → `RpcError`, as the framing adapters carry it.
+    #[test]
+    fn the_rustls_payload_survives_the_io_round_trip() {
+        let r = client_handshake(
+            server_config(SRV_CRT, SRV_KEY),
+            client(ROGUE_CRT, &TLS13, None),
+        );
+        let code = r.expect_err("refused");
+        let io = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rsbinder::rpc::rustls::Error::InvalidCertificate(
+                rsbinder::rpc::rustls::CertificateError::UnknownIssuer,
+            ),
+        );
+        let back = RpcError::from(std::io::Error::from(RpcError::from(io)));
+        assert_eq!(StatusCode::from(back), code);
+    }
+
+    /// A refused client certificate reaches the client as the refusal, not a reset (module doc).
+    #[test]
+    fn refused_client_certificate_reaches_the_client() {
+        for version in [&TLS12, &TLS13] {
+            // The server trusts only `EXPIRED_CA` for clients; `SRV_CRT` comes from `CA`.
+            let server =
+                RpcServer::setup_tcp_server_tls("127.0.0.1:0", mtls_server(EXPIRED_CA, version))
+                    .expect("setup_tcp_server_tls");
+            server
+                .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+                    PingSvc,
+                )))))
+                .expect("set_root");
+            let addr = server.tcp_address().expect("tcp_address");
+            let bg = server.run_background().expect("run_background");
+            for round in 0..ROUNDS {
+                let cli = client(CA, version, Some((SRV_CRT, SRV_KEY)));
+                // TLS 1.2 fails the connect; TLS 1.3 completes it and fails the first call.
+                let opened = RpcSession::setup_tcp_client_tls(addr, "localhost", cli);
+                assert_eq!(
+                    opened.is_ok(),
+                    std::ptr::eq(version, &TLS13),
+                    "{version:?} round {round}: where the refusal lands"
+                );
+                let r = opened.and_then(|s| s.get_root().map(drop));
+                assert_eq!(
+                    r.err(),
+                    Some(errno(libc::EKEYREJECTED)),
+                    "{version:?} round {round}: the server's unknown_ca alert must reach the client"
+                );
+            }
+            let _ = bg.stop_and_join();
+        }
+    }
+
+    /// The android-13+ profile reads the server's handshake response, so the refusal ends the open.
+    #[test]
+    fn refused_client_certificate_ends_an_android13plus_open() {
+        use rsbinder::rpc::RpcClientConfig;
+
+        for version in [&TLS12, &TLS13] {
+            let server =
+                RpcServer::setup_tcp_server_tls("127.0.0.1:0", mtls_server(EXPIRED_CA, version))
+                    .expect("setup_tcp_server_tls");
+            server.set_android13plus(2);
+            server
+                .set_root(Interface::as_binder(&Binder::new(BnPing(Box::new(
+                    PingSvc,
+                )))))
+                .expect("set_root");
+            let addr = server.tcp_address().expect("tcp_address");
+            let bg = server.run_background().expect("run_background");
+            for round in 0..ROUNDS {
+                let cli = client(CA, version, Some((SRV_CRT, SRV_KEY)));
+                let r = RpcSession::setup_client_android13plus_with_config(
+                    RpcClientConfig::tls("127.0.0.1", addr.port(), "localhost", cli, 2)
+                        .timeout(Duration::from_secs(5)),
+                );
+                assert_eq!(
+                    r.err(),
+                    Some(errno(libc::EKEYREJECTED)),
+                    "{version:?} round {round}: the open must return the refusal"
+                );
+            }
+            let _ = bg.stop_and_join();
+        }
+    }
+
+    // ---- `Reconnecting` over a refused certificate ---------------------
+
+    struct PingProxy(SIBinder);
+    impl Interface for PingProxy {
+        fn as_binder(&self) -> SIBinder {
+            self.0.clone()
+        }
+    }
+    impl IPing for PingProxy {
+        fn ping(&self, s: &str) -> Result<String> {
+            ping_via(&self.0, s)
+        }
+    }
+    impl rsbinder::FromIBinder for dyn IPing {
+        fn interface_descriptor() -> &'static str {
+            DESC
+        }
+        fn try_from(ibinder: SIBinder) -> Result<rsbinder::Strong<Self>> {
+            Ok(rsbinder::Strong::new(Box::new(PingProxy(ibinder))))
+        }
+    }
+
+    fn serve_ping(port: u16, cert: &str, key_pem: &str) -> rsbinder::ServerGuard {
+        let svc = Interface::as_binder(&Binder::new(BnPing(Box::new(PingSvc))));
+        rsbinder::serve(Endpoint::tls("127.0.0.1", port))
+            .expect("serve tls://")
+            .with(|o| o.tls = Some(server_config(cert, key_pem)))
+            .add("ping", svc)
+            .expect("add")
+            .spawn()
+            .expect("spawn")
+    }
+
+    fn port_of(guard: &rsbinder::ServerGuard) -> u16 {
+        guard
+            .server()
+            .expect("rpc server")
+            .tcp_address()
+            .expect("bound TCP address")
+            .port()
+    }
+
+    fn fast_policy() -> rsbinder::reconnect::ReconnectPolicy {
+        let mut p = rsbinder::reconnect::ReconnectPolicy::default();
+        p.initial = Duration::from_millis(5);
+        p.max = Duration::from_millis(50);
+        p
+    }
+
+    /// The trust store an attempt uses; `options` runs per attempt, so a swap takes effect next.
+    type Trust = Arc<Mutex<Arc<ClientConfig>>>;
+
+    fn helper(port: u16, trust: &Trust) -> Result<rsbinder::Reconnecting<dyn IPing>> {
+        let trust = Arc::clone(trust);
+        rsbinder::Reconnecting::<dyn IPing>::builder(
+            Uri::new(Endpoint::tls("127.0.0.1", port)).with_service("ping"),
+        )
+        .options(move |o, _| {
+            o.tls = Some(Arc::clone(&trust.lock().unwrap()));
+            o.tls_server_name = Some("localhost".to_string());
+            o.timeout = Some(Duration::from_secs(5));
+        })
+        .policy(fast_policy())
+        .build()
+    }
+
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            if f() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// `build` stops on an untrusted certificate: no retry can make the issuer known.
+    #[test]
+    fn reconnecting_build_refuses_an_untrusted_certificate() {
+        let guard = serve_ping(0, SRV_CRT, SRV_KEY);
+        let trust: Trust = Arc::new(Mutex::new(client_config_trusting(ROGUE_CRT)));
+        let r = helper(port_of(&guard), &trust);
+        assert_eq!(r.err(), Some(errno(libc::EKEYREJECTED)));
+    }
+
+    /// An expired certificate is never permanent: `build` returns a helper that keeps trying.
+    #[test]
+    fn reconnecting_build_retries_an_expired_certificate() {
+        let guard = serve_ping(0, EXPIRED_CRT, EXPIRED_KEY);
+        let trust: Trust = Arc::new(Mutex::new(client_config_trusting(EXPIRED_CA)));
+        let h = helper(port_of(&guard), &trust).expect("expired is not a build error");
+        assert!(
+            eventually(|| h.last_error() == Some(errno(libc::EKEYEXPIRED))),
+            "last_error: {:?}",
+            h.last_error()
+        );
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !h.is_closed(),
+            "an expired certificate must not close the helper"
+        );
+    }
+
+    /// Once running, a refused certificate is retried in the background and reported, not fatal.
+    #[test]
+    fn reconnecting_retries_a_refusal_after_build() {
+        let guard = serve_ping(0, SRV_CRT, SRV_KEY);
+        let port = port_of(&guard);
+        let trust: Trust = Arc::new(Mutex::new(client_config_trusting(CA)));
+        let h = helper(port, &trust).expect("build");
+        assert_eq!(h.with(|p| p.ping("a")).as_deref(), Ok("pong:a"));
+
+        // The server goes, and the next attempts meet a certificate this client does not trust.
+        *trust.lock().unwrap() = client_config_trusting(ROGUE_CRT);
+        drop(guard);
+        let guard = serve_ping(port, SRV_CRT, SRV_KEY);
+        let _ = h.with(|p| p.ping("b"));
+        assert!(
+            eventually(|| h.last_error() == Some(errno(libc::EKEYREJECTED))),
+            "last_error: {:?}",
+            h.last_error()
+        );
+        assert!(
+            !h.is_closed(),
+            "a refusal after build must not close the helper"
+        );
+
+        // Trust restored: the helper reconnects on its own.
+        *trust.lock().unwrap() = client_config_trusting(CA);
+        let p = h
+            .wait_connected(Some(Duration::from_secs(10)))
+            .expect("reconnected once the certificate is trusted again");
+        assert_eq!(p.ping("c").as_deref(), Ok("pong:c"));
+        drop(guard);
     }
 }

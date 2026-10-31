@@ -457,7 +457,10 @@ over RPC, the session timeout (`RpcSession::set_reply_timeout` or `ClientOptions
 While a thread is handling a transaction, an async proxy call on that thread executes
 **at the call site**, synchronously, before the first poll. This is deliberate: the
 kernel's deadlock prevention needs the nested outbound call to come from the thread that
-is holding the inbound one, and RPC needs the same thread to keep its session pin.
+is holding the inbound one, and RPC needs the same thread to keep its session pin. The
+rule lives in the generated code, so it holds for every `BinderAsyncPool`, not only
+`Tokio`. A stream's async receive and an `rsbinder-topic` subscriber's `recv_async` follow
+it too: inside a handler their wait for the next record blocks the handler's thread.
 
 The consequence is that the usual combinators do nothing there:
 

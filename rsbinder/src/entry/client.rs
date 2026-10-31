@@ -123,8 +123,8 @@ pub struct ClientOptions {
     /// whoever initializes `ProcessState` first, so a *different* path here
     /// is [`StatusCode::BadValue`] at
     /// [`open`](Client::open) — see
-    /// [`ServeOptions::threads`](super::ServeOptions::threads) for the same
-    /// rule on the server side.
+    /// [`ServeOptions::mmap_size`](super::ServeOptions::mmap_size) for the
+    /// same rule on the server side.
     pub driver: Option<std::path::PathBuf>,
     /// Kernel: `?mmap=` equivalent — the size of the mapping this
     /// process receives into. A client is a receiver too: the reply to

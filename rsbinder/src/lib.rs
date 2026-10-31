@@ -97,7 +97,12 @@
 //!   and `--no-default-features` builds carry zero RPC/networking cost.
 //! - `rpc-tcp-debug` — plaintext TCP backend (implies `rpc`). Debug and
 //!   interop bring-up **only**, never production — use `rpc-tls` for real
-//!   networks.
+//!   networks. It is a feature, not a build profile: Cargo unifies features,
+//!   so one crate in the dependency graph that enables it enables it for the
+//!   whole build, release builds included. The one path where a peer rather
+//!   than this process picks an inet socket, an Android 16 `IAccessor`
+//!   connection, therefore also needs the run-time opt-in
+//!   `rpc::set_accessor_plaintext_inet(true)`.
 //! - `rpc-vsock` — vsock backend for host↔VM channels (implies `rpc`;
 //!   Linux and Android targets only).
 //! - `rpc-tls` — TLS backend over rustls (implies `rpc`). rsbinder never
@@ -377,9 +382,16 @@ pub use binder::{
 // The `function_names` arm of `declare_binder_interface!` calls it from consumer crates.
 #[doc(hidden)]
 pub use binder::__transaction_name;
+// Generated casts reach a local binder's in-process transport through these.
+#[doc(hidden)]
+pub use native::{__local_binder, __local_transport_ready};
 
 #[cfg(feature = "async")]
 pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
+// Generated async proxies, `stream` and `rsbinder-topic` apply the inline rule through it.
+#[cfg(feature = "async")]
+#[doc(hidden)]
+pub use binder_async::__spawn_transact;
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
 // Fuzz entry points: the out-of-workspace `fuzz/` crate reaches them only via the root.
