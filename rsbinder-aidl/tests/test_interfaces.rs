@@ -105,9 +105,21 @@ pub mod ArrayOfInterfaces {
         /// re-published as a local service on another transport in one line:
         /// `BnEmptyInterface::new_binder(upstream)` (the **gateway** pattern —
         /// `new_binder` takes any `T: IEmptyInterface + Send + Sync + 'static`).
-        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-        /// forwarded as-is is refused at the stack boundary.
+        /// A gateway that has to change some methods (a binder argument crossing
+        /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+        /// stack boundary) implements `IEmptyInterfaceDelegate` instead.
         impl IEmptyInterface for rsbinder::Strong<dyn IEmptyInterface> {
+        }
+        /// Per-method hooks for a gateway that re-publishes a `IEmptyInterface`: each
+        /// method gets the upstream handle and by default forwards the call to it
+        /// unchanged. Override the methods to change and publish with
+        /// `BnEmptyInterface::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+        /// A binder argument is forwarded as it is, which is right when caller and
+        /// upstream share one stack; across stacks it is refused, so override that
+        /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+        pub trait IEmptyInterfaceDelegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+        }
+        impl<__RsbHooks: IEmptyInterfaceDelegate> IEmptyInterface for rsbinder::bridge::Delegating<dyn IEmptyInterface, __RsbHooks> {
         }
         fn on_transact(
             _service: &dyn IEmptyInterface, _code: rsbinder::TransactionCode, _reader: &mut rsbinder::Parcel, _reply: &mut rsbinder::Parcel) -> rsbinder::Result<()> {
@@ -193,11 +205,29 @@ pub mod ArrayOfInterfaces {
         /// re-published as a local service on another transport in one line:
         /// `BnMyInterface::new_binder(upstream)` (the **gateway** pattern —
         /// `new_binder` takes any `T: IMyInterface + Send + Sync + 'static`).
-        /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-        /// forwarded as-is is refused at the stack boundary.
+        /// A gateway that has to change some methods (a binder argument crossing
+        /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+        /// stack boundary) implements `IMyInterfaceDelegate` instead.
         impl IMyInterface for rsbinder::Strong<dyn IMyInterface> {
             fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
                 (**self).r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
+            }
+        }
+        /// Per-method hooks for a gateway that re-publishes a `IMyInterface`: each
+        /// method gets the upstream handle and by default forwards the call to it
+        /// unchanged. Override the methods to change and publish with
+        /// `BnMyInterface::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+        /// A binder argument is forwarded as it is, which is right when caller and
+        /// upstream share one stack; across stacks it is refused, so override that
+        /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+        pub trait IMyInterfaceDelegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+            fn r#methodWithInterfaces(&self, _aidl_upstream: &rsbinder::Strong<dyn IMyInterface>, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
+                _aidl_upstream.r#methodWithInterfaces(_arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
+            }
+        }
+        impl<__RsbHooks: IMyInterfaceDelegate> IMyInterface for rsbinder::bridge::Delegating<dyn IMyInterface, __RsbHooks> {
+            fn r#methodWithInterfaces(&self, _arg_iface: &rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>, _arg_nullable_iface: ::core::option::Option<&rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_iface_array_in: &[rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>], _arg_iface_array_out: &mut ::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>, _arg_iface_array_inout: &mut ::std::vec::Vec<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>, _arg_nullable_iface_array_in: ::core::option::Option<&[::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>]>, _arg_nullable_iface_array_out: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>, _arg_nullable_iface_array_inout: &mut ::core::option::Option<::std::vec::Vec<::core::option::Option<rsbinder::Strong<dyn super::IEmptyInterface::IEmptyInterface>>>>) -> rsbinder::BinderResult<::core::option::Option<::std::vec::Vec<::core::option::Option<::std::string::String>>>> {
+                <__RsbHooks as IMyInterfaceDelegate>::r#methodWithInterfaces(rsbinder::bridge::Delegating::hooks(self), rsbinder::bridge::Delegating::upstream(self), _arg_iface, _arg_nullable_iface, _arg_iface_array_in, _arg_iface_array_out, _arg_iface_array_inout, _arg_nullable_iface_array_in, _arg_nullable_iface_array_out, _arg_nullable_iface_array_inout)
             }
         }
         fn on_transact(
@@ -756,6 +786,7 @@ fn names_clashing_with_generated_interface_items_are_rejected() {
         "interface IFoo { parcelable BpFoo { int a; } void m(); }",
         "interface IFoo { parcelable IFooDefault { int a; } void m(); }",
         "interface IFoo { parcelable IFooDefaultRef { int a; } void m(); }",
+        "interface IFoo { parcelable IFooDelegate { int a; } void m(); }",
     ] {
         let ctx = rsbinder_aidl::SourceContext::new("test.aidl", input);
         let document = rsbinder_aidl::parse_document(&ctx).expect(input);

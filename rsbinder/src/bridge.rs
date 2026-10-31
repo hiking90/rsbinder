@@ -9,10 +9,17 @@
 //! unwrapped and wrapped again: a proxy of one session cannot enter a parcel
 //! of another, and rsbinder refuses it at write time.
 //!
-//! Wrapping is one call — `BnFoo::new_binder(proxy)`. Doing it *per
-//! forwarded call* is the trap: each `new_binder` mints a new object, so the
-//! upstream sees a different callback identity every time and any interface
-//! that pairs registration with removal by identity breaks.
+//! A gateway that changes nothing is one call: `BnFoo::new_binder(proxy)`.
+//! A gateway that has to change some methods — the ones carrying a binder,
+//! say — implements the generated `IFooDelegate` trait, whose every method
+//! forwards to the upstream by default, overrides just those, and publishes
+//! the pair as a [`Delegating`](crate::bridge::Delegating)
+//! (`BnFoo::new_binder(Delegating::new(proxy, hooks))`).
+//!
+//! Wrapping a binder argument is one call too — `BnCallback::new_binder(cb)`.
+//! Doing it *per forwarded call* is the trap: each `new_binder` mints a new
+//! object, so the upstream sees a different callback identity every time and
+//! any interface that pairs registration with removal by identity breaks.
 //! [`Rewrap`](crate::bridge::Rewrap) is the memo table that fixes it — same
 //! remote in, same local out.
 //!
@@ -22,6 +29,114 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WIBinder};
+
+/// An upstream handle plus the hooks that override some of its methods: the
+/// service a gateway publishes when it changes only part of an interface.
+///
+/// For every AIDL interface `IFoo` the generator emits a trait
+/// `IFooDelegate` and `impl<H: IFooDelegate> IFoo for Delegating<dyn IFoo, H>`.
+/// Each `IFooDelegate` method takes the upstream as its first argument and
+/// by default forwards the call to it unchanged, so a gateway overrides only
+/// the methods it has to change and publishes the result with the usual
+/// constructor:
+///
+/// ```ignore
+/// use rsbinder::bridge::{Delegating, Rewrap};
+///
+/// struct Hooks {
+///     callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(BnCallback::new_binder)
+/// }
+///
+/// impl IFooDelegate for Hooks {
+///     // The one method with a binder argument; every other method forwards.
+///     fn register(
+///         &self,
+///         upstream: &Strong<dyn IFoo>,
+///         cb: &Strong<dyn ICallback>,
+///     ) -> BinderResult<()> {
+///         upstream.register(&self.callbacks.wrap(cb))
+///     }
+/// }
+///
+/// let service = BnFoo::new_binder(Delegating::new(upstream, Hooks { callbacks }));
+/// ```
+///
+/// # What the defaults do and do not do
+///
+/// - A forwarded call passes its arguments through as they are. Plain data
+///   needs nothing more. A binder argument does when it crosses stacks: a
+///   proxy of one session written into a parcel of another (an RPC caller's
+///   callback forwarded to a kernel upstream, or two RPC sessions) is refused
+///   with `InvalidOperation`, so such a gateway overrides that method and
+///   re-wraps the binder ([`Rewrap`]). Nothing forces the override, because a
+///   delegate whose caller and upstream share one stack (both on kernel
+///   binder) forwards a binder correctly as it is. The generator does not
+///   re-wrap on its own (plan 2-22 D-3): only the gateway knows whether a
+///   binder's identity matters to the upstream.
+/// - `getInterfaceVersion` / `getInterfaceHash` (on a versioned interface)
+///   forward too, so the gateway reports the upstream's values. The generated
+///   dispatch then answers a caller with at most the gateway module's own
+///   `VERSION` (and its own `HASH` in that case), since the gateway cannot
+///   dispatch a method its module does not have (plan 17 D-16).
+/// - The delegate is sync only (plan 2-22 D-2). A sync `Bn*` is reachable
+///   from async clients as any sync service is.
+/// - [`Interface`] on `Delegating` forwards `as_binder`, `dump` and
+///   `dump_fd` to the upstream, as `Strong`'s own impl does: the hooks are not
+///   asked.
+///
+/// `I` is always a `dyn IFoo` in practice; it is a parameter so that one
+/// library type serves every generated interface.
+pub struct Delegating<I: FromIBinder + ?Sized, H> {
+    upstream: Strong<I>,
+    hooks: H,
+}
+
+impl<I: FromIBinder + ?Sized, H> Delegating<I, H> {
+    /// Pair `upstream` with the `hooks` that override some of its methods.
+    pub fn new(upstream: Strong<I>, hooks: H) -> Self {
+        Self { upstream, hooks }
+    }
+
+    /// The handle the default methods forward to.
+    pub fn upstream(&self) -> &Strong<I> {
+        &self.upstream
+    }
+
+    /// The hooks given to [`new`](Self::new).
+    pub fn hooks(&self) -> &H {
+        &self.hooks
+    }
+
+    /// The upstream handle and the hooks, taken apart again.
+    pub fn into_parts(self) -> (Strong<I>, H) {
+        (self.upstream, self.hooks)
+    }
+}
+
+impl<I: FromIBinder + ?Sized, H: Send + Sync> Interface for Delegating<I, H> {
+    fn as_binder(&self) -> SIBinder {
+        self.upstream.as_binder()
+    }
+
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> crate::Result<()> {
+        self.upstream.dump(writer, args)
+    }
+
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> crate::Result<()> {
+        self.upstream.dump_fd(fd, args)
+    }
+}
+
+impl<I: FromIBinder + std::fmt::Debug + ?Sized, H: std::fmt::Debug> std::fmt::Debug
+    for Delegating<I, H>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Delegating")
+            .field("upstream", &self.upstream)
+            .field("hooks", &self.hooks)
+            .finish()
+    }
+}
 
 /// One remote → one local wrapper, for as long as the pair is alive.
 ///
@@ -34,23 +149,27 @@ use crate::binder::{DeathRecipient, FromIBinder, Interface, SIBinder, Strong, WI
 /// unrelated objects, so the removal matches nothing.
 ///
 /// `Rewrap` keeps the mapping, so the second call re-uses the wrapper the
-/// first one made:
+/// first one made. In a gateway built on [`Delegating`], the two hooks that
+/// carry the callback are the only methods it overrides:
 ///
 /// ```ignore
-/// struct Gateway {
-///     upstream: Strong<dyn IFoo>,
+/// struct Hooks {
 ///     callbacks: Rewrap<dyn ICallback>,
 /// }
 ///
-/// // once, at construction:
-/// callbacks: Rewrap::new(BnCallback::new_binder),
+/// impl IFooDelegate for Hooks {
+///     fn register(&self, up: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+///         up.register(&self.callbacks.wrap(cb))
+///     }
+///     fn unregister(&self, up: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>)
+///         -> BinderResult<()>
+///     {
+///         up.unregister(&self.callbacks.wrap(cb))   // same object
+///     }
+/// }
 ///
-/// fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-///     self.upstream.register(&self.callbacks.wrap(cb))
-/// }
-/// fn unregister(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-///     self.upstream.unregister(&self.callbacks.wrap(cb))   // same object
-/// }
+/// let hooks = Hooks { callbacks: Rewrap::new(BnCallback::new_binder) };
+/// let service = BnFoo::new_binder(Delegating::new(upstream, hooks));
 /// ```
 ///
 /// # Lifetimes
@@ -206,8 +325,11 @@ impl DeathRecipient for Reaper {
 impl<I: FromIBinder + ?Sized> Rewrap<I> {
     /// Build a table whose wrappers are made by `make_local`.
     ///
-    /// `make_local` is normally `BnFoo::new_binder` itself — the generated
-    /// delegating impl means the proxy satisfies `new_binder`'s bound.
+    /// `make_local` is normally `BnCallback::new_binder` itself: the generated
+    /// `impl ICallback for Strong<dyn ICallback>` forwards every method, so the
+    /// remote satisfies `new_binder`'s bound. A callback interface whose own
+    /// methods need changing on the way passes
+    /// `|cb| BnCallback::new_binder(Delegating::new(cb, CallbackHooks))` instead.
     pub fn new(make_local: impl Fn(Strong<I>) -> Strong<I> + Send + Sync + 'static) -> Self {
         Self {
             make_local: Box::new(make_local),

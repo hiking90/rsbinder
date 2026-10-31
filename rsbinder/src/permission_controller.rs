@@ -52,7 +52,7 @@ mod generated {
 
 pub use generated::android::os::IPermissionController::{
     BnPermissionController, BpPermissionController, IPermissionController,
-    IPermissionControllerDefault, IPermissionControllerDefaultRef,
+    IPermissionControllerDefault, IPermissionControllerDefaultRef, IPermissionControllerDelegate,
 };
 
 #[cfg(feature = "async")]

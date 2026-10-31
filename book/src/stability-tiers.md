@@ -83,8 +83,9 @@ tweaks; wire formats are already locked.
   feature required since 0.12.0. The bytes are the IPC bytes, so only the two
   signatures may still change. See [Storing Values](./data-serialization.md).
 - **Cross-stack bridging (new in 0.11.0)** — `impl Interface for Strong<I>`
-  (a proxy publishes as a local service, so a gateway is one line) and
-  `bridge::Rewrap`. See
+  (a proxy publishes as a local service, so a gateway is one line),
+  `bridge::Rewrap`, and `bridge::Delegating` with the generated `IFooDelegate`
+  (a gateway overrides only the methods it changes). See
   [Cross-Transport Services](./cross-transport-services.md).
 - **`lazy_service` (new in 0.11.0)** — `LazyServiceRegistrar` and the AOSP
   `registerService` / client-callback lifecycle, gated against Android's own

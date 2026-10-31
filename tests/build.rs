@@ -225,6 +225,16 @@ fn main() {
         .generate()
         .unwrap();
 
+    // Plan 17 K-22 (`tests/sync_only_codegen.rs`): sync-only code against an async rsbinder.
+    rsbinder_aidl::Builder::new()
+        .source(PathBuf::from("aidl/synconly/ISyncOnly.aidl"))
+        .set_async_support(false)
+        .version(3)
+        .hash("sync-only-v3")
+        .output(PathBuf::from("sync_only.rs"))
+        .generate()
+        .unwrap();
+
     // Plan 10-7: `stream_rpc.rs` and the kernel `stream_probe` share it, so not behind `rpc`.
     rsbinder_aidl::Builder::new()
         .source(PathBuf::from("aidl/streamdemo/IStreamDemo.aidl"))

@@ -281,17 +281,33 @@ makes it publishable.
 
 **The rule: every binder object crossing B is unwrapped by B and wrapped
 again. Plain data flows through untouched.** So a method with a binder
-argument — a callback registration, say — needs B to override just that
-method and re-wrap the argument before forwarding it:
+argument — a callback registration, say — needs B to re-wrap the argument
+before forwarding it, and only that method. For every interface `IFoo` the
+generator emits a trait `IFooDelegate` whose methods receive the upstream
+handle and forward the call to it by default. B overrides the one method and
+publishes the pair as
+[`bridge::Delegating`](https://docs.rs/rsbinder/latest/rsbinder/bridge/struct.Delegating.html):
 
 ```rust
-fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-    self.upstream.register(&BnCallback::new_binder(cb.clone()))
+use rsbinder::bridge::Delegating;
+
+struct Hooks;
+
+impl IFooDelegate for Hooks {
+    fn register(&self, upstream: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+        upstream.register(&BnCallback::new_binder(cb.clone()))
+    }
 }
+
+let service = BnFoo::new_binder(Delegating::new(upstream, Hooks));
 ```
 
-Forwarding `cb` as-is fails with `InvalidOperation`, reported back to the
-original caller.
+Every other method takes the default and forwards. Forwarding `cb` as-is
+fails with `InvalidOperation`, reported back to the original caller. The
+generator does not force the override and does not re-wrap on its own: a
+delegate whose caller and upstream share one stack (both on kernel binder)
+forwards a binder correctly as it is, and only the gateway knows whether a
+binder's identity matters to the upstream.
 
 That inline `new_binder` is correct for one call and wrong across calls:
 each one mints a *new* object, so `register(cb)` and `unregister(cb)` reach C
@@ -300,22 +316,30 @@ as two unrelated binders and the removal matches nothing.
 is the table that fixes it — same remote in, same local out:
 
 ```rust
-struct Gateway {
-    upstream: Strong<dyn IFoo>,
+struct Hooks {
     callbacks: Rewrap<dyn ICallback>,   // Rewrap::new(BnCallback::new_binder)
 }
 
-fn register(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-    self.upstream.register(&self.callbacks.wrap(cb))
-}
-fn unregister(&self, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
-    self.upstream.unregister(&self.callbacks.wrap(cb))   // the same object
+impl IFooDelegate for Hooks {
+    fn register(&self, upstream: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+        upstream.register(&self.callbacks.wrap(cb))
+    }
+    fn unregister(&self, upstream: &Strong<dyn IFoo>, cb: &Strong<dyn ICallback>) -> BinderResult<()> {
+        upstream.unregister(&self.callbacks.wrap(cb))   // the same object
+    }
 }
 ```
 
 It holds only weak references, so it never keeps a wrapper alive: the
 wrapper lives as long as C holds it, and the entry goes when the remote dies
 or the wrapper is dropped.
+
+**Versions.** On a versioned interface the gateway reports C's
+`getInterfaceVersion` and `getInterfaceHash` — the one-line form and the
+delegate defaults both forward them — but never a version above B's own
+module: when B was built from an older AIDL than C, B cannot dispatch the
+methods C added, so B's generated dispatch answers its own `VERSION` and,
+with it, its own `HASH`.
 
 What a gateway costs, all of it visible in B:
 

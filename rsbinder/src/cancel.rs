@@ -86,7 +86,7 @@ mod generated {
 
 pub use generated::android::os::ICancellationSignal::{
     BnCancellationSignal, BpCancellationSignal, ICancellationSignal, ICancellationSignalDefault,
-    ICancellationSignalDefaultRef,
+    ICancellationSignalDefaultRef, ICancellationSignalDelegate,
 };
 
 #[cfg(feature = "async")]

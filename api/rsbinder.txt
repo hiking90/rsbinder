@@ -29,6 +29,69 @@ pub const rsbinder::blob::BLOB_ASHMEM_MUTABLE: i32
 pub const rsbinder::blob::BLOB_INPLACE: i32
 pub const rsbinder::blob::BLOB_INPLACE_LIMIT: usize
 pub mod rsbinder::bridge
+pub struct rsbinder::bridge::Delegating<I: rsbinder::FromIBinder + ?core::marker::Sized, H>
+impl<I: rsbinder::FromIBinder + ?core::marker::Sized, H> rsbinder::bridge::Delegating<I, H>
+pub fn rsbinder::bridge::Delegating<I, H>::hooks(&self) -> &H
+pub fn rsbinder::bridge::Delegating<I, H>::into_parts(self) -> (rsbinder::Strong<I>, H)
+pub fn rsbinder::bridge::Delegating<I, H>::new(rsbinder::Strong<I>, H) -> Self
+pub fn rsbinder::bridge::Delegating<I, H>::upstream(&self) -> &rsbinder::Strong<I>
+impl<I: rsbinder::FromIBinder + ?core::marker::Sized, H: core::marker::Send + core::marker::Sync> rsbinder::Interface for rsbinder::bridge::Delegating<I, H>
+pub fn rsbinder::bridge::Delegating<I, H>::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::bridge::Delegating<I, H>::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+pub fn rsbinder::bridge::Delegating<I, H>::dump_fd(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
+impl<I: rsbinder::FromIBinder + core::fmt::Debug + ?core::marker::Sized, H: core::fmt::Debug> core::fmt::Debug for rsbinder::bridge::Delegating<I, H>
+pub fn rsbinder::bridge::Delegating<I, H>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<__RsbHooks: rsbinder::cancel::ICancellationSignalDelegate> rsbinder::cancel::ICancellationSignal for rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::setDefaultImpl(rsbinder::cancel::ICancellationSignalDefaultRef) -> rsbinder::cancel::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDelegate> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDelegate> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::addService(&self, &str, &rsbinder::SIBinder, bool, i32) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::checkService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::checkService2(&self, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getConnectionInfo(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getDeclaredInstances(&self, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getService2(&self, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getServiceDebugInfo(&self) -> rsbinder::BinderResult<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getUpdatableNames(&self, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::isDeclared(&self, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::listServices(&self, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::registerClientCallback(&self, &str, &rsbinder::SIBinder, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::registerForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
+impl<__RsbHooks: rsbinder::permission_controller::IPermissionControllerDelegate> rsbinder::permission_controller::IPermissionController for rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::checkPermission(&self, &str, i32, i32) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::permission_controller::IPermissionControllerDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::getPackageUid(&self, &str, i32) -> rsbinder::BinderResult<i32>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::getPackagesForUid(&self, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::setDefaultImpl(rsbinder::permission_controller::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::IPermissionControllerDefaultRef where Self: core::marker::Sized
+impl<I, H> core::marker::Freeze for rsbinder::bridge::Delegating<I, H> where H: core::marker::Freeze, I: ?core::marker::Sized
+impl<I, H> core::marker::Send for rsbinder::bridge::Delegating<I, H> where H: core::marker::Send, I: ?core::marker::Sized
+impl<I, H> core::marker::Sync for rsbinder::bridge::Delegating<I, H> where H: core::marker::Sync, I: ?core::marker::Sized
+impl<I, H> core::marker::Unpin for rsbinder::bridge::Delegating<I, H> where H: core::marker::Unpin, I: ?core::marker::Sized
+impl<I, H> core::marker::UnsafeUnpin for rsbinder::bridge::Delegating<I, H> where H: core::marker::UnsafeUnpin, I: ?core::marker::Sized
+impl<I, H> core::panic::unwind_safe::RefUnwindSafe for rsbinder::bridge::Delegating<I, H> where H: core::panic::unwind_safe::RefUnwindSafe, I: core::panic::unwind_safe::RefUnwindSafe + ?core::marker::Sized
+impl<I, H> core::panic::unwind_safe::UnwindSafe for rsbinder::bridge::Delegating<I, H> where H: core::panic::unwind_safe::UnwindSafe, I: core::panic::unwind_safe::UnwindSafe + ?core::marker::Sized
 pub struct rsbinder::bridge::Rewrap<I: rsbinder::FromIBinder + ?core::marker::Sized>
 impl<I: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::bridge::Rewrap<I>
 pub fn rsbinder::bridge::Rewrap<I>::is_empty(&self) -> bool
@@ -148,6 +211,11 @@ pub fn rsbinder::cancel::BpCancellationSignal::cancel(&self) -> rsbinder::Binder
 pub fn rsbinder::cancel::BpCancellationSignal::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::cancel::BpCancellationSignal::getDefaultImpl() -> core::option::Option<rsbinder::cancel::ICancellationSignalDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::cancel::BpCancellationSignal::setDefaultImpl(rsbinder::cancel::ICancellationSignalDefaultRef) -> rsbinder::cancel::ICancellationSignalDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::cancel::ICancellationSignalDelegate> rsbinder::cancel::ICancellationSignal for rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::cancel(&self) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::cancel::ICancellationSignalDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::cancel::ICancellationSignal, __RsbHooks>::setDefaultImpl(rsbinder::cancel::ICancellationSignalDefaultRef) -> rsbinder::cancel::ICancellationSignalDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::cancel::ICancellationSignalAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::cancel::ICancellationSignalAsync::cancel<'a>(&'a self) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::cancel::ICancellationSignalAsync::descriptor() -> &'static str where Self: core::marker::Sized
@@ -162,6 +230,8 @@ pub fn rsbinder::cancel::ICancellationSignalAsyncService::cancel<'life0, 'async_
 pub fn rsbinder::cancel::ICancellationSignalAsyncService::descriptor() -> &'static str where Self: core::marker::Sized
 pub trait rsbinder::cancel::ICancellationSignalDefault: core::marker::Send + core::marker::Sync
 pub fn rsbinder::cancel::ICancellationSignalDefault::cancel(&self) -> rsbinder::BinderResult<()>
+pub trait rsbinder::cancel::ICancellationSignalDelegate: core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::cancel::ICancellationSignalDelegate::cancel(&self, &rsbinder::Strong<dyn rsbinder::cancel::ICancellationSignal>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::cancel::cancel_remote(&rsbinder::SIBinder) -> rsbinder::Result<()>
 pub type rsbinder::cancel::ICancellationSignalDefaultRef = alloc::sync::Arc<dyn rsbinder::cancel::ICancellationSignalDefault>
 pub mod rsbinder::entry
@@ -1017,6 +1087,11 @@ pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDelegate> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsync::onClients<'a>(&'a self, &'a rsbinder::SIBinder, bool) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
@@ -1031,6 +1106,8 @@ pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackA
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackAsyncService::onClients<'life0, 'life1, 'async_trait>(&'life0 self, &'life1 rsbinder::SIBinder, bool) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = rsbinder::BinderResult<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait
 pub trait rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefault: core::marker::Send + core::marker::Sync
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefault::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
+pub trait rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDelegate: core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDelegate::onClients(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
 pub type rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef = alloc::sync::Arc<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefault>
 pub mod rsbinder::hub::android_16::android::os::IServiceCallback
 pub struct rsbinder::hub::android_16::android::os::IServiceCallback::BnServiceCallback(_)
@@ -1100,6 +1177,11 @@ pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallba
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDelegate> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsync::onRegistration<'a>(&'a self, &'a str, &'a rsbinder::SIBinder) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
@@ -1114,6 +1196,8 @@ pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbac
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackAsyncService::onRegistration<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, &'life1 str, &'life2 rsbinder::SIBinder) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = rsbinder::BinderResult<()>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
 pub trait rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefault: core::marker::Send + core::marker::Sync
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefault::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub trait rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDelegate: core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDelegate::onRegistration(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub type rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef = alloc::sync::Arc<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefault>
 pub mod rsbinder::hub::android_16::android::os::IServiceManager
 pub struct rsbinder::hub::android_16::android::os::IServiceManager::BnServiceManager(_)
@@ -1280,6 +1364,26 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::addService(&self, &str, &rsbinder::SIBinder, bool, i32) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::checkService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::checkService2(&self, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getConnectionInfo(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getDeclaredInstances(&self, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getService2(&self, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getServiceDebugInfo(&self) -> rsbinder::BinderResult<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getUpdatableNames(&self, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::isDeclared(&self, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::listServices(&self, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::registerClientCallback(&self, &str, &rsbinder::SIBinder, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::registerForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
 pub trait rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::addService<'a>(&'a self, &'a str, &'a rsbinder::SIBinder, bool, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<()>>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerAsync::checkService<'a>(&'a self, &'a str) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>>
@@ -1369,6 +1473,23 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerD
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefault::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefault::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefault::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
+pub trait rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate: core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::addService(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str, &rsbinder::SIBinder, bool, i32) -> rsbinder::BinderResult<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::checkService(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::checkService2(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::getConnectionInfo(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::getDeclaredInstances(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::getService(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::getService2(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::getServiceDebugInfo(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>) -> rsbinder::BinderResult<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::getUpdatableNames(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::isDeclared(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::listServices(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::registerClientCallback(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str, &rsbinder::SIBinder, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::registerForNotifications(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::tryUnregisterService(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::unregisterForNotifications(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate::updatableViaApex(&self, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager>, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
 pub type rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef = alloc::sync::Arc<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefault>
 pub mod rsbinder::hub::android_16::android::os::Service
 pub enum rsbinder::hub::android_16::android::os::Service::Service
@@ -1737,6 +1858,11 @@ pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDelegate> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::hub::android_16::IServiceCallback: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::IServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::IServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
@@ -1757,6 +1883,11 @@ pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallba
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDelegate> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::hub::android_16::IServiceManager: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::android_16::IServiceManager::addService(&self, &str, &rsbinder::SIBinder, bool, i32) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::IServiceManager::checkService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
@@ -1837,6 +1968,26 @@ pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDelegate> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::addService(&self, &str, &rsbinder::SIBinder, bool, i32) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::checkService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::checkService2(&self, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getConnectionInfo(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getDeclaredInstances(&self, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getService(&self, &str) -> rsbinder::BinderResult<core::option::Option<rsbinder::SIBinder>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getService2(&self, &str) -> rsbinder::BinderResult<rsbinder::hub::android_16::android::os::Service::Service>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getServiceDebugInfo(&self) -> rsbinder::BinderResult<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::getUpdatableNames(&self, &str) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::isDeclared(&self, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::listServices(&self, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::registerClientCallback(&self, &str, &rsbinder::SIBinder, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::registerForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceManager::IServiceManagerDefaultRef where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::tryUnregisterService(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::unregisterForNotifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceManager::IServiceManager, __RsbHooks>::updatableViaApex(&self, &str) -> rsbinder::BinderResult<core::option::Option<alloc::string::String>>
 pub fn rsbinder::hub::android_16::add_service(&rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager, &str, rsbinder::SIBinder) -> core::result::Result<(), rsbinder::Status>
 pub fn rsbinder::hub::android_16::check_service(&rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager, &str) -> core::option::Option<rsbinder::hub::android_16::android::os::ServiceWithMetadata::ServiceWithMetadata>
 pub fn rsbinder::hub::android_16::get_connection_info(&rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager, &str) -> core::option::Option<rsbinder::hub::android_16::android::os::ConnectionInfo::ConnectionInfo>
@@ -2018,6 +2169,11 @@ pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IClientCallback::BpClientCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDelegate> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::onClients(&self, &rsbinder::SIBinder, bool) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IClientCallback::IClientCallbackDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::hub::IServiceCallback: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::hub::IServiceCallback::descriptor() -> &'static str where Self: core::marker::Sized
 pub fn rsbinder::hub::IServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
@@ -2038,6 +2194,11 @@ pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallba
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::android_16::android::os::IServiceCallback::BpServiceCallback::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDelegate> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback for rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::onRegistration(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback, __RsbHooks>::setDefaultImpl(rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef) -> rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallbackDefaultRef where Self: core::marker::Sized
 pub fn rsbinder::hub::add_service(&str, impl core::convert::Into<rsbinder::SIBinder>) -> core::result::Result<(), rsbinder::Status>
 pub fn rsbinder::hub::check_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::check_service(&str) -> core::option::Option<rsbinder::SIBinder>
@@ -2344,6 +2505,15 @@ pub fn rsbinder::permission_controller::BpPermissionController::getPackagesForUi
 pub fn rsbinder::permission_controller::BpPermissionController::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
 pub fn rsbinder::permission_controller::BpPermissionController::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
 pub fn rsbinder::permission_controller::BpPermissionController::setDefaultImpl(rsbinder::permission_controller::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::IPermissionControllerDefaultRef where Self: core::marker::Sized
+impl<__RsbHooks: rsbinder::permission_controller::IPermissionControllerDelegate> rsbinder::permission_controller::IPermissionController for rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::checkPermission(&self, &str, i32, i32) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::descriptor() -> &'static str where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::getDefaultImpl() -> core::option::Option<rsbinder::permission_controller::IPermissionControllerDefaultRef> where Self: core::marker::Sized
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::getPackageUid(&self, &str, i32) -> rsbinder::BinderResult<i32>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::getPackagesForUid(&self, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
+pub fn rsbinder::bridge::Delegating<dyn rsbinder::permission_controller::IPermissionController, __RsbHooks>::setDefaultImpl(rsbinder::permission_controller::IPermissionControllerDefaultRef) -> rsbinder::permission_controller::IPermissionControllerDefaultRef where Self: core::marker::Sized
 pub trait rsbinder::permission_controller::IPermissionControllerAsync<__RsbPool>: rsbinder::Interface + core::marker::Send
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::checkPermission<'a>(&'a self, &'a str, i32, i32) -> rsbinder::BoxFuture<'a, rsbinder::BinderResult<bool>>
 pub fn rsbinder::permission_controller::IPermissionControllerAsync::descriptor() -> &'static str where Self: core::marker::Sized
@@ -2378,6 +2548,12 @@ pub fn rsbinder::permission_controller::IPermissionControllerDefault::getPackage
 pub fn rsbinder::permission_controller::IPermissionControllerDefault::getPackagesForUid(&self, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
 pub fn rsbinder::permission_controller::IPermissionControllerDefault::isRuntimePermission(&self, &str) -> rsbinder::BinderResult<bool>
 pub fn rsbinder::permission_controller::IPermissionControllerDefault::noteOp(&self, &str, i32, &str) -> rsbinder::BinderResult<i32>
+pub trait rsbinder::permission_controller::IPermissionControllerDelegate: core::marker::Send + core::marker::Sync + 'static
+pub fn rsbinder::permission_controller::IPermissionControllerDelegate::checkPermission(&self, &rsbinder::Strong<dyn rsbinder::permission_controller::IPermissionController>, &str, i32, i32) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::permission_controller::IPermissionControllerDelegate::getPackageUid(&self, &rsbinder::Strong<dyn rsbinder::permission_controller::IPermissionController>, &str, i32) -> rsbinder::BinderResult<i32>
+pub fn rsbinder::permission_controller::IPermissionControllerDelegate::getPackagesForUid(&self, &rsbinder::Strong<dyn rsbinder::permission_controller::IPermissionController>, i32) -> rsbinder::BinderResult<alloc::vec::Vec<alloc::string::String>>
+pub fn rsbinder::permission_controller::IPermissionControllerDelegate::isRuntimePermission(&self, &rsbinder::Strong<dyn rsbinder::permission_controller::IPermissionController>, &str) -> rsbinder::BinderResult<bool>
+pub fn rsbinder::permission_controller::IPermissionControllerDelegate::noteOp(&self, &rsbinder::Strong<dyn rsbinder::permission_controller::IPermissionController>, &str, i32, &str) -> rsbinder::BinderResult<i32>
 pub trait rsbinder::permission_controller::PermissionAuthority: core::marker::Send + core::marker::Sync
 pub fn rsbinder::permission_controller::PermissionAuthority::check(&self, &str, &rsbinder::Caller) -> bool
 pub fn rsbinder::permission_controller::check_permission(&rsbinder::Parcel, &str) -> bool
@@ -3114,7 +3290,6 @@ impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::stream::Token
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::stream::Token
 pub const rsbinder::stream::END_RESERVE: usize
 pub macro rsbinder::declare_binder_enum!
-pub macro rsbinder::declare_binder_interface!
 pub macro rsbinder::impl_deserialize_for_parcelable!
 pub macro rsbinder::impl_serialize_for_parcelable!
 pub macro rsbinder::impl_service_specific_error!
@@ -4692,6 +4867,10 @@ impl rsbinder::Interface for rsbinder::permission_controller::BpPermissionContro
 pub fn rsbinder::permission_controller::BpPermissionController::as_binder(&self) -> rsbinder::SIBinder
 pub fn rsbinder::permission_controller::BpPermissionController::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::permission_controller::BpPermissionController::dump_fd(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
+impl<I: rsbinder::FromIBinder + ?core::marker::Sized, H: core::marker::Send + core::marker::Sync> rsbinder::Interface for rsbinder::bridge::Delegating<I, H>
+pub fn rsbinder::bridge::Delegating<I, H>::as_binder(&self) -> rsbinder::SIBinder
+pub fn rsbinder::bridge::Delegating<I, H>::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>
+pub fn rsbinder::bridge::Delegating<I, H>::dump_fd(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
 impl<I: rsbinder::FromIBinder + ?core::marker::Sized> rsbinder::Interface for rsbinder::Strong<I>
 pub fn rsbinder::Strong<I>::as_binder(&self) -> rsbinder::SIBinder
 pub fn rsbinder::Strong<I>::dump(&self, &mut dyn std::io::Write, &[alloc::string::String]) -> rsbinder::Result<()>

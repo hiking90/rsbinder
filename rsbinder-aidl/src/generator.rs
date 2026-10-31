@@ -220,6 +220,9 @@ pub mod {{mod}} {
 const INTERFACE_TEMPLATE: &str = r#"
 pub mod {{mod}} {
     #![allow(clippy::all, unused_imports, non_upper_case_globals, non_snake_case, dead_code, deprecated, reason = "rsbinder-aidl generated code")]
+    {%- if enabled_async %}
+    {{crate}}::__require_async! {}
+    {%- endif %}
     {%- for member in const_members %}
     {%- if member.3 %}
     {{ member.3 }}
@@ -688,21 +691,29 @@ pub mod {{mod}} {
         }
         {%- endfor %}
         {%- if version is number %}
-        // Forward so an in-process call sees the same override `on_transact` dispatches to.
+        // The service's override, clamped as `on_transact` clamps it (plan 17 D-16).
         fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
             {%- if enabled_async %}
-            self.0.as_sync().r#getInterfaceVersion()
+            self.0.as_sync().r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION))
             {%- else %}
-            self.0.r#getInterfaceVersion()
+            self.0.r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION))
             {%- endif %}
         }
         {%- endif %}
         {%- if hash %}
         fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             {%- if enabled_async %}
-            self.0.as_sync().r#getInterfaceHash()
+            let _aidl_service = self.0.as_sync();
             {%- else %}
-            self.0.r#getInterfaceHash()
+            let _aidl_service = &*self.0;
+            {%- endif %}
+            {%- if version is number %}
+            match _aidl_service.r#getInterfaceVersion() {
+                ::core::result::Result::Ok(_aidl_v) if _aidl_v > VERSION => ::core::result::Result::Ok(::std::string::String::from(HASH)),
+                _ => _aidl_service.r#getInterfaceHash(),
+            }
+            {%- else %}
+            _aidl_service.r#getInterfaceHash()
             {%- endif %}
         }
         {%- endif %}
@@ -711,8 +722,9 @@ pub mod {{mod}} {
     /// re-published as a local service on another transport in one line:
     /// `{{ bn_name }}::new_binder(upstream)` (the **gateway** pattern —
     /// `new_binder` takes any `T: {{ name }} + Send + Sync + 'static`).
-    /// Binder-typed arguments still have to be re-wrapped by hand; a proxy
-    /// forwarded as-is is refused at the stack boundary.
+    /// A gateway that has to change some methods (a binder argument crossing
+    /// stacks has to be re-wrapped; a proxy forwarded as-is is refused at the
+    /// stack boundary) implements `{{ name }}Delegate` instead.
     impl {{ name }} for {{crate}}::Strong<dyn {{ name }}> {
         {%- for member in fn_members %}
         fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
@@ -728,6 +740,47 @@ pub mod {{mod}} {
         {%- if hash %}
         fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
             (**self).r#getInterfaceHash()
+        }
+        {%- endif %}
+    }
+    /// Per-method hooks for a gateway that re-publishes a `{{ name }}`: each
+    /// method gets the upstream handle and by default forwards the call to it
+    /// unchanged. Override the methods to change and publish with
+    /// `{{ bn_name }}::new_binder(rsbinder::bridge::Delegating::new(upstream, hooks))`.
+    /// A binder argument is forwarded as it is, which is right when caller and
+    /// upstream share one stack; across stacks it is refused, so override that
+    /// method and re-wrap the binder (`rsbinder::bridge::Rewrap`).
+    pub trait {{ name }}Delegate: ::core::marker::Send + ::core::marker::Sync + 'static {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}(&self, _aidl_upstream: &{{crate}}::Strong<dyn {{ name }}>{{ member.args | trim_start_matches(pat="&self") }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
+            _aidl_upstream.r#{{ member.identifier }}({{ member.func_call_params }})
+        }
+        {%- endfor %}
+        {%- if version is number %}
+        fn r#getInterfaceVersion(&self, _aidl_upstream: &{{crate}}::Strong<dyn {{ name }}>) -> {{crate}}::BinderResult<i32> {
+            _aidl_upstream.r#getInterfaceVersion()
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self, _aidl_upstream: &{{crate}}::Strong<dyn {{ name }}>) -> {{crate}}::BinderResult<::std::string::String> {
+            _aidl_upstream.r#getInterfaceHash()
+        }
+        {%- endif %}
+    }
+    impl<__RsbHooks: {{ name }}Delegate> {{ name }} for {{crate}}::bridge::Delegating<dyn {{ name }}, __RsbHooks> {
+        {%- for member in fn_members %}
+        fn r#{{ member.identifier }}({{ member.args }}) -> {{crate}}::BinderResult<{{ member.return_type }}> {
+            <__RsbHooks as {{ name }}Delegate>::r#{{ member.identifier }}({{crate}}::bridge::Delegating::hooks(self), {{crate}}::bridge::Delegating::upstream(self), {{ member.func_call_params }})
+        }
+        {%- endfor %}
+        {%- if version is number %}
+        fn r#getInterfaceVersion(&self) -> {{crate}}::BinderResult<i32> {
+            <__RsbHooks as {{ name }}Delegate>::r#getInterfaceVersion({{crate}}::bridge::Delegating::hooks(self), {{crate}}::bridge::Delegating::upstream(self))
+        }
+        {%- endif %}
+        {%- if hash %}
+        fn r#getInterfaceHash(&self) -> {{crate}}::BinderResult<::std::string::String> {
+            <__RsbHooks as {{ name }}Delegate>::r#getInterfaceHash({{crate}}::bridge::Delegating::hooks(self), {{crate}}::bridge::Delegating::upstream(self))
         }
         {%- endif %}
     }
@@ -770,7 +823,8 @@ pub mod {{mod}} {
         {%- endfor %}
         {%- if version is number %}
             transactions::r#getInterfaceVersion => {
-                let _aidl_return = _service.r#getInterfaceVersion();
+                // At most VERSION: a newer one's methods are not dispatched here (plan 17 D-16).
+                let _aidl_return = _service.r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION));
                 match &_aidl_return {
                     ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
@@ -785,7 +839,15 @@ pub mod {{mod}} {
         {%- endif %}
         {%- if hash %}
             transactions::r#getInterfaceHash => {
+                {%- if version is number %}
+                // A clamped version answers with this module's HASH (plan 17 D-16).
+                let _aidl_return = match _service.r#getInterfaceVersion() {
+                    ::core::result::Result::Ok(_aidl_v) if _aidl_v > VERSION => ::core::result::Result::Ok(::std::string::String::from(HASH)),
+                    _ => _service.r#getInterfaceHash(),
+                };
+                {%- else %}
                 let _aidl_return = _service.r#getInterfaceHash();
+                {%- endif %}
                 match &_aidl_return {
                     ::core::result::Result::Ok(_aidl_return) => {
                         _reply.write(&{{crate}}::Status::from({{crate}}::StatusCode::Ok))?;
@@ -2117,6 +2179,7 @@ impl Generator {
             format!("Bp{stem}"),
             format!("{}Default", decl.name),
             format!("{}DefaultRef", decl.name),
+            format!("{}Delegate", decl.name),
         ];
         if self.enabled_async {
             generated_types.push(format!("Bn{stem}Adapter"));
@@ -2854,7 +2917,8 @@ mod tests {
     #[test]
     fn binder_impl_forwards_version_and_hash() {
         let source = "package t; interface IFoo { void m(); }";
-        for (enabled_async, call) in [(false, "self.0.r#"), (true, "self.0.as_sync().r#")] {
+        for (enabled_async, service) in [(false, "&*self.0"), (true, "self.0.as_sync()")] {
+            let call = service.trim_start_matches("&*").to_owned() + ".r#";
             let ctx = crate::SourceContext::new("t.aidl", source);
             let doc = crate::parse_document(&ctx).expect("parse");
             let out = Generator::new(enabled_async, false)
@@ -2866,13 +2930,31 @@ mod tests {
                 .find("impl IFoo for rsbinder::Binder<BnFoo>")
                 .expect("Binder impl");
             let block = &out[start..start + out[start..].find("\n    }\n").expect("impl end")];
+            // Plan 17 D-16: clamped to VERSION, and HASH when the service's version is above it.
             assert!(
-                block.contains(&format!("{call}getInterfaceVersion()")),
+                block.contains(&format!(
+                    "{call}getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION))"
+                )),
                 "{block}"
             );
             assert!(
-                block.contains(&format!("{call}getInterfaceHash()")),
+                block.contains(&format!("let _aidl_service = {service};")),
                 "{block}"
+            );
+            assert!(
+                block.contains("Ok(_aidl_v) if _aidl_v > VERSION => ::core::result::Result::Ok(::std::string::String::from(HASH))"),
+                "{block}"
+            );
+            assert!(
+                block.contains("_ => _aidl_service.r#getInterfaceHash(),"),
+                "{block}"
+            );
+            // `on_transact` answers the same way as the in-process impl.
+            assert!(
+                out.contains(
+                    "let _aidl_return = _service.r#getInterfaceVersion().map(|_aidl_v| _aidl_v.min(VERSION));"
+                ),
+                "{out}"
             );
         }
     }

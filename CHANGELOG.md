@@ -278,6 +278,21 @@ Each item below changes what a 0.12.0 program observes.
 - **`rsbinder_fmq::Regions::write_at` is no longer public**; write through
   `WriteTxn::write_at` / `UnsyncWriteTxn::write_at`. No transaction hands
   out a `&mut Regions`, so it could not be called.
+- **A published service never reports a version above its generated
+  module's `VERSION`.** The generated `on_transact` for
+  `getInterfaceVersion` and `impl IFoo for Binder<BnFoo>` answer
+  `min(service, VERSION)`, and `getInterfaceHash` answers the module's own
+  `HASH` when the service's version was above it. A gateway built from an
+  older `.aidl` than its upstream reported the upstream's version, whose
+  newer methods its own `on_transact` cannot dispatch. The client-side
+  `impl IFoo for Strong<dyn IFoo>` still reports the upstream's values.
+- **A nested `.aidl` type named `{Interface}Delegate` is refused**: it
+  collides with the generated delegate trait (see Added).
+- **`declare_binder_interface!` is hidden from the docs**: it is for
+  generated code; write interfaces with `#[rsbinder::interface]` or
+  `.aidl`. Its `native` block takes `adapter:` and `r#async:` together or
+  neither; one of them alone, or an async interface without them, is a
+  `compile_error!` naming what is missing.
 - On a 32-bit target `MessageQueue::attach` refuses, with
   `InvalidDescriptor`, a data grantor whose `extent` plus `offset` modulo the page size is more than
   `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and
@@ -602,6 +617,14 @@ Each item below changes what a 0.12.0 program observes.
 
 - **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
   has it.
+- **`bridge::Delegating` and a generated `IFooDelegate` trait per
+  interface**: a gateway overrides only the methods it changes (typically
+  the one that re-wraps a binder argument) and publishes
+  `BnFoo::new_binder(Delegating::new(upstream, hooks))`; every other
+  method, `getInterfaceVersion` and `getInterfaceHash` forward to the
+  upstream. Sync only; binder arguments are not re-wrapped automatically,
+  and a method that carries a binder is not forced to be overridden (a
+  same-stack gateway may forward it as it is).
 - **`Caller::InProcess`**, **`ProcessState::set_max_threads`**, and with
   `rpc-tcp-debug` **`rpc::set_accessor_plaintext_inet` /
   `accessor_plaintext_inet`**: see Migrating.
@@ -918,6 +941,11 @@ Each item below changes what a 0.12.0 program observes.
 
 ### Fixed
 
+- **Interface code generated with `Builder::set_async_support(false)`
+  compiles against rsbinder with its `async` feature on** (the default); it
+  failed with `cannot find type BnFoo`. Code generated with async support
+  and built against rsbinder without `async` fails with one error that
+  names the fix (enable `async`/`tokio`, or `set_async_support(false)`).
 - **A `dump` of `rsb_hub` no longer waits on the caller.** The hub has one
   binder thread, and 0.12.0 wrote the dump, or the reason it was denied, to
   the caller's fd on that thread: a caller that passed a pipe and did not
