@@ -570,7 +570,6 @@ fn types_whose_drop_ends_something_are_must_use() {
     ];
     const EXEMPT: &[(&str, &str, &str)] = &[
         // The drop gives back memory, a mapping or a reference, which an unused value never needed.
-        ("rsbinder", "binder.rs", "SIBinder"),
         ("rsbinder", "parcel.rs", "Parcel"),
         ("rsbinder", "process_state.rs", "ProcessState"),
         ("rsbinder", "proxy.rs", "ProxyHandle"),

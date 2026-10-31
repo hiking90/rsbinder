@@ -30,7 +30,6 @@
 
 #![cfg(feature = "rpc")]
 
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::thread;
 
@@ -38,7 +37,7 @@ use rsbinder::rpc::transport::MemTransport;
 use rsbinder::rpc::{AddressSpace, RpcServer, RpcSession};
 use rsbinder::{
     Binder, DeathRecipient, IBinder, Interface, Parcel, Remotable, Result, SIBinder, StatusCode,
-    Transactable, TransactionCode, WIBinder,
+    Transactable, TransactionCode,
 };
 
 // ---- fixtures -------------------------------------------------------
@@ -128,21 +127,6 @@ impl IBinder for KernelishProxy {
     }
     fn is_remote(&self) -> bool {
         true
-    }
-    fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-        Ok(())
-    }
-    fn attempt_inc_strong(&self) -> bool {
-        true
-    }
-    fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        Ok(())
-    }
-    fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-        Ok(())
-    }
-    fn dec_weak(&self) -> Result<()> {
-        Ok(())
     }
 }
 

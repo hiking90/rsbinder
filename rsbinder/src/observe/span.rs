@@ -121,7 +121,7 @@ mod tracing_observer {
     pub struct TracingObserver;
 
     impl TransactionObserver for TracingObserver {
-        fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+        fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
             let name = AidlSpanName {
                 descriptor: ctx.descriptor,
                 method: ctx.method,
@@ -129,21 +129,21 @@ mod tracing_observer {
                 server: true,
             };
             let span = tracing::trace_span!(target: "rsbinder::aidl", "aidl", name = %name);
-            // Tag must be Send, so no `Span::enter` guard; `on_reply` exits on this thread.
-            span.with_subscriber(|(id, dispatch)| dispatch.enter(id))?;
-            Some(Box::new(span))
+            if span.is_disabled() {
+                return None;
+            }
+            // The guard is the tag: dropping it in `on_reply` exits the span on this thread.
+            Some(Box::new(span.entered()))
         }
 
         fn on_reply(
             &self,
             _ctx: &TxnContext<'_>,
-            tag: Option<Box<dyn Any + Send>>,
+            tag: Option<Box<dyn Any>>,
             _result: &Result<()>,
             _elapsed: Duration,
         ) {
-            if let Some(span) = tag.and_then(|tag| tag.downcast::<tracing::Span>().ok()) {
-                span.with_subscriber(|(id, dispatch)| dispatch.exit(id));
-            }
+            drop(tag);
         }
     }
 }

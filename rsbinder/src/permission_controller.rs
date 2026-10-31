@@ -43,15 +43,18 @@
 //! which process answers, and the kept strong reference counts as a client
 //! of the registered service, so its `tryUnregisterService` is refused.
 
-include!(concat!(env!("OUT_DIR"), "/permission_controller.rs"));
+// Private: the re-exports below are the one public path to the generated items.
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/permission_controller.rs"));
+}
 
-pub use android::os::IPermissionController::{
+pub use generated::android::os::IPermissionController::{
     BnPermissionController, BpPermissionController, IPermissionController,
     IPermissionControllerDefault, IPermissionControllerDefaultRef,
 };
 
 #[cfg(feature = "async")]
-pub use android::os::IPermissionController::{
+pub use generated::android::os::IPermissionController::{
     IPermissionControllerAsync, IPermissionControllerAsyncService,
 };
 

@@ -153,7 +153,7 @@ impl StatsObserver {
 }
 
 impl TransactionObserver for StatsObserver {
-    fn on_transact(&self, _ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+    fn on_transact(&self, _ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
         let now = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
         self.max_in_flight.fetch_max(now, Ordering::Relaxed);
         None
@@ -162,7 +162,7 @@ impl TransactionObserver for StatsObserver {
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        _tag: Option<Box<dyn Any + Send>>,
+        _tag: Option<Box<dyn Any>>,
         result: &Result<()>,
         elapsed: Duration,
     ) {

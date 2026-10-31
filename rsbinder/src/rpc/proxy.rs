@@ -62,11 +62,10 @@
 //! returns.
 
 use std::any::Any;
-use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, Mutex, OnceLock};
 
-use crate::binder::{DeathRecipient, IBinder, SIBinder, Stability, Transactable, WIBinder};
+use crate::binder::{DeathRecipient, IBinder, Stability, Transactable, WIBinder};
 use crate::binder::{TransactionCode, TransactionFlags};
 use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
@@ -433,27 +432,6 @@ impl IBinder for RpcProxy {
 
     fn is_remote(&self) -> bool {
         true
-    }
-
-    // The wire `DEC_STRONG` from `Drop` drives the ref-count; these hooks are no-ops.
-    fn inc_strong(&self, _strong: &SIBinder) -> Result<()> {
-        Ok(())
-    }
-
-    fn attempt_inc_strong(&self) -> bool {
-        true
-    }
-
-    fn dec_strong(&self, _strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        Ok(())
-    }
-
-    fn inc_weak(&self, _weak: &WIBinder) -> Result<()> {
-        Ok(())
-    }
-
-    fn dec_weak(&self) -> Result<()> {
-        Ok(())
     }
 
     fn stability(&self) -> Stability {

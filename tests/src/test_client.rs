@@ -2239,23 +2239,11 @@ fn test_concurrent_service_resolution_slow_path_no_deadlock() {
 
 /// Test for issue #47: cached interface string bug
 ///
-/// Originally reproduced the case where `handle_to_proxy` returned a
-/// stale proxy with an incorrect descriptor when handles were reused
-/// for different services. The bug pattern below intentionally drove
-/// the kernel weak count for each service handle to zero between
-/// resolutions:
-///
-/// ```ignore
-/// let service_manager = rsbinder::hub::default()?;
-/// let all_services = service_manager.list_services(0xf);
-/// for service_name in &all_services {
-///     let service = service_manager.get_service(service_name).unwrap();
-///     println!("{} interface: {}", service_name, service.descriptor());
-///     service.dec_weak().unwrap();
-/// }
-/// ```
-///
-/// `dec_weak()` below is a no-op on proxies (the cache pin owns the kernel weak ref); a marker.
+/// Reproduces the case where `handle_to_proxy` returned a stale proxy
+/// with an incorrect descriptor when handles were reused for different
+/// services. The reported pattern released each service between
+/// resolutions so the kernel could hand its handle to the next one; the
+/// test drops each proxy before the next lookup for the same effect.
 #[test]
 #[cfg_attr(
     not(any(target_os = "linux", target_os = "android")),
@@ -2297,7 +2285,7 @@ fn test_issue_47_cached_interface_string() {
             service_descriptors.push((service_name.clone(), descriptor));
 
             // Release the service (this is important to potentially trigger handle reuse)
-            let _ = service.dec_weak();
+            drop(service);
         }
     }
 
@@ -2329,7 +2317,7 @@ fn test_issue_47_cached_interface_string() {
                 bug_detected = true;
             }
 
-            let _ = service.dec_weak();
+            drop(service);
         }
     }
 
@@ -2515,9 +2503,8 @@ fn test_binder_extension_use_as_interface() {
 /// Verifies that user-space `SIBinder` clones do NOT raise the kernel
 /// strong count: under the cache-pin model the kernel observes exactly
 /// **one `BC_ACQUIRE` per `Arc<ProxyHandle>` lifetime**, regardless of
-/// how many `SIBinder` / `Strong<I>` clones exist. A per-clone
-/// `RefCounter.strong` cycle would have been able to elevate the kernel
-/// count.
+/// how many `SIBinder` / `Strong<I>` clones exist. A per-clone kernel
+/// command would elevate the kernel count.
 ///
 /// Sampling discipline: every command must reach the kernel before we
 /// read the count, so we issue a `ping_binder()` (which forces a driver

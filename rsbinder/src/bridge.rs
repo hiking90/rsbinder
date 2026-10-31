@@ -371,7 +371,6 @@ fn key_of(binder: &SIBinder) -> usize {
 mod tests {
     use super::*;
     use crate::binder::{IBinder, Stability};
-    use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// `unlink_to_death` counts or panics, like a proxy with a poisoned `recipients` lock.
@@ -406,21 +405,6 @@ mod tests {
         }
         fn stability(&self) -> Stability {
             Stability::default()
-        }
-        fn inc_strong(&self, _: &SIBinder) -> crate::Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> crate::Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> crate::Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> crate::Result<()> {
-            Ok(())
         }
     }
 

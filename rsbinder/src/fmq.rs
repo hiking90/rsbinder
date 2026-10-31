@@ -368,7 +368,7 @@ mod convert {
             );
             let nomem = rustix::io::Errno::NOMEM;
             let os = rsbinder_fmq::Error::Os(rsbinder_fmq::Errno::from_raw(nomem.raw_os_error()));
-            assert_eq!(StatusCode::from(os), StatusCode::from(nomem));
+            assert_eq!(StatusCode::from(os), crate::error::errno_status(nomem));
             let not_an_errno = rsbinder_fmq::Error::Os(rsbinder_fmq::Errno::from_raw(0));
             assert_eq!(StatusCode::from(not_an_errno), StatusCode::Unknown);
         }

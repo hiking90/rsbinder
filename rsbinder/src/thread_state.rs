@@ -177,14 +177,11 @@
 //!   would re-enter its loop and block in `talk_with_driver` waiting for a
 //!   command a conforming peer never sends, hanging (possibly the main
 //!   thread) on a malformed or hostile reply.
-//! - **Native target ref balance.** For a `BR_TRANSACTION` to a local binder,
+//! - **Native target lifetime.** For a `BR_TRANSACTION` to a local binder,
 //!   `target.ptr` is the process-monotonic id assigned by `publish_native`.
 //!   It is resolved via the sidecar table (read-only, no count change); the
-//!   table keeps `Inner<T>` alive while the entry exists, so the `SIBinder`
-//!   built there can drive the user's `Transactable`. Its `RefCounter` ops
-//!   balance within the block: `from_arc` calls `inc_strong` (+1),
-//!   `attempt_increase` adds one (+1), `decrease()` cancels one (−1), and the
-//!   `SIBinder`'s `Drop` cancels the last (−1).
+//!   table keeps `Inner<T>` alive while the entry exists, and the `SIBinder`
+//!   built from the returned `Arc` keeps it alive for the dispatch.
 //! - **Reply path containment.** The saved transaction state is restored on
 //!   every exit (an `Err` or panic must not leak it into the next command),
 //!   and a panic from the reply flush/await — `talk_with_driver` or a nested
@@ -1400,34 +1397,24 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let result = {
                     let target_ptr = tr.target_ptr();
                     if target_ptr != 0 {
-                        // A `publish_native` id; ref balance: module doc "Dispatch notes".
+                        // A `publish_native` id; lifetime: module doc "Dispatch notes".
                         let id = target_ptr;
                         match ProcessState::as_self().lookup_native(id) {
                             Some(arc) => {
                                 let strong = SIBinder::from_arc(arc);
-                                if strong.attempt_increase() {
-                                    // May be `None` for a user `IBinder`: reject, no panic.
-                                    let result = match strong.as_transactable() {
-                                        Some(t) => dispatch_kernel_observed(
-                                            &strong,
-                                            t,
-                                            &tr_secctx.transaction_data,
-                                            &mut reader,
-                                            &mut reply,
-                                        ),
-                                        None => {
-                                            log::error!("native id {id} is not Transactable");
-                                            Err(StatusCode::UnknownTransaction)
-                                        }
-                                    };
-                                    // No `?`: the reply and state restore must still run.
-                                    if let Err(e) = strong.decrease() {
-                                        log::error!("dec_strong failed for native id {id}: {e:?}");
+                                // May be `None` for a user `IBinder`: reject, no panic.
+                                match strong.as_transactable() {
+                                    Some(t) => dispatch_kernel_observed(
+                                        &strong,
+                                        t,
+                                        &tr_secctx.transaction_data,
+                                        &mut reader,
+                                        &mut reply,
+                                    ),
+                                    None => {
+                                        log::error!("native id {id} is not Transactable");
+                                        Err(StatusCode::UnknownTransaction)
                                     }
-                                    result
-                                } else {
-                                    log::warn!("Failed strong.attempt_increase for native id {id}");
-                                    Err(StatusCode::UnknownTransaction)
                                 }
                             }
                             None => {
@@ -1533,7 +1520,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
-                // Id bookkeeping only; the table holds RefCounter.weak up for the entry's life.
+                // Id bookkeeping only; the table entry keeps the native alive.
                 if ProcessState::as_self().ref_native_kernel(id).is_none() {
                     log::error!("BR_INCREFS for unknown native id {id}");
                     debug_assert!(false, "BR_INCREFS for unknown native id {id}");
@@ -1556,7 +1543,7 @@ fn execute_command(cmd: i32) -> Result<()> {
                 let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
                 drop(state);
 
-                // Bookkeeping only, as BR_INCREFS; `binder_pin` holds RefCounter.strong up.
+                // Bookkeeping only, as BR_INCREFS.
                 if ProcessState::as_self().ref_native_kernel(id).is_none() {
                     log::error!("BR_ACQUIRE for unknown native id {id}");
                     debug_assert!(false, "BR_ACQUIRE for unknown native id {id}");
@@ -1845,7 +1832,7 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
                 std::process::abort();
             }
             // As AOSP; an in-flight call's BR_REPLY still comes (module doc "Driver errors").
-            return Err(StatusCode::from(errno));
+            return Err(errno_status(errno));
         }
 
         log::trace!(
@@ -1956,7 +1943,7 @@ fn write_without_thread_state_with(
             Err(errno) if errno == rustix::io::Errno::INTR => {}
             Err(errno) => {
                 log::error!("binder::write_read() after thread-local teardown: {errno}");
-                return Err(StatusCode::from(errno));
+                return Err(errno_status(errno));
             }
         }
     }
@@ -2392,15 +2379,34 @@ pub(crate) fn clear_freeze_notification(handle: u32) -> Result<()> {
     }
 }
 
+/// The caller of the transaction this thread is handling: pid, uid and,
+/// where the kernel sent one, the SELinux security context.
+///
+/// Built by [`CallingContext::current`]; the fields are read-only data.
+/// More fields may be added, so the type is `#[non_exhaustive]`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CallingContext {
     pub pid: binder::pid_t,
     pub uid: binder::uid_t,
     pub sid: Option<CString>,
 }
 
-impl std::default::Default for CallingContext {
-    fn default() -> CallingContext {
+impl CallingContext {
+    /// The caller of the transaction this thread is handling, read at the
+    /// time of the call.
+    ///
+    /// Inside a kernel binder transaction this is the kernel-delivered
+    /// sender (`sid` only when the target asked for it with
+    /// [`BinderFeatures::set_requesting_sid`](crate::BinderFeatures)); inside an
+    /// RPC transaction it is the peer's identity, with no `sid`. Outside
+    /// any transaction, or in a process that has not initialized
+    /// [`ProcessState`], it is this process (`getpid`, `getuid`), as AOSP
+    /// `IPCThreadState::getCallingPid` / `getCallingUid` answer there.
+    ///
+    /// Take it inside the handler: a value stored and read later still
+    /// names the caller of the call that made it.
+    pub fn current() -> CallingContext {
         // An in-flight RPC transaction wins (pure-RPC safe); RPC carries no SELinux `sid`.
         if let Some((uid, pid)) = rpc_calling() {
             return CallingContext {
@@ -2426,7 +2432,7 @@ impl std::default::Default for CallingContext {
                     sid: transaction.calling_sid.clone(),
                 },
                 None => {
-                    log::debug!("CallingContext::new() called outside of transaction");
+                    log::debug!("CallingContext::current() called outside of transaction");
                     CallingContext {
                         pid: rustix::process::getpid().as_raw_nonzero().get() as _,
                         uid: rustix::process::getuid().as_raw(),
@@ -2533,7 +2539,7 @@ pub fn get_calling_sid() -> Option<CString> {
 /// `mCallingPid = getpid()` (`IPCThreadState.cpp`). A call that never
 /// crossed a process boundary is this process calling itself.
 ///
-/// Convenience wrapper around `CallingContext::default().pid` for the
+/// Convenience wrapper around `CallingContext::current().pid` for the
 /// common case where only the PID is needed — avoids the
 /// `Option<CString>` allocation of the full context.
 pub fn get_calling_pid() -> binder::pid_t {
@@ -2567,7 +2573,7 @@ pub fn get_calling_pid() -> binder::pid_t {
 /// the transaction did not arrive on, therefore reads as this process,
 /// never as root.
 ///
-/// Convenience wrapper around `CallingContext::default().uid` for the
+/// Convenience wrapper around `CallingContext::current().uid` for the
 /// common case where only the UID is needed.
 ///
 /// Note: this is the *kernel-delivered* sender UID. To temporarily
@@ -2827,7 +2833,7 @@ pub fn get_extended_error() -> Result<ExtendedError> {
             // Unknown cmd: `binder_ioctl` says `EINVAL`; the supported ioctl fails only `EFAULT`.
             StatusCode::InvalidOperation
         } else {
-            StatusCode::from(errno)
+            errno_status(errno)
         }
     })?;
     Ok(ExtendedError {
@@ -2938,8 +2944,8 @@ mod tests {
             assert!(is_handling_transaction());
             // RPC carries no SELinux context.
             assert!(get_calling_sid().is_none());
-            assert_eq!(CallingContext::default().uid, 1234);
-            assert_eq!(CallingContext::default().pid, 42);
+            assert_eq!(CallingContext::current().uid, 1234);
+            assert_eq!(CallingContext::current().pid, 42);
             // `calling_caller` exposes the full RPC peer (Phase C).
             match calling_caller() {
                 Some(Caller::Rpc(PeerIdentity::Local { uid, pid })) => {
@@ -3453,21 +3459,6 @@ mod tests {
             fn is_remote(&self) -> bool {
                 false
             }
-            fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-                Ok(())
-            }
-            fn attempt_inc_strong(&self) -> bool {
-                true
-            }
-            fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
-                Ok(())
-            }
-            fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-                Ok(())
-            }
-            fn dec_weak(&self) -> Result<()> {
-                Ok(())
-            }
         }
 
         // Sentinel A: its drop pushes B's id into BINDER_DEREFS, like a mid-drain BR_DECREFS.
@@ -3511,21 +3502,6 @@ mod tests {
             }
             fn is_remote(&self) -> bool {
                 false
-            }
-            fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-                Ok(())
-            }
-            fn attempt_inc_strong(&self) -> bool {
-                true
-            }
-            fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
-                Ok(())
-            }
-            fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-                Ok(())
-            }
-            fn dec_weak(&self) -> Result<()> {
-                Ok(())
             }
         }
 
@@ -3721,21 +3697,6 @@ mod tests {
         fn is_remote(&self) -> bool {
             false
         }
-        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<std::mem::ManuallyDrop<SIBinder>>) -> Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> Result<()> {
-            Ok(())
-        }
     }
 
     /// A kernel call nested in an RPC handler sees the kernel caller; see `# Mutation gates`.
@@ -3848,7 +3809,7 @@ mod tests {
 
         let sid = get_calling_sid();
         let caller = calling_caller();
-        let context = CallingContext::default();
+        let context = CallingContext::current();
         THREAD_STATE.with(|ts| ts.borrow_mut().transaction = previous);
 
         let expected = CString::new("u:r:system_server:s0").unwrap();

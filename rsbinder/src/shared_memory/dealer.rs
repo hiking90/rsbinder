@@ -1,22 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! `MemoryDealer` — AOSP's chunk allocator over one shared heap
-//! (`frameworks/native/libs/binder/MemoryDealer.cpp`, Plan 4-7a Phase D).
-//!
-//! One heap is allocated and published **once**; every
-//! [`allocate`](MemoryDealer::allocate) carves an `(offset, size)`
-//! window out of it and hands it back as an [`Allocation`] — an
-//! `android.utils.IMemory` whose `GET_MEMORY` reply names the shared
-//! heap binder. A peer that keeps a [`HeapCache`](crate::shared_memory::HeapCache)
-//! therefore maps the heap a single time and then resolves each
-//! allocation to a bare offset: no fd passing and no `mmap` per buffer,
-//! which is the whole point for streaming (camera / audio) traffic.
-//!
-//! Allocator = AOSP `SimpleBestFitAllocator`: 32-byte granules
-//! (`kMemoryAlign`), best-fit over a sorted free list, and coalescing
-//! with both neighbours on free. `PAGE_ALIGNED` allocations are
-//! supported through [`allocate_page_aligned`](MemoryDealer::allocate_page_aligned).
+//! `MemoryDealer`; documented in the parent module, section "Dealer".
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 

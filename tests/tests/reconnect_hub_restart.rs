@@ -52,7 +52,7 @@ fn hub() -> Killed {
     // Up once it answers a lookup as the context manager.
     assert!(
         eventually(|| hub::default()
-            .and_then(|sm| sm.try_get_service("none"))
+            .and_then(|sm| sm.try_get_service("none").map_err(StatusCode::from))
             .is_ok()),
         "rsb_hub did not come up"
     );

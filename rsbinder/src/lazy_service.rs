@@ -133,7 +133,7 @@ impl Registry for HubRegistry {
         binder: &SIBinder,
         callback: &Strong<dyn IClientCallback>,
     ) -> std::result::Result<(), Status> {
-        crate::hub::register_client_callback_status(name, binder, callback)
+        crate::hub::register_client_callback(name, binder, callback)
     }
 
     fn try_unregister_service(
@@ -141,7 +141,7 @@ impl Registry for HubRegistry {
         name: &str,
         binder: &SIBinder,
     ) -> std::result::Result<(), Status> {
-        crate::hub::try_unregister_service_status(name, binder)
+        crate::hub::try_unregister_service(name, binder)
     }
 }
 

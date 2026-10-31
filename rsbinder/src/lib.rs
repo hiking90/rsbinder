@@ -292,7 +292,6 @@ mod proxy;
 /// (`getBinderProxyCount` / `setBinderProxyCountWatermarks` /
 /// `setBinderProxyCountEventCallback` / `enableCountByUid`).
 pub mod proxy_count;
-mod ref_counter;
 /// Shared-memory IPC: AOSP `IMemoryHeap` / `IMemory` traits, a
 /// `memfd_create` (Linux/Android) / `shm_open` (macOS) backed
 /// `MemoryHeapBase`, and wire-faithful `android.utils.IMemory*`
@@ -302,8 +301,8 @@ pub mod shared_memory;
 // Status and exception handling, re-exported at the crate root.
 mod status;
 mod sys;
-/// Thread-local binder state
-pub mod thread_state;
+// Thread-local binder state; the crate-root re-exports are the public path.
+mod thread_state;
 mod transaction_data;
 // Transport capabilities; not under `rpc`: the kernel path answers the same questions.
 mod transport_caps;
@@ -422,8 +421,14 @@ pub use proxy::{Proxy, ProxyHandle};
 
 // Explicit, not glob, so a new `pub` item in `rt` cannot leak past semver review.
 #[cfg(feature = "tokio")]
+#[expect(
+    deprecated,
+    reason = "re-exports `get_interface_async` while it is kept"
+)]
+pub use rt::get_interface_async;
+#[cfg(feature = "tokio")]
 pub use rt::{
-    check_interface_async, death_signal, get_interface_async, wait_for_interface_async,
+    check_interface_async, death_signal, try_get_interface_async, wait_for_interface_async,
     DeathSignal, Tokio, TokioRuntime,
 };
 // `status` stays private: the root re-exports are the only path to these types.

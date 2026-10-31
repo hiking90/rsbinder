@@ -58,7 +58,7 @@ static QUERIES: AtomicI32 = AtomicI32::new(0);
 struct CountQueries;
 
 impl TransactionObserver for CountQueries {
-    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn std::any::Any + Send>> {
+    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn std::any::Any>> {
         if ctx.code == INTERFACE_TRANSACTION {
             QUERIES.fetch_add(1, Ordering::SeqCst);
         }
@@ -67,7 +67,7 @@ impl TransactionObserver for CountQueries {
     fn on_reply(
         &self,
         _: &TxnContext<'_>,
-        _: Option<Box<dyn std::any::Any + Send>>,
+        _: Option<Box<dyn std::any::Any>>,
         _: &rsbinder::Result<()>,
         _: Duration,
     ) {

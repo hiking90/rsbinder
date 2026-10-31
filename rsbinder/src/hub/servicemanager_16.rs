@@ -134,10 +134,9 @@ pub fn get_service(
 pub fn try_get_service(
     sm: &BpServiceManager,
     name: &str,
-) -> Result<Option<android::os::ServiceWithMetadata::ServiceWithMetadata>> {
+) -> std::result::Result<Option<android::os::ServiceWithMetadata::ServiceWithMetadata>, Status> {
     sm.getService2(name)
         .map(|service| dispatch_typed_service(name, service))
-        .map_err(|e| e.into())
 }
 
 /// Retrieve an existing service called @a name from the service
@@ -194,9 +193,8 @@ pub fn register_for_notifications(
     sm: &BpServiceManager,
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
-) -> Result<()> {
+) -> std::result::Result<(), Status> {
     sm.registerForNotifications(name, callback)
-        .map_err(|e| e.into())
 }
 
 /// Unregisters all requests for notifications for a specific callback.
@@ -204,9 +202,8 @@ pub fn unregister_for_notifications(
     sm: &BpServiceManager,
     name: &str,
     callback: &crate::Strong<dyn IServiceCallback>,
-) -> Result<()> {
+) -> std::result::Result<(), Status> {
     sm.unregisterForNotifications(name, callback)
-        .map_err(|e| e.into())
 }
 
 /// Register a callback for client (proxy) presence transitions on a lazy
@@ -216,15 +213,18 @@ pub fn register_client_callback(
     name: &str,
     service: &SIBinder,
     callback: &crate::Strong<dyn IClientCallback>,
-) -> Result<()> {
+) -> std::result::Result<(), Status> {
     sm.registerClientCallback(name, service, callback)
-        .map_err(|e| e.into())
 }
 
 /// Attempt to unregister a service previously registered with `add_service`.
 /// AOSP `IServiceManager::tryUnregisterService`.
-pub fn try_unregister_service(sm: &BpServiceManager, name: &str, service: &SIBinder) -> Result<()> {
-    sm.tryUnregisterService(name, service).map_err(|e| e.into())
+pub fn try_unregister_service(
+    sm: &BpServiceManager,
+    name: &str,
+    service: &SIBinder,
+) -> std::result::Result<(), Status> {
+    sm.tryUnregisterService(name, service)
 }
 
 /// Every declared instance of `iface`. An interface declared as

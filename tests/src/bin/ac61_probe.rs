@@ -154,11 +154,11 @@ fn main() {
             }
             "notify" => match hub::register_for_notifications(arg, &callback) {
                 Ok(()) => "OK",
-                Err(err) => outcome_of_code(err),
+                Err(err) => outcome_of_status(&err),
             },
             "unnotify" => match hub::unregister_for_notifications(arg, &callback) {
                 Ok(()) => "OK",
-                Err(err) => outcome_of_code(err),
+                Err(err) => outcome_of_status(&err),
             },
             "list" => {
                 // `hub::list_services` swallows a transport error into an

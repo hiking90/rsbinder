@@ -52,7 +52,7 @@ struct Recorder {
 }
 
 impl TransactionObserver for Recorder {
-    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
         if ctx.descriptor == DESCRIPTOR && ctx.method == Some("ping") {
             panic!("observer bug on ping");
         }
@@ -62,7 +62,7 @@ impl TransactionObserver for Recorder {
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        tag: Option<Box<dyn Any + Send>>,
+        tag: Option<Box<dyn Any>>,
         result: &rsbinder::Result<()>,
         _elapsed: Duration,
     ) {

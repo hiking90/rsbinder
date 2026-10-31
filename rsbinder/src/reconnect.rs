@@ -1142,7 +1142,8 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
     /// `build` looks once; the thread then waits for the name to be registered, not attempting.
     fn kernel_lookup(&self, name: &str, mode: Mode) -> std::result::Result<SIBinder, Failure> {
         let sm = crate::hub::default().map_err(Failure::transient)?;
-        if let Some(b) = sm.try_get_service(name).map_err(Failure::transient)? {
+        let found = sm.try_get_service(name);
+        if let Some(b) = found.map_err(|s| Failure::transient(s.into()))? {
             return Ok(b);
         }
         // Android 10 has no registration to probe; the thread's wait polls instead.
@@ -1153,7 +1154,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         if mode == Mode::Build {
             // `getService` answers a denied name as an absent one; a registration tells them apart.
             let probe = crate::hub::BnServiceCallback::new_binder(Unwatched);
-            return match sm.register_for_notifications_status(name, &probe) {
+            return match sm.register_for_notifications(name, &probe) {
                 Ok(()) => {
                     let _ = sm.unregister_for_notifications(name, &probe);
                     Err(Failure::transient(StatusCode::NameNotFound))

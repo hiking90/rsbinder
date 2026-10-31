@@ -18,6 +18,7 @@
  */
 
 #[cfg(feature = "async")]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __declare_binder_interface {
     {
@@ -173,6 +174,7 @@ macro_rules! __declare_binder_interface {
 }
 
 #[cfg(not(feature = "async"))]
+#[doc(hidden)]
 #[macro_export]
 macro_rules! __declare_binder_interface {
     {

@@ -342,7 +342,7 @@ impl Interface for Guarded {}
 
 impl ITopic for Guarded {
     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
-        if CallingContext::default().uid != self.uid {
+        if CallingContext::current().uid != self.uid {
             return Err(Status::from(ExceptionCode::Security));
         }
         self.acceptor.accept(request)
@@ -353,7 +353,7 @@ impl ITopic for Guarded {
 fn an_itopic_of_the_application_refuses_or_admits_through_its_acceptor() {
     let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
     // Outside a transaction, this process's own.
-    let uid = CallingContext::default().uid;
+    let uid = CallingContext::current().uid;
     let guard = |uid| {
         let acceptor = publisher.acceptor();
         BnTopic::new_binder(Guarded { uid, acceptor }).as_binder()

@@ -36,7 +36,7 @@
 //! this; handwritten AOSP interfaces such as `android.utils.IMemoryHeap` use the raw
 //! form directly.
 
-use crate::error::{Result, StatusCode};
+use crate::error::{errno_status, Result, StatusCode};
 use crate::{
     Deserialize, DeserializeArray, DeserializeOption, Parcel, Serialize, SerializeArray,
     SerializeOption,
@@ -68,7 +68,7 @@ impl ParcelFileDescriptor {
     /// `ParcelFileDescriptor::dup`. Useful when you must both keep an fd and
     /// hand a copy to a parcel.
     pub fn try_clone(&self) -> Result<Self> {
-        let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0)?;
+        let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0).map_err(errno_status)?;
         Ok(Self(dup))
     }
 
@@ -103,12 +103,13 @@ impl ParcelFileDescriptor {
     pub fn pipe() -> Result<(Self, Self)> {
         // Apple has no pipe2: CLOEXEC goes on afterwards, racing only an `exec` on another thread.
         #[cfg(not(target_vendor = "apple"))]
-        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        let (read, write) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(errno_status)?;
         #[cfg(target_vendor = "apple")]
         let (read, write) = {
-            let (read, write) = rustix::pipe::pipe()?;
-            rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC)?;
-            rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC)?;
+            let (read, write) = rustix::pipe::pipe().map_err(errno_status)?;
+            rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC).map_err(errno_status)?;
+            rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC).map_err(errno_status)?;
             (read, write)
         };
         Ok((Self(read), Self(write)))
@@ -255,7 +256,7 @@ pub(crate) fn write_raw_fd(parcel: &mut Parcel, fd: BorrowedFd<'_>) -> Result<()
 /// Fd-mode gate + dup, run before writing anything so a failure leaves the parcel untouched.
 fn dup_for_parcel(parcel: &Parcel, fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     rpc_fd_profile(parcel)?;
-    Ok(rustix::io::fcntl_dupfd_cloexec(fd, 0)?)
+    rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(errno_status)
 }
 
 /// Body of [`write_raw_fd`] for a [`dup_for_parcel`] fd; ownership moves only after the body.

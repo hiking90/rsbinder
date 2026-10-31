@@ -12,12 +12,15 @@
 //! * [`MemoryHeapBase`](crate::shared_memory::MemoryHeapBase) — owner-side heap (`memfd_create` on
 //!   Linux/Android, `shm_open` on macOS). [`MappedHeap`](crate::shared_memory::MappedHeap) — the
 //!   receiver-side mapping of an fd that arrived through a parcel.
-//!   See [`heap`](crate::shared_memory::heap) for the backing-store table and the aliasing
+//!   See [Heaps](#heaps) for the backing-store table and the aliasing
 //!   contract.
 //! * [`MemoryDealer`](crate::shared_memory::MemoryDealer) — AOSP's chunk
 //!   allocator: one heap, many `IMemory` windows, with
 //!   [`HeapCache`](crate::shared_memory::HeapCache) on the receiving side
-//!   so the heap is mapped once. See [`dealer`](crate::shared_memory::dealer).
+//!   so the heap is mapped once. See [Dealer](#dealer).
+//! * [`SharedMemory`] — `android.os.SharedMemory`; see [SharedMemory](#sharedmemory).
+//! * [`BnMemoryHeap`] / [`BpMemoryHeap`] / [`BnMemory`] / [`BpMemory`] — the
+//!   `IMemoryHeap` / `IMemory` wire; see [Wire](#wire).
 //!
 //! A shared region travels over any transport that can carry an fd:
 //! the kernel binder (`BINDER_TYPE_FD`) and Unix-socket RPC with
@@ -34,6 +37,156 @@
 //! (`MappedHeap::from_fd`) still maps a received fd. Check
 //! [`is_supported`](crate::shared_memory::is_supported) to branch at runtime.
 //!
+//! # Heaps
+//!
+//! Concrete shared-memory heaps (plan 4-7a Phase A).
+//!
+//! * [`MemoryHeapBase`] — the *owner* side. Allocates an anonymous
+//!   shared region and (by default) maps it into this process.
+//! * [`MappedHeap`] — the *receiver* side. Wraps an fd that arrived
+//!   through a parcel plus the wire geometry (`size`, `offset`,
+//!   `flags`) and maps it.
+//!
+//! Backing store by target:
+//!
+//! | target | create | size guard |
+//! |---|---|---|
+//! | linux / android | `memfd_create(MFD_CLOEXEC \| MFD_ALLOW_SEALING)` | `F_SEAL_GROW \| F_SEAL_SHRINK` (+`F_SEAL_FUTURE_WRITE` for read-only, +`F_SEAL_SEAL` unless [`FLAG_MEMFD_ALLOW_SEALING`]) — the AOSP `MemoryHeapBase::FORCE_MEMFD` path |
+//! | macos | `shm_open` + immediate `shm_unlink` (two fds: `O_RDWR` for the owner, `O_RDONLY` to export) | kernel-inherent: a POSIX shm object accepts exactly **one** `ftruncate` (≡ `F_SEAL_GROW \| F_SEAL_SHRINK`), and an `O_RDONLY` fd refuses `PROT_WRITE` mappings and `mprotect` upgrades (≡ `F_SEAL_FUTURE_WRITE`). See plan 4-7b |
+//! | other | no backing store — every [`MemoryHeapBase`] constructor returns `InvalidOperation`, and [`is_supported`] is `false`. The receiver side is not all gone: see [`MappedHeap::from_fd`] | — |
+//!
+//! The owner mapping is always created *before* seals are applied so
+//! that `F_SEAL_FUTURE_WRITE` leaves the owner's own mapping writable,
+//! exactly like AOSP `MemoryHeapBase.cpp`. Receivers map `PROT_READ`
+//! only when [`FLAG_READ_ONLY`] is set — and on every backend the
+//! kernel refuses a writable mapping to a peer that ignores the flag
+//! (Linux 5.1+; an older kernel lacks `F_SEAL_FUTURE_WRITE`, which
+//! `seals()` reports).
+//!
+//! `seals()` reports the **effective protections** of the fd a heap
+//! exports as `SEAL_*` bits: `F_GET_SEALS` on Linux/Android, synthesized
+//! from the kernel semantics above on macOS (`SEAL_SHRINK | SEAL_GROW`,
+//! plus `SEAL_FUTURE_WRITE` when the exported fd is read-only; never
+//! `SEAL_SEAL`). On macOS only a POSIX shm object qualifies: it has no
+//! vnode, so `st_mode` carries no `S_IFMT` bits. A regular file (resizable
+//! by any holder) yields `None`, matching `F_GET_SEALS` failing on
+//! non-memfd fds on Linux.
+//!
+//! **Aliasing.** A shared mapping is, by definition, writable by other
+//! processes at any time, so no safe accessor ever exposes it as `&[u8]`:
+//! [`read_at`](crate::shared_memory::MemoryHeapBase::read_at) /
+//! [`write_at`](crate::shared_memory::MemoryHeapBase::write_at)
+//! copy through atomics, and [`IMemoryHeap::base`] returns the read-only
+//! [`SharedBytes`] view built on the same copies. Only the raw
+//! [`as_ptr`](crate::shared_memory::MemoryHeapBase::as_ptr) carries AOSP's `unsecurePointer()`
+//! caveat, and it is the caller's `unsafe` to dereference.
+//!
+//! The heaps' shared state is `Send + Sync` on the same basis. The mapping
+//! is a `rsbinder_fmq::shm::Mapping`, an address range with no thread
+//! affinity that is `Send + Sync` itself, and every safe access goes through
+//! `Mapping::region` — atomic loads and stores, uniformly word-sized on the
+//! word part — so concurrent `read_at`/`write_at`/`base` from several
+//! threads (or another process) are data races only in the hardware sense,
+//! never in Rust's model. That is the contract `shm::Mapping` sets for the
+//! code that turns its address into references: atomic access only, no byte
+//! at two sizes through one mapping, and `Relaxed` loads no wider than a
+//! `usize` through a read-only one. Stores are gated on the heap being
+//! writable, so a `PROT_READ` mapping is never written. The atomic view
+//! relies on the mapping starting on a page boundary (the heap's offset is
+//! page-aligned, so the word part is `usize`-aligned), `AtomicUsize` having
+//! `usize`'s size and alignment, and `AtomicU8` being `repr(transparent)`
+//! over `u8`.
+//!
+//! `shm::Mapping` adds two refusals to the `mmap` it makes, both
+//! `BadValue`: a range of more than `isize::MAX` bytes, which no Rust slice
+//! may span (a 32-bit target only), and on Linux and Android an fd the
+//! kernel reports as a hugetlbfs file, whose mapping could not be released
+//! on drop.
+//!
+//! # Dealer
+//!
+//! `MemoryDealer` — AOSP's chunk allocator over one shared heap
+//! (`frameworks/native/libs/binder/MemoryDealer.cpp`, plan 4-7a Phase D).
+//!
+//! One heap is allocated and published **once**; every
+//! [`allocate`](crate::shared_memory::MemoryDealer::allocate) carves an `(offset, size)`
+//! window out of it and hands it back as an [`Allocation`] — an
+//! `android.utils.IMemory` whose `GET_MEMORY` reply names the shared
+//! heap binder. A peer that keeps a [`HeapCache`]
+//! therefore maps the heap a single time and then resolves each
+//! allocation to a bare offset: no fd passing and no `mmap` per buffer,
+//! which is the whole point for streaming (camera / audio) traffic.
+//!
+//! Allocator = AOSP `SimpleBestFitAllocator`: 32-byte granules
+//! (`kMemoryAlign`), best-fit over a sorted free list, and coalescing
+//! with both neighbours on free. `PAGE_ALIGNED` allocations are
+//! supported through
+//! [`allocate_page_aligned`](crate::shared_memory::MemoryDealer::allocate_page_aligned).
+//!
+//! # SharedMemory
+//!
+//! `android.os.SharedMemory` / NDK `ASharedMemory` equivalent (plan
+//! 4-7a Phase C).
+//!
+//! On the wire a `SharedMemory` is **one file descriptor** and nothing
+//! else (`SharedMemory.java` `writeToParcel` → `writeFileDescriptor`);
+//! the receiver recovers the size from the fd itself. So an AIDL
+//! `ParcelFileDescriptor` argument/return carrying a memfd or ashmem fd
+//! is byte-identical to a Java/NDK `SharedMemory`, and this type is the
+//! convenience wrapper on both ends.
+//!
+//! Size recovery follows libcutils `ashmem_get_size_region`: `fstat`
+//! for a memfd / POSIX shm object, and — on Android — the
+//! `ASHMEM_GET_SIZE` ioctl for a legacy `/dev/ashmem` fd, which reports
+//! `st_size == 0`.
+//!
+//! # Wire
+//!
+//! Wire-faithful `android.utils.IMemoryHeap` / `android.utils.IMemory`
+//! stubs (plan 4-7a Phase B).
+//!
+//! AOSP `IMemory.cpp` is handwritten, not AIDL; the transaction layout
+//! reproduced here is (android17-release):
+//!
+//! | interface | code | request | reply |
+//! |---|---|---|---|
+//! | `android.utils.IMemoryHeap` | [`HEAP_ID`] = `FIRST_CALL_TRANSACTION` | token only | **raw** `fd` object · `u64 size` · `i64 offset` · `u32 flags` (`IMemory.cpp:404-409`) |
+//! | `android.utils.IMemory` | [`GET_MEMORY`] = `FIRST_CALL_TRANSACTION` | token only | `strong binder (heap)` · `i64 offset` · `u64 size` (`IMemory.cpp:239-245`) |
+//!
+//! Neither reply carries a `Status` header — the transaction status is
+//! the only error channel, as in AOSP. The heap fd is AOSP
+//! `writeFileDescriptor` / `readFileDescriptor`: the bare fd object with
+//! **no** `ParcelFileDescriptor` not-null / comm markers (STAGE3 against
+//! real libbinder is what pins this — rsbinder↔rsbinder is symmetric
+//! and would not notice an 8-byte skew). The interface token on the
+//! request is checked by the native dispatcher before `on_transact`
+//! runs, so the `Bn*` types here do not re-check it.
+//!
+//! Proxies go through `SIBinder::as_remote` (kernel `ProxyHandle` or
+//! RPC `RpcProxy`) and fall back to an in-process
+//! `Transactable` call for a local binder, so one `Bp*` serves all
+//! three cases. A `Bp*` resolves its remote geometry **once**, on
+//! first use, like AOSP `BpMemoryHeap::assertReallyMapped()` /
+//! `BpMemory::getMemory()`; it never re-transacts.
+//!
+//! [`SharedMemory`]: crate::shared_memory::SharedMemory
+//! [`BnMemoryHeap`]: crate::shared_memory::BnMemoryHeap
+//! [`BpMemoryHeap`]: crate::shared_memory::BpMemoryHeap
+//! [`BnMemory`]: crate::shared_memory::BnMemory
+//! [`BpMemory`]: crate::shared_memory::BpMemory
+//! [`MemoryHeapBase`]: crate::shared_memory::MemoryHeapBase
+//! [`MappedHeap`]: crate::shared_memory::MappedHeap
+//! [`MappedHeap::from_fd`]: crate::shared_memory::MappedHeap::from_fd
+//! [`FLAG_MEMFD_ALLOW_SEALING`]: crate::shared_memory::FLAG_MEMFD_ALLOW_SEALING
+//! [`FLAG_READ_ONLY`]: crate::shared_memory::FLAG_READ_ONLY
+//! [`is_supported`]: crate::shared_memory::is_supported
+//! [`IMemoryHeap::base`]: crate::shared_memory::IMemoryHeap::base
+//! [`SharedBytes`]: crate::shared_memory::SharedBytes
+//! [`Allocation`]: crate::shared_memory::Allocation
+//! [`HeapCache`]: crate::shared_memory::HeapCache
+//! [`HEAP_ID`]: crate::shared_memory::HEAP_ID
+//! [`GET_MEMORY`]: crate::shared_memory::GET_MEMORY
+//!
 //! # Mixed-size atomics
 //!
 //! The crate-private `Region` view splits a mapped shared region into its `usize`-aligned
@@ -42,10 +195,10 @@
 //! atomic accesses of *different* sizes a data race when one is a write, so a byte-granular
 //! fast path would race the word path of another thread writing the same window.
 
-pub mod dealer;
-pub mod heap;
-pub mod shared;
-pub mod wire;
+mod dealer;
+pub(crate) mod heap;
+pub(crate) mod shared;
+mod wire;
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};

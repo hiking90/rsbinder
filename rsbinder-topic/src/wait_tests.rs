@@ -460,7 +460,7 @@ fn a_publishers_stats_name_its_subscriptions_and_count_its_records() {
     let stats = publisher.stats();
     assert_eq!((stats.published, stats.bytes), (3, 12));
     // Outside a transaction, this process's own: the subscribers are in it.
-    let caller = rsbinder::CallingContext::default();
+    let caller = rsbinder::CallingContext::current();
     assert_eq!(stats.subscribers.len(), 2);
     for info in &stats.subscribers {
         assert_eq!((info.uid, info.pid, info.lost), (caller.uid, caller.pid, 0));

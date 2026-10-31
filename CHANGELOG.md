@@ -156,6 +156,66 @@ Each item below changes what a 0.12.0 program observes.
   `local_node_count` and `RpcServer::{live_session_node_count,
   session_live_conns, session_slot_count}` are `#[doc(hidden)]` behind the
   `test-util` feature.
+- **`IBinder` no longer has `inc_strong`, `attempt_inc_strong`,
+  `dec_strong`, `inc_weak` and `dec_weak`.** They counted nothing that
+  decided a lifetime (the `Arc` does), and a stray `dec_strong(None)`
+  panicked the next `SIBinder` drop in a debug build. Delete them from a
+  hand-written `IBinder` impl; to release a binder, drop it
+  (`service.dec_weak()?;` becomes `drop(service);`). `rpc_transact`, which
+  skips `check_interface`, now takes an argument only rsbinder can build.
+  `set_parceled` stays.
+- **`hub::register_for_notifications`, `unregister_for_notifications`,
+  `register_client_callback` and `try_unregister_service` return
+  `BinderResult<()>`**, as `add_service` does, and so do the
+  `ServiceManager` methods and the `hub::android_N` functions of those
+  names. The service manager's exception reaches the caller: a refused name
+  is `EX_SECURITY` rather than `StatusCode::FailedTransaction`. `?` into a
+  `StatusCode` or `Box<dyn Error>` function still compiles; a `match` on a
+  `StatusCode` becomes one on `exception_code()` or `transaction_error()`.
+  On Android 10 all four return `EX_UNSUPPORTED_OPERATION`.
+- **`hub::try_get_service` and `try_get_interface` return
+  `BinderResult<Option<_>>`** (`Status`, not `StatusCode`), as every
+  `hub::try_*` lookup does; `Err(StatusCode::X)` patterns become
+  `Err(s) if s.transaction_error() == StatusCode::X`, and a denied lookup
+  shows as `EX_SECURITY`. **`get_interface_async` is deprecated** in favour
+  of `try_get_interface_async`, which is `Ok(None)` for a name that is not
+  registered: `try_get_interface_async::<T>(name).await?.ok_or(StatusCode::NameNotFound)?`.
+- **`CallingContext::default()` is gone; use `CallingContext::current()`.**
+  `Default` read the caller at construction, so a `#[derive(Default)]`
+  struct or an `unwrap_or_default()` recorded whichever caller happened to
+  be current. `CallingContext` is `#[non_exhaustive]`.
+- **`ProcessState::init`, `init_with_mmap_size` and `init_default` return
+  `Result<&'static ProcessState, StatusCode>`** instead of
+  `Box<dyn Error>` (`?` into `Box<dyn Error>` still works). A second call
+  with a different driver path, `max_threads` or mmap size returns
+  `BadValue` instead of `Ok` with the earlier state (AOSP `initWithDriver`
+  aborts); the same settings again stay `Ok`. `driver_name()` and
+  `max_threads()` read the settings in force. A missing driver node is
+  `NameNotFound`, a failed ioctl or mmap its errno status, a protocol
+  version mismatch `NoInit`.
+- **`rsbinder::thread_state` and `shared_memory::{heap, dealer, shared,
+  wire}` are private modules**: `rsbinder::thread_state::X` becomes
+  `rsbinder::X` (`rsbinder::CallingContext`, `rsbinder::get_calling_uid`),
+  `rsbinder::shared_memory::heap::MemoryHeapBase` becomes
+  `rsbinder::shared_memory::MemoryHeapBase`. The generated
+  `cancel::android::os::…` and `permission_controller::android::os::…`
+  modules are private too; their items stay at `rsbinder::cancel::*` and
+  `rsbinder::permission_controller::*`. `__declare_binder_interface!` is
+  `#[doc(hidden)]`.
+- **`impl From<rustix::io::Errno> for StatusCode` is removed**, so `rustix`
+  is in neither crate's public API. Convert an errno with
+  `StatusCode::from(std::io::Error::from_raw_os_error(n))`; the mapping is
+  unchanged.
+- **`ParcelableHolder::new(Stability)` is deprecated; use
+  `ParcelableHolder::local()` or `vintf()`.** A holder's wire stability is
+  LOCAL or VINTF only: `new(Stability::Vendor)` and `new(Stability::System)`
+  now panic (they wrote LOCAL while behaving otherwise, and `Vendor` refused
+  non-VINTF parcelables). Generated code uses `vintf()`.
+- **`TransactionObserver`'s tag is `Option<Box<dyn Any>>`**, not
+  `Option<Box<dyn Any + Send>>`: `on_transact` and `on_reply` run on the
+  serving thread, so the tag may be a thread-bound guard; a
+  `Box<dyn Any + Send>` still coerces. `TracingObserver` keeps the entered
+  span as its tag.
 - On a 32-bit target `MessageQueue::attach` refuses, with
   `InvalidDescriptor`, a data grantor whose `extent` plus `offset` modulo the page size is more than
   `isize::MAX` (2 GiB − 1). That sum is the length mapped for the ring, and

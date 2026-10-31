@@ -554,7 +554,7 @@ impl Client {
     /// not (yet) registered.
     pub fn try_get<T: FromIBinder + ?Sized>(&self, name: &str) -> Result<Option<Strong<T>>> {
         match &self.inner {
-            Inner::Kernel => crate::hub::try_get_interface(name),
+            Inner::Kernel => crate::hub::try_get_interface(name).map_err(StatusCode::from),
             #[cfg(feature = "rpc")]
             Inner::Rpc(s) => match s.get_service(name) {
                 Ok(b) => b.into_interface_checked().map(Some),

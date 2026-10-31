@@ -470,7 +470,7 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 ///
 /// impl ITopic for Guarded {
 ///     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
-///         if CallingContext::default().uid != 1000 {
+///         if CallingContext::current().uid != 1000 {
 ///             return Err(Status::from(ExceptionCode::Security));
 ///         }
 ///         self.acceptor.accept(request)
@@ -546,7 +546,7 @@ trait Accept: Send + Sync {
 impl<T: Payload + 'static> Accept for Shared<T> {
     fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         if let Some(authorize) = &self.authorize {
-            if !authorize.admits(&CallingContext::default()) {
+            if !authorize.admits(&CallingContext::current()) {
                 return Err(Status::from((
                     ExceptionCode::Security,
                     "the publisher's policy does not admit the caller",
@@ -603,7 +603,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             }),
             None => None,
         };
-        let caller = CallingContext::default();
+        let caller = CallingContext::current();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
         let link = Link::new(

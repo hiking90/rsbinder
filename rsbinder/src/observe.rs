@@ -40,7 +40,8 @@
 //!   rsbinder lock held and no thread-state borrow outstanding, so an
 //!   observer may itself make binder calls.
 //! - Every `on_transact` is followed by exactly one `on_reply` on the same
-//!   thread; the value `on_transact` returns comes back as `tag`.
+//!   thread; the value `on_transact` returns comes back as `tag`, which
+//!   never leaves that thread and so need not be `Send`.
 //! - A panic in either call is caught and logged. It does not change the
 //!   transaction's result, and `on_reply` still runs after a panicking
 //!   `on_transact` (with `tag = None`). The same holds for a panic in the
@@ -174,14 +175,18 @@ pub trait TransactionObserver: Send + Sync {
     /// Called before the handler runs. The returned value is handed back to
     /// [`on_reply`](Self::on_reply) for the same transaction — a start
     /// marker, a span guard, anything per-call.
-    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>>;
+    ///
+    /// The tag need not be `Send`: both calls and the tag's drop run on the
+    /// thread that serves the transaction, on kernel binder and over RPC, so
+    /// a thread-bound guard such as `tracing`'s `EnteredSpan` may be the tag.
+    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>>;
 
     /// Called after the handler returns and before the reply is sent.
     /// `elapsed` is the time spent in the handler, `on_transact` excluded.
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        tag: Option<Box<dyn Any + Send>>,
+        tag: Option<Box<dyn Any>>,
         result: &Result<()>,
         elapsed: Duration,
     );
@@ -263,10 +268,10 @@ impl std::fmt::Debug for Fanout {
     }
 }
 
-struct FanoutTags(Vec<Option<Box<dyn Any + Send>>>);
+struct FanoutTags(Vec<Option<Box<dyn Any>>>);
 
 impl TransactionObserver for Fanout {
-    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+    fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
         let tags = self
             .observers
             .iter()
@@ -284,7 +289,7 @@ impl TransactionObserver for Fanout {
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        tag: Option<Box<dyn Any + Send>>,
+        tag: Option<Box<dyn Any>>,
         result: &Result<()>,
         elapsed: Duration,
     ) {
@@ -445,7 +450,7 @@ mod tests {
 
     // Parallel lib tests dispatch real transactions; record only this test's context.
     impl TransactionObserver for Recorder {
-        fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+        fn on_transact(&self, ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
             if ctx.descriptor != "x.y.IZ" {
                 return None;
             }
@@ -462,7 +467,7 @@ mod tests {
         fn on_reply(
             &self,
             ctx: &TxnContext<'_>,
-            tag: Option<Box<dyn Any + Send>>,
+            tag: Option<Box<dyn Any>>,
             result: &Result<()>,
             _elapsed: Duration,
         ) {

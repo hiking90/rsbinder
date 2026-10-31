@@ -373,9 +373,9 @@ impl From<StatusCode> for i32 {
 /// [`StatusCode::Errno`]): on Apple platforms
 /// `StatusCode::from(-libc::ECONNREFUSED)` is [`StatusCode::NotEnoughData`],
 /// since `-61` is AOSP `NOT_ENOUGH_DATA`, and an unnamed negative status is
-/// [`StatusCode::Unknown`]. Build a status from
-/// an OS error with `From<rustix::io::Errno>` or `From<std::io::Error>`,
-/// which map the host's errno by name.
+/// [`StatusCode::Unknown`]. Build a status from an OS error with
+/// `From<std::io::Error>` (for a raw errno,
+/// `std::io::Error::from_raw_os_error`), which maps the host's errno by name.
 impl From<i32> for StatusCode {
     fn from(code: i32) -> Self {
         status_from_wire(FOLD_UNNAMED_ERRNO, code)
@@ -388,35 +388,42 @@ impl From<std::array::TryFromSliceError> for StatusCode {
     }
 }
 
+/// Maps the host's errno by name: `ENOMEM` is [`StatusCode::NoMemory`],
+/// `EPIPE` [`StatusCode::DeadObject`], `EBADF` [`StatusCode::BadFd`] and so
+/// on, and an errno without a named status is [`StatusCode::Errno`] holding
+/// the negated errno. An error that carries no errno is
+/// [`StatusCode::Unknown`].
+///
+/// This is the conversion for a raw errno as well:
+/// `StatusCode::from(std::io::Error::from_raw_os_error(errno))`.
 impl From<std::io::Error> for StatusCode {
     fn from(err: std::io::Error) -> Self {
         // Keep the errno (BADF still yields BadFd); no errno, or one rustix rejects, is Unknown.
         match rustix::io::Errno::from_io_error(&err) {
-            Some(errno) => StatusCode::from(errno),
+            Some(errno) => errno_status(errno),
             None => StatusCode::Unknown,
         }
     }
 }
 
-impl From<rustix::io::Errno> for StatusCode {
-    fn from(errno: rustix::io::Errno) -> Self {
-        match errno {
-            rustix::io::Errno::NOMEM => StatusCode::NoMemory,
-            rustix::io::Errno::NOSYS => StatusCode::InvalidOperation,
-            rustix::io::Errno::INVAL => StatusCode::BadValue,
-            rustix::io::Errno::NOENT => StatusCode::NameNotFound,
-            rustix::io::Errno::PERM => StatusCode::PermissionDenied,
-            rustix::io::Errno::NODEV => StatusCode::NoInit,
-            rustix::io::Errno::EXIST => StatusCode::AlreadyExists,
-            rustix::io::Errno::PIPE => StatusCode::DeadObject,
-            rustix::io::Errno::BADMSG => StatusCode::UnknownTransaction,
-            rustix::io::Errno::OVERFLOW => StatusCode::BadIndex,
-            rustix::io::Errno::NODATA => StatusCode::NotEnoughData,
-            rustix::io::Errno::WOULDBLOCK => StatusCode::WouldBlock,
-            rustix::io::Errno::TIMEDOUT => StatusCode::TimedOut,
-            rustix::io::Errno::BADF => StatusCode::BadFd,
-            _ => unnamed_errno(errno.raw_os_error()),
-        }
+/// The crate's errno conversion; private so `rustix` stays out of the public API (plan 17 C-4).
+pub(crate) fn errno_status(errno: rustix::io::Errno) -> StatusCode {
+    match errno {
+        rustix::io::Errno::NOMEM => StatusCode::NoMemory,
+        rustix::io::Errno::NOSYS => StatusCode::InvalidOperation,
+        rustix::io::Errno::INVAL => StatusCode::BadValue,
+        rustix::io::Errno::NOENT => StatusCode::NameNotFound,
+        rustix::io::Errno::PERM => StatusCode::PermissionDenied,
+        rustix::io::Errno::NODEV => StatusCode::NoInit,
+        rustix::io::Errno::EXIST => StatusCode::AlreadyExists,
+        rustix::io::Errno::PIPE => StatusCode::DeadObject,
+        rustix::io::Errno::BADMSG => StatusCode::UnknownTransaction,
+        rustix::io::Errno::OVERFLOW => StatusCode::BadIndex,
+        rustix::io::Errno::NODATA => StatusCode::NotEnoughData,
+        rustix::io::Errno::WOULDBLOCK => StatusCode::WouldBlock,
+        rustix::io::Errno::TIMEDOUT => StatusCode::TimedOut,
+        rustix::io::Errno::BADF => StatusCode::BadFd,
+        _ => unnamed_errno(errno.raw_os_error()),
     }
 }
 
@@ -616,49 +623,49 @@ mod tests {
 
     #[test]
     fn test_status_code_from_errno() {
-        let code = StatusCode::from(rustix::io::Errno::NOMEM);
+        let code = errno_status(rustix::io::Errno::NOMEM);
         assert_eq!(code, StatusCode::NoMemory);
 
-        let code = StatusCode::from(rustix::io::Errno::NOSYS);
+        let code = errno_status(rustix::io::Errno::NOSYS);
         assert_eq!(code, StatusCode::InvalidOperation);
 
-        let code = StatusCode::from(rustix::io::Errno::INVAL);
+        let code = errno_status(rustix::io::Errno::INVAL);
         assert_eq!(code, StatusCode::BadValue);
 
-        let code = StatusCode::from(rustix::io::Errno::NOENT);
+        let code = errno_status(rustix::io::Errno::NOENT);
         assert_eq!(code, StatusCode::NameNotFound);
 
-        let code = StatusCode::from(rustix::io::Errno::PERM);
+        let code = errno_status(rustix::io::Errno::PERM);
         assert_eq!(code, StatusCode::PermissionDenied);
 
-        let code = StatusCode::from(rustix::io::Errno::NODEV);
+        let code = errno_status(rustix::io::Errno::NODEV);
         assert_eq!(code, StatusCode::NoInit);
 
-        let code = StatusCode::from(rustix::io::Errno::EXIST);
+        let code = errno_status(rustix::io::Errno::EXIST);
         assert_eq!(code, StatusCode::AlreadyExists);
 
-        let code = StatusCode::from(rustix::io::Errno::PIPE);
+        let code = errno_status(rustix::io::Errno::PIPE);
         assert_eq!(code, StatusCode::DeadObject);
 
-        let code = StatusCode::from(rustix::io::Errno::BADMSG);
+        let code = errno_status(rustix::io::Errno::BADMSG);
         assert_eq!(code, StatusCode::UnknownTransaction);
 
-        let code = StatusCode::from(rustix::io::Errno::OVERFLOW);
+        let code = errno_status(rustix::io::Errno::OVERFLOW);
         assert_eq!(code, StatusCode::BadIndex);
 
-        let code = StatusCode::from(rustix::io::Errno::NODATA);
+        let code = errno_status(rustix::io::Errno::NODATA);
         assert_eq!(code, StatusCode::NotEnoughData);
 
-        let code = StatusCode::from(rustix::io::Errno::WOULDBLOCK);
+        let code = errno_status(rustix::io::Errno::WOULDBLOCK);
         assert_eq!(code, StatusCode::WouldBlock);
 
-        let code = StatusCode::from(rustix::io::Errno::TIMEDOUT);
+        let code = errno_status(rustix::io::Errno::TIMEDOUT);
         assert_eq!(code, StatusCode::TimedOut);
 
-        let code = StatusCode::from(rustix::io::Errno::BADF);
+        let code = errno_status(rustix::io::Errno::BADF);
         assert_eq!(code, StatusCode::BadFd);
 
-        let code = StatusCode::from(rustix::io::Errno::from_raw_os_error(64));
+        let code = errno_status(rustix::io::Errno::from_raw_os_error(64));
         assert_eq!(code, StatusCode::Errno(-64));
     }
 
@@ -778,7 +785,7 @@ mod tests {
                 target_arch = "sparc64",
             ))
         ));
-        let refused = StatusCode::from(rustix::io::Errno::CONNREFUSED);
+        let refused = errno_status(rustix::io::Errno::CONNREFUSED);
         let host = -rustix::io::Errno::CONNREFUSED.raw_os_error();
         assert_eq!(refused, StatusCode::Errno(host));
         let (wire, back) = if linux_numbering {

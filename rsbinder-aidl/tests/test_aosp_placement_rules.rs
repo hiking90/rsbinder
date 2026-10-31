@@ -642,8 +642,7 @@ parcelable Foo {
     );
     // Wire-visible half: the holder inside `Inner` records the inherited stability byte.
     assert_eq!(
-        out.matches("ParcelableHolder::new(rsbinder::Stability::Vintf)")
-            .count(),
+        out.matches("ParcelableHolder::vintf()").count(),
         1,
         "nested Inner's holder must inherit Vintf stability (wire byte 1):\n{out}"
     );

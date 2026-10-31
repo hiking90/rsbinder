@@ -93,7 +93,7 @@ pub fn get_service(sm: &BpServiceManager, name: &str) -> Option<SIBinder> {
 /// reported as `Ok(None)` ("not registered, retry"), never `Err`. A waiter
 /// therefore never *gives up* on Android 10 — it polls until the service
 /// appears. (11+ can distinguish the two and so propagates `Err`.)
-pub fn try_get_service(sm: &BpServiceManager, name: &str) -> Result<Option<SIBinder>> {
+pub fn try_get_service(sm: &BpServiceManager, name: &str) -> BinderResult<Option<SIBinder>> {
     let result = (|| -> Result<Option<SIBinder>> {
         let mut data = sm.proxy().prepare_request(SERVICE_MANAGER_DESCRIPTOR)?;
         data.write(name)?;

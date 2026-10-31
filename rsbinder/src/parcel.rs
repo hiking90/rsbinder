@@ -2237,7 +2237,8 @@ impl Parcel {
 
     /// A dup of the fd of the FD object at the cursor; the parcel keeps its own.
     pub(crate) fn read_kernel_fd_dup(&mut self) -> Result<OwnedFd> {
-        Ok(self.read_kernel_fd_with(|fd| rustix::io::fcntl_dupfd_cloexec(fd, 0))??)
+        self.read_kernel_fd_with(|fd| rustix::io::fcntl_dupfd_cloexec(fd, 0))?
+            .map_err(crate::error::errno_status)
     }
 
     /// The fd of this parcel's FD object at `at`: the table's entry, or a `from_ipc_parts` handle.
@@ -2506,7 +2507,8 @@ impl Parcel {
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
                     // `off` is uncommitted until the push below, so a failed dup leaves no entry.
-                    let newfd = rustix::io::fcntl_dupfd_cloexec(other.kernel_fd_at(src)?, 0)?;
+                    let newfd = rustix::io::fcntl_dupfd_cloexec(other.kernel_fd_at(src)?, 0)
+                        .map_err(crate::error::errno_status)?;
                     flat.set_handle(std::os::fd::AsRawFd::as_raw_fd(&newfd) as _);
                     flat.set_cookie(1);
                     write_flat_binder(self.data.as_mut_slice(), off, &flat)?;
@@ -4517,7 +4519,7 @@ mod data_serde {
         txn.rpc_record_object_position(obj_pos);
         txn.set_data_position(0);
 
-        let mut holder = crate::ParcelableHolder::new(crate::Stability::Local);
+        let mut holder = crate::ParcelableHolder::local();
         holder.read_from_parcel(&mut txn).unwrap();
         assert_eq!(
             holder.with_payload_parcel(|p| p.map(|p| p.rpc_object_positions().to_vec())),
@@ -4639,7 +4641,7 @@ mod data_serde {
         txn.rpc_set_in_fds(vec![outside.into(), inside.into()]);
         txn.set_data_position(12);
 
-        let mut holder = crate::ParcelableHolder::new(crate::Stability::Local);
+        let mut holder = crate::ParcelableHolder::local();
         holder.read_from_parcel(&mut txn).unwrap();
         assert_eq!(
             txn.data_position(),

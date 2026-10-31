@@ -1,32 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wire-faithful `android.utils.IMemoryHeap` / `android.utils.IMemory`
-//! stubs (Plan 4-7a Phase B).
-//!
-//! AOSP `IMemory.cpp` is handwritten, not AIDL; the transaction layout
-//! reproduced here is (android17-release):
-//!
-//! | interface | code | request | reply |
-//! |---|---|---|---|
-//! | `android.utils.IMemoryHeap` | `HEAP_ID` = `FIRST_CALL_TRANSACTION` | token only | **raw** `fd` object · `u64 size` · `i64 offset` · `u32 flags` (`IMemory.cpp:404-409`) |
-//! | `android.utils.IMemory` | `GET_MEMORY` = `FIRST_CALL_TRANSACTION` | token only | `strong binder (heap)` · `i64 offset` · `u64 size` (`IMemory.cpp:239-245`) |
-//!
-//! Neither reply carries a `Status` header — the transaction status is
-//! the only error channel, as in AOSP. The heap fd is AOSP
-//! `writeFileDescriptor` / `readFileDescriptor`: the bare fd object with
-//! **no** `ParcelFileDescriptor` not-null / comm markers (STAGE3 against
-//! real libbinder is what pins this — rsbinder↔rsbinder is symmetric
-//! and would not notice an 8-byte skew). The interface token on the
-//! request is checked by the native dispatcher before `on_transact`
-//! runs, so the `Bn*` types here do not re-check it.
-//!
-//! Proxies go through `SIBinder::as_remote` (kernel `ProxyHandle` or
-//! RPC `RpcProxy`) and fall back to an in-process
-//! `Transactable` call for a local binder, so one `Bp*` serves all
-//! three cases. A `Bp*` resolves its remote geometry **once**, on
-//! first use, like AOSP `BpMemoryHeap::assertReallyMapped()` /
-//! `BpMemory::getMemory()`; it never re-transacts.
+//! The `IMemoryHeap` / `IMemory` wire; documented in the parent module, section "Wire".
 //!
 //! # Tests
 //!

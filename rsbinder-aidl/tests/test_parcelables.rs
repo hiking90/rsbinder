@@ -121,7 +121,7 @@ pub mod VintfExtendableParcelable {
     impl ::core::default::Default for VintfExtendableParcelable {
         fn default() -> Self {
             Self {
-                r#ext: rsbinder::ParcelableHolder::new(rsbinder::Stability::Vintf),
+                r#ext: rsbinder::ParcelableHolder::vintf(),
             }
         }
     }

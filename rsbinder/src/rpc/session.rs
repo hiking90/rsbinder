@@ -4134,7 +4134,8 @@ impl RpcSessionInner {
                 consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
                     // Unwinding would skip the serve loop's slot cleanup; mirrors the kernel path.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        target.rpc_transact(code, &mut reader, &mut reply)
+                        let token = crate::binder::sealed::Token::new();
+                        target.rpc_transact(token, code, &mut reader, &mut reply)
                     }))
                     .unwrap_or_else(|payload| {
                         let msg = payload

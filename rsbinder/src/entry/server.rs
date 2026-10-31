@@ -235,7 +235,8 @@ pub(super) fn kernel_init(
         })?,
         None => ProcessState::default_driver_path(),
     };
-    let ps = ProcessState::init_with_mmap_size(
+    // Not `init_with_mmap_size`: an option left `None` must accept whatever state exists.
+    let ps = ProcessState::init_or_existing(
         driver_path,
         max_threads.unwrap_or(crate::DEFAULT_MAX_BINDER_THREADS),
         mmap_size.unwrap_or_else(ProcessState::default_mmap_size),

@@ -145,7 +145,7 @@ impl Remotable for Interop {
                 reply.write(&Interface::as_binder(&Binder::new(Interop)))
             }
             TX_ECHO_HOLDER => {
-                let mut holder = ParcelableHolder::new(Stability::Local);
+                let mut holder = ParcelableHolder::local();
                 holder.read_from_parcel(reader)?;
                 let relayed = holder.write_to_parcel(reply);
                 eprintln!("[rsbinder-server] echo_holder: undecoded relay -> {relayed:?}");
@@ -165,7 +165,7 @@ impl Remotable for Interop {
                 reply.write(&i32::from(home))
             }
             TX_HOLDER_RETRY => {
-                let mut holder = ParcelableHolder::new(Stability::Local);
+                let mut holder = ParcelableHolder::local();
                 holder.read_from_parcel(reader)?;
                 let first = holder.get_parcelable::<RetryProbe>();
                 let second = holder.get_parcelable::<RetryProbe>();

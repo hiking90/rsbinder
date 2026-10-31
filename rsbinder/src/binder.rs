@@ -46,7 +46,6 @@ use std::any::Any;
 use std::borrow::Borrow;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::{self, Arc};
 
@@ -563,24 +562,36 @@ pub trait IBinder: Any + Send + Sync {
     /// `Remotable::on_transact`. Native binders override it; the
     /// default is "not an RPC dispatch target".
     ///
-    /// Present only with the `rpc` feature, so the default public API
-    /// surface is unchanged.
+    /// Present only with the `rpc` feature. The [`sealed::Token`] argument
+    /// is a type outside code cannot name or build, so only rsbinder calls
+    /// or overrides this: the call skips `check_interface`, which a caller
+    /// outside the RPC server adapter must not do.
     #[cfg(feature = "rpc")]
+    #[doc(hidden)]
     fn rpc_transact(
         &self,
+        token: sealed::Token,
         code: TransactionCode,
         reader: &mut Parcel,
         reply: &mut Parcel,
     ) -> Result<()> {
-        let _ = (code, reader, reply);
+        let _ = (token, code, reader, reply);
         Err(StatusCode::UnknownTransaction)
     }
+}
 
-    fn inc_strong(&self, strong: &SIBinder) -> Result<()>;
-    fn attempt_inc_strong(&self) -> bool;
-    fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()>;
-    fn inc_weak(&self, weak: &WIBinder) -> Result<()>;
-    fn dec_weak(&self) -> Result<()>;
+/// Types that keep an [`IBinder`] method callable by rsbinder only.
+#[cfg(feature = "rpc")]
+pub(crate) mod sealed {
+    /// Built only inside rsbinder; see `IBinder::rpc_transact`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Token(());
+
+    impl Token {
+        pub(crate) const fn new() -> Self {
+            Self(())
+        }
+    }
 }
 
 /// An outbound-transaction-issuing proxy, abstract over the kernel
@@ -987,23 +998,16 @@ pub struct SIBinder {
 impl SIBinder {
     /// Wrap an `Arc<dyn IBinder>` in an `SIBinder`.
     ///
-    /// Drives `inc_strong` on the inner binder. For native binders this
-    /// advances the local `RefCounter.strong`; for proxies it is a no-op
-    /// (proxy ref-count is owned by the cache-pin model — see
-    /// `proxy::ProxyHandle`).
+    /// The `Arc` alone decides the binder's lifetime: wrapping counts
+    /// nothing and sends no kernel command (a proxy's kernel reference is
+    /// owned by its `ProxyHandle`). This never returns `Err`; the `Result`
+    /// is kept so existing `?` callers compile.
     pub fn new(data: Arc<dyn IBinder>) -> Result<Self> {
-        let this = Self { inner: data };
-        this.increase()?;
-        Ok(this)
+        Ok(Self::from_arc(data))
     }
 
     pub(crate) fn from_arc(inner: Arc<dyn IBinder>) -> Self {
-        // After `ProxyHandle::new_acquired` sent `BC_ACQUIRE`; as `new`, since proxies no-op.
-        let this = Self { inner };
-        // Drives a native `RefCounter.strong`; proxies short-circuit to `Ok(())`.
-        this.increase()
-            .expect("inc_strong on existing Arc<dyn IBinder> must not fail");
-        this
+        Self { inner }
     }
 
     /// Inner `Arc`, for sidecar tables (`published_natives`) and `Arc::as_ptr` identity checks.
@@ -1093,18 +1097,6 @@ impl SIBinder {
     /// at least once? Delegates to [`IBinder::was_parceled`].
     pub fn was_parceled(&self) -> bool {
         self.inner.was_parceled()
-    }
-
-    pub(crate) fn increase(&self) -> Result<()> {
-        self.inner.inc_strong(self)
-    }
-
-    pub(crate) fn attempt_increase(&self) -> bool {
-        self.inner.attempt_inc_strong()
-    }
-
-    pub(crate) fn decrease(&self) -> Result<()> {
-        self.inner.dec_strong(None)
     }
 
     /// Try to convert this Binder object into a trait object for the given
@@ -1204,16 +1196,6 @@ impl Debug for SIBinder {
 impl Clone for SIBinder {
     fn clone(&self) -> Self {
         Self::from_arc(Arc::clone(&self.inner))
-    }
-}
-
-impl Drop for SIBinder {
-    fn drop(&mut self) {
-        self.decrease()
-            .map_err(|err| {
-                log::error!("Error in SIBinder::drop() is {err:?}");
-            })
-            .ok();
     }
 }
 
@@ -1679,7 +1661,7 @@ mod tests {
     // use crate::proxy::ProxyHandle;
     use super::*;
 
-    /// Driver-free native `IBinder`; no-op ref counts, so tests see bare `Arc` semantics.
+    /// Driver-free native `IBinder`.
     struct MockBinder;
 
     impl IBinder for MockBinder {
@@ -1703,21 +1685,6 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             false
-        }
-        fn inc_strong(&self, _: &SIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn attempt_inc_strong(&self) -> bool {
-            true
-        }
-        fn dec_strong(&self, _: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-            Ok(())
-        }
-        fn inc_weak(&self, _: &WIBinder) -> Result<()> {
-            Ok(())
-        }
-        fn dec_weak(&self) -> Result<()> {
-            Ok(())
         }
     }
 

@@ -194,7 +194,7 @@ If your service enforces access control, return `PermissionDenied`:
 
 ```rust
 fn restricted_operation(&self) -> rsbinder::BinderResult<()> {
-    let caller = rsbinder::thread_state::CallingContext::default();
+    let caller = rsbinder::CallingContext::current();
     if caller.uid != ALLOWED_UID {
         return Err(rsbinder::StatusCode::PermissionDenied.into());
     }

@@ -96,14 +96,14 @@ use rsbinder::observe::{set_observer, TransactionObserver, TxnContext};
 struct SlowCallLog;
 
 impl TransactionObserver for SlowCallLog {
-    fn on_transact(&self, _ctx: &TxnContext<'_>) -> Option<Box<dyn Any + Send>> {
+    fn on_transact(&self, _ctx: &TxnContext<'_>) -> Option<Box<dyn Any>> {
         None
     }
 
     fn on_reply(
         &self,
         ctx: &TxnContext<'_>,
-        _tag: Option<Box<dyn Any + Send>>,
+        _tag: Option<Box<dyn Any>>,
         result: &rsbinder::Result<()>,
         elapsed: Duration,
     ) {
@@ -125,7 +125,8 @@ set_observer(Some(Arc::new(SlowCallLog)));
 `trace(true)`), the one-way flag, the caller's uid and pid, and the transport
 (`TransportCaps::KERNEL` or the RPC session's capabilities). Whatever
 `on_transact` returns comes back to `on_reply` as `tag` — a start marker or a
-span, for example.
+span guard, for example. The tag never leaves the serving thread, so it need not
+be `Send`.
 
 What an implementation can rely on:
 

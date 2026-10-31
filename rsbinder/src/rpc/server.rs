@@ -498,7 +498,7 @@ fn remove_if_stale(path: &Path) -> Result<()> {
         "RpcServer::setup_unix_server: a socket exists at {path:?}; Apple platforms never \
          remove it (delete it once no server listens on it)"
     );
-    Err(StatusCode::from(rustix::io::Errno::ADDRINUSE))
+    Err(crate::error::errno_status(rustix::io::Errno::ADDRINUSE))
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -515,7 +515,7 @@ fn remove_if_stale(path: &Path) -> Result<()> {
         // `EAGAIN`: a listener whose backlog is full (Linux `unix_stream_connect`).
         Ok(()) | Err(Errno::AGAIN) | Err(Errno::INPROGRESS) => {
             log::error!("RpcServer::setup_unix_server: another server is listening on {path:?}");
-            Err(StatusCode::from(Errno::ADDRINUSE))
+            Err(crate::error::errno_status(Errno::ADDRINUSE))
         }
         Err(Errno::CONNREFUSED) => std::fs::remove_file(path).or_else(|e| match e.kind() {
             ErrorKind::NotFound => Ok(()),

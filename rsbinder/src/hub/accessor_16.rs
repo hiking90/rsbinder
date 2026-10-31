@@ -54,12 +54,10 @@
 // cfg lives on the mod decl in super; repeating it trips clippy::duplicated_attributes.
 
 use std::any::Any;
-use std::mem::ManuallyDrop;
 use std::sync::{Arc, Weak};
 
 use crate::binder::{
     DeathRecipient, IBinder, Interface, SIBinder, Stability, Transactable, TransactionCode,
-    WIBinder,
 };
 use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
@@ -150,31 +148,12 @@ impl IBinder for AccessorRoot {
 
     fn rpc_transact(
         &self,
+        token: crate::binder::sealed::Token,
         code: TransactionCode,
         reader: &mut Parcel,
         reply: &mut Parcel,
     ) -> Result<()> {
-        self.inner_binder().rpc_transact(code, reader, reply)
-    }
-
-    fn inc_strong(&self, strong: &SIBinder) -> Result<()> {
-        self.inner_binder().inc_strong(strong)
-    }
-
-    fn attempt_inc_strong(&self) -> bool {
-        self.inner_binder().attempt_inc_strong()
-    }
-
-    fn dec_strong(&self, strong: Option<ManuallyDrop<SIBinder>>) -> Result<()> {
-        self.inner_binder().dec_strong(strong)
-    }
-
-    fn inc_weak(&self, weak: &WIBinder) -> Result<()> {
-        self.inner_binder().inc_weak(weak)
-    }
-
-    fn dec_weak(&self) -> Result<()> {
-        self.inner_binder().dec_weak()
+        self.inner_binder().rpc_transact(token, code, reader, reply)
     }
 }
 
