@@ -298,10 +298,7 @@ mod tests {
         assert!(enforcer.check_caller(
             Permission::Find,
             "svc",
-            &Caller::Rpc(rsbinder::rpc::PeerIdentity::Local {
-                uid: 1000,
-                pid: 4321
-            })
+            &Caller::Rpc(rsbinder::rpc::PeerIdentity::local(1000, 4321))
         ));
     }
 

@@ -136,18 +136,22 @@ fn test_notifications() -> rsbinder::Result<()> {
     let callback = hub::BnServiceCallback::new_binder(MyServiceCallback {});
 
     // Notifications are not supported on Android 10's C service manager —
-    // the hub maps that to UnknownTransaction. Verify that contract instead
+    // the hub answers EX_UNSUPPORTED_OPERATION. Verify that contract instead
     // of trying to register.
     #[cfg(target_os = "android")]
     if get_android_sdk_version() == hub::sdk_versions::ANDROID_10 {
-        assert_eq!(
-            hub::register_for_notifications("mytest_service", &callback),
-            Err(StatusCode::UnknownTransaction)
-        );
-        assert_eq!(
-            hub::unregister_for_notifications("mytest_service", &callback),
-            Err(StatusCode::UnknownTransaction)
-        );
+        let unsupported = |result: rsbinder::BinderResult<()>| {
+            result.err().map(|status| status.exception_code())
+                == Some(rsbinder::ExceptionCode::UnsupportedOperation)
+        };
+        assert!(unsupported(hub::register_for_notifications(
+            "mytest_service",
+            &callback
+        )));
+        assert!(unsupported(hub::unregister_for_notifications(
+            "mytest_service",
+            &callback
+        )));
         return Ok(());
     }
 
