@@ -6,11 +6,12 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Six remain: refuted prose, the one slot un-push, the files a
+//! Seven remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in, the method surface of
-//! `CommandStream`, the places a raw fd number becomes an fd, and the
-//! public types whose drop ends something — each a closed set, not an
-//! enumeration of ways to get it wrong. The call sites of the layer split
+//! `CommandStream`, the places a raw fd number becomes an fd, the
+//! public types whose drop ends something, and the library threads made by
+//! a call that panics — each a closed set, not an enumeration of ways to
+//! get it wrong. The call sites of the layer split
 //! are not scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
 //! stream's callers.
@@ -103,6 +104,18 @@
 //! impl in its own file must be listed in `MUST_USE` or in `EXEMPT` with the
 //! reason. A type whose drop effect comes from a field has no `Drop` impl of
 //! its own, so the scan does not find it: add it to `MUST_USE` by hand.
+//!
+//! # Thread creation
+//!
+//! `std::thread::spawn` and a `thread::scope`'s `spawn` panic when the OS
+//! refuses a thread, which is the environment failing, not the caller: the
+//! library makes its threads with `thread::Builder` and returns the error to
+//! a direct caller, or logs it where no caller waits (a kernel-requested
+//! looper). `library_threads_are_made_by_builder` finds either call in the
+//! code of `rsbinder`, `rsbinder-fmq` and `rsbinder-topic`, outside a file
+//! named `*tests.rs` and outside a `mod .. {` under a `cfg` naming `test`,
+//! and allows only the sites in its list. `RpcServer::run_background` stays
+//! there until it returns a handle (plan 17 R-1).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -644,4 +657,95 @@ fn drop_impls(lines: &[&str]) -> Vec<String> {
                 .collect()
         })
         .collect()
+}
+
+/// Pins the library's panicking thread creations; see module doc "Thread creation".
+#[test]
+fn library_threads_are_made_by_builder() {
+    // (crate, file under `src/`, enclosing `fn` line prefix), one entry per call.
+    const PINNED: &[(&str, &str, &str)] = &[
+        // Fire-and-forget accept loop; plan 17 R-1 gives it a handle and a `Result`.
+        ("rsbinder", "rpc/server.rs", "pub fn run_background("),
+    ];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    for krate in ["rsbinder", "rsbinder-fmq", "rsbinder-topic"] {
+        let src_root = workspace.join(krate).join("src");
+        if !src_root.is_dir() {
+            eprintln!(
+                "skipping {krate}: sources not reachable at {}",
+                src_root.display()
+            );
+            continue;
+        }
+        visit(&src_root, &mut |path, content| {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                return;
+            }
+            let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+            let rel = rel.replace('\\', "/");
+            let lines: Vec<&str> = content.lines().map(code_only).collect();
+            let test = test_module_lines(&lines);
+            for (i, line) in lines.iter().enumerate() {
+                let calls =
+                    line.matches("thread::spawn(").count() + line.matches("thread::scope(").count();
+                if test[i] || calls == 0 {
+                    continue;
+                }
+                let enclosing = enclosing_fn(&lines, i + 1).unwrap_or("<no fn>").to_string();
+                for _ in 0..calls {
+                    found.push((krate.to_string(), rel.clone(), enclosing.clone()));
+                }
+            }
+        });
+    }
+    let mut missing = Vec::new();
+    for (krate, file, prefix) in PINNED {
+        match found
+            .iter()
+            .position(|(k, p, f)| k == krate && p == file && f.starts_with(prefix))
+        {
+            Some(at) => drop(found.swap_remove(at)),
+            None => missing.push(format!("{krate}/src/{file}: {prefix}")),
+        }
+    }
+    assert!(
+        found.is_empty() && missing.is_empty(),
+        "a library thread is made by a call that panics on failure, or a pinned site moved — \
+         use `thread::Builder` and return the error; see this test's doc.\n\
+         unpinned: {found:#?}\nmissing: {missing:#?}"
+    );
+}
+
+/// For each line, whether it lies in a `mod .. {` whose attributes hold a `cfg` naming `test`.
+fn test_module_lines(lines: &[&str]) -> Vec<bool> {
+    let mut mask = vec![false; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let indent = &line[..line.len() - line.trim_start().len()];
+        let is_mod = line.trim_end().ends_with('{')
+            && (line.trim_start().starts_with("mod ") || line.contains(" mod "));
+        let attrs = lines[..i]
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .take_while(|l| !l.is_empty() && !l.ends_with(['}', ';']))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let words = attrs.split(|c: char| !(c.is_alphanumeric() || c == '_'));
+        let cfg_test = attrs.contains("cfg(") && words.into_iter().any(|w| w == "test");
+        if !(is_mod && cfg_test) {
+            i += 1;
+            continue;
+        }
+        let close = format!("{indent}}}");
+        let end = lines[i..]
+            .iter()
+            .position(|l| *l == close)
+            .map_or(lines.len(), |n| i + n + 1);
+        mask[i..end].fill(true);
+        i = end;
+    }
+    mask
 }
