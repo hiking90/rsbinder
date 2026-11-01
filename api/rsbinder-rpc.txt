@@ -2390,6 +2390,7 @@ pub fn rsbinder::hub::get_connection_info(&str) -> core::option::Option<rsbinder
 pub fn rsbinder::hub::get_declared_instances(&str) -> alloc::vec::Vec<alloc::string::String>
 pub fn rsbinder::hub::get_service_debug_info() -> rsbinder::Result<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
 pub fn rsbinder::hub::is_declared(&str) -> bool
+pub fn rsbinder::hub::is_valid_service_name(&str) -> bool
 pub fn rsbinder::hub::list_services(i32) -> alloc::vec::Vec<alloc::string::String>
 pub fn rsbinder::hub::register_client_callback(&str, &rsbinder::SIBinder, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::register_for_notifications(&str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>

@@ -148,11 +148,10 @@ impl From<TopicInfo> for TopicListing {
     }
 }
 
-/// Whether `name` is one a registry takes: 1 to 127 bytes of `[A-Za-z0-9._/-]`, as a service
-/// name of `rsb_hub`.
+/// Whether `name` is one a registry takes: 1 to 127 bytes of `[A-Za-z0-9._/-]`, the rule of a
+/// service name ([`rsbinder::hub::is_valid_service_name`]).
 pub fn is_valid_name(name: &str) -> bool {
-    let allowed = |c: u8| c.is_ascii_alphanumeric() || b"._/-".contains(&c);
-    (1..=127).contains(&name.len()) && name.bytes().all(allowed)
+    rsbinder::hub::is_valid_service_name(name)
 }
 
 /// The host side of a registry of topic names: register [`as_binder`](Self::as_binder) with

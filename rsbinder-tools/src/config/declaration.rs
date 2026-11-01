@@ -44,32 +44,13 @@ impl InstanceName {
 }
 
 /// Is `name` one `rsb_hub` accepts in `addService`: 1 to 127 bytes of
-/// `[A-Za-z0-9._/-]`.
+/// `[A-Za-z0-9._/-]` ([`rsbinder::hub::is_valid_service_name`], AOSP's rule).
 ///
 /// A declaration is held to the same rule, so a name no service could ever
 /// register is refused when the configuration loads rather than leaving a
 /// declared-but-unregistrable instance for clients to wait on.
 pub fn is_valid_service_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 127 {
-        return false;
-    }
-    for c in name.chars() {
-        if c == '_' || c == '-' || c == '.' || c == '/' {
-            continue;
-        }
-        if c.is_ascii_lowercase() {
-            continue;
-        }
-        if c.is_ascii_uppercase() {
-            continue;
-        }
-        if c.is_ascii_digit() {
-            continue;
-        }
-        return false;
-    }
-
-    true
+    rsbinder::hub::is_valid_service_name(name)
 }
 
 /// The name `rsb_hub` registers itself under: AOSP `main.cpp`'s
@@ -262,32 +243,6 @@ mod tests {
         let (k, v) = decl("com.example.IFooBar/default");
         d.insert(k, v);
         assert!(d.instances_of("com.example.IFoo").is_empty());
-    }
-
-    /// `rsbinder-topic` keeps a copy of the rule, as it does not depend on this crate.
-    #[cfg(feature = "topic")]
-    #[test]
-    fn the_topic_registry_takes_the_names_add_service_takes() {
-        let mut names: Vec<String> = ["", "a", "é", "日本", "aé"]
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        for len in [126, 127, 128] {
-            names.push("a".repeat(len));
-        }
-        names.push(format!("{}é", "a".repeat(125)));
-        names.extend(
-            (0..=0xffu32)
-                .filter_map(char::from_u32)
-                .map(|c| format!("a{c}b")),
-        );
-        for name in &names {
-            assert_eq!(
-                rsbinder_topic::registry::is_valid_name(name),
-                is_valid_service_name(name),
-                "{name:?}"
-            );
-        }
     }
 
     #[test]

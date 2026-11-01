@@ -2179,6 +2179,52 @@ pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
     default()?.get_service_debug_info()
 }
 
+/// Whether `name` is a service name the Android service manager accepts in
+/// `addService`: 1 to 127 bytes of `[A-Za-z0-9._/-]`.
+///
+/// This is AOSP `ServiceManager.cpp` `isValidServiceName` (android17-release),
+/// which refuses any other name with `EX_ILLEGAL_ARGUMENT`. `rsb_hub` holds
+/// both services and declarations to it, and `rsbinder-topic`'s registry
+/// holds topic names to it, so a caller can check a name before it reaches
+/// any of them. It answers no question about a name's permission or
+/// declaration; the service manager decides those.
+pub fn is_valid_service_name(name: &str) -> bool {
+    let allowed = |c: u8| c.is_ascii_alphanumeric() || b"._/-".contains(&c);
+    (1..=127).contains(&name.len()) && name.bytes().all(allowed)
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::is_valid_service_name;
+
+    /// The AOSP rule by input: length bounds in bytes, the four punctuation marks, and no
+    /// other byte, a multibyte character's included.
+    #[test]
+    fn a_service_name_is_1_to_127_bytes_of_the_aosp_set() {
+        let mut names: Vec<(String, bool)> = vec![
+            (String::new(), false),
+            ("a".into(), true),
+            ("android.os.IServiceManager/default".into(), true),
+            ("a_b-c.d/E9".into(), true),
+            ("é".into(), false),
+            ("日本".into(), false),
+            ("aé".into(), false),
+            ("a".repeat(126), true),
+            ("a".repeat(127), true),
+            ("a".repeat(128), false),
+            // 125 bytes and a two-byte character: 127 bytes, refused for the character.
+            (format!("{}é", "a".repeat(125)), false),
+        ];
+        names.extend((0..=0xffu32).filter_map(char::from_u32).map(|c| {
+            let ok = c.is_ascii_alphanumeric() || "._/-".contains(c);
+            (format!("a{c}b"), ok)
+        }));
+        for (name, expected) in &names {
+            assert_eq!(is_valid_service_name(name), *expected, "{name:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod wait_end_tests {
     use super::*;

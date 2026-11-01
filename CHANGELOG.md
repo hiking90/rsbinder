@@ -315,6 +315,10 @@ accepts both the 0.12.0 bytes and the new ones.
   is logged instead of unwinding (an abort when the link drops during
   another unwind), and an unlink error such as `DeadObject` after the
   obituary is logged at debug level.
+- **`hub::is_valid_service_name`**: whether a name is one the service
+  manager accepts (AOSP `isValidServiceName`: 1 to 127 bytes of
+  `[A-Za-z0-9._/-]`). `rsb_hub`'s configuration and `rsbinder-topic`'s
+  registry check their names with it.
 - **`impl TryFrom<i32> for ExceptionCode`**: the variant for a wire value,
   every variant included (the reply-header markers, `TransactionFailed`,
   `JustError`); any other value is the error. `Deserialize` still reads a
