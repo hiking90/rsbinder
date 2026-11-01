@@ -73,17 +73,23 @@ use std::os::fd::BorrowedFd;
 
 use crate::error::Result;
 
+mod element;
 mod futex;
 mod mapping;
 mod memfd;
+mod piece;
 mod run;
 // Workspace-internal (`rsbinder::stream`, `rsbinder-topic`), outside the tier; see its module doc.
 #[doc(hidden)]
 pub mod spin;
 mod word;
 
+pub use element::Element;
 pub use futex::{futex_wait, futex_wake, Deadline};
-pub use mapping::{Access, Mapping};
+pub use mapping::{Access, Mapping, RoMapping};
+pub use piece::{
+    AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType, Words,
+};
 pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
 pub use run::{RoRun, Run};
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.

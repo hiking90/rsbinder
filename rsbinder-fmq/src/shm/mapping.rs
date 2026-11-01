@@ -104,15 +104,91 @@ pub enum Access {
 /// [`shrink_sealed`](super::shrink_sealed) answers whether a received fd is.
 #[derive(Debug)]
 pub struct Mapping {
-    base: NonNull<u8>,
-    len: usize,
+    memory: Memory,
     delta: usize,
+    writable: bool,
 }
 
-// SAFETY: an address range without thread affinity; `Mapping` itself never dereferences it.
-unsafe impl Send for Mapping {}
-// SAFETY: as for `Send`; `&Mapping` gives out the address and the length, nothing else.
-unsafe impl Sync for Mapping {}
+/// The bytes a mapping or a [`Mapping::heap`] holds, released on drop.
+#[derive(Debug)]
+pub(super) struct Memory {
+    base: NonNull<u8>,
+    len: usize,
+    heap: bool,
+}
+
+// SAFETY: an address range without thread affinity; `Memory` itself never dereferences it.
+unsafe impl Send for Memory {}
+// SAFETY: as for `Send`; `&Memory` gives out nothing.
+unsafe impl Sync for Memory {}
+
+/// The alignment of a [`Mapping::heap`]: every word a piece can be, on every target.
+const HEAP_ALIGN: usize = 8;
+
+impl Memory {
+    fn heap_layout(len: usize) -> Result<std::alloc::Layout> {
+        std::alloc::Layout::from_size_align(len, HEAP_ALIGN)
+            .map_err(|_| Error::BadValue("heap memory exceeds the address space"))
+    }
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        if self.heap {
+            let layout = Self::heap_layout(self.len).expect("the layout `heap` allocated with");
+            // SAFETY: `alloc_zeroed`'s own pointer and layout (`Mapping::heap`), freed once, here.
+            unsafe { std::alloc::dealloc(self.base.as_ptr(), layout) };
+        } else {
+            // SAFETY: `mmap`'s own `base`/`len`; the pieces holding it are gone with this value.
+            #[cfg(not(any(
+                windows,
+                target_os = "espidf",
+                target_os = "horizon",
+                target_os = "vita",
+                target_os = "wasi"
+            )))]
+            let _ = unsafe { rustix::mm::munmap(self.base.as_ptr().cast(), self.len) };
+        }
+    }
+}
+
+/// `mmap` `extent` bytes of `fd` from byte `offset`: the memory, and where `offset` lies in it.
+fn map_memory(
+    fd: BorrowedFd<'_>,
+    offset: u64,
+    extent: u64,
+    access: Access,
+) -> Result<(Memory, usize)> {
+    let page = rustix::param::page_size() as u64;
+    let map_offset = offset - offset % page;
+    let delta = usize::try_from(offset - map_offset)
+        .map_err(|_| Error::BadValue("mapping offset exceeds the address space"))?;
+    let len = usize::try_from(extent)
+        .ok()
+        .and_then(|e| e.checked_add(delta))
+        // Non-empty keeps `delta < len` for `as_ptr`; `isize::MAX` is what a slice may span.
+        .filter(|len| extent > 0 && *len <= isize::MAX as usize)
+        .ok_or(Error::BadValue(
+            "mapping extent is zero or exceeds the address space",
+        ))?;
+    // The kernel maps hugetlbfs in whole huge pages; `Drop`'s `munmap` of `len` would fail.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if is_hugetlbfs(fd) {
+        return Err(Error::BadValue("mapping of a hugetlbfs file"));
+    }
+    if regular_file_size(fd)
+        .is_some_and(|size| offset.checked_add(extent).is_none_or(|end| end > size))
+    {
+        return Err(Error::BadValue("mapping reaches past the end of the file"));
+    }
+    let base = mmap_shared(fd, len, access, map_offset)?;
+    let memory = Memory {
+        base,
+        len,
+        heap: false,
+    };
+    Ok((memory, delta))
+}
 
 impl Mapping {
     /// Map `extent` bytes of `fd` starting at byte `offset`.
@@ -140,30 +216,53 @@ impl Mapping {
     /// device's size is not its file size. A failure of the `fstat` that
     /// measures the file is not an error of this call either.
     pub fn map(fd: BorrowedFd<'_>, offset: u64, extent: u64, access: Access) -> Result<Self> {
-        let page = rustix::param::page_size() as u64;
-        let map_offset = offset - offset % page;
-        let delta = usize::try_from(offset - map_offset)
-            .map_err(|_| Error::BadValue("mapping offset exceeds the address space"))?;
-        let len = usize::try_from(extent)
-            .ok()
-            .and_then(|e| e.checked_add(delta))
-            // Non-empty keeps `delta < len` for `as_ptr`; `isize::MAX` is what a slice may span.
-            .filter(|len| extent > 0 && *len <= isize::MAX as usize)
-            .ok_or(Error::BadValue(
-                "mapping extent is zero or exceeds the address space",
-            ))?;
-        // The kernel maps hugetlbfs in whole huge pages; `Drop`'s `munmap` of `len` would fail.
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        if is_hugetlbfs(fd) {
-            return Err(Error::BadValue("mapping of a hugetlbfs file"));
+        let (memory, delta) = map_memory(fd, offset, extent, access)?;
+        Ok(Self {
+            memory,
+            delta,
+            writable: access == Access::ReadWrite,
+        })
+    }
+
+    /// `len` zeroed bytes of this process's heap, to [`carve`](Self::carve)
+    /// as a mapping is carved: what a test, or Miri, which has no `mmap`, runs
+    /// a protocol over. The memory starts on a multiple of 8 and is shared
+    /// with no other process.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadValue`] when `len` is zero or more than `isize::MAX`
+    /// less 7.
+    pub fn heap(len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(Error::BadValue("heap memory of zero bytes"));
         }
-        if regular_file_size(fd)
-            .is_some_and(|size| offset.checked_add(extent).is_none_or(|end| end > size))
-        {
-            return Err(Error::BadValue("mapping reaches past the end of the file"));
-        }
-        let base = mmap_shared(fd, len, access, map_offset)?;
-        Ok(Self { base, len, delta })
+        let layout = Memory::heap_layout(len)?;
+        // SAFETY: a layout of non-zero size.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        let base = NonNull::new(base).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Ok(Self {
+            memory: Memory {
+                base,
+                len,
+                heap: true,
+            },
+            delta: 0,
+            writable: true,
+        })
+    }
+
+    /// Split the mapping into the pieces its layout names
+    /// ([`Carve`](super::Carve)); the mapping is consumed, so no second
+    /// layout is ever laid over the same bytes.
+    ///
+    /// # Panics
+    ///
+    /// When the mapping was made [`Access::ReadOnly`]: carve it through
+    /// [`RoMapping`] instead, whose pieces have no stores.
+    pub fn carve(self) -> super::Carve {
+        assert!(self.writable, "a read-only mapping is carved as a `RoMapping`");
+        super::Carve::new(self.memory, self.delta)
     }
 
     /// The address of the byte at the `offset` given to [`map`](Self::map).
@@ -171,7 +270,9 @@ impl Mapping {
     #[inline]
     pub fn as_ptr(&self) -> NonNull<u8> {
         // `map` refuses an empty extent: `delta < len`, so the add never saturates.
-        self.base.map_addr(|addr| addr.saturating_add(self.delta))
+        self.memory
+            .base
+            .map_addr(|addr| addr.saturating_add(self.delta))
     }
 
     /// The `extent` given to [`map`](Self::map): the mapped bytes from
@@ -182,21 +283,52 @@ impl Mapping {
         reason = "`map` refuses an empty extent, so `is_empty` would be a constant"
     )]
     pub fn len(&self) -> usize {
-        self.len - self.delta
+        self.memory.len - self.delta
     }
 }
 
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        // SAFETY: `mmap`'s own `base`/`len`; the type doc binds references to this value's life.
-        #[cfg(not(any(
-            windows,
-            target_os = "espidf",
-            target_os = "horizon",
-            target_os = "vita",
-            target_os = "wasi"
-        )))]
-        let _ = unsafe { rustix::mm::munmap(self.base.as_ptr().cast(), self.len) };
+/// A [`Mapping`] made `PROT_READ`: this process loads its bytes and never
+/// stores them. [`carve`](Self::carve) hands out pieces that have no store
+/// method, so code that holds one cannot write the peer's memory.
+///
+/// What [`Access::ReadOnly`] says about which atomic loads are defined on
+/// such memory, and about write-sealed memfds, holds here.
+#[derive(Debug)]
+pub struct RoMapping {
+    memory: Memory,
+    delta: usize,
+}
+
+impl RoMapping {
+    /// Map `extent` bytes of `fd` starting at byte `offset`, read-only: as
+    /// [`Mapping::map`] does with [`Access::ReadOnly`], with its errors.
+    pub fn map(fd: BorrowedFd<'_>, offset: u64, extent: u64) -> Result<Self> {
+        let (memory, delta) = map_memory(fd, offset, extent, Access::ReadOnly)?;
+        Ok(Self { memory, delta })
+    }
+
+    /// Split the mapping into the read-only pieces its layout names
+    /// ([`RoCarve`](super::RoCarve)); the mapping is consumed.
+    pub fn carve(self) -> super::RoCarve {
+        super::RoCarve::new(self.memory, self.delta)
+    }
+
+    /// The `extent` given to [`map`](Self::map). Never zero.
+    #[inline]
+    #[expect(
+        clippy::len_without_is_empty,
+        reason = "`map` refuses an empty extent, so `is_empty` would be a constant"
+    )]
+    pub fn len(&self) -> usize {
+        self.memory.len - self.delta
+    }
+}
+
+impl Memory {
+    /// The address `delta` bytes in, and how many bytes follow it.
+    pub(super) fn at(&self, delta: usize) -> (NonNull<u8>, usize) {
+        let at = self.base.map_addr(|addr| addr.saturating_add(delta));
+        (at, self.len - delta)
     }
 }
 
@@ -383,6 +515,35 @@ mod tests {
         out.fill(0);
         reader.load(&mut out);
         assert_eq!(out, src);
+    }
+
+    /// Two mappings of one file are two allocations: each carved once, each seeing the other.
+    #[test]
+    fn carved_pieces_of_two_mappings_see_each_others_stores() {
+        let (file, page) = two_pages(&read_write());
+        let at = page as u64 + 8;
+        let mut rw = Mapping::map(file.as_fd(), at, 64, Access::ReadWrite)
+            .unwrap()
+            .carve();
+        let mut ro = RoMapping::map(file.as_fd(), at, 64).unwrap().carve();
+        assert_eq!((rw.len(), ro.len()), (64, 64));
+        let (word, bytes) = (rw.word32(0).unwrap(), rw.bytes(5, 50).unwrap());
+        let (seen_word, seen) = (ro.word32(0).unwrap(), ro.bytes(5, 50).unwrap());
+        word.store(0x1234_5678, Ordering::Release);
+        let src: Vec<u8> = (0..50).map(|i| i as u8 ^ 0x3c).collect();
+        bytes.store_release(0, &src);
+        let mut out = vec![0u8; 50];
+        seen.load_acquire(0, &mut out);
+        assert_eq!((seen_word.load_acquire(), out), (0x1234_5678, src));
+    }
+
+    #[test]
+    #[should_panic(expected = "carved as a `RoMapping`")]
+    fn a_read_only_mapping_is_not_carved_writable() {
+        let (file, page) = two_pages(&read_write());
+        let _ = Mapping::map(file.as_fd(), 0, page as u64, Access::ReadOnly)
+            .unwrap()
+            .carve();
     }
 
     #[test]

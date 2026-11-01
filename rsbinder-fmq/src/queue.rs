@@ -7,8 +7,6 @@ use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr::NonNull;
-#[cfg(target_has_atomic = "64")]
-pub(crate) use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -18,45 +16,9 @@ use crate::descriptor::{
 use crate::error::{received, Error, Result};
 use crate::event_flag::{EventFlag, NOT_EMPTY, NOT_FULL};
 use crate::ring;
+pub(crate) use crate::shm::AtomicU64;
 use crate::shm::{self, Access, CreateOptions, Deadline, Mapping, Run, Seals};
-
-/// A type that can be an element of a [`MessageQueue`].
-///
-/// The ring is memory another process writes, so an element is read from it
-/// as raw bytes and must be meaningful whatever those bytes are.
-///
-/// # Safety
-///
-/// Every bit pattern of `size_of::<Self>()` bytes must be a valid `Self`;
-/// `Self` must have no padding bytes (they would be copied out of and back
-/// into shared memory as data) and an alignment of at most 8. The
-/// primitive integers and floats satisfy this; `bool`, `char` and enums do
-/// not. A `#[repr(C)]` struct of such fields with no padding does, which is
-/// how AIDL `@FixedSize` parcelables become elements.
-pub unsafe trait Element: Copy + 'static {}
-
-macro_rules! elements {
-    ($($t:ty),* $(,)?) => { $(
-        // SAFETY: primitive numbers: no padding, every bit pattern valid, align <= 8.
-        unsafe impl Element for $t {}
-    )* };
-}
-elements!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
-
-/// Stands in for std's `AtomicU64` on a target without one. Uninhabited: no `Counter` is made.
-#[cfg(not(target_has_atomic = "64"))]
-pub(crate) enum AtomicU64 {}
-
-#[cfg(not(target_has_atomic = "64"))]
-impl AtomicU64 {
-    fn load(&self, _: Ordering) -> u64 {
-        match *self {}
-    }
-
-    pub(crate) fn store(&self, _: u64, _: Ordering) {
-        match *self {}
-    }
-}
+pub use crate::shm::Element;
 
 /// `Unsupported` where no queue can exist: off Linux and Android, or without 64-bit atomics.
 pub(crate) fn check_target() -> Result<()> {

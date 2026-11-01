@@ -163,16 +163,18 @@ public_api() {
         diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
 }
 
-# `shm::Run`, the queue's `Regions` and the unsynchronized queue's two cores under Miri, in two passes. The copies that
-# race need Miri's weak-memory emulation, and it is what tells `Release`/`Acquire` from `Relaxed`
-# (x86 runs both as the same code); the round trip makes sequential accesses at two sizes, on
-# which that emulation panics.
+# `shm::Run`, the carved pieces (`shm::piece`), the queue's `Regions` and the unsynchronized
+# queue's two cores under Miri, in two passes. The copies that race need Miri's weak-memory
+# emulation, and it is what tells `Release`/`Acquire` from `Relaxed` (x86 runs both as the same
+# code); `Run`'s round trip makes sequential accesses at two sizes, on which that emulation
+# panics. The pieces' round trip accesses each byte at one size and stays in the first pass.
 miri_fmq() {
     local seed dir=CARGO_TARGET_DIR=target/miri
     local miri=(cargo +nightly-2026-05-25 miri test -p rsbinder-fmq --lib --)
     for seed in 0 1 2 3 4 5 6 7; do
         tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" "${miri[@]}" \
-            shm::run unsync::tests queue::tests --skip round_trip || return 1
+            shm::run shm::piece unsync::tests queue::tests --skip shm::run::tests::round_trip ||
+            return 1
     done
     tpass env "$dir" MIRIFLAGS="-Zmiri-disable-weak-memory-emulation" "${miri[@]}" \
         shm::run::tests::round_trip
