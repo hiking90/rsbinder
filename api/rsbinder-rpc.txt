@@ -4576,6 +4576,20 @@ impl core::marker::Unpin for rsbinder::ClientOptions
 impl core::marker::UnsafeUnpin for rsbinder::ClientOptions
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ClientOptions
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ClientOptions
+pub struct rsbinder::DeathLink
+impl rsbinder::DeathLink
+pub fn rsbinder::DeathLink::new(&rsbinder::SIBinder, alloc::sync::Arc<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<Self>
+impl core::fmt::Debug for rsbinder::DeathLink
+pub fn rsbinder::DeathLink::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for rsbinder::DeathLink
+pub fn rsbinder::DeathLink::drop(&mut self)
+impl core::marker::Freeze for rsbinder::DeathLink
+impl core::marker::Send for rsbinder::DeathLink
+impl core::marker::Sync for rsbinder::DeathLink
+impl core::marker::Unpin for rsbinder::DeathLink
+impl core::marker::UnsafeUnpin for rsbinder::DeathLink
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::DeathLink
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::DeathLink
 pub struct rsbinder::DeathSignal
 impl core::fmt::Debug for rsbinder::DeathSignal
 pub fn rsbinder::DeathSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result

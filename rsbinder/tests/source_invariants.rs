@@ -588,6 +588,7 @@ fn types_whose_drop_ends_something_are_must_use() {
     // (crate, file under `src/`, type).
     const MUST_USE: &[(&str, &str, &str)] = &[
         ("rsbinder", "bridge.rs", "Rewrap"),
+        ("rsbinder", "death.rs", "DeathLink"),
         ("rsbinder", "entry/server.rs", "Server"),
         ("rsbinder", "entry/server.rs", "ServerGuard"),
         (

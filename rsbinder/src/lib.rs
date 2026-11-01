@@ -392,6 +392,7 @@ pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 #[cfg(feature = "async")]
 #[doc(hidden)]
 pub use binder_async::__spawn_transact;
+pub use death::DeathLink;
 pub use error::{Result, StatusCode};
 pub use file_descriptor::ParcelFileDescriptor;
 // Fuzz entry points: the out-of-workspace `fuzz/` crate reaches them only via the root.

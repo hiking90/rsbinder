@@ -49,11 +49,77 @@ use std::collections::HashMap;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use crate::binder::{DeathRecipient, WIBinder};
+use crate::binder::{DeathRecipient, SIBinder, WIBinder};
 use crate::error::{Result, StatusCode};
 use crate::freeze::ClearDone;
+
+/// A death notification that is unregistered when this value drops.
+///
+/// [`DeathLink::new`] links `recipient` to `binder` with
+/// [`IBinder::link_to_death`](crate::IBinder::link_to_death) and keeps a
+/// strong reference to both, so the caller need not keep the recipient alive
+/// for the notification to fire. Dropping the link calls
+/// [`unlink_to_death`](crate::IBinder::unlink_to_death) and then drops the
+/// binder reference.
+///
+/// The drop never panics past itself: the unlink and the binder's drop run
+/// under `catch_unwind`, so a panic there (a poisoned lock inside rsbinder, or
+/// the last reference to a proxy whose own drop panics) is logged at error
+/// level instead of unwinding, which would abort the process if the link were
+/// dropped during another unwind. An unlink that returns an error is logged at
+/// debug level: [`StatusCode::DeadObject`] is what an unlink returns after
+/// the binder's death was delivered.
+///
+/// A recipient linked to the same binder twice is notified twice; each link
+/// removes one registration when it drops (see `unlink_to_death`).
+#[must_use = "dropping the link unregisters the death notification"]
+pub struct DeathLink {
+    /// `None` only inside `Drop`, which drops it under the catch.
+    binder: Option<SIBinder>,
+    recipient: Arc<dyn DeathRecipient>,
+}
+
+impl DeathLink {
+    /// Link `recipient` to `binder`; on failure, what `link_to_death` returned, such as
+    /// [`StatusCode::DeadObject`] for a binder whose death was already delivered, or
+    /// [`StatusCode::InvalidOperation`] for a local binder.
+    pub fn new(binder: &SIBinder, recipient: Arc<dyn DeathRecipient>) -> Result<Self> {
+        binder.link_to_death(Arc::downgrade(&recipient))?;
+        Ok(Self {
+            binder: Some(binder.clone()),
+            recipient,
+        })
+    }
+}
+
+impl Drop for DeathLink {
+    fn drop(&mut self) {
+        let binder = self.binder.take();
+        let recipient = Arc::downgrade(&self.recipient);
+        // Borrowed here: a binder dropped by this unwind could panic during cleanup and abort.
+        let unlinked = catch_unwind(AssertUnwindSafe(|| {
+            binder.as_ref().map(|b| b.unlink_to_death(recipient))
+        }));
+        match unlinked {
+            Ok(Some(Err(err))) => log::debug!("death link: unlink_to_death returned {err:?}"),
+            Ok(_) => {}
+            Err(_) => log::error!("death link: unlink_to_death panicked"),
+        }
+        if catch_unwind(AssertUnwindSafe(move || drop(binder))).is_err() {
+            log::error!("death link: the binder's drop panicked");
+        }
+    }
+}
+
+impl fmt::Debug for DeathLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeathLink")
+            .field("binder", &self.binder)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A proxy's death recipients and its `obituary_sent` latch; see the module doc.
 pub(crate) struct DeathRecipients {
@@ -458,6 +524,119 @@ mod tests {
             let (_strong, who) = who();
             DeathRecipients::dispatch(&snapshot, &who, "test");
             assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    mod link {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        use super::super::*;
+        use crate::binder::{IBinder, Transactable};
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Unlink {
+            Ok,
+            Dead,
+            Panic,
+        }
+
+        /// Records its link and the unlinks of that same recipient; `drop_panics` on its drop.
+        struct Mock {
+            unlink: Unlink,
+            linked: std::sync::Mutex<Option<Weak<dyn DeathRecipient>>>,
+            unlinked: Arc<AtomicUsize>,
+            drop_panics: bool,
+        }
+        impl IBinder for Mock {
+            fn link_to_death(&self, recipient: Weak<dyn DeathRecipient>) -> Result<()> {
+                *self.linked.lock().expect("lock") = Some(recipient);
+                Ok(())
+            }
+            fn unlink_to_death(&self, recipient: Weak<dyn DeathRecipient>) -> Result<()> {
+                let linked = self.linked.lock().expect("lock").clone().expect("linked");
+                assert!(Weak::ptr_eq(&linked, &recipient), "the linked recipient");
+                self.unlinked.fetch_add(1, Ordering::SeqCst);
+                match self.unlink {
+                    Unlink::Ok => Ok(()),
+                    Unlink::Dead => Err(StatusCode::DeadObject),
+                    Unlink::Panic => panic!("the unlink panics"),
+                }
+            }
+            fn ping_binder(&self) -> Result<()> {
+                Ok(())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_transactable(&self) -> Option<&dyn Transactable> {
+                None
+            }
+            fn descriptor(&self) -> &str {
+                "rsbinder.test.IMock"
+            }
+            fn is_remote(&self) -> bool {
+                true
+            }
+        }
+        impl Drop for Mock {
+            fn drop(&mut self) {
+                if self.drop_panics {
+                    panic!("the binder's drop panics");
+                }
+            }
+        }
+
+        struct Quiet;
+        impl DeathRecipient for Quiet {
+            fn binder_died(&self, _: &WIBinder) {}
+        }
+
+        fn link(unlink: Unlink, drop_panics: bool) -> (DeathLink, Arc<AtomicUsize>) {
+            let unlinked = Arc::new(AtomicUsize::new(0));
+            let binder = SIBinder::from_arc(Arc::new(Mock {
+                unlink,
+                linked: std::sync::Mutex::new(None),
+                unlinked: unlinked.clone(),
+                drop_panics,
+            }));
+            let link = DeathLink::new(&binder, Arc::new(Quiet)).expect("link");
+            (link, unlinked)
+        }
+
+        #[test]
+        fn a_drop_unlinks_its_recipient_once() {
+            for unlink in [Unlink::Ok, Unlink::Dead] {
+                let (link, unlinked) = link(unlink, false);
+                drop(link);
+                assert_eq!(unlinked.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[test]
+        fn a_panicking_unlink_stays_inside_the_drop() {
+            let (link, unlinked) = link(Unlink::Panic, false);
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(link))).is_ok());
+            assert_eq!(unlinked.load(Ordering::SeqCst), 1);
+        }
+
+        /// The link held the binder's last reference, whose drop panics.
+        #[test]
+        fn a_panicking_binder_drop_stays_inside_the_drop() {
+            let (link, _) = link(Unlink::Ok, true);
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(link))).is_ok());
+        }
+
+        /// Dropped by another unwind: a panic escaping this drop would abort the test binary.
+        #[test]
+        fn a_drop_during_an_unwind_does_not_abort() {
+            let (link, unlinked) = link(Unlink::Panic, true);
+            let outer = catch_unwind(AssertUnwindSafe(move || {
+                let _link = link;
+                panic!("the outer panic");
+            }));
+            assert!(outer.is_err());
+            assert_eq!(unlinked.load(Ordering::SeqCst), 1);
         }
     }
 }

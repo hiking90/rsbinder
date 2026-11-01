@@ -305,6 +305,12 @@ accepts both the 0.12.0 bytes and the new ones.
 
 - **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
   has it.
+- **`DeathLink`**: a death notification that unregisters when it drops.
+  `DeathLink::new(&binder, recipient)` links and keeps both strongly; the
+  drop unlinks and drops the binder under `catch_unwind`, so a panic there
+  is logged instead of unwinding (an abort when the link drops during
+  another unwind), and an unlink error such as `DeadObject` after the
+  obituary is logged at debug level.
 - **`bridge::Delegating` and a generated `IFooDelegate` trait per
   interface**: a gateway overrides only the methods it changes (typically
   the one that re-wraps a binder argument) and publishes
