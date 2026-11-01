@@ -6,11 +6,11 @@
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rsbinder_fmq::shm;
 
-use super::{IMemoryHeap, Region, SharedBytes, FLAG_READ_ONLY, WORD};
+use super::{check_range, IMemoryHeap, SharedBytes, FLAG_READ_ONLY};
 use crate::error::{Result, StatusCode};
 use crate::file_descriptor::ParcelFileDescriptor;
 
@@ -50,44 +50,39 @@ fn round_up_to_page(size: usize) -> Option<usize> {
     size.checked_add(ps - 1).map(|s| s & !(ps - 1))
 }
 
-/// One page-aligned shared mapping; `rsbinder_fmq::shm` makes it and unmaps it on drop.
-struct Mapping(shm::Mapping);
+/// One shared mapping carved whole by `rsbinder_fmq::shm`, which unmaps it with the piece.
+enum Mapping {
+    Rw(shm::Bytes),
+    Ro(shm::RoBytes),
+}
 
 impl Mapping {
     fn map(fd: &OwnedFd, len: usize, offset: usize, writable: bool) -> Result<Self> {
-        // `region` views the base as `usize` words; a page-aligned offset keeps it page-aligned.
+        // AOSP `MemoryHeapBase::mapfd` hands `offset` to `mmap`, which takes page-aligned ones.
         if offset % page_size() != 0 {
             return Err(StatusCode::BadValue);
         }
-        let access = if writable {
-            shm::Access::ReadWrite
+        let (fd, at, extent) = (fd.as_fd(), offset as u64, len as u64);
+        Ok(if writable {
+            let mut carve = shm::Mapping::map(fd, at, extent, shm::Access::ReadWrite)?.carve();
+            Self::Rw(carve.bytes(0, len)?)
         } else {
-            shm::Access::ReadOnly
-        };
-        let mapping = shm::Mapping::map(fd.as_fd(), offset as u64, len as u64, access)?;
-        Ok(Self(mapping))
+            Self::Ro(shm::RoMapping::map(fd, at, extent)?.carve().bytes(0, len)?)
+        })
     }
 
-    /// The mapping as atomics ([`Region`]): `&[u8]` would assert immutability peers can break.
-    fn region(&self) -> Region<'_> {
-        let len = self.0.len();
-        let words = len / WORD;
-        let base = self.0.as_ptr().as_ptr();
-        // SAFETY: live page-aligned mapping outlives the borrows; atomic layouts match; disjoint.
-        let (words, tail) = unsafe {
-            (
-                std::slice::from_raw_parts(base.cast::<AtomicUsize>(), words),
-                std::slice::from_raw_parts(
-                    base.add(words * WORD).cast::<AtomicU8>(),
-                    len - words * WORD,
-                ),
-            )
-        };
-        Region::new(words, tail)
+    fn view(&self) -> SharedBytes<'_> {
+        match self {
+            Self::Rw(bytes) => SharedBytes::of(bytes),
+            Self::Ro(bytes) => SharedBytes::of_ro(bytes),
+        }
     }
 
     fn as_ptr(&self) -> *mut u8 {
-        self.0.as_ptr().as_ptr()
+        match self {
+            Self::Rw(bytes) => bytes.as_ptr(),
+            Self::Ro(bytes) => bytes.as_ptr().cast_mut(),
+        }
     }
 }
 
@@ -106,26 +101,30 @@ struct HeapInner {
 }
 
 impl HeapInner {
-    fn region(&self) -> Result<Region<'_>> {
-        self.map
-            .as_ref()
-            .map(Mapping::region)
-            .ok_or(StatusCode::InvalidOperation)
+    fn mapping(&self) -> Result<&Mapping> {
+        self.map.as_ref().ok_or(StatusCode::InvalidOperation)
     }
 
     fn read_at(&self, off: usize, dst: &mut [u8]) -> Result<()> {
-        self.region()?.load(off, dst)
+        self.mapping()?.view().copy_to(off, dst)
     }
 
     fn write_at(&self, off: usize, src: &[u8]) -> Result<()> {
         if !self.writable {
             return Err(StatusCode::PermissionDenied);
         }
-        self.region()?.store(off, src)
+        match self.mapping()? {
+            Mapping::Rw(bytes) => {
+                check_range(bytes.len(), off, src.len())?;
+                bytes.store(off, src);
+                Ok(())
+            }
+            Mapping::Ro(_) => Err(StatusCode::PermissionDenied),
+        }
     }
 
     fn base(&self) -> Option<SharedBytes<'_>> {
-        self.region().ok().map(SharedBytes::whole)
+        self.map.as_ref().map(Mapping::view)
     }
 
     fn as_ptr(&self) -> Option<*mut u8> {

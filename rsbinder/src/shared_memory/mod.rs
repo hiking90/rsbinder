@@ -81,21 +81,14 @@
 //! [`as_ptr`](crate::shared_memory::MemoryHeapBase::as_ptr) carries AOSP's `unsecurePointer()`
 //! caveat, and it is the caller's `unsafe` to dereference.
 //!
-//! The heaps' shared state is `Send + Sync` on the same basis. The mapping
-//! is a `rsbinder_fmq::shm::Mapping`, an address range with no thread
-//! affinity that is `Send + Sync` itself, and every safe access goes through
-//! `Mapping::region` — atomic loads and stores, uniformly word-sized on the
-//! word part — so concurrent `read_at`/`write_at`/`base` from several
-//! threads (or another process) are data races only in the hardware sense,
-//! never in Rust's model. That is the contract `shm::Mapping` sets for the
-//! code that turns its address into references: atomic access only, no byte
-//! at two sizes through one mapping, and `Relaxed` loads no wider than a
-//! `usize` through a read-only one. Stores are gated on the heap being
-//! writable, so a `PROT_READ` mapping is never written. The atomic view
-//! relies on the mapping starting on a page boundary (the heap's offset is
-//! page-aligned, so the word part is `usize`-aligned), `AtomicUsize` having
-//! `usize`'s size and alignment, and `AtomicU8` being `repr(transparent)`
-//! over `u8`.
+//! The heaps' shared state is `Send + Sync` on the same basis. A heap's
+//! mapping is carved whole into one `rsbinder_fmq::shm::Bytes` (writable)
+//! or `RoBytes` (a [`FLAG_READ_ONLY`] heap mapped `PROT_READ`), and every
+//! access goes through it: atomic loads and stores, each byte at the one
+//! size the area's split gives it. Concurrent `read_at`/`write_at`/`base`
+//! from several threads (or another process) are therefore races between
+//! atomics, never data races in Rust's model. A read-only heap holds no
+//! value with a store method, so its `PROT_READ` mapping is never written.
 //!
 //! `shm::Mapping` adds two refusals to the `mmap` it makes, both
 //! `BadValue`: a range of more than `isize::MAX` bytes, which no Rust slice
@@ -186,14 +179,9 @@
 //! [`HeapCache`]: crate::shared_memory::HeapCache
 //! [`HEAP_ID`]: crate::shared_memory::HEAP_ID
 //! [`GET_MEMORY`]: crate::shared_memory::GET_MEMORY
-//!
-//! # Mixed-size atomics
-//!
-//! The crate-private `Region` view splits a mapped shared region into its `usize`-aligned
-//! words and the `< WORD` trailing bytes. Every access is word-sized on the word part (partial
-//! words go through a CAS) and byte-sized on the tail: Rust's memory model makes overlapping
-//! atomic accesses of *different* sizes a data race when one is a write, so a byte-granular
-//! fast path would race the word path of another thread writing the same window.
+
+// Every access to a heap's memory is a copy through `rsbinder_fmq::shm` pieces (plan 12-2).
+#![forbid(unsafe_code)]
 
 mod dealer;
 pub(crate) mod heap;
@@ -201,7 +189,8 @@ pub(crate) mod shared;
 mod wire;
 
 use std::os::fd::{AsRawFd, BorrowedFd};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+use rsbinder_fmq::shm;
 
 use crate::error::{Result, StatusCode};
 
@@ -226,85 +215,35 @@ pub use wire::{
 /// mapping, created before the seal, stays writable.
 pub const FLAG_READ_ONLY: u32 = 0x0000_0001;
 
-pub(crate) const WORD: usize = std::mem::size_of::<usize>();
-
-/// Mapped region as `usize` words + a `< WORD` tail; see module doc "Mixed-size atomics".
-#[derive(Clone, Copy)]
-pub(crate) struct Region<'a> {
-    words: &'a [AtomicUsize],
-    tail: &'a [AtomicU8],
+/// `BadValue` unless `off..off + len` lies in `0..total`.
+pub(crate) fn check_range(total: usize, off: usize, len: usize) -> Result<()> {
+    match off.checked_add(len) {
+        Some(end) if end <= total => Ok(()),
+        _ => Err(StatusCode::BadValue),
+    }
 }
 
-impl<'a> Region<'a> {
-    pub(crate) fn new(words: &'a [AtomicUsize], tail: &'a [AtomicU8]) -> Self {
-        Self { words, tail }
+/// A heap's mapping as `rsbinder_fmq::shm` carved it: writable or read-only.
+#[derive(Clone, Copy)]
+enum Area<'a> {
+    Rw(&'a shm::Bytes),
+    Ro(&'a shm::RoBytes),
+}
+
+impl Area<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Area::Rw(bytes) => bytes.len(),
+            Area::Ro(bytes) => bytes.len(),
+        }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.words.len() * WORD + self.tail.len()
-    }
-
-    fn check(&self, off: usize, len: usize) -> Result<()> {
-        let end = off.checked_add(len).ok_or(StatusCode::BadValue)?;
-        if end > self.len() {
-            return Err(StatusCode::BadValue);
+    /// Relaxed loads of `dst.len()` bytes at `off`, a range the caller checked.
+    fn load(&self, off: usize, dst: &mut [u8]) {
+        match self {
+            Area::Rw(bytes) => bytes.load(off, dst),
+            Area::Ro(bytes) => bytes.load(off, dst),
         }
-        Ok(())
-    }
-
-    /// Copy `dst.len()` bytes out, starting at `off` (relaxed loads).
-    pub(crate) fn load(&self, off: usize, dst: &mut [u8]) -> Result<()> {
-        self.check(off, dst.len())?;
-        let word_bytes = self.words.len() * WORD;
-        let mut done = 0;
-        while done < dst.len() && off + done < word_bytes {
-            let at = off + done;
-            let shift = at % WORD;
-            let n = (WORD - shift).min(dst.len() - done);
-            let w = self.words[at / WORD].load(Ordering::Relaxed).to_ne_bytes();
-            dst[done..done + n].copy_from_slice(&w[shift..shift + n]);
-            done += n;
-        }
-        let tail_at = (off + done).saturating_sub(word_bytes);
-        for (d, s) in dst[done..].iter_mut().zip(&self.tail[tail_at..]) {
-            *d = s.load(Ordering::Relaxed);
-        }
-        Ok(())
-    }
-
-    /// Copy `src` in at `off` (relaxed stores; a partial word is CAS-merged to keep neighbours).
-    pub(crate) fn store(&self, off: usize, src: &[u8]) -> Result<()> {
-        self.check(off, src.len())?;
-        let word_bytes = self.words.len() * WORD;
-        let mut done = 0;
-        while done < src.len() && off + done < word_bytes {
-            let at = off + done;
-            let shift = at % WORD;
-            let n = (WORD - shift).min(src.len() - done);
-            let w = &self.words[at / WORD];
-            let chunk = &src[done..done + n];
-            if n == WORD {
-                let full = usize::from_ne_bytes(chunk.try_into().expect("one word"));
-                w.store(full, Ordering::Relaxed);
-            } else {
-                let mut cur = w.load(Ordering::Relaxed);
-                loop {
-                    let mut bytes = cur.to_ne_bytes();
-                    bytes[shift..shift + n].copy_from_slice(chunk);
-                    let next = usize::from_ne_bytes(bytes);
-                    match w.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
-                        Ok(_) => break,
-                        Err(seen) => cur = seen,
-                    }
-                }
-            }
-            done += n;
-        }
-        let tail_at = (off + done).saturating_sub(word_bytes);
-        for (d, s) in self.tail[tail_at..].iter().zip(&src[done..]) {
-            d.store(*s, Ordering::Relaxed);
-        }
-        Ok(())
     }
 }
 
@@ -322,17 +261,27 @@ impl<'a> Region<'a> {
 /// ([IMemory.h:78-91](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/include/binder/IMemory.h;l=78)).
 #[derive(Clone, Copy)]
 pub struct SharedBytes<'a> {
-    region: Region<'a>,
+    area: Area<'a>,
     off: usize,
     len: usize,
 }
 
 impl<'a> SharedBytes<'a> {
-    pub(crate) fn whole(region: Region<'a>) -> Self {
+    /// The whole of a writable heap's mapping.
+    pub(crate) fn of(bytes: &'a shm::Bytes) -> Self {
+        Self::whole(Area::Rw(bytes))
+    }
+
+    /// The whole of a read-only heap's mapping.
+    pub(crate) fn of_ro(bytes: &'a shm::RoBytes) -> Self {
+        Self::whole(Area::Ro(bytes))
+    }
+
+    fn whole(area: Area<'a>) -> Self {
         Self {
-            region,
+            area,
             off: 0,
-            len: region.len(),
+            len: area.len(),
         }
     }
 
@@ -354,11 +303,9 @@ impl<'a> SharedBytes<'a> {
     /// Copy `dst.len()` bytes starting at `off` (relative to the window).
     /// `BadValue` if the range is out of bounds.
     pub fn copy_to(&self, off: usize, dst: &mut [u8]) -> Result<()> {
-        let end = off.checked_add(dst.len()).ok_or(StatusCode::BadValue)?;
-        if end > self.len {
-            return Err(StatusCode::BadValue);
-        }
-        self.region.load(self.off + off, dst)
+        check_range(self.len, off, dst.len())?;
+        self.area.load(self.off + off, dst);
+        Ok(())
     }
 
     /// The sub-window `[off, off + len)`, or `None` if out of bounds.
@@ -368,7 +315,7 @@ impl<'a> SharedBytes<'a> {
             return None;
         }
         Some(Self {
-            region: self.region,
+            area: self.area,
             off: self.off + off,
             len,
         })
@@ -376,10 +323,11 @@ impl<'a> SharedBytes<'a> {
 
     /// Snapshot of the whole window.
     pub fn to_vec(&self) -> Vec<u8> {
-        let mut v = vec![0u8; self.len];
-        self.region
-            .load(self.off, &mut v)
-            .expect("window is within the region");
+        let mut v = Vec::with_capacity(self.len);
+        match self.area {
+            Area::Rw(bytes) => bytes.load_extend(self.off, self.len, &mut v),
+            Area::Ro(bytes) => bytes.load_extend(self.off, self.len, &mut v),
+        }
         v
     }
 }

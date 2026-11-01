@@ -419,8 +419,6 @@ fn byte_order_primitives_stay_pinned() {
                 ("binder_object.rs", 16),
                 // `TransactionData`'s L3 codec and `target` accessors (15) + layout tests (8).
                 ("transaction_data.rs", 23),
-                // fd/memfd bookkeeping, never parcel wire.
-                ("shared_memory/mod.rs", 4),
             ],
         },
         Pin {
