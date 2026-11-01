@@ -778,13 +778,21 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         if st.in_flight == Some(attempt) {
             st.in_flight_died = true;
         }
-        if st.phase == Phase::Connected && st.conn.as_ref().is_some_and(|c| c.attempt == attempt) {
-            log::info!("Reconnecting: {} died; reconnecting", self.cfg);
-            st.phase = Phase::Stale;
-            self.ensure_thread(&mut st);
-        }
+        self.go_stale(&mut st, attempt, "died");
         drop(st);
         self.notify();
+    }
+
+    /// Under the lock: connection `attempt` ended (`how`); reconnect unless already replaced.
+    fn go_stale(self: &Arc<Self>, st: &mut State<T>, attempt: u64, how: &str) -> bool {
+        let current = st.conn.as_ref().is_some_and(|c| c.attempt == attempt);
+        if st.phase != Phase::Connected || !current {
+            return false;
+        }
+        log::info!("Reconnecting: {} {how}; reconnecting", self.cfg);
+        st.phase = Phase::Stale;
+        self.ensure_thread(st);
+        true
     }
 
     /// Under the lock: start the reconnect thread for a `Stale` helper that has none.
@@ -1040,10 +1048,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             Ok(p) => p,
             Err(code) => {
                 self.end_parts(conn_parts);
-                return Err(Failure {
-                    code,
-                    permanent: code == StatusCode::BadType,
-                });
+                return Err(lookup_failure(code));
             }
         };
 
@@ -1271,10 +1276,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
     /// Under the lock: the connection `attempt` has ended; reconnect unless already replaced.
     #[cfg(feature = "rpc")]
     fn mark_stale(self: &Arc<Self>, st: &mut State<T>, attempt: u64) {
-        if st.phase == Phase::Connected && st.conn.as_ref().is_some_and(|c| c.attempt == attempt) {
-            log::info!("Reconnecting: {} ended; reconnecting", self.cfg);
-            st.phase = Phase::Stale;
-            self.ensure_thread(st);
+        if self.go_stale(st, attempt, "ended") {
             self.cv.notify_all();
         }
     }
@@ -1344,8 +1346,8 @@ fn refused_at_build(mode: Mode, code: StatusCode) -> bool {
     }
 }
 
-/// `BadType` is another interface (or a libbinder root asked for a name); the rest may pass.
-#[cfg(feature = "rpc")]
+/// A lookup's or a cast's `code`: `BadType` is another interface (or a libbinder root asked for
+/// a name), which a retry gets again; the rest may pass.
 fn lookup_failure(code: StatusCode) -> Failure {
     Failure {
         code,
