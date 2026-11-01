@@ -347,7 +347,7 @@ impl<'a> SendWait<'a> {
 
     /// `Some(false)` room or send error, `Some(true)` (`input` only) input or EOF, `None` expired.
     pub(crate) fn wait(&mut self, input: bool) -> RpcResult<Option<bool>> {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        use rustix::event::PollFlags;
 
         let events = if input {
             PollFlags::IN | PollFlags::OUT
@@ -363,14 +363,9 @@ impl<'a> SendWait<'a> {
                 (Some(left), Some(Some(d)), Some(_)) => Some(left.min(super::look_every(d))),
                 (left, _, _) => left,
             };
-            let ts = pause.map(|d| Timespec {
-                tv_sec: d.as_secs().try_into().unwrap_or(i64::MAX),
-                tv_nsec: d.subsec_nanos() as _,
-            });
-            let mut fds = [PollFd::from_borrowed_fd(self.sock, events)];
-            match poll(&mut fds, ts.as_ref()) {
-                Ok(0) => {}
-                Ok(_) => return Ok(Some(fds[0].revents().contains(PollFlags::IN))),
+            match super::poll_one(self.sock, events, pause) {
+                Ok(seen) if seen.is_empty() => {}
+                Ok(seen) => return Ok(Some(seen.contains(PollFlags::IN))),
                 Err(rustix::io::Errno::INTR) => continue,
                 Err(e) => return Err(std::io::Error::from(e).into()),
             }
@@ -413,12 +408,9 @@ impl UnixTransport {
 
     /// [`from_stream`](Self::from_stream) keeping the transport layer's error, for the server.
     pub(crate) fn wrap(stream: UnixStream) -> RpcResult<Self> {
-        // No `MSG_NOSIGNAL` on Apple (module doc "fd passing"); EINVAL = both directions shut.
+        // No `MSG_NOSIGNAL` on Apple (module doc "fd passing").
         #[cfg(target_vendor = "apple")]
-        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(|e| match e {
-            rustix::io::Errno::INVAL => RpcError::EndOfStream,
-            e => std::io::Error::from(e).into(),
-        })?;
+        super::set_nosigpipe(stream.as_fd())?;
         let peer = resolve_peer(&stream);
         let desc = match stream.peer_addr() {
             Ok(a) => format!("unix:{a:?}"),

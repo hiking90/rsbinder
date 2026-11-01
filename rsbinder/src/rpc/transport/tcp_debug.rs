@@ -66,12 +66,9 @@ impl TcpDebugTransport {
 
     fn wrap(stream: TcpStream) -> RpcResult<Self> {
         warn_once();
-        // No `MSG_NOSIGNAL` on Apple, as `UnixTransport::from_stream`; EINVAL: both ways shut.
+        // No `MSG_NOSIGNAL` on Apple, as `UnixTransport::from_stream`.
         #[cfg(target_vendor = "apple")]
-        rustix::net::sockopt::set_socket_nosigpipe(&stream, true).map_err(|e| match e {
-            rustix::io::Errno::INVAL => crate::rpc::RpcError::EndOfStream,
-            e => std::io::Error::from(e).into(),
-        })?;
+        super::set_nosigpipe(stream.as_fd())?;
         // `RpcError: From<std::io::Error>` — `?` converts directly.
         stream.set_nodelay(true)?;
         let desc = match stream.peer_addr() {

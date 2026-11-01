@@ -537,11 +537,7 @@ fn linger_for_alert(conn: &mut Connection, stream: &dyn TlsStream) {
 
 /// `BadValue` (via `EINVAL`) for a zero handshake deadline, which bounds nothing.
 fn refuse_zero_handshake_timeout(d: Duration, what: &str) -> RpcResult<()> {
-    if d.is_zero() {
-        log::error!("{what}: a zero handshake_timeout is refused; pass a nonzero bound");
-        return Err(RpcError::Io(std::io::Error::from(rustix::io::Errno::INVAL)));
-    }
-    Ok(())
+    crate::rpc::deadline::refuse_zero(Some(d), what)
 }
 
 impl std::fmt::Debug for TlsTransport {
@@ -849,7 +845,7 @@ impl TlsTransport {
 
     /// Plaintext or the peer's end is ready for `drain`; takes in what the socket holds, unblocked.
     fn input_waiting(&self, sock: std::os::fd::BorrowedFd<'_>) -> RpcResult<bool> {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        use rustix::event::PollFlags;
         loop {
             {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
@@ -867,13 +863,8 @@ impl TlsTransport {
                 self.pump_incoming()?;
                 continue;
             }
-            let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::IN)];
-            let now = Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            match poll(&mut fds, Some(&now)) {
-                Ok(_) if fds[0].revents().contains(PollFlags::IN) => {}
+            match super::poll_one(sock, PollFlags::IN, Some(Duration::ZERO)) {
+                Ok(seen) if seen.contains(PollFlags::IN) => {}
                 // Nothing to read; an error flag alone is the next send's to report.
                 Ok(_) => return Ok(false),
                 Err(rustix::io::Errno::INTR) => continue,
@@ -913,18 +904,9 @@ impl TlsTransport {
             return Ok(true);
         }
         let mut tmp = [0u8; TLS_READ_CHUNK];
-        let k = self
-            .reads
-            .read(self.stream.socket(), &self.queue, || loop {
-                match self.stream.read(&mut tmp) {
-                    Ok(k) => return Ok(k),
-                    // EINTR: retry the interrupted blocking read.
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    // Deadline → `Timeout`, as plain sockets (the `DeadlineMidFrame` split).
-                    Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
-                    Err(e) => return Err(e.into()),
-                }
-            })?;
+        let k = self.reads.read(self.stream.socket(), &self.queue, || {
+            super::read_once(|b| self.stream.read(b), &mut tmp)
+        })?;
         let mut c = self.conn.lock().expect("tls conn poisoned");
         if k == 0 {
             let mut eof: &[u8] = &[];

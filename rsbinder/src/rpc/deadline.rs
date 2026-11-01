@@ -31,6 +31,21 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use super::{RpcError, RpcResult};
+
+/// A zero duration is not a deadline (plan 17 C-2 rule 2), wherever an RPC deadline is set:
+/// `Io(EINVAL)`, which a caller sees as `BadValue`. `None` waits without bound on purpose.
+pub(crate) fn refuse_zero(timeout: Option<Duration>, what: &str) -> RpcResult<()> {
+    if timeout.is_some_and(|d| d.is_zero()) {
+        log::error!(
+            "rsbinder RPC: {what} was given a zero duration, which is not a deadline; pass a \
+             positive duration, or `None` to wait indefinitely on purpose"
+        );
+        return Err(RpcError::Io(rustix::io::Errno::INVAL.into()));
+    }
+    Ok(())
+}
+
 /// What a deadline runs when it passes: shut the connection down.
 pub(crate) type Cut = Box<dyn FnOnce() + Send>;
 

@@ -1374,14 +1374,7 @@ fn gen_rpc_session_id() -> RpcResult<RpcSessionId> {
 
 /// C-2 rule 2 (plan 17): a zero reply, idle or handshake deadline is `BadValue`, never "none".
 pub(crate) fn reject_zero_deadline(timeout: Option<Duration>, setter: &str) -> Result<()> {
-    if timeout.is_some_and(|d| d.is_zero()) {
-        log::error!(
-            "rsbinder RPC: {setter} was given a zero duration, which is not a deadline; pass a \
-             positive duration, or `None` to wait indefinitely on purpose"
-        );
-        return Err(StatusCode::BadValue);
-    }
-    Ok(())
+    super::deadline::refuse_zero(timeout, setter).map_err(StatusCode::from)
 }
 
 thread_local! {
@@ -1496,15 +1489,7 @@ struct HandshakeDeadline<'a> {
 impl<'a> HandshakeDeadline<'a> {
     fn arm(transport: &'a dyn RpcTransport, deadline: Option<Duration>) -> RpcResult<Self> {
         // Sole funnel: the `RpcTransport` trait does not promise to reject `Some(ZERO)`.
-        if deadline.is_some_and(|d| d.is_zero()) {
-            log::error!(
-                "rsbinder RPC: a zero handshake deadline is not a deadline — pass a positive \
-                 duration, or `None` to wait indefinitely on purpose"
-            );
-            return Err(RpcError::Io(std::io::Error::from(
-                std::io::ErrorKind::InvalidInput,
-            )));
-        }
+        super::deadline::refuse_zero(deadline, "a handshake deadline")?;
         let armed = match deadline {
             Some(_) => match transport
                 .set_read_timeout(deadline)
@@ -6523,9 +6508,11 @@ mod tests {
     #[test]
     fn zero_handshake_deadline_is_refused_before_it_reaches_a_transport() {
         let (a, _b) = super::super::transport::MemTransport::pair();
-        assert!(
-            HandshakeDeadline::arm(&a, Some(Duration::ZERO)).is_err(),
-            "a zero duration is not a deadline"
+        let refused = HandshakeDeadline::arm(&a, Some(Duration::ZERO)).err();
+        assert_eq!(
+            refused.map(StatusCode::from),
+            Some(StatusCode::BadValue),
+            "a zero duration is not a deadline, and every setter says so alike"
         );
         // The two shapes that are deadlines still arm.
         assert!(HandshakeDeadline::arm(&a, None).is_ok());

@@ -805,16 +805,54 @@ pub(crate) fn write_frame<W: std::io::Write>(w: &mut W, buf: &[u8]) -> RpcResult
 
 /// Stream-backend `recv_raw`: one `read` (`Ok(0)` = EOF), `EINTR` retried, deadline → `Timeout`.
 pub(crate) fn read_raw<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<usize> {
+    read_once(|b| r.read(b), buf)
+}
+
+/// [`read_raw`] over any one-read function, such as a `tls::TlsStream`'s socket read.
+pub(crate) fn read_once(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    buf: &mut [u8],
+) -> RpcResult<usize> {
     loop {
-        return match r.read(buf) {
+        return match read(buf) {
             Ok(n) => Ok(n),
             // EINTR: retry, as `recv_raw_with_fds` and AOSP `interruptableReadFully` do.
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // Deadline → `Timeout`: `read_exact_raw` splits `Timeout`/`DeadlineMidFrame`.
+            // Deadline → `Timeout`: `fill_exact` splits `Timeout`/`DeadlineMidFrame`.
             Err(e) if is_timeout(&e) => Err(RpcError::Timeout),
             Err(e) => Err(RpcError::from(e)),
         };
     }
+}
+
+/// One `poll` of `fd` for `events`, waiting at most `wait` (`None`: no bound); what it reported.
+///
+/// Empty flags when the wait passed. `EINTR` is the caller's to retry, since each caller
+/// recomputes what is left of its own deadline first.
+pub(crate) fn poll_one(
+    fd: std::os::fd::BorrowedFd<'_>,
+    events: rustix::event::PollFlags,
+    wait: Option<std::time::Duration>,
+) -> rustix::io::Result<rustix::event::PollFlags> {
+    use rustix::event::{poll, PollFd, Timespec};
+    let ts = wait.map(|d| Timespec {
+        tv_sec: d.as_secs().try_into().unwrap_or(i64::MAX),
+        tv_nsec: d.subsec_nanos() as _,
+    });
+    let mut fds = [PollFd::from_borrowed_fd(fd, events)];
+    poll(&mut fds, ts.as_ref())?;
+    Ok(fds[0].revents())
+}
+
+/// `SO_NOSIGPIPE` on an Apple socket, which has no `MSG_NOSIGNAL` and on which std sets it only
+/// for sockets std made. XNU refuses it with `EINVAL` once both directions are shut (the peer
+/// closed before the wrap), which is the end of the stream.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn set_nosigpipe(fd: std::os::fd::BorrowedFd<'_>) -> RpcResult<()> {
+    rustix::net::sockopt::set_socket_nosigpipe(fd, true).map_err(|e| match e {
+        rustix::io::Errno::INVAL => RpcError::EndOfStream,
+        e => std::io::Error::from(e).into(),
+    })
 }
 
 /// Bytes `sock` holds that its peer has not taken yet (`SIOCOUTQ`).
@@ -916,8 +954,6 @@ impl ReadDeadline {
         queue: &OutQueue,
         read: impl FnOnce() -> RpcResult<T>,
     ) -> RpcResult<T> {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
-
         let ns = self.limit_ns.load(std::sync::atomic::Ordering::Relaxed);
         let (Some(sock), true) = (sock, ns != 0) else {
             return read();
@@ -938,14 +974,9 @@ impl ReadDeadline {
             } else {
                 left
             };
-            let ts = Timespec {
-                tv_sec: pause.as_secs().try_into().unwrap_or(i64::MAX),
-                tv_nsec: pause.subsec_nanos() as _,
-            };
-            let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::IN)];
-            match poll(&mut fds, Some(&ts)) {
+            match poll_one(sock, rustix::event::PollFlags::IN, Some(pause)) {
                 // Input, the peer's end, or an error: the read returns at once with it.
-                Ok(n) if n > 0 => return read(),
+                Ok(seen) if !seen.is_empty() => return read(),
                 Ok(_) => {
                     if queued > 0 {
                         let now = queue.bytes(sock).unwrap_or(queued);
@@ -1066,7 +1097,7 @@ pub(crate) fn socket_peer_closed(
     fd: std::os::fd::BorrowedFd<'_>,
     kind: SocketKind,
 ) -> Option<bool> {
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::PollFlags;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let (ask, closed) = {
         let _ = kind;
@@ -1085,15 +1116,8 @@ pub(crate) fn socket_peer_closed(
         #[cfg(not(target_vendor = "apple"))]
         SocketKind::TcpOrVsock => return None,
     };
-    let mut fds = [PollFd::from_borrowed_fd(fd, ask)];
-    let now = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    match poll(&mut fds, Some(&now)) {
-        Ok(_) => Some(fds[0].revents().intersects(closed)),
-        Err(_) => None,
-    }
+    let seen = poll_one(fd, ask, Some(std::time::Duration::ZERO)).ok()?;
+    Some(seen.intersects(closed))
 }
 
 /// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` for `d`, as `RpcTransport::set_liveness` states them.
