@@ -617,6 +617,7 @@ fn types_whose_drop_ends_something_are_must_use() {
         ("rsbinder", "rt/tokio_rt.rs", "DeathSignal"),
         ("rsbinder", "stream/mod.rs", "Receiver"),
         ("rsbinder", "stream/mod.rs", "Sink"),
+        ("rsbinder-fmq", "shm/spin.rs", "SpinSlot"),
         ("rsbinder-topic", "named.rs", "NamedSubscriber"),
         ("rsbinder-topic", "publisher.rs", "LoanMut"),
         ("rsbinder-topic", "publisher.rs", "Publisher"),

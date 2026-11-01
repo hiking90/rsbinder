@@ -77,14 +77,21 @@ pub fn spin_budget(deadline: Option<&Deadline>) -> Duration {
     }
 }
 
-/// One of this process's concurrent looks: a look pays only while its peer runs, so half the cores.
-struct SpinSlot;
+/// One of this process's concurrent looks, held while it lasts: a look pays only while its peer
+/// runs, so at most half the cores' worth of threads look at once.
+///
+/// [`spin_until`] takes one past its first round. A look of its own shape, such as one that
+/// reads a counter less often than every turn, takes one at the same point, so that it counts
+/// against the same limit.
+#[must_use = "the slot is given back when it drops"]
+pub struct SpinSlot;
 
 static SPINNERS: AtomicUsize = AtomicUsize::new(0);
 
 impl SpinSlot {
+    /// A slot, or `None` when the process already has its share of threads looking.
     #[inline]
-    fn take() -> Option<SpinSlot> {
+    pub fn take() -> Option<SpinSlot> {
         static MAX: OnceLock<usize> = OnceLock::new();
         let max = *MAX.get_or_init(|| {
             std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))

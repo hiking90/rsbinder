@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::spin::{spin_budget, SpinGauge, SPIN_CLOCK_EVERY};
+use rsbinder_fmq::shm::spin::{spin_budget, SpinGauge, SpinSlot, SPIN_CLOCK_EVERY};
 use rsbinder_fmq::shm::Deadline;
 use rsbinder_fmq::{AttachPolicy, Descriptor, EventFlag, MessageQueue, NOT_EMPTY, NOT_FULL};
 
@@ -1255,6 +1255,7 @@ impl<T: Deserialize> Consumer<T> {
             return;
         }
         let start = Instant::now();
+        let mut slot = None;
         loop {
             for _ in 0..SPIN_CLOCK_EVERY {
                 std::hint::spin_loop();
@@ -1262,6 +1263,13 @@ impl<T: Deserialize> Consumer<T> {
             match queue.available_to_read() {
                 Ok(now) if now > seen && now < MIN_BATCH && start.elapsed() < budget => seen = now,
                 _ => return,
+            }
+            // After the first round, as `spin_until`: a longer look takes a share of the process.
+            if slot.is_none() {
+                slot = SpinSlot::take();
+                if slot.is_none() {
+                    return;
+                }
             }
         }
     }
