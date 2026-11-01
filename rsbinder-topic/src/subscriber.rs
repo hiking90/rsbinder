@@ -299,7 +299,10 @@ impl<T: Payload> Subscriber<T> {
             Start::Last => ring::Start::Last,
             Start::Oldest => ring::Start::Oldest,
         };
-        let reader = Reader::attach(memory, start).map_err(|_| StatusCode::BadValue)?;
+        let reader = Reader::attach(memory, start).map_err(|ring::Corrupted(what)| {
+            log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
+            StatusCode::BadValue
+        })?;
         Ok(Self {
             _abandon: Abandon {
                 local: local.clone(),

@@ -28,6 +28,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   versions, minus the registration notice: after the first lookup misses,
   the next comes a second later rather than at once, and a missing service
   logs the same "still waiting" warning every ten seconds.
+- **`rsbinder-topic`** logs, once per subscription, which check of the
+  topic's memory or pool failed when a receive ends with
+  `Closed::Corrupted`, and when a subscription is refused for it; the
+  error itself is unchanged.
 
 ## [0.13.0] - 2026-10-31
 

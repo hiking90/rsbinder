@@ -735,6 +735,10 @@ impl<M: Loads> Reader<M> {
     /// Remember a failed check, so that the reader stays failed.
     fn keep<T>(&mut self, checked: Result<T, Corrupted>) -> Result<T, Corrupted> {
         if let Err(Corrupted(what)) = checked {
+            // Once: every later call returns the kept failure without looking again.
+            if self.failed.is_none() {
+                log::error!("topic: the topic's memory is corrupted: {what}");
+            }
             self.failed = Some(what);
         }
         checked

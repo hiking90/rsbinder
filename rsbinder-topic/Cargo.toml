@@ -40,7 +40,8 @@ rustix = { workspace = true, features = ["event", "net", "mm"] }
 # `Notify`: a `recv_async` joins the wait a dropped one left on the blocking pool.
 # `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on.
 tokio = { workspace = true, optional = true, features = ["sync", "net"] }
-# The warning a topic with backpressure gives when it takes a subscription out (plan 15 §6.5).
+# The warning a topic with backpressure gives when it takes a subscription out (plan 15 §6.5),
+# and the check a subscriber's corrupted topic memory failed.
 log = { workspace = true }
 
 [build-dependencies]
