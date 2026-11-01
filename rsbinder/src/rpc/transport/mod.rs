@@ -14,10 +14,11 @@
 //!
 //! The separate frame API ([`send_frame`](RpcTransport::send_frame) /
 //! [`recv_frame`](RpcTransport::recv_frame)), which no session calls,
-//! frames on the transport side. Stream backends
-//! (`unix`, `tcp_debug`) share the length-prefix helpers in this
-//! module; the in-process `mem` backend frames implicitly (one channel
-//! message == one frame).
+//! frames on the transport side. Every stream backend (`unix`,
+//! `tcp_debug`, `vsock`, `tls`) keeps the trait's defaults, which frame on
+//! top of its raw calls, so the frame API has that backend's raw send and
+//! read rules (deadlines, a slow peer); the in-process `mem` backend frames
+//! implicitly (one channel message == one frame).
 //!
 //! The shared stream frame is `u32 little-endian length | <length> body
 //! bytes`, with no magic and no self-sync: the length alone delimits the
@@ -25,12 +26,9 @@
 //! interleave because a connection has one writer at a time: every send,
 //! a `DEC_STRONG` from `RpcProxy::drop` included, goes out on a slot its
 //! thread holds (`session.rs` `ConnGuard`, `exclusive_tid`), so a frame
-//! written in more than one call stays whole. `unix` and `tcp_debug` send
-//! the length and the body as two slices of one `sendmsg`
-//! (`unix::send_frame_vectored`). `tls` and `vsock` coalesce them into one
-//! `write_all` (`write_frame`): over `tls` two writes would let a
-//! `close_notify` from `shutdown` land between them, and `vsock` has no
-//! vectored send path here.
+//! written in more than one call stays whole. The default `send_frame` builds
+//! the length and the body into one buffer for one `send_raw`: over `tls`
+//! two sends would let a `close_notify` from `shutdown` land between them.
 //!
 //! The trait is **synchronous / blocking** (matches android-12 r34's
 //! blocking-thread model). An `async` adapter can be layered *on top*
@@ -788,12 +786,8 @@ fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
     Ok(framed)
 }
 
-/// Write one length-prefixed frame to a blocking stream.
-#[cfg(any(
-    test,
-    feature = "rpc-tls",
-    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
-))]
+/// Write one length-prefixed frame to a blocking stream: what `send_frame` sends, for tests.
+#[cfg(test)]
 pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     // One buffer, one `write_all`; the slot's single writer keeps the frame whole (module doc).
     let framed = encode_frame(buf)?;
@@ -1187,7 +1181,8 @@ pub(crate) fn read_frame_with(
     Ok(body)
 }
 
-/// Read one length-prefixed frame from a blocking stream.
+/// Read one length-prefixed frame from a blocking stream: the fuzz entry's and the tests'.
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
     read_frame_with(|buf| read_raw(r, buf))
 }

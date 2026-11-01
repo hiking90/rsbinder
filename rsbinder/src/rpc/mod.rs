@@ -349,11 +349,10 @@ impl From<std::io::Error> for RpcError {
 
 impl From<RpcError> for std::io::Error {
     /// Boundary projection back to `std::io::Error` for callers that
-    /// hold an `io::Result<_>` accumulator. Its consumers are the
-    /// adapters that bridge an [`transport::RpcTransport`] to a
-    /// `std::io` `Read`/`Write` — `RawTransportIo`
-    /// (`rpc::wire_android13`, the AOSP raw framing of both profiles) and
-    /// `RawIo` (`rpc::transport::tls`, length-prefixed frames over TLS).
+    /// hold an `io::Result<_>` accumulator. Its consumer is the one
+    /// adapter that bridges an [`transport::RpcTransport`] to a
+    /// `std::io` `Read`/`Write`, `RawTransportIo` (`rpc::wire_android13`,
+    /// the AOSP raw framing and handshake of both profiles).
     ///
     /// `RpcError::Io` hands its payload back as-is, but the reverse
     /// direction folds the disconnect kinds, so an `Io` carrying one of

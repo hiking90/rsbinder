@@ -124,7 +124,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, Connection, ServerConnection};
 use sha2::{Digest, Sha256};
 
-use super::{read_frame, write_frame, CertId, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{CertId, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Ciphertext read chunk: one TLS record is ≤ 16 KiB, so a read takes about one record.
@@ -954,15 +954,6 @@ impl TlsTransport {
 }
 
 impl RpcTransport for TlsTransport {
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // R34 framing over a `Write` adapter: bytes identical to every other stream backend.
-        write_frame(&mut RawIo(self), buf)
-    }
-
-    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        read_frame(&mut RawIo(self))
-    }
-
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         let sock = self.stream.socket().filter(|_| super::unix::WAITING_SENDS);
         self.send_records(buf, sock, None)
@@ -1082,36 +1073,5 @@ impl RpcTransport for TlsTransport {
         let cut = super::absorb_already_shut(self.stream.shutdown_stream());
         drop(held);
         cut
-    }
-}
-
-/// R34 framing over raw TLS I/O, so [`write_frame`]/[`read_frame`] emit identical bytes.
-struct RawIo<'a>(&'a TlsTransport);
-impl Read for RawIo<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self.0.recv_raw(buf) {
-            Ok(n) => Ok(n),
-            // Keep the io kind so `read_header` handles timeouts and clean close as R34 does.
-            Err(RpcError::Io(e)) => Err(e),
-            // `EAGAIN`'s kind, so `read_header`'s `is_timeout` fires (`DeadlineMidFrame` split).
-            Err(RpcError::Timeout) => Err(std::io::ErrorKind::WouldBlock.into()),
-            Err(RpcError::EndOfStream) => Ok(0),
-            // Carried as the payload so `From<io::Error>` hands it back past `read_header`.
-            Err(e @ RpcError::UncleanEndOfStream) => Err(std::io::Error::from(e)),
-            Err(e) => Err(std::io::Error::other(e.to_string())),
-        }
-    }
-}
-impl Write for RawIo<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        // Kind-preserving: a closed-peer write must reach `write_frame` as `EndOfStream`.
-        self.0.send_raw(buf).map_err(std::io::Error::from)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(()) // send_raw already flushes the socket
     }
 }

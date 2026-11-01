@@ -99,7 +99,7 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use super::{read_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport, MAX_FRAME_LEN};
+use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport, MAX_FRAME_LEN};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
@@ -608,16 +608,6 @@ fn peer_pid(_fd: std::os::fd::RawFd) -> i32 {
 }
 
 impl RpcTransport for UnixTransport {
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // A send runs beside a receiving thread with no lock.
-        send_frame_vectored(self.stream.as_fd(), buf, &[])
-    }
-
-    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        let mut r = &self.stream;
-        read_frame(&mut r)
-    }
-
     /// Raw, unframed write (android-13+ profile — the real android RPC
     /// wire has no length prefix). `send(2)` with `SEND_FLAGS` (no `SIGPIPE`)
     /// needs only `&self`, so it stays full-duplex (same as `send_frame`).

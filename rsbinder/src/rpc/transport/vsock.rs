@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 
 use vsock::{VsockAddr, VsockStream};
 
-use super::{read_frame, write_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// A framed transport over a connected vsock stream (Linux).
@@ -98,17 +98,6 @@ impl VsockTransport {
 }
 
 impl RpcTransport for VsockTransport {
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // `&VsockStream: Write` (vsock 0.5+): lock-free duplex, as in `UnixTransport`.
-        let mut w = &self.stream;
-        write_frame(&mut w, buf)
-    }
-
-    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        let mut r = &self.stream;
-        read_frame(&mut r)
-    }
-
     /// Raw, unframed write for the android-13+ profile (the real android
     /// RPC wire has no length prefix).
     /// The trait default refuses raw access, and a

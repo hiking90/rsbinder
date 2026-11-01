@@ -25,8 +25,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::unix::{send_frame_vectored, send_waiting};
-use super::{read_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
+use super::unix::send_waiting;
+use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// Set on the first `TcpDebugTransport` construction; gates the one-time warning, read by tests.
@@ -143,10 +143,6 @@ impl TcpDebugTransport {
 }
 
 impl RpcTransport for TcpDebugTransport {
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        send_frame_vectored(self.stream.as_fd(), buf, &[])
-    }
-
     // No fd passing: `fds` reaches only the trait's refusing default.
     fn send_raw_draining(
         &self,
@@ -164,11 +160,6 @@ impl RpcTransport for TcpDebugTransport {
             &[],
             Some(drain),
         )
-    }
-
-    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        let mut r = &self.stream;
-        read_frame(&mut r)
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android

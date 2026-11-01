@@ -116,7 +116,7 @@
 //! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). android-12
 //! frames its messages the same way. This is distinct from the
 //! `RpcTransport::send_frame` framing, which prepends a `u32` length
-//! (`transport::write_frame`) — that prefix is an rsbinder-ism a real
+//! (the trait's default) — that prefix is an rsbinder-ism a real
 //! android peer neither writes nor expects, and no `RpcSession` uses it.
 //!
 //! The `*_aosp_message*` and handshake helpers operate directly on a byte
