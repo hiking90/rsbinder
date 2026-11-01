@@ -526,6 +526,18 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   counted in `rejected_unknown_id_count`; the founding connection serves as
   before. Android 12 libbinder has no TLS and an rsbinder r34 client opens
   one connection, so no client of either sends such a join.
+- **An RPC server reads an interface token only before an AIDL call code**
+  (`FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION`), as the kernel path
+  and AOSP `RpcState` do: the generated stub checks the token, not the
+  session. `EXTENSION_TRANSACTION`, `DEBUG_PID_TRANSACTION`,
+  `DUMP_TRANSACTION` and a custom code outside that range reach the binder
+  with the parcel at position 0. 0.12.0 read a token before every code but
+  a two-way `PING` or `INTERFACE`, and failed a parcel without one with
+  `NotEnoughData`; Android 17 libbinder's `getExtension` sends none. A
+  handler of a non-call code whose client writes a token
+  (`prepare_request`, `prepare_transact(true)`) now reads that token as
+  payload: build the parcel with `prepare_transact(false)`. A oneway `PING`
+  or `INTERFACE` succeeds where 0.12.0 logged an error.
 - An RPC session on the android-13+ wire takes a null binder's stability
   from the low 16 bits of the word, as libbinder 13+ does, and accepts a
   word such as `0x00010000`; 0.12.0 compared all 32 bits with `UNDECLARED`

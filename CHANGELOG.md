@@ -215,6 +215,11 @@ accepts both the 0.12.0 bytes and the new ones.
   join or attach on the session id and the transport kind alone.
 - An `RpcServer` set up with TLS (`setup_*_tls`) refuses every r34 join;
   the r34 founding connection serves as before.
+- An RPC server reads the interface token only before an AIDL call code
+  (`FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION`), as the kernel path
+  does: `EXTENSION_TRANSACTION`, `DEBUG_PID_TRANSACTION`, `DUMP_TRANSACTION`
+  and a custom code outside that range reach the binder at position 0.
+  0.12.0 read a token first and failed a parcel without one.
 
 **Streams and topics**
 

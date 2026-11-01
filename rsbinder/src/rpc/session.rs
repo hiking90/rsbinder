@@ -4045,7 +4045,13 @@ impl RpcSessionInner {
             // AOSP RPC leaves the work source alone; reset it so a handler's `set` cannot leak.
             let _work_source = crate::thread_state::WorkSourceDispatchGuard::enter();
             crate::observe::observed(observed_ctx, || {
-                consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
+                // AOSP `RpcState` checks no token; the stub does, for call codes (kernel path too).
+                let token = if crate::binder::code_takes_token(code) {
+                    consume_rpc_interface_token(&mut reader, target.descriptor())
+                } else {
+                    Ok(())
+                };
+                token.and_then(|()| {
                     // Unwinding would skip the serve loop's slot cleanup; mirrors the kernel path.
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let token = crate::binder::sealed::Token::new();

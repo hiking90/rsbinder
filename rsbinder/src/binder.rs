@@ -101,6 +101,11 @@ const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
 pub const FIRST_CALL_TRANSACTION: u32 = 0x00000001;
 pub const LAST_CALL_TRANSACTION: u32 = 0x00ffffff;
 
+/// Whether a transaction with `code` starts with an interface token (AIDL call codes only).
+pub(crate) const fn code_takes_token(code: TransactionCode) -> bool {
+    FIRST_CALL_TRANSACTION <= code && code <= LAST_CALL_TRANSACTION
+}
+
 pub const PING_TRANSACTION: u32 = b_pack_chars('_', 'P', 'N', 'G');
 pub const DUMP_TRANSACTION: u32 = b_pack_chars('_', 'D', 'M', 'P');
 pub const SHELL_COMMAND_TRANSACTION: u32 = b_pack_chars('_', 'C', 'M', 'D');
@@ -2064,6 +2069,24 @@ mod tests {
         // ...but neither upgrades.
         assert!(matches!(weak1.upgrade(), Err(StatusCode::DeadObject)));
         assert!(matches!(weak2.upgrade(), Err(StatusCode::DeadObject)));
+    }
+
+    #[test]
+    fn only_call_codes_take_a_token() {
+        assert!(!code_takes_token(0));
+        assert!(code_takes_token(FIRST_CALL_TRANSACTION));
+        assert!(code_takes_token(LAST_CALL_TRANSACTION));
+        assert!(!code_takes_token(LAST_CALL_TRANSACTION + 1));
+        for code in [
+            PING_TRANSACTION,
+            DUMP_TRANSACTION,
+            SHELL_COMMAND_TRANSACTION,
+            INTERFACE_TRANSACTION,
+            EXTENSION_TRANSACTION,
+            DEBUG_PID_TRANSACTION,
+        ] {
+            assert!(!code_takes_token(code), "{code:#x}");
+        }
     }
 
     #[test]

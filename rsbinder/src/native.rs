@@ -476,7 +476,7 @@ impl<T: Remotable> Transactable for Inner<T> {
             }
 
             _ => {
-                if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code)
+                if crate::binder::code_takes_token(code)
                     && !(thread_state::check_interface(reader, T::descriptor())?)
                 {
                     // Status, never payload (read as success); as AOSP NDK `ABBinder::onTransact`.
@@ -1222,6 +1222,127 @@ mod rpc_dispatch_tests {
             );
         }
         handle.join().unwrap();
+    }
+
+    /// Special codes carry no token over RPC either (AOSP `getExtension` sends an empty parcel).
+    #[test]
+    fn rpc_special_codes_dispatch_without_an_interface_token() {
+        use crate::binder::RemoteProxy;
+
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let root = Binder::new(Echo);
+        root.set_extension(&Interface::as_binder(&Binder::new(Echo)))
+            .unwrap();
+        server.set_root(Interface::as_binder(&root)).unwrap();
+        let handle = std::thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        {
+            let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+            let root = client.get_root().unwrap();
+            let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
+            let call = |code| {
+                let data = rp.prepare_transact(false).unwrap();
+                assert_eq!(data.data_size(), 0);
+                rp.send(code, &data, 0)
+            };
+            let mut reply = call(EXTENSION_TRANSACTION).unwrap().unwrap();
+            assert!(reply.read::<Option<SIBinder>>().unwrap().is_some());
+            let mut reply = call(DEBUG_PID_TRANSACTION).unwrap().unwrap();
+            assert_eq!(
+                reply.read::<i32>().unwrap(),
+                rustix::process::getpid().as_raw_nonzero().get()
+            );
+            // A custom non-call code: the handler reads its payload from position 0.
+            let mut data = rp.prepare_transact(false).unwrap();
+            data.write(&42i32).unwrap();
+            let mut reply = rp.send(ECHO, &data, 0).unwrap().unwrap();
+            assert_eq!(reply.read::<i32>().unwrap(), 42);
+        }
+        handle.join().unwrap();
+    }
+
+    /// A token-less `DUMP` reaches `on_dump` on both fd shapes: R34 `[idx]`, android-13+ v1/v2.
+    #[test]
+    fn an_rpc_dump_without_a_token_reaches_on_dump() {
+        use crate::rpc::transport::UnixTransport;
+        use crate::rpc::FileDescriptorTransportMode as FdMode;
+        use std::io::Read;
+        use std::os::fd::AsFd;
+
+        for version in [None, Some(1), Some(2)] {
+            let (a, b) = UnixTransport::pair().unwrap();
+            let (server, client) = match version {
+                None => {
+                    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+                    server.set_supported_fd_modes(&[FdMode::Unix]);
+                    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+                    (server, client)
+                }
+                Some(v) => {
+                    let accept = std::thread::spawn(move || {
+                        let (t, codec, fd_mode, _, _) =
+                            RpcSession::android13plus_accept_handshake(Box::new(a), v).unwrap();
+                        RpcSession::from_android13plus(t, codec, fd_mode, true).unwrap()
+                    });
+                    let client =
+                        RpcSession::connect_android13plus_fd(Box::new(b), v, FdMode::Unix).unwrap();
+                    (accept.join().unwrap(), client)
+                }
+            };
+            server
+                .set_root(Interface::as_binder(&Binder::new(Svc)))
+                .unwrap();
+            let handle = std::thread::spawn(move || {
+                let _ = server.serve_blocking();
+            });
+            {
+                if version.is_none() {
+                    assert_eq!(
+                        client.negotiate_fd_transport(FdMode::Unix),
+                        Ok(FdMode::Unix)
+                    );
+                }
+                let root = client.get_root().unwrap();
+                let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
+                let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+                let mut data = crate::binder::RemoteProxy::prepare_transact(rp, false).unwrap();
+                crate::file_descriptor::write_raw_fd(&mut data, write_end.as_fd()).unwrap();
+                data.write(&0i32).unwrap();
+                drop(write_end);
+                rp.send(DUMP_TRANSACTION, &data, 0).unwrap();
+                let mut got = [0u8; 6];
+                std::fs::File::from(read_end).read_exact(&mut got).unwrap();
+                assert_eq!(&got, b"dumped", "version {version:?}");
+            }
+            // The serve loop returns when the connection closes.
+            drop(client);
+            handle.join().unwrap();
+        }
+    }
+
+    /// Echoes one `i32` for the non-call code `ECHO`.
+    struct Echo;
+    const ECHO: TransactionCode = LAST_CALL_TRANSACTION + 1;
+    impl Remotable for Echo {
+        fn descriptor() -> &'static str {
+            "x.y.IEcho"
+        }
+        fn on_transact(
+            &self,
+            code: TransactionCode,
+            data: &mut Parcel,
+            reply: &mut Parcel,
+        ) -> Result<()> {
+            if code != ECHO {
+                return Err(StatusCode::UnknownTransaction);
+            }
+            reply.write(&data.read::<i32>()?)
+        }
+        fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+            Ok(())
+        }
     }
 
     /// An RPC `DUMP_TRANSACTION` takes its fd from the session's table (AOSP `readFileDescriptor`).
