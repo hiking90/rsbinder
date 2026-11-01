@@ -281,22 +281,13 @@ pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// takes a per-arm precondition for exactly this:
 /// `_ = &mut died, if !dead => { dead = true; … }`.
 ///
-/// Dropping it before the death unregisters the notification.
-///
-/// Dropping it never panics. The kernel `unlink_to_death` panics on a
-/// poisoned recipients lock, which any earlier panic under that lock leaves
-/// behind. The unlink therefore runs under `catch_unwind` (as
-/// `bridge::unlink_all` does); a caught panic is logged and leaves the death
-/// link registered.
+/// Dropping it before the death unregisters the notification, through a
+/// [`DeathLink`](crate::DeathLink), so dropping it never panics.
 #[must_use = "dropping the signal at once unregisters the death notification at once"]
 pub struct DeathSignal {
     rx: tokio::sync::oneshot::Receiver<()>,
-    /// Strong: the link keeps only a `Weak`, so without this the notification would never fire.
-    recipient: Arc<SignalRecipient>,
-    /// Strong: the proxy owns the subscription; if the caller drops it, a weak ref pends forever.
-    binder: SIBinder,
-    /// `false` for an already-dead binder, which never got a link to undo.
-    linked: bool,
+    /// Holds the recipient and the binder; `None` for an already-dead binder, never linked.
+    link: Option<crate::DeathLink>,
     /// Set once `rx` has yielded: a `oneshot` receiver panics if polled again (see "fused").
     fired: bool,
 }
@@ -339,30 +330,10 @@ impl Future for DeathSignal {
     }
 }
 
-impl Drop for DeathSignal {
-    fn drop(&mut self) {
-        if !self.linked {
-            return;
-        }
-        // Unlink may panic (see `DeathSignal` doc); a panic out of `Drop` mid-unwind aborts.
-        let unlink = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.binder.unlink_to_death_arc(&self.recipient)
-        }));
-        match unlink {
-            Ok(Ok(())) => {}
-            // Expected once the obituary has been delivered.
-            Ok(Err(err)) => log::debug!("DeathSignal: unlink_to_death returned {err:?}"),
-            Err(_) => {
-                log::error!("DeathSignal: unlink_to_death panicked; a death link stays registered")
-            }
-        }
-    }
-}
-
 impl std::fmt::Debug for DeathSignal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeathSignal")
-            .field("linked", &self.linked)
+            .field("linked", &self.link.is_some())
             .field("fired", &self.fired)
             .finish_non_exhaustive()
     }
@@ -406,27 +377,20 @@ pub fn death_signal(binder: &SIBinder) -> Result<DeathSignal, StatusCode> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let recipient = Arc::new(SignalRecipient(Mutex::new(Some(tx))));
 
-    match binder.link_to_death_arc(&recipient) {
-        Ok(()) => Ok(DeathSignal {
-            rx,
-            recipient,
-            binder: binder.clone(),
-            linked: true,
-            fired: false,
-        }),
+    let link = match crate::DeathLink::new(binder, recipient.clone()) {
+        Ok(link) => Some(link),
         // Already dead (both stacks answer `DeadObject` after the obituary): completed signal.
         Err(StatusCode::DeadObject) => {
             recipient.fire();
-            Ok(DeathSignal {
-                rx,
-                recipient,
-                binder: binder.clone(),
-                linked: false,
-                fired: false,
-            })
+            None
         }
-        Err(err) => Err(err),
-    }
+        Err(err) => return Err(err),
+    };
+    Ok(DeathSignal {
+        rx,
+        link,
+        fired: false,
+    })
 }
 
 /// Use the Tokio `spawn_blocking` pool with AIDL.
@@ -576,7 +540,7 @@ mod tests {
     use crate::binder::{IBinder, Stability};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Records what [`death_signal`] does; `unlink_panics` models a poisoned `recipients` lock.
+    /// Records what [`death_signal`] does; `unlink_panics` models a panic inside the unlink.
     struct FakeRemote {
         link: Option<StatusCode>,
         unlink_panics: bool,

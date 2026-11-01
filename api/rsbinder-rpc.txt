@@ -4596,8 +4596,6 @@ pub fn rsbinder::DeathSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core:
 impl core::future::future::Future for rsbinder::DeathSignal
 pub type rsbinder::DeathSignal::Output = ()
 pub fn rsbinder::DeathSignal::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<()>
-impl core::ops::drop::Drop for rsbinder::DeathSignal
-pub fn rsbinder::DeathSignal::drop(&mut self)
 impl core::marker::Freeze for rsbinder::DeathSignal
 impl core::marker::Send for rsbinder::DeathSignal
 impl core::marker::Sync for rsbinder::DeathSignal

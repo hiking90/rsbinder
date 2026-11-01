@@ -86,7 +86,9 @@ use crate::entry::{open_staged, Client, ClientOptions, OpenStage};
 use crate::hub::{WaitEnd, WaiterState};
 #[cfg(feature = "rpc")]
 use crate::rpc::RpcSession;
-use crate::{DeathRecipient, FromIBinder, Result, SIBinder, Status, StatusCode, Strong, WIBinder};
+use crate::{
+    DeathLink, DeathRecipient, FromIBinder, Result, SIBinder, Status, StatusCode, Strong, WIBinder,
+};
 
 /// How a [`Reconnecting`] paces its attempts and how long a call waits for one.
 ///
@@ -611,13 +613,10 @@ enum Watch {
 
 struct Conn<T: FromIBinder + ?Sized + 'static> {
     proxy: Strong<T>,
-    binder: SIBinder,
+    parts: Parts,
     attempt: u64,
     #[cfg(feature = "rpc")]
     watch: Watch,
-    recipient: Option<Arc<Recipient<T>>>,
-    #[cfg(feature = "rpc")]
-    session: Option<RpcSession>,
 }
 
 struct State<T: FromIBinder + ?Sized + 'static> {
@@ -959,18 +958,11 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)).min(p.max)
     }
 
-    /// Unlink and end what a dropped connection holds; never under the lock.
+    /// Unlink and end what a dropped connection holds, then drop its proxy; never under the lock.
     fn discard(&self, conn: Conn<T>) {
-        if let Some(r) = &conn.recipient {
-            let _ = conn.binder.unlink_to_death_arc(r);
-        }
-        #[cfg(feature = "rpc")]
-        if let Some(s) = &conn.session {
-            if !s.is_ended() {
-                s.close_session();
-            }
-        }
-        drop(conn);
+        let Conn { proxy, parts, .. } = conn;
+        self.end_parts(parts);
+        drop(proxy);
     }
 
     fn close(&self) {
@@ -1041,7 +1033,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             binder,
             #[cfg(feature = "rpc")]
             session,
-            recipient: None,
+            link: None,
         };
 
         let proxy: Strong<T> = match conn_parts.binder.clone().into_interface_checked() {
@@ -1060,13 +1052,15 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                 shared: Arc::downgrade(self),
                 attempt: id,
             });
-            if let Err(code) = conn_parts.binder.link_to_death_arc(&recipient) {
-                // A dead binder the service manager has not forgotten yet, or a session gone.
-                drop(proxy);
-                self.end_parts(conn_parts);
-                return Err(Failure::transient(code));
+            match DeathLink::new(&conn_parts.binder, recipient) {
+                Ok(link) => conn_parts.link = Some(link),
+                Err(code) => {
+                    // A dead binder the service manager has not forgotten yet, or a session gone.
+                    drop(proxy);
+                    self.end_parts(conn_parts);
+                    return Err(Failure::transient(code));
+                }
             }
-            conn_parts.recipient = Some(recipient);
         }
 
         let generation = {
@@ -1102,13 +1096,10 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         }
         Ok(Conn {
             proxy,
-            binder: conn_parts.binder,
+            parts: conn_parts,
             attempt: id,
             #[cfg(feature = "rpc")]
             watch,
-            recipient: conn_parts.recipient,
-            #[cfg(feature = "rpc")]
-            session: conn_parts.session,
         })
     }
 
@@ -1124,11 +1115,9 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         Failure::permanent(StatusCode::Unknown)
     }
 
-    /// Undo a failed attempt's link and session (plan 10-10b K6).
-    fn end_parts(&self, parts: Parts<T>) {
-        if let Some(r) = &parts.recipient {
-            let _ = parts.binder.unlink_to_death_arc(r);
-        }
+    /// Undo a link, then end the session (plan 10-10b K6): closed first, it would run the recipient.
+    fn end_parts(&self, parts: Parts) {
+        drop(parts.link);
         #[cfg(feature = "rpc")]
         end_if_live(parts.session.as_ref());
     }
@@ -1255,7 +1244,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                         #[cfg(feature = "rpc")]
                         watch: conn.watch,
                         #[cfg(feature = "rpc")]
-                        session: conn.session.clone(),
+                        session: conn.parts.session.clone(),
                     };
                     drop(st);
                     #[cfg(feature = "rpc")]
@@ -1330,12 +1319,12 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
     }
 }
 
-/// What an attempt holds before it becomes a `Conn`.
-struct Parts<T: FromIBinder + ?Sized + 'static> {
+/// What an attempt holds, and a `Conn` ends with: the binder, its session, the death link.
+struct Parts {
     binder: SIBinder,
     #[cfg(feature = "rpc")]
     session: Option<RpcSession>,
-    recipient: Option<Arc<Recipient<T>>>,
+    link: Option<DeathLink>,
 }
 
 /// A live session the helper drops must be closed: its incoming threads hold it (K6).
@@ -1417,6 +1406,59 @@ mod tests {
         fn try_from(_: SIBinder) -> Result<Strong<Self>> {
             Err(StatusCode::BadType)
         }
+    }
+
+    /// A remote binder that links, and whose unlink panics and is counted.
+    struct PanickingUnlink(Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::IBinder for PanickingUnlink {
+        fn link_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Ok(())
+        }
+        fn unlink_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("the unlink panics");
+        }
+        fn ping_binder(&self) -> Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_transactable(&self) -> Option<&dyn crate::Transactable> {
+            None
+        }
+        fn descriptor(&self) -> &str {
+            "rsbinder.test.Unreachable"
+        }
+        fn is_remote(&self) -> bool {
+            true
+        }
+    }
+
+    /// A connection's unlink that panics is logged by its `DeathLink`, not raised by `discard`.
+    #[test]
+    fn a_panicking_unlink_stays_inside_discard() {
+        let unlinked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let binder = SIBinder::new(Arc::new(PanickingUnlink(unlinked.clone()))).expect("binder");
+        let h = stale_helper();
+        let recipient = Arc::new(Recipient {
+            shared: Arc::downgrade(&h.shared),
+            attempt: 1,
+        });
+        let conn = Conn {
+            proxy: Strong::new(Box::new(Unreachable)),
+            parts: Parts {
+                link: Some(DeathLink::new(&binder, recipient).expect("link")),
+                binder,
+                #[cfg(feature = "rpc")]
+                session: None,
+            },
+            attempt: 1,
+            #[cfg(feature = "rpc")]
+            watch: Watch::Recipient,
+        };
+        assert!(catch_unwind(AssertUnwindSafe(|| h.shared.discard(conn))).is_ok());
+        assert_eq!(unlinked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// A helper as `build` leaves it after a transient failure: `Stale`, no thread yet.
