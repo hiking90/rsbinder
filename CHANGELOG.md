@@ -21,6 +21,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `register_for_notifications` with the unregister held by a guard, the
   pairing `wait_for_service` and `rsbinder-topic`'s service-manager
   resolver now use.
+- **`rsbinder_fmq::shm::seal_unsupported`**: whether an `add_seals` error
+  means the kernel lacks a seal of the mask (`EINVAL` for a mask with
+  `FUTURE_WRITE`, Linux before 5.1). It reads the answer right only for a
+  memfd the caller created, since a file that takes no seals answers
+  `EINVAL` too.
 
 ### Changed
 
@@ -32,6 +37,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   topic's memory or pool failed when a receive ends with
   `Closed::Corrupted`, and when a subscription is refused for it; the
   error itself is unchanged.
+
+### Removed
+
+- **`rsbinder_fmq::shm::create_mapped`**: nothing called it, and its one
+  error did not say which of the create, the map or the seal failed. Call
+  `create`, `Mapping::map` and `add_seals` in that order; `add_seals`'s
+  documentation says why the map comes before a `FUTURE_WRITE` seal.
 
 ## [0.13.0] - 2026-10-31
 

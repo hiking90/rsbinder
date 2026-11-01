@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use crate::descriptor::{
     default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor, Grantor,
 };
-use crate::error::{received, Error, Result, EINVAL};
+use crate::error::{received, Error, Result};
 use crate::queue::{
     allocate_shared, check_target, map_counter, map_grantor_ro, map_ring, ring_bytes, AtomicU64,
     Element, Regions,
@@ -417,8 +417,7 @@ impl<T: Element> UnsyncWriter<T> {
             seals |= Seals::FUTURE_WRITE;
         }
         match shm::add_seals(desc.fds[0].as_fd(), seals) {
-            // The kernel applies none of a mask that holds a seal it does not know.
-            Err(Error::Os(EINVAL)) if options.read_only_readers => return Err(Error::Unsupported),
+            Err(e) if shm::seal_unsupported(seals, &e) => return Err(Error::Unsupported),
             other => other?,
         }
         let shape = Shape {

@@ -107,7 +107,9 @@ use rsbinder::fmq::shm::{
     self, Bytes, Carve, CreateOptions, Lendable, Mapping, RoBytes, RoCarve, RoLendable, RoMapping,
     RoWord32, RoWord64, Seals, Word, Words,
 };
-use rsbinder::fmq::{Descriptor, Errno, Error, Flavor, Grantor, Result};
+#[cfg(test)]
+use rsbinder::fmq::Errno;
+use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 
 use crate::pool::{GenerationLoads, Generations, LendError, LentSlot, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
@@ -207,14 +209,13 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// The errno a kernel answers for a seal it does not know.
-const EINVAL: Errno = Errno::from_raw(rustix::io::Errno::INVAL.raw_os_error());
-
 /// Add `seals` to `fd`: `shm::add_seals`, behind the switch above.
 fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
     #[cfg(test)]
     if seals.contains(Seals::FUTURE_WRITE) && NO_FUTURE_WRITE.get() {
-        return Err(Error::Os(EINVAL));
+        // The errno a kernel answers for a seal it does not know.
+        let einval = Errno::from_raw(rustix::io::Errno::INVAL.raw_os_error());
+        return Err(Error::Os(einval));
     }
     shm::add_seals(fd, seals)
 }
@@ -223,8 +224,7 @@ fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
 fn seal(fd: BorrowedFd<'_>) -> Result<()> {
     let seals = Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL;
     match add_seals(fd, seals) {
-        // The kernel applies none of a mask that holds a seal it does not know.
-        Err(Error::Os(EINVAL)) => Err(Error::Unsupported),
+        Err(e) if shm::seal_unsupported(seals, &e) => Err(Error::Unsupported),
         other => other,
     }
 }

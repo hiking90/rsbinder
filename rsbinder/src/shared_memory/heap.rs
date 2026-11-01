@@ -205,11 +205,8 @@ mod backend {
         }
         match shm::add_seals(fd.as_fd(), seals) {
             Ok(()) => Ok(()),
-            // Pre-5.1 kernel lacks FUTURE_WRITE (EINVAL): apply the rest; `seals()` shows the gap.
-            Err(rsbinder_fmq::Error::Os(errno))
-                if errno.raw() == rustix::io::Errno::INVAL.raw_os_error()
-                    && seals.contains(Seals::FUTURE_WRITE) =>
-            {
+            // Pre-5.1 kernel lacks FUTURE_WRITE: apply the rest; `seals()` shows the gap.
+            Err(e) if shm::seal_unsupported(seals, &e) => {
                 log::warn!("memfd F_SEAL_FUTURE_WRITE unsupported by this kernel; read-only heap is not write-sealed");
                 shm::add_seals(fd.as_fd(), seals.difference(Seals::FUTURE_WRITE))?;
                 Ok(())
