@@ -2692,4 +2692,27 @@ mod tests {
             assert_eq!(back.message(), status.message());
         }
     }
+
+    /// A record whose exception no call may end with still ends the stream, as `BadValue`.
+    #[test]
+    fn an_end_record_with_a_marker_or_unknown_exception_reads_as_bad_value() {
+        for exception in [-127, -128, -129, -256, 7] {
+            let status = end_status(&end_payload(exception, 0, Some("m")));
+            assert_eq!(status.exception_code(), ExceptionCode::TransactionFailed);
+            assert_eq!(
+                status.transaction_error(),
+                StatusCode::BadValue,
+                "{exception}"
+            );
+        }
+    }
+
+    /// The end record's bytes (`contrib/ndk/rsbinder_stream.h`): two `i32` LE, then the message.
+    #[test]
+    fn an_end_record_is_two_le_words_and_the_message() {
+        let mut expected = vec![0xf8, 0xff, 0xff, 0xff, 0x09, 0x00, 0x00, 0x00];
+        expected.extend_from_slice(b"busy");
+        assert_eq!(end_payload(-8, 9, Some("busy")), expected);
+        assert_eq!(end_payload(0, 0, None), [0; 8]);
+    }
 }

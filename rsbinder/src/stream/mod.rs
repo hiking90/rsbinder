@@ -2121,7 +2121,7 @@ mod tests {
 
     #[test]
     fn an_exception_code_the_wire_may_not_carry_is_refused() {
-        for exception in [-127, -128, -129, 7] {
+        for exception in [-127, -128, -129, -256, 7] {
             assert_eq!(
                 status_from_fields(exception, 0, None).err(),
                 Some(StatusCode::BadValue),
