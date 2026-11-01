@@ -294,6 +294,34 @@ impl<T: Remotable> Inner<T> {
         Ok(())
     }
 
+    /// After the token, kernel and RPC alike: AOSP `BBinder::transact`'s special codes, the
+    /// stub, then the `onTransact` fallbacks below.
+    fn dispatch_common(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
+        match code {
+            PING_TRANSACTION => Ok(()),
+            EXTENSION_TRANSACTION => {
+                let ext = self.extension.read().expect("Extension lock poisoned");
+                SerializeOption::serialize_option(ext.as_ref(), reply)
+            }
+            STOP_RECORDING_TRANSACTION | START_RECORDING_TRANSACTION => {
+                log::error!("recording transactions are not supported");
+                Err(StatusCode::InvalidOperation)
+            }
+            DEBUG_PID_TRANSACTION => {
+                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
+            }
+            _ => match self.remotable.on_transact(code, reader, reply) {
+                Err(StatusCode::UnknownTransaction) => self.on_transact(code, reader, reply),
+                result => result,
+            },
+        }
+    }
+
     // The following functions can be redefined depending on the service.
     fn on_transact(
         &self,
@@ -404,29 +432,7 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
         reader: &mut Parcel,
         reply: &mut Parcel,
     ) -> Result<()> {
-        match code {
-            PING_TRANSACTION => Ok(()),
-            EXTENSION_TRANSACTION => {
-                let ext = self.extension.read().expect("Extension lock poisoned");
-                SerializeOption::serialize_option(ext.as_ref(), reply)?;
-                Ok(())
-            }
-            STOP_RECORDING_TRANSACTION | START_RECORDING_TRANSACTION => {
-                log::error!("recording transactions are not supported over RPC");
-                Err(StatusCode::InvalidOperation)
-            }
-            DEBUG_PID_TRANSACTION => {
-                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
-            }
-            _ => match self.remotable.on_transact(code, reader, reply) {
-                Ok(_) => Ok(()),
-                Err(StatusCode::UnknownTransaction) => {
-                    // As `Inner::transact`: fall back for INTERFACE_TRANSACTION etc.
-                    self.on_transact(code, reader, reply)
-                }
-                Err(err) => Err(err),
-            },
-        }
+        self.dispatch_common(code, reader, reply)
     }
 
     fn descriptor(&self) -> &str {
@@ -450,51 +456,13 @@ impl<T: Remotable> Transactable for Inner<T> {
         reply: &mut Parcel,
     ) -> Result<()> {
         reader.set_data_position(0);
-        match code {
-            PING_TRANSACTION => {
-                // Noting to do for PING_TRANSACTION.
-                Ok(())
-            }
-            EXTENSION_TRANSACTION => {
-                let ext = self.extension.read().expect("Extension lock poisoned");
-                SerializeOption::serialize_option(ext.as_ref(), reply)?;
-                Ok(())
-            }
-
-            STOP_RECORDING_TRANSACTION => {
-                log::error!("STOP_RECORDING_TRANSACTION is not supported.");
-                Err(StatusCode::InvalidOperation)
-            }
-
-            START_RECORDING_TRANSACTION => {
-                log::error!("START_RECORDING_TRANSACTION is not supported.");
-                Err(StatusCode::InvalidOperation)
-            }
-
-            DEBUG_PID_TRANSACTION => {
-                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
-            }
-
-            _ => {
-                if crate::binder::code_takes_token(code)
-                    && !(thread_state::check_interface(reader, T::descriptor())?)
-                {
-                    // Status, never payload (read as success); as AOSP NDK `ABBinder::onTransact`.
-                    return Err(StatusCode::BadType);
-                }
-
-                match self.remotable.on_transact(code, reader, reply) {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        if err == StatusCode::UnknownTransaction {
-                            self.on_transact(code, reader, reply)
-                        } else {
-                            Err(err)
-                        }
-                    }
-                }
-            }
+        if crate::binder::code_takes_token(code)
+            && !(thread_state::check_interface(reader, T::descriptor())?)
+        {
+            // Status, never payload (read as success); as AOSP NDK `ABBinder::onTransact`.
+            return Err(StatusCode::BadType);
         }
+        self.dispatch_common(code, reader, reply)
     }
 }
 
@@ -1261,6 +1229,40 @@ mod rpc_dispatch_tests {
             assert_eq!(reply.read::<i32>().unwrap(), 42);
         }
         handle.join().unwrap();
+    }
+
+    /// The kernel `transact` and `rpc_transact` answer every non-call code from one table: the
+    /// same status and reply bytes (`EXTENSION`, which writes a binder, is checked above).
+    #[test]
+    fn kernel_and_rpc_dispatch_answer_non_call_codes_alike() {
+        let b = Interface::as_binder(&Binder::new(Echo));
+        let t = b.as_transactable().unwrap();
+        for code in [
+            PING_TRANSACTION,
+            INTERFACE_TRANSACTION,
+            DEBUG_PID_TRANSACTION,
+            START_RECORDING_TRANSACTION,
+            STOP_RECORDING_TRANSACTION,
+            SHELL_COMMAND_TRANSACTION,
+            SYSPROPS_TRANSACTION,
+            ECHO,
+            ECHO + 1,
+        ] {
+            let run = |kernel: bool| {
+                let mut reader = Parcel::new();
+                reader.write(&7i32).unwrap();
+                let mut reply = Parcel::new();
+                let result = if kernel {
+                    t.transact(code, &mut reader, &mut reply)
+                } else {
+                    reader.set_data_position(0);
+                    let token = crate::binder::sealed::Token::new();
+                    b.rpc_transact(token, code, &mut reader, &mut reply)
+                };
+                (result, reply.rpc_data_bytes().to_vec())
+            };
+            assert_eq!(run(true), run(false), "{code:#x}");
+        }
     }
 
     /// A token-less `DUMP` reaches `on_dump` on both fd shapes: R34 `[idx]`, android-13+ v1/v2.
