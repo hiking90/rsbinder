@@ -62,7 +62,7 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, Arc, Mutex, OnceLock};
+use std::sync::{self, Arc, Mutex, OnceLock, PoisonError};
 
 use crate::binder::{
     DeathRecipient, IBinder, ReceivedStability, Stability, Transactable, WIBinder,
@@ -113,17 +113,11 @@ impl RpcProxy {
     /// Fire `binder_died` on each recipient (AOSP `BpBinder::sendObituary`, RPC); idempotent.
     pub(crate) fn send_obituary(&self, who: &WIBinder) {
         let snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
-            // `obituary_sent` is touched only under this lock; poison logs, never panics.
-            let mut recipients = match self.recipients.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    log::error!(
-                        "RPC obituary skipped: recipients lock poisoned for addr {:?}",
-                        self.addr
-                    );
-                    return;
-                }
-            };
+            // `obituary_sent` is touched only under this lock; the list survives a panic.
+            let mut recipients = self
+                .recipients
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if self.obituary_sent.load(Ordering::Relaxed) {
                 return;
             }
@@ -366,19 +360,27 @@ impl IBinder for RpcProxy {
     /// happened to fail, so it is not registered. A call that fails on a
     /// lost connection still runs the session's death sequence, which is
     /// what fires the recipients registered on a session that qualifies.
+    ///
+    /// The checks run in this order: `InvalidOperation` above, then
+    /// [`StatusCode::DeadObject`] after the obituary, then
+    /// [`StatusCode::BadValue`] for a recipient with no strong reference left.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         if !self.session.notices_connection_loss() {
             unwatched_session_link();
             return Err(StatusCode::InvalidOperation);
         }
         // Check `obituary_sent` under the lock, as AOSP `linkToDeath` checks `mObitsSent`.
-        let mut recipients = self.recipients.lock().map_err(|_| {
-            // Poison = a prior panic on the death path; `DeadObject` lets the caller reconnect.
-            StatusCode::DeadObject
-        })?;
+        let mut recipients = self
+            .recipients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.obituary_sent.load(Ordering::Relaxed) {
             // Connection already dropped — AOSP returns DEAD_OBJECT.
             return Err(StatusCode::DeadObject);
+        }
+        // As the kernel proxy: a dead weak would never fire.
+        if recipient.strong_count() == 0 {
+            return Err(StatusCode::BadValue);
         }
         recipients.push(recipient);
         Ok(())
@@ -388,10 +390,10 @@ impl IBinder for RpcProxy {
     /// — kernel `removeAt(i)` parity, *not* `retain`, so a duplicate
     /// registration keeps its remaining subscriptions).
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        let mut recipients = self.recipients.lock().map_err(|_| {
-            // Poison = a prior panic on the death path; `DeadObject` lets the caller reconnect.
-            StatusCode::DeadObject
-        })?;
+        let mut recipients = self
+            .recipients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }

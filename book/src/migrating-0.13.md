@@ -538,6 +538,12 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   (`prepare_request`, `prepare_transact(true)`) now reads that token as
   payload: build the parcel with `prepare_transact(false)`. A oneway `PING`
   or `INTERFACE` succeeds where 0.12.0 logged an error.
+- **`link_to_death` on an RPC proxy refuses a recipient with no strong
+  reference left** with `BadValue`, as a kernel proxy always has: such a
+  recipient could never be notified. 0.12.0 returned `Ok` and dropped it at
+  the obituary. The checks run in the order `InvalidOperation` (a session
+  that would not notice the loss), `DeadObject`, `BadValue`. Keep a strong
+  `Arc` of the recipient for as long as the link should last.
 - An RPC session on the android-13+ wire takes a null binder's stability
   from the low 16 bits of the word, as libbinder 13+ does, and accepts a
   word such as `0x00010000`; 0.12.0 compared all 32 bits with `UNDECLARED`

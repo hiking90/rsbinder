@@ -3274,6 +3274,16 @@ fn rpc_death_recipient_fires_on_session_drop() {
     // The "incoming thread": recorded before the thread starts, so the links below never race it.
     let serve = client.spawn_serve().expect("spawn_serve");
 
+    // As the kernel proxy: a recipient already gone would never fire.
+    let (tx_gone, _rx_gone) = std::sync::mpsc::sync_channel::<()>(1);
+    let strong: Arc<dyn rsbinder::DeathRecipient> = Arc::new(DeathFlag(tx_gone));
+    let gone = Arc::downgrade(&strong);
+    drop(strong);
+    assert_eq!(
+        root.link_to_death(gone),
+        Err(rsbinder::StatusCode::BadValue)
+    );
+
     root.link_to_death(weak_live.clone()).expect("link live");
     root.link_to_death(weak_dead.clone()).expect("link dead");
     // Single-position removal: only `dead` is unlinked.

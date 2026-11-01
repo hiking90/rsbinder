@@ -52,10 +52,14 @@
 //! 3. A second `send_obituary` (e.g. a spurious double `BR_DEAD_BINDER`) sees
 //!    `obituary_sent` and returns, as C++'s `if (mObitsSent) return;`.
 //! 4. The unlink (and with it any `BC_CLEAR_DEATH_NOTIFICATION`) is reported
-//!    before the list is taken, best
-//!    effort: `BR_DEAD_BINDER` is delivered once, so a queueing failure must
+//!    before the list is taken, best effort, a panic included:
+//!    `BR_DEAD_BINDER` is delivered once, so a queueing failure must
 //!    not abort the obituary, or the recipients would never hear of the death
 //!    and `obituary_sent` would never latch.
+//!
+//! The `recipients` lock recovers from poison: the list only ever has a
+//! recipient pushed or removed, so it is valid after any panic. The death
+//! registry's own lock is not recovered (`process_state`).
 //! 5. The `Release` store of `obituary_sent` publishes the teardown to the
 //!    lock-free `Acquire` loads in `submit_transact` and `dump` (C++
 //!    `mAlive = 0; ... mObitsSent = 1`, published by the mutex unlock). Those
@@ -186,7 +190,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, Arc, Mutex, RwLock};
+use std::sync::{self, Arc, Mutex, PoisonError, RwLock};
 
 use crate::process_state::{HandlePin, ProcessState};
 use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
@@ -375,7 +379,11 @@ impl ProxyHandle {
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
         // Mirrors C++ `BpBinder::sendObituary`; see module doc "Death notifications".
         let recipients_snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
-            let mut recipients = self.recipients.lock().expect("Recipients lock poisoned");
+            // A list of pushes and removes stays valid across a panic: recover it.
+            let mut recipients = self
+                .recipients
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
 
             // Checked and set under the lock (as C++), so `Relaxed` suffices.
             if self.obituary_sent.load(Ordering::Relaxed) {
@@ -383,14 +391,22 @@ impl ProxyHandle {
             }
 
             if !recipients.is_empty() {
-                // Best effort, as AOSP: a failure must not stop the once-only obituary.
-                let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
-                if let Err(e) = unlinked {
-                    log::error!(
+                // Best effort, as AOSP, panic included: `BR_DEAD_BINDER` comes once.
+                let unlinked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ProcessState::as_self().unlink_death(self.handle, self.owner_key())
+                }));
+                match unlinked {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::error!(
                         "clear_death_notification failed for handle {}: {e:?}; \
                          delivering the obituary anyway",
                         self.handle()
-                    );
+                    ),
+                    Err(_) => log::error!(
+                        "clear_death_notification panicked for handle {}; \
+                         delivering the obituary anyway",
+                        self.handle()
+                    ),
                 }
             }
 
@@ -586,12 +602,15 @@ impl IBinder for ProxyHandle {
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock before checking `obituary_sent`; see module doc "Death notifications".
-        let mut recipients = self.recipients.lock().expect("Recipients lock poisoned");
+        let mut recipients = self
+            .recipients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }
-        // A dead weak would never fire: reject it before it takes a kernel subscription.
-        if recipient.upgrade().is_none() {
+        // A dead weak would never fire; a count, as an `upgrade` could run its `Drop` here.
+        if recipient.strong_count() == 0 {
             return Err(StatusCode::BadValue);
         }
         if recipients.is_empty() {
@@ -614,7 +633,10 @@ impl IBinder for ProxyHandle {
     /// once expects one callback to remain.
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         // Lock before checking `obituary_sent`, as C++ `BpBinder::unlinkToDeath`.
-        let mut recipients = self.recipients.lock().expect("Recipients lock poisoned");
+        let mut recipients = self
+            .recipients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.obituary_sent.load(Ordering::Relaxed) {
             return Err(StatusCode::DeadObject);
         }

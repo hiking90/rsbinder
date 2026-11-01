@@ -1283,6 +1283,7 @@ impl ProcessState {
     }
 
     fn death_lock(&self) -> sync::MutexGuard<'_, DeathRegistry> {
+        // Not recovered: a panic before `abort_request` leaves a slot no kernel request backs.
         self.death.lock().expect("Death registry lock poisoned")
     }
 

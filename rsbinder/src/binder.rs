@@ -347,6 +347,10 @@ pub trait IBinder: Any + Send + Sync {
     /// caller must keep its own strong `Arc` to the recipient alive for the
     /// duration of the link — otherwise the notification silently never fires.
     ///
+    /// A remote binder returns [`StatusCode::DeadObject`] once its death has
+    /// been delivered, and [`StatusCode::BadValue`] for a `recipient` with no
+    /// strong reference left, which could never fire.
+    ///
     /// Over the RPC transport, death is detected as a dropped session
     /// connection rather than a kernel `BR_DEAD_BINDER`, and the link is
     /// refused with `InvalidOperation` unless this side's session notices a

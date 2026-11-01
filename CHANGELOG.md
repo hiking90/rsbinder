@@ -220,6 +220,9 @@ accepts both the 0.12.0 bytes and the new ones.
   does: `EXTENSION_TRANSACTION`, `DEBUG_PID_TRANSACTION`, `DUMP_TRANSACTION`
   and a custom code outside that range reach the binder at position 0.
   0.12.0 read a token first and failed a parcel without one.
+- `link_to_death` on an RPC proxy refuses a recipient with no strong
+  reference left with `BadValue`, as a kernel proxy does; 0.12.0 returned
+  `Ok` and never notified it.
 
 **Streams and topics**
 
