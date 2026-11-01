@@ -335,8 +335,9 @@ use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::death::{DeathCmd, DeathRegistry};
-use crate::freeze::{ClearDone, FreezeCmd, FreezeRegistry};
+use crate::death::DeathRegistry;
+use crate::freeze::FreezeRegistry;
+use crate::notification::{ClearDone, NotifyCmd, Registrations};
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
 /// A handle's shared `BC_INCREFS`; `Drop` write-locks `handle_to_proxy`, so never drop under it.
@@ -1262,20 +1263,35 @@ impl ProcessState {
 
     /// `BR_CLEAR_DEATH_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
     pub(crate) fn death_clear_done(&self, handle: u32) {
-        {
-            let mut registry = self.death_lock();
-            // A link made during the clear asked for this request (module doc "Death links").
-            if registry.clear_done(handle) == ClearDone::Rerequest {
-                if let Err(err) = thread_state::send_death_request(handle) {
-                    registry.abort_request(handle);
-                    log::error!(
-                        "BC_REQUEST_DEATH_NOTIFICATION for handle {handle} failed: {err:?}; \
-                         its recipients will not hear of its death"
-                    );
-                }
+        // A link made during the clear asked for this request (module doc "Death links").
+        self.finish_clear(
+            self.death_lock(),
+            handle,
+            ClearKind::Death,
+            thread_state::send_death_request,
+            "its recipients will not hear of its death",
+        );
+    }
+
+    /// A clear's done for `registry`: the request a registration made during the clear asked
+    /// for, flushed under the lock (or the slot forgotten), then the pins the clear held.
+    fn finish_clear<R: Registrations>(
+        &self,
+        mut registry: sync::MutexGuard<'_, R>,
+        handle: u32,
+        kind: ClearKind,
+        request: fn(u32) -> Result<()>,
+        lost: &str,
+    ) {
+        if registry.clear_done(handle) == ClearDone::Rerequest {
+            if let Err(err) = request(handle) {
+                registry.abort_request(handle);
+                log::error!("{kind:?} re-request for handle {handle} failed: {err:?}; {lost}");
             }
         }
-        let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Death);
+        drop(registry);
+        // The ledger warns for a done with no clear in flight, of either kind.
+        let count = self.pin_ledger_lock().clear_done(handle, kind);
         release_pins(handle, count);
     }
 
@@ -1287,7 +1303,7 @@ impl ProcessState {
     /// `owner`'s recipient list became non-empty; `Err` means nothing was registered.
     pub(crate) fn link_death(&self, handle: u32, owner: usize) -> Result<()> {
         let mut registry = self.death_lock();
-        if registry.link(handle, owner) == Some(DeathCmd::Request) {
+        if registry.link(handle, owner) == Some(NotifyCmd::Request) {
             // Flushed under the lock: a clear written after it must not overtake it.
             thread_state::send_death_request(handle)
                 .inspect_err(|_| registry.abort_request(handle))?;
@@ -1299,7 +1315,7 @@ impl ProcessState {
     pub(crate) fn unlink_death(&self, handle: u32, owner: usize) -> Result<()> {
         let mut registry = self.death_lock();
         match registry.unlink(handle, owner) {
-            Some(DeathCmd::Clear) => thread_state::clear_death_notification(handle),
+            Some(NotifyCmd::Clear) => thread_state::clear_death_notification(handle),
             _ => Ok(()),
         }
     }
@@ -1333,7 +1349,7 @@ impl ProcessState {
     ) -> Result<()> {
         {
             let mut registry = self.freeze_lock();
-            if registry.add(handle, owner, proxy, callback) == Some(FreezeCmd::Request) {
+            if registry.add(handle, owner, proxy, callback) == Some(NotifyCmd::Request) {
                 self.request_freeze_locked(&mut registry, handle)?;
             }
         }
@@ -1359,7 +1375,7 @@ impl ProcessState {
         callback: &sync::Weak<dyn FrozenStateChangeCallback>,
     ) -> Result<()> {
         let mut registry = self.freeze_lock();
-        if registry.remove(handle, owner, callback)? == Some(FreezeCmd::Clear) {
+        if registry.remove(handle, owner, callback)? == Some(NotifyCmd::Clear) {
             Self::write_freeze_clear(handle);
             // AOSP flushes eagerly (`RELEASE_LIBBINDER_FREEZE_USE_FLUSH_EAGERLY`).
             if let Err(err) = thread_state::flush_commands_if_alive() {
@@ -1373,7 +1389,7 @@ impl ProcessState {
 
     /// `ProxyHandle::drop` of a proxy that registered callbacks; on a looper the clear waits.
     pub(crate) fn drop_frozen_owner(&self, handle: u32, owner: usize) {
-        if self.freeze_lock().drop_owner(handle, owner) == Some(FreezeCmd::Clear) {
+        if self.freeze_lock().drop_owner(handle, owner) == Some(NotifyCmd::Clear) {
             Self::write_freeze_clear(handle);
         }
     }
@@ -1394,25 +1410,14 @@ impl ProcessState {
 
     /// `BR_CLEAR_FREEZE_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
     pub(crate) fn freeze_clear_done(&self, handle: u32) {
-        let outcome = {
-            let mut registry = self.freeze_lock();
-            let outcome = registry.clear_done(handle);
-            // AOSP re-requests here too (`onFrozenStateChangeListenerRemoved`).
-            if outcome == ClearDone::Rerequest {
-                if let Err(err) = self.request_freeze_locked(&mut registry, handle) {
-                    log::error!(
-                        "BC_REQUEST_FREEZE_NOTIFICATION for handle {handle} failed: {err:?}; \
-                         its callbacks are dropped"
-                    );
-                }
-            }
-            outcome
-        };
-        if outcome == ClearDone::Unexpected {
-            log::warn!("BR_CLEAR_FREEZE_NOTIFICATION_DONE for handle {handle} with no clear");
-        }
-        let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Freeze);
-        release_pins(handle, count);
+        // AOSP re-requests here too (`onFrozenStateChangeListenerRemoved`).
+        self.finish_clear(
+            self.freeze_lock(),
+            handle,
+            ClearKind::Freeze,
+            thread_state::send_freeze_request,
+            "its callbacks are dropped",
+        );
     }
 
     /// Runs `handle`'s undelivered callbacks, one thread at a time; see `freeze` module doc.

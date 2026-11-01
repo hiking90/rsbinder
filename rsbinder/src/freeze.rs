@@ -79,32 +79,7 @@ use std::sync::{self, Arc};
 
 use crate::binder::{FrozenState, FrozenStateChangeCallback};
 use crate::error::StatusCode;
-
-/// A command the caller writes while still holding the registry lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FreezeCmd {
-    Request,
-    Clear,
-}
-
-/// What a `BR_CLEAR_FREEZE_NOTIFICATION_DONE` did to the slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClearDone {
-    /// The slot is gone; nothing is registered for the handle.
-    Removed,
-    /// Callbacks were added during the clear; the caller writes a request.
-    Rerequest,
-    /// No clear was in flight for the handle.
-    Unexpected,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kernel {
-    /// The request was written; `last` is the latest state the kernel reported.
-    Registered { last: Option<bool> },
-    /// The clear was written; `rerequest` if callbacks were added since.
-    PendingClear { rerequest: bool },
-}
+use crate::notification::{ClearDone, Kernel, NotifyCmd, Registrations};
 
 struct Entry<P> {
     owner: usize,
@@ -117,27 +92,19 @@ struct Entry<P> {
 struct Slot<P> {
     /// Unique per slot ever created; the delivery claim's token (module doc "Delivery").
     id: u64,
-    kernel: Kernel,
+    /// Registered with the latest state the kernel reported, if any.
+    kernel: Kernel<Option<bool>>,
     entries: Vec<Entry<P>>,
     delivering: bool,
 }
 
 impl<P> Slot<P> {
     /// After entries were removed: the clear to write, if none remain.
-    fn after_removal(&mut self) -> Option<FreezeCmd> {
+    fn after_removal(&mut self) -> Option<NotifyCmd> {
         if !self.entries.is_empty() {
             return None;
         }
-        match &mut self.kernel {
-            Kernel::Registered { .. } => {
-                self.kernel = Kernel::PendingClear { rerequest: false };
-                Some(FreezeCmd::Clear)
-            }
-            Kernel::PendingClear { rerequest } => {
-                *rerequest = false;
-                None
-            }
-        }
+        self.kernel.emptied()
     }
 }
 
@@ -168,7 +135,7 @@ impl<P: Clone> FreezeRegistry<P> {
         owner: usize,
         proxy: P,
         callback: sync::Weak<dyn FrozenStateChangeCallback>,
-    ) -> Option<FreezeCmd> {
+    ) -> Option<NotifyCmd> {
         let entry = Entry {
             owner,
             proxy,
@@ -180,26 +147,19 @@ impl<P: Clone> FreezeRegistry<P> {
                 self.next_id += 1;
                 vacant.insert(Slot {
                     id: self.next_id,
-                    kernel: Kernel::Registered { last: None },
+                    kernel: Kernel::requested(),
                     entries: vec![entry],
                     delivering: false,
                 });
-                Some(FreezeCmd::Request)
+                Some(NotifyCmd::Request)
             }
             MapEntry::Occupied(occupied) => {
                 let slot = occupied.into_mut();
-                if let Kernel::PendingClear { rerequest } = &mut slot.kernel {
-                    *rerequest = true;
-                }
+                slot.kernel.added();
                 slot.entries.push(entry);
                 None
             }
         }
-    }
-
-    /// Forgets `handle` after its request could not be written.
-    pub(crate) fn abort_request(&mut self, handle: u32) {
-        self.slots.remove(&handle);
     }
 
     /// Removes `owner`'s first registration of `callback`; `Some(Clear)` if none remain.
@@ -208,7 +168,7 @@ impl<P: Clone> FreezeRegistry<P> {
         handle: u32,
         owner: usize,
         callback: &sync::Weak<dyn FrozenStateChangeCallback>,
-    ) -> Result<Option<FreezeCmd>, StatusCode> {
+    ) -> Result<Option<NotifyCmd>, StatusCode> {
         let slot = self
             .slots
             .get_mut(&handle)
@@ -223,7 +183,7 @@ impl<P: Clone> FreezeRegistry<P> {
     }
 
     /// Removes every entry of a dropping proxy; `Some(Clear)` if none remain.
-    pub(crate) fn drop_owner(&mut self, handle: u32, owner: usize) -> Option<FreezeCmd> {
+    pub(crate) fn drop_owner(&mut self, handle: u32, owner: usize) -> Option<NotifyCmd> {
         let slot = self.slots.get_mut(&handle)?;
         slot.entries.retain(|e| e.owner != owner);
         slot.after_removal()
@@ -232,7 +192,7 @@ impl<P: Clone> FreezeRegistry<P> {
     /// Records a `BR_FROZEN_BINDER`; `true` if the state is new and should be delivered.
     pub(crate) fn state_changed(&mut self, handle: u32, is_frozen: bool) -> bool {
         match self.slots.get_mut(&handle).map(|slot| &mut slot.kernel) {
-            Some(Kernel::Registered { last }) if *last != Some(is_frozen) => {
+            Some(Kernel::Registered(last)) if *last != Some(is_frozen) => {
                 *last = Some(is_frozen);
                 true
             }
@@ -241,32 +201,12 @@ impl<P: Clone> FreezeRegistry<P> {
         }
     }
 
-    /// Records a `BR_CLEAR_FREEZE_NOTIFICATION_DONE`.
-    pub(crate) fn clear_done(&mut self, handle: u32) -> ClearDone {
-        let Some(slot) = self.slots.get_mut(&handle) else {
-            return ClearDone::Unexpected;
-        };
-        match slot.kernel {
-            Kernel::Registered { .. } => ClearDone::Unexpected,
-            Kernel::PendingClear { rerequest } if rerequest && !slot.entries.is_empty() => {
-                // The kernel resends the initial state, and AOSP re-delivers it to all.
-                slot.kernel = Kernel::Registered { last: None };
-                slot.entries.iter_mut().for_each(|e| e.delivered = None);
-                ClearDone::Rerequest
-            }
-            Kernel::PendingClear { .. } => {
-                self.slots.remove(&handle);
-                ClearDone::Removed
-            }
-        }
-    }
-
     /// One `P` per owner with an undelivered state; empty while another thread delivers.
     pub(crate) fn pending_owners(&self, handle: u32) -> Vec<P> {
         let Some(slot) = self.slots.get(&handle).filter(|slot| !slot.delivering) else {
             return Vec::new();
         };
-        let Kernel::Registered { last: Some(last) } = slot.kernel else {
+        let Kernel::Registered(Some(last)) = slot.kernel else {
             return Vec::new();
         };
         let mut owners: Vec<(usize, P)> = Vec::new();
@@ -284,10 +224,7 @@ impl<P: Clone> FreezeRegistry<P> {
         if slot.delivering {
             return None;
         }
-        let Kernel::Registered {
-            last: Some(is_frozen),
-        } = slot.kernel
-        else {
+        let Kernel::Registered(Some(is_frozen)) = slot.kernel else {
             return None;
         };
         // AOSP prunes dead callbacks here too; an emptied list keeps the registration.
@@ -317,8 +254,33 @@ impl<P: Clone> FreezeRegistry<P> {
     }
 
     #[cfg(test)]
-    fn kernel(&self, handle: u32) -> Option<Kernel> {
+    fn kernel(&self, handle: u32) -> Option<Kernel<Option<bool>>> {
         self.slots.get(&handle).map(|slot| slot.kernel)
+    }
+}
+
+impl<P> Registrations for FreezeRegistry<P> {
+    /// Records a `BR_CLEAR_FREEZE_NOTIFICATION_DONE`.
+    fn clear_done(&mut self, handle: u32) -> ClearDone {
+        let Some(slot) = self.slots.get_mut(&handle) else {
+            return ClearDone::Unexpected;
+        };
+        match slot.kernel.clear_done(!slot.entries.is_empty()) {
+            ClearDone::Rerequest => {
+                // The kernel resends the initial state, and AOSP re-delivers it to all.
+                slot.entries.iter_mut().for_each(|e| e.delivered = None);
+                ClearDone::Rerequest
+            }
+            ClearDone::Removed => {
+                self.slots.remove(&handle);
+                ClearDone::Removed
+            }
+            ClearDone::Unexpected => ClearDone::Unexpected,
+        }
+    }
+
+    fn abort_request(&mut self, handle: u32) {
+        self.slots.remove(&handle);
     }
 }
 
@@ -346,12 +308,12 @@ mod tests {
         let (c1, c2) = (callback(), callback());
         assert_eq!(
             reg.add(H, A, A, Arc::downgrade(&c1)),
-            Some(FreezeCmd::Request)
+            Some(NotifyCmd::Request)
         );
         assert_eq!(reg.add(H, A, A, Arc::downgrade(&c2)), None);
         // A second proxy of the same handle (case (b) overlap) must not request again.
         assert_eq!(reg.add(H, B, B, Arc::downgrade(&c1)), None);
-        assert_eq!(reg.kernel(H), Some(Kernel::Registered { last: None }));
+        assert_eq!(reg.kernel(H), Some(Kernel::Registered(None)));
     }
 
     #[test]
@@ -363,7 +325,7 @@ mod tests {
         assert_eq!(reg.remove(H, A, &Arc::downgrade(&c1)), Ok(None));
         assert_eq!(
             reg.remove(H, A, &Arc::downgrade(&c2)),
-            Ok(Some(FreezeCmd::Clear))
+            Ok(Some(NotifyCmd::Clear))
         );
         assert_eq!(
             reg.kernel(H),
@@ -390,7 +352,7 @@ mod tests {
         assert_eq!(reg.remove(H, A, &Arc::downgrade(&c)), Ok(None));
         assert_eq!(
             reg.remove(H, A, &Arc::downgrade(&c)),
-            Ok(Some(FreezeCmd::Clear))
+            Ok(Some(NotifyCmd::Clear))
         );
         assert_eq!(
             reg.remove(99, A, &Arc::downgrade(&c)),
@@ -405,7 +367,7 @@ mod tests {
         reg.add(H, A, A, Arc::downgrade(&old));
         reg.add(H, B, B, Arc::downgrade(&new));
         assert_eq!(reg.drop_owner(H, A), None);
-        assert_eq!(reg.drop_owner(H, B), Some(FreezeCmd::Clear));
+        assert_eq!(reg.drop_owner(H, B), Some(NotifyCmd::Clear));
     }
 
     #[test]
@@ -416,7 +378,7 @@ mod tests {
         drop(c);
         assert!(reg.state_changed(H, true));
         assert!(reg.begin_batch(H, A).is_none());
-        assert_eq!(reg.drop_owner(H, A), Some(FreezeCmd::Clear));
+        assert_eq!(reg.drop_owner(H, A), Some(NotifyCmd::Clear));
     }
 
     #[test]
@@ -424,11 +386,11 @@ mod tests {
         let mut reg = FreezeRegistry::default();
         let c = callback();
         reg.add(H, A, A, Arc::downgrade(&c));
-        assert_eq!(reg.drop_owner(H, A), Some(FreezeCmd::Clear));
+        assert_eq!(reg.drop_owner(H, A), Some(NotifyCmd::Clear));
         // No request while the clear is in flight (kernel would refuse a second one).
         assert_eq!(reg.add(H, B, B, Arc::downgrade(&c)), None);
         assert_eq!(reg.clear_done(H), ClearDone::Rerequest);
-        assert_eq!(reg.kernel(H), Some(Kernel::Registered { last: None }));
+        assert_eq!(reg.kernel(H), Some(Kernel::Registered(None)));
     }
 
     #[test]
@@ -444,7 +406,7 @@ mod tests {
         // A fresh add after removal requests again.
         assert_eq!(
             reg.add(H, B, B, Arc::downgrade(&c)),
-            Some(FreezeCmd::Request)
+            Some(NotifyCmd::Request)
         );
     }
 
@@ -455,7 +417,7 @@ mod tests {
         let c = callback();
         reg.add(H, A, A, Arc::downgrade(&c));
         assert_eq!(reg.clear_done(H), ClearDone::Unexpected);
-        assert_eq!(reg.kernel(H), Some(Kernel::Registered { last: None }));
+        assert_eq!(reg.kernel(H), Some(Kernel::Registered(None)));
     }
 
     #[test]
@@ -464,13 +426,13 @@ mod tests {
         let c = callback();
         assert_eq!(
             reg.add(H, A, A, Arc::downgrade(&c)),
-            Some(FreezeCmd::Request)
+            Some(NotifyCmd::Request)
         );
         reg.abort_request(H);
         assert_eq!(reg.kernel(H), None);
         assert_eq!(
             reg.add(H, A, A, Arc::downgrade(&c)),
-            Some(FreezeCmd::Request)
+            Some(NotifyCmd::Request)
         );
     }
 
@@ -556,11 +518,11 @@ mod tests {
         reg.add(H, A, A, Arc::downgrade(&c));
         reg.state_changed(H, true);
         let (stale, _, _) = reg.begin_batch(H, A).expect("old slot's batch");
-        assert_eq!(reg.drop_owner(H, A), Some(FreezeCmd::Clear));
+        assert_eq!(reg.drop_owner(H, A), Some(NotifyCmd::Clear));
         assert_eq!(reg.clear_done(H), ClearDone::Removed);
         assert_eq!(
             reg.add(H, B, B, Arc::downgrade(&c)),
-            Some(FreezeCmd::Request)
+            Some(NotifyCmd::Request)
         );
         reg.state_changed(H, false);
         let (fresh, _, _) = reg.begin_batch(H, B).expect("new slot's batch");

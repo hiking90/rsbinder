@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::binder::{DeathRecipient, SIBinder, WIBinder};
 use crate::error::{panic_message, Result, StatusCode};
-use crate::freeze::ClearDone;
+use crate::notification::{ClearDone, Kernel, NotifyCmd, Registrations};
 
 /// A death notification that is unregistered when this value drops.
 ///
@@ -260,21 +260,8 @@ impl DeathRecipients {
     }
 }
 
-/// A command the caller writes while still holding the registry lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeathCmd {
-    Request,
-    Clear,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kernel {
-    Registered,
-    PendingClear { rerequest: bool },
-}
-
 struct Slot {
-    kernel: Kernel,
+    kernel: Kernel<()>,
     linked: Vec<usize>,
 }
 
@@ -286,20 +273,19 @@ pub(crate) struct DeathRegistry {
 
 impl DeathRegistry {
     /// `owner`'s recipient list became non-empty; `Some(Request)` when the handle had no slot.
-    pub(crate) fn link(&mut self, handle: u32, owner: usize) -> Option<DeathCmd> {
+    pub(crate) fn link(&mut self, handle: u32, owner: usize) -> Option<NotifyCmd> {
         match self.slots.entry(handle) {
             MapEntry::Vacant(vacant) => {
                 vacant.insert(Slot {
-                    kernel: Kernel::Registered,
+                    kernel: Kernel::requested(),
                     linked: vec![owner],
                 });
-                Some(DeathCmd::Request)
+                Some(NotifyCmd::Request)
             }
             MapEntry::Occupied(occupied) => {
                 let slot = occupied.into_mut();
-                if let Kernel::PendingClear { rerequest } = &mut slot.kernel {
-                    *rerequest = true;
-                }
+                slot.kernel.added();
+                // One owner per proxy: a second link of the same proxy is no new registration.
                 if !slot.linked.contains(&owner) {
                     slot.linked.push(owner);
                 }
@@ -308,51 +294,37 @@ impl DeathRegistry {
         }
     }
 
-    /// Forgets `handle` after its request never reached the kernel.
-    pub(crate) fn abort_request(&mut self, handle: u32) {
-        self.slots.remove(&handle);
-    }
-
     /// `owner`'s recipient list became empty; `Some(Clear)` when it was the last.
-    pub(crate) fn unlink(&mut self, handle: u32, owner: usize) -> Option<DeathCmd> {
+    pub(crate) fn unlink(&mut self, handle: u32, owner: usize) -> Option<NotifyCmd> {
         let slot = self.slots.get_mut(&handle)?;
         slot.linked.retain(|linked| *linked != owner);
         if !slot.linked.is_empty() {
             return None;
         }
-        match &mut slot.kernel {
-            Kernel::Registered => {
-                slot.kernel = Kernel::PendingClear { rerequest: false };
-                Some(DeathCmd::Clear)
-            }
-            Kernel::PendingClear { rerequest } => {
-                *rerequest = false;
-                None
-            }
-        }
-    }
-
-    /// Records a `BR_CLEAR_DEATH_NOTIFICATION_DONE`.
-    pub(crate) fn clear_done(&mut self, handle: u32) -> ClearDone {
-        let Some(slot) = self.slots.get_mut(&handle) else {
-            return ClearDone::Unexpected;
-        };
-        match slot.kernel {
-            Kernel::Registered => ClearDone::Unexpected,
-            Kernel::PendingClear { rerequest } if rerequest && !slot.linked.is_empty() => {
-                slot.kernel = Kernel::Registered;
-                ClearDone::Rerequest
-            }
-            Kernel::PendingClear { .. } => {
-                self.slots.remove(&handle);
-                ClearDone::Removed
-            }
-        }
+        slot.kernel.emptied()
     }
 
     #[cfg(test)]
-    fn kernel(&self, handle: u32) -> Option<Kernel> {
+    fn kernel(&self, handle: u32) -> Option<Kernel<()>> {
         self.slots.get(&handle).map(|slot| slot.kernel)
+    }
+}
+
+impl Registrations for DeathRegistry {
+    /// Records a `BR_CLEAR_DEATH_NOTIFICATION_DONE`.
+    fn clear_done(&mut self, handle: u32) -> ClearDone {
+        let Some(slot) = self.slots.get_mut(&handle) else {
+            return ClearDone::Unexpected;
+        };
+        let done = slot.kernel.clear_done(!slot.linked.is_empty());
+        if done == ClearDone::Removed {
+            self.slots.remove(&handle);
+        }
+        done
+    }
+
+    fn abort_request(&mut self, handle: u32) {
+        self.slots.remove(&handle);
     }
 }
 
@@ -367,9 +339,9 @@ mod tests {
     #[test]
     fn one_request_and_one_clear_per_registration() {
         let mut reg = DeathRegistry::default();
-        assert_eq!(reg.link(H, OLD), Some(DeathCmd::Request));
+        assert_eq!(reg.link(H, OLD), Some(NotifyCmd::Request));
         assert_eq!(reg.link(H, OLD), None, "an owner links once");
-        assert_eq!(reg.unlink(H, OLD), Some(DeathCmd::Clear));
+        assert_eq!(reg.unlink(H, OLD), Some(NotifyCmd::Clear));
         assert_eq!(reg.unlink(H, OLD), None, "nothing left to clear");
         assert_eq!(reg.clear_done(H), ClearDone::Removed);
         assert_eq!(reg.kernel(H), None);
@@ -380,11 +352,11 @@ mod tests {
     #[test]
     fn an_old_proxys_drop_keeps_a_newer_link() {
         let mut reg = DeathRegistry::default();
-        assert_eq!(reg.link(H, OLD), Some(DeathCmd::Request));
+        assert_eq!(reg.link(H, OLD), Some(NotifyCmd::Request));
         assert_eq!(reg.link(H, NEW), None);
         assert_eq!(reg.unlink(H, OLD), None);
-        assert_eq!(reg.kernel(H), Some(Kernel::Registered));
-        assert_eq!(reg.unlink(H, NEW), Some(DeathCmd::Clear));
+        assert_eq!(reg.kernel(H), Some(Kernel::Registered(())));
+        assert_eq!(reg.unlink(H, NEW), Some(NotifyCmd::Clear));
     }
 
     /// The order `death_reorder_kernel` forces: the old clear is written first,
@@ -393,15 +365,15 @@ mod tests {
     fn a_link_during_a_clear_requests_after_the_done() {
         let mut reg = DeathRegistry::default();
         reg.link(H, OLD);
-        assert_eq!(reg.unlink(H, OLD), Some(DeathCmd::Clear));
+        assert_eq!(reg.unlink(H, OLD), Some(NotifyCmd::Clear));
         assert_eq!(
             reg.link(H, NEW),
             None,
             "no request while the clear is in flight"
         );
         assert_eq!(reg.clear_done(H), ClearDone::Rerequest);
-        assert_eq!(reg.kernel(H), Some(Kernel::Registered));
-        assert_eq!(reg.unlink(H, NEW), Some(DeathCmd::Clear));
+        assert_eq!(reg.kernel(H), Some(Kernel::Registered(())));
+        assert_eq!(reg.unlink(H, NEW), Some(NotifyCmd::Clear));
     }
 
     #[test]
@@ -412,7 +384,7 @@ mod tests {
         reg.link(H, NEW);
         assert_eq!(reg.unlink(H, NEW), None);
         assert_eq!(reg.clear_done(H), ClearDone::Removed);
-        assert_eq!(reg.link(H, NEW), Some(DeathCmd::Request));
+        assert_eq!(reg.link(H, NEW), Some(NotifyCmd::Request));
     }
 
     #[test]
@@ -422,7 +394,7 @@ mod tests {
         assert_eq!(reg.clear_done(H), ClearDone::Unexpected);
         reg.link(H, OLD);
         assert_eq!(reg.clear_done(H), ClearDone::Unexpected);
-        assert_eq!(reg.kernel(H), Some(Kernel::Registered));
+        assert_eq!(reg.kernel(H), Some(Kernel::Registered(())));
         reg.abort_request(H);
         assert_eq!(reg.kernel(H), None);
     }

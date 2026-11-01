@@ -276,6 +276,8 @@ mod death;
 mod file_descriptor;
 // Per-handle freeze-notification bookkeeping behind `IBinder::add_frozen_state_change_callback`.
 mod freeze;
+// The kernel registration state the death and freeze registries share.
+mod notification;
 // `LazyServiceRegistrar`; documented inside (plain comment, same reason as `entry`).
 pub mod lazy_service;
 mod macros;
