@@ -13,61 +13,6 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
-### Added
-
-- **`hub::watch`**: calls a closure with the binder each time the default
-  service manager registers a service under a name, until the returned
-  **`hub::ServiceWatch`** drops; the drop unregisters the callback. It is
-  `register_for_notifications` with the unregister held by a guard, the
-  pairing `wait_for_service` and `rsbinder-topic`'s service-manager
-  resolver now use.
-- **`rsbinder_fmq::shm::seal_unsupported`**: whether an `add_seals` error
-  means the kernel lacks a seal of the mask (`EINVAL` for a mask with
-  `FUTURE_WRITE`, Linux before 5.1). It reads the answer right only for a
-  memfd the caller created, since a file that takes no seals answers
-  `EINVAL` too.
-- **`rsbinder_fmq::EventFlag::wake_committed_lazy`**: `wake_lazy` on the
-  targets whose code for a libfmq waiter orders it too (x86, x86-64,
-  AArch64, 32-bit ARM, RISC-V 64), `wake` elsewhere; the wake the stream
-  ring sends after each committed record.
-- **`rsbinder_fmq::shm::Deadline::until`**: the futex deadline at an
-  `Instant`, as `Deadline::after` the time left until it.
-- **`rsbinder_fmq::shm::ring_parts`**: the one or two parts of a copy
-  that wraps at a ring's end, handed to a closure that makes the copy
-  with whichever `Bytes`/`RoBytes` method the protocol needs. The FMQ
-  queues and `rsbinder-topic` copy through it.
-
-### Changed
-
-- **`wait_for_service` on Android 10** waits in the same loop as on later
-  versions, minus the registration notice: after the first lookup misses,
-  the next comes a second later rather than at once, and a missing service
-  logs the same "still waiting" warning every ten seconds.
-- **`rsbinder-topic`** logs, once per subscription, which check of the
-  topic's memory or pool failed when a receive ends with
-  `Closed::Corrupted`, and when a subscription is refused for it; the
-  error itself is unchanged.
-
-### Removed
-
-- **`rsbinder_fmq::shm::create_mapped`**: nothing called it, and its one
-  error did not say which of the create, the map or the seal failed. Call
-  `create`, `Mapping::map` and `add_seals` in that order; `add_seals`'s
-  documentation says why the map comes before a `FUTURE_WRITE` seal.
-
-### Fixed
-
-- **A kernel binder proxy made from a TLS destructor** (one that runs
-  after the binder thread state's own) fails with `InvalidOperation`
-  instead of aborting the process; a proxy dropped there still sends its
-  decrements, as it did.
-- **A failed flush no longer leaks a kernel reference count.** The proxy
-  cache's `BC_INCREFS` is taken back when the driver never consumed it
-  (the lookup fails with the driver's error, no longer `DeadObject`) and
-  counts as sent when it did; a `BC_ACQUIRE` counts as sent once queued,
-  as in AOSP `incStrongHandle`. Before, either failure left a count the
-  matching decrement never undid.
-
 ## [0.13.0] - 2026-10-31
 
 ### Migrating from 0.12.0
@@ -113,6 +58,8 @@ accepts both the 0.12.0 bytes and the new ones.
   call is `DeadObject`; the `*_interface` lookups return `Err(DeadObject)`.
 - `hub::default` accepts a context manager that is not an `IServiceManager`
   instead of returning `BadType`.
+- On Android 10, `wait_for_service` looks again a second after its first
+  miss, not at once, and logs "still waiting" every ten seconds.
 
 **Binder objects and process state**
 
@@ -159,6 +106,9 @@ accepts both the 0.12.0 bytes and the new ones.
 - `ProcessState::start_thread_pool` leaves the pool unstarted when its first
   worker cannot be created; a `binder://` `Client` and a kernel `Server`
   return the failure.
+- A kernel proxy lookup whose `BC_INCREFS` the driver never took fails
+  with that error, not `DeadObject`; one made from a TLS destructor after
+  the binder thread state's is `InvalidOperation`, where 0.12.0 aborted.
 
 **Calling identity and permissions**
 
@@ -607,9 +557,8 @@ accepts both the 0.12.0 bytes and the new ones.
   `rsbinder::fmq::shm`): what the queue is built from, for protocols other
   than FMQ. `create` with `CreateOptions`, `add_seals`, `seals` and `Seals`
   (a memfd and its seals; `add_seals` returns the kernel's error unchanged,
-  so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle);
-  `create_mapped` (create, map writable, then seal, the one order in which
-  the owner keeps a writable mapping under `FUTURE_WRITE`);
+  so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle;
+  an owner that writes through its own mapping maps it before that seal);
   `Mapping` and `RoMapping` (a shared mapping at any byte offset, read-write
   or read-only, on macOS as well as Linux and Android), and `Mapping::heap`
   (the same over heap memory, for tests and Miri); `futex_wait`,
@@ -692,6 +641,27 @@ accepts both the 0.12.0 bytes and the new ones.
   themselves, where `from_bytes` decodes a copy, and leaves them unchanged.
   A caller that encodes or decodes many values allocates only when its
   buffer grows; `to_bytes` and `from_bytes` are these two on a new buffer.
+- **`hub::watch`**: calls a closure with the binder each time the default
+  service manager registers a service under a name, until the returned
+  **`hub::ServiceWatch`** drops; the drop unregisters the callback. It is
+  `register_for_notifications` with the unregister held by a guard, the
+  pairing `wait_for_service` and `rsbinder-topic`'s service-manager
+  resolver now use.
+- **`rsbinder_fmq::shm::seal_unsupported`**: whether an `add_seals` error
+  means the kernel lacks a seal of the mask (`EINVAL` for a mask with
+  `FUTURE_WRITE`, Linux before 5.1). It reads the answer right only for a
+  memfd the caller created, since a file that takes no seals answers
+  `EINVAL` too.
+- **`rsbinder_fmq::EventFlag::wake_committed_lazy`**: `wake_lazy` on the
+  targets whose code for a libfmq waiter orders it too (x86, x86-64,
+  AArch64, 32-bit ARM, RISC-V 64), `wake` elsewhere; the wake the stream
+  ring sends after each committed record.
+- **`rsbinder_fmq::shm::Deadline::until`**: the futex deadline at an
+  `Instant`, as `Deadline::after` the time left until it.
+- **`rsbinder_fmq::shm::ring_parts`**: the one or two parts of a copy
+  that wraps at a ring's end, handed to a closure that makes the copy
+  with whichever `Bytes`/`RoBytes` method the protocol needs. The FMQ
+  queues and `rsbinder-topic` copy through it.
 
 ### Changed
 
@@ -769,6 +739,14 @@ accepts both the 0.12.0 bytes and the new ones.
 - **`rsbinder_fmq::Error::Os` has no `source()`.** Its `Display` already is
   the errno's message, so a reporter that walks the source chain (`anyhow`'s
   `{:#}`, `eyre`, `tracing`) printed it twice.
+- **`wait_for_service` on Android 10** waits in the same loop as on later
+  versions, minus the registration notice: after the first lookup misses,
+  the next comes a second later rather than at once, and a missing service
+  logs the same "still waiting" warning every ten seconds (see *Migrating*).
+- **`rsbinder-topic`** logs, once per subscription, which check of the
+  topic's memory or pool failed when a receive ends with
+  `Closed::Corrupted`, and when a subscription is refused for it; the
+  error itself is unchanged.
 
 ### Fixed
 
@@ -909,6 +887,16 @@ accepts both the 0.12.0 bytes and the new ones.
   partial reply of a handler that panicked is discarded under its own
   `catch_unwind`, kernel and RPC alike, so a `Drop` that panics there no
   longer unwinds the binder thread or the RPC serve thread.
+- **A kernel binder proxy made from a TLS destructor** (one that runs
+  after the binder thread state's own) fails with `InvalidOperation`
+  instead of aborting the process; a proxy dropped there still sends its
+  decrements, as it did.
+- **A failed flush no longer leaks a kernel reference count.** The proxy
+  cache's `BC_INCREFS` is taken back when the driver never consumed it
+  (the lookup fails with the driver's error, no longer `DeadObject`; see
+  *Migrating*) and counts as sent when it did; a `BC_ACQUIRE` counts as
+  sent once queued, as in AOSP `incStrongHandle`. Before, either failure
+  left a count the matching decrement never undid.
 
 ### Security
 

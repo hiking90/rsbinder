@@ -124,6 +124,12 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   without asking for its descriptor, so a context manager that is not an
   `IServiceManager` is accepted and its calls fail as that object answers
   them. 0.12.0 returned `BadType` from `hub::default`.
+- On Android 10, whose service manager sends no registration notice,
+  `wait_for_service` and `wait_for_interface` wait in the loop the later
+  versions use: after the first lookup misses, the next one comes a second
+  later, not at once, and a service still missing logs "still waiting"
+  every ten seconds. 0.12.0 looked again at once and logged nothing. The
+  answer is the same; only a test that times the second lookup sees it.
 
 ## Binder objects and process state
 
@@ -238,6 +244,16 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `binder://` `Client` and starting a kernel `Server` now return the
   failure as an `Err` (`try_start_thread_pool`, CHANGELOG *Added*) instead
   of succeeding with no pool.
+- **A kernel proxy lookup whose `BC_INCREFS` the driver never took fails
+  with the driver's error**, not `DeadObject` (`hub` lookups, a parcel's
+  binder read, `ProcessState::strong_proxy_for_handle`). The command is
+  taken back first, so no reference count is left behind; 0.12.0 returned
+  `DeadObject` and left the command queued, to be applied by the next
+  write with no decrement to match it. When the driver did take it and
+  the ioctl still failed, the lookup now succeeds and the proxy's drop
+  undoes the count. A lookup made from a TLS destructor that runs after
+  the binder thread state's own is `InvalidOperation`; 0.12.0 panicked
+  there, which aborts the process.
 
 ## Calling identity and permissions
 
