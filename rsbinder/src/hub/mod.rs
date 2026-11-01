@@ -108,8 +108,8 @@
 //!
 //! `register_for_notifications`, `unregister_for_notifications` and
 //! `register_client_callback` hand the caller's callback to a pre-16
-//! service manager through a thin forwarder (`ForwardServiceCallback`,
-//! `ForwardClientCallback`) that returns the original `SIBinder`, instead of
+//! service manager through a thin forwarder (`ForwardCallback`, which
+//! implements both traits) that returns the original `SIBinder`, instead of
 //! reconstructing a typed `Strong` of the per-version trait.
 //!
 //! Each `android_N::IServiceCallback` / `IClientCallback` is generated from
@@ -790,7 +790,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         feature = "android_15"
     )
 ))]
-struct ForwardServiceCallback(crate::SIBinder);
+struct ForwardCallback(crate::SIBinder);
 
 #[cfg(all(
     target_os = "android",
@@ -802,13 +802,13 @@ struct ForwardServiceCallback(crate::SIBinder);
         feature = "android_15"
     )
 ))]
-impl crate::Interface for ForwardServiceCallback {
+impl crate::Interface for ForwardCallback {
     fn as_binder(&self) -> crate::SIBinder {
         self.0.clone()
     }
 }
 
-/// Wraps the unified callback as a per-version `Strong<dyn IServiceCallback>` (pre-16 arms).
+/// Wraps a unified callback as the per-version `Strong<dyn android_N::ICallback>` (pre-16 arms).
 #[cfg(all(
     target_os = "android",
     any(
@@ -819,11 +819,9 @@ impl crate::Interface for ForwardServiceCallback {
         feature = "android_15",
     )
 ))]
-macro_rules! wrap_callback {
-    ($modu:ident, $callback:expr) => {
-        crate::Strong::<dyn $modu::IServiceCallback>::new(Box::new(ForwardServiceCallback(
-            $callback.as_binder(),
-        )))
+macro_rules! forward {
+    ($modu:ident::$iface:ident, $callback:expr) => {
+        crate::Strong::<dyn $modu::$iface>::new(Box::new(ForwardCallback($callback.as_binder())))
     };
 }
 
@@ -852,99 +850,39 @@ fn unsupported(method: &str, since: u32) -> Status {
         .into()
 }
 
-/// Emits the per-version `IServiceCallback` impl for `ForwardServiceCallback` (pre-16).
-macro_rules! forward_service_callback_impl {
+/// Emits `ForwardCallback`'s per-version `IServiceCallback` and `IClientCallback` impls (pre-16).
+macro_rules! forward_callback_impls {
     ($modu:ident, $feat:literal) => {
+        // Both callbacks are unreachable on the serialize-only path (type doc): error, not panic.
         #[cfg(all(target_os = "android", feature = $feat))]
-        impl $modu::IServiceCallback for ForwardServiceCallback {
+        impl $modu::IServiceCallback for ForwardCallback {
             fn r#onRegistration(
                 &self,
                 _name: &str,
                 _binder: &crate::SIBinder,
             ) -> crate::BinderResult<()> {
-                // Unreachable on the serialize-only path (type doc); error rather than panic.
                 Err(crate::StatusCode::UnknownTransaction.into())
             }
         }
-    };
-}
 
-forward_service_callback_impl!(android_11, "android_11");
-forward_service_callback_impl!(android_12, "android_12");
-forward_service_callback_impl!(android_13, "android_13");
-forward_service_callback_impl!(android_14, "android_14");
-forward_service_callback_impl!(android_15, "android_15");
-
-/// `IClientCallback` analogue of [`ForwardServiceCallback`]; same module doc section.
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_11",
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15"
-    )
-))]
-struct ForwardClientCallback(crate::SIBinder);
-
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_11",
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15"
-    )
-))]
-impl crate::Interface for ForwardClientCallback {
-    fn as_binder(&self) -> crate::SIBinder {
-        self.0.clone()
-    }
-}
-
-/// Wraps the unified callback as a per-version `Strong<dyn IClientCallback>` (pre-16 arms).
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_11",
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15",
-    )
-))]
-macro_rules! wrap_client_callback {
-    ($modu:ident, $callback:expr) => {
-        crate::Strong::<dyn $modu::IClientCallback>::new(Box::new(ForwardClientCallback(
-            $callback.as_binder(),
-        )))
-    };
-}
-
-/// Emits the per-version `IClientCallback` impl for `ForwardClientCallback` (pre-16).
-macro_rules! forward_client_callback_impl {
-    ($modu:ident, $feat:literal) => {
         #[cfg(all(target_os = "android", feature = $feat))]
-        impl $modu::IClientCallback for ForwardClientCallback {
+        impl $modu::IClientCallback for ForwardCallback {
             fn r#onClients(
                 &self,
                 _registered: &crate::SIBinder,
                 _has_clients: bool,
             ) -> crate::BinderResult<()> {
-                // Unreachable on the serialize-only path (type doc); error rather than panic.
                 Err(crate::StatusCode::UnknownTransaction.into())
             }
         }
     };
 }
 
-forward_client_callback_impl!(android_11, "android_11");
-forward_client_callback_impl!(android_12, "android_12");
-forward_client_callback_impl!(android_13, "android_13");
-forward_client_callback_impl!(android_14, "android_14");
-forward_client_callback_impl!(android_15, "android_15");
+forward_callback_impls!(android_11, "android_11");
+forward_callback_impls!(android_12, "android_12");
+forward_callback_impls!(android_13, "android_13");
+forward_callback_impls!(android_14, "android_14");
+forward_callback_impls!(android_15, "android_15");
 
 impl ServiceManager {
     /// Checks if a service with the given name is available.
@@ -1330,31 +1268,31 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_11, callback),
+                &forward!(android_11::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_12, callback),
+                &forward!(android_12::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_13, callback),
+                &forward!(android_13::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_14, callback),
+                &forward!(android_14::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
             ServiceManager::Android15(sm) => android_15::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_15, callback),
+                &forward!(android_15::IServiceCallback, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::registerForNotifications(sm, name, callback)
@@ -1382,31 +1320,31 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_11, callback),
+                &forward!(android_11::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_12, callback),
+                &forward!(android_12::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_13, callback),
+                &forward!(android_13::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_14, callback),
+                &forward!(android_14::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
             ServiceManager::Android15(sm) => android_15::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_15, callback),
+                &forward!(android_15::IServiceCallback, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
@@ -1442,35 +1380,35 @@ impl ServiceManager {
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_11, callback),
+                &forward!(android_11::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_12, callback),
+                &forward!(android_12::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_13, callback),
+                &forward!(android_13::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_14, callback),
+                &forward!(android_14::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
             ServiceManager::Android15(sm) => android_15::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_15, callback),
+                &forward!(android_15::IClientCallback, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::registerClientCallback(sm, name, service, callback)
