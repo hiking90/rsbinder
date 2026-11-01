@@ -213,7 +213,7 @@ pub trait RpcTransport: Send + Sync {
     /// refuses a declared length above [`MAX_FRAME_LEN`] before
     /// allocating.
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        read_frame(&mut RawCalls(self))
+        read_frame_with(|buf| self.recv_raw(buf))
     }
 
     /// The other end's identity, as established by this transport.
@@ -774,16 +774,6 @@ impl fmt::Display for PeerIdentity {
 
 // --- Length-prefix framing shared by stream backends (module doc) ---
 
-/// A transport's `recv_raw` as `Read`, for the default `recv_frame`.
-struct RawCalls<'a, T: RpcTransport + ?Sized>(&'a T);
-
-impl<T: RpcTransport + ?Sized> Read for RawCalls<'_, T> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Kind-preserving, so `read_header`/`read_body` see a deadline as `is_timeout`.
-        self.0.recv_raw(buf).map_err(std::io::Error::from)
-    }
-}
-
 /// `buf` behind its `u32` little-endian length; `FrameTooLarge` past [`MAX_FRAME_LEN`].
 fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
     if buf.len() > MAX_FRAME_LEN {
@@ -994,41 +984,76 @@ impl ReadDeadline {
     }
 }
 
-/// Read exactly `buf.len()` header bytes; see module doc "Short reads and writes".
-fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(if filled == 0 {
-                    RpcError::EndOfStream
-                } else {
-                    RpcError::Truncated
-                });
+/// What a frame reader makes of [`RpcError::UncleanEndOfStream`] once its frame has begun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UncleanEnd {
+    /// It stays itself: the AOSP-framing readers (`rpc` module doc "Frame-boundary reads").
+    Keep,
+    /// It becomes `Truncated`: the length-prefix readers (module doc "Short reads and writes").
+    Truncate,
+}
+
+/// Fill `buf` through `read_one`, one read a call with `Ok(0)` for the end of the stream.
+///
+/// The one classification of a short read (module doc "Short reads and writes"). Before the
+/// frame has begun (`started` is false and no byte of `buf` has come), a failure stands as it
+/// is and `Ok(0)` is `EndOfStream`. After, the two that leave a frame boundary are the cut
+/// they now are: `EndOfStream` (and `Ok(0)`) is `Truncated`, `Timeout` is `DeadlineMidFrame`,
+/// and `UncleanEndOfStream` is what `unclean` says. An `Io` error is first read as [`read_raw`]
+/// reads an `io::Error`: `Interrupted` is read again, an armed deadline is `Timeout`, and a
+/// disconnect kind is `EndOfStream`. The `Err` carries the bytes of `buf` that came before it.
+pub(crate) fn fill_exact(
+    buf: &mut [u8],
+    started: bool,
+    unclean: UncleanEnd,
+    mut read_one: impl FnMut(&mut [u8]) -> RpcResult<usize>,
+) -> Result<(), (RpcError, usize)> {
+    let mut got = 0;
+    while got < buf.len() {
+        let e = match read_one(&mut buf[got..]) {
+            Ok(0) => RpcError::EndOfStream,
+            Ok(n) => {
+                got += n;
+                continue;
             }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // Nothing consumed: clean Timeout (still frame-synchronized); mid-header: desync.
-            Err(e) if is_timeout(&e) => {
-                return Err(if filled == 0 {
-                    RpcError::Timeout
-                } else {
-                    RpcError::DeadlineMidFrame
-                });
-            }
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof && filled > 0 => {
-                return Err(RpcError::Truncated);
-            }
-            // Past the first byte any disconnect, even one folded to `EndOfStream`, lost position.
-            Err(e) => {
-                return Err(match RpcError::from(e) {
-                    RpcError::EndOfStream if filled > 0 => RpcError::Truncated,
-                    other => other,
-                })
-            }
-        }
+            Err(RpcError::Io(e)) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(RpcError::Io(e)) if is_timeout(&e) => RpcError::Timeout,
+            Err(RpcError::Io(e)) => RpcError::from(e),
+            Err(e) => e,
+        };
+        let cut = match e {
+            e if !started && got == 0 => e,
+            RpcError::EndOfStream => RpcError::Truncated,
+            RpcError::Timeout => RpcError::DeadlineMidFrame,
+            RpcError::UncleanEndOfStream if unclean == UncleanEnd::Truncate => RpcError::Truncated,
+            e => e,
+        };
+        return Err((cut, got));
     }
     Ok(())
+}
+
+/// `read_one` for [`fill_exact`] over a `recvmsg` (`recv`), gathering its fds into `fds`.
+///
+/// At most [`unix::MAX_FDS_PER_FRAME`] fds in all, across every read of the frame. Fds that
+/// came with no byte are a cut frame, never a clean end: the sender's first `sendmsg` carried
+/// them, so a frame had begun.
+pub(crate) fn gathering_fds<'a>(
+    mut recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> + 'a,
+    fds: &'a mut Vec<std::os::fd::OwnedFd>,
+) -> impl FnMut(&mut [u8]) -> RpcResult<usize> + 'a {
+    move |buf| {
+        let (n, mut more) = recv(buf)?;
+        let with_fds = !more.is_empty();
+        fds.append(&mut more);
+        if fds.len() > unix::MAX_FDS_PER_FRAME {
+            return Err(RpcError::Protocol("too many fds in one RPC frame"));
+        }
+        if n == 0 && with_fds {
+            return Err(RpcError::Truncated);
+        }
+        Ok(n)
+    }
 }
 
 /// A deadline this end armed (`WouldBlock`; `TimedOut` is the kernel's); see module doc.
@@ -1143,43 +1168,28 @@ pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
     }
 }
 
-/// Read exactly `buf.len()` body bytes; see module doc "Short reads and writes".
-fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => return Err(RpcError::Truncated),
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if is_timeout(&e) => return Err(RpcError::DeadlineMidFrame),
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(RpcError::Truncated),
-            // Header consumed: any disconnect, even one folded to `EndOfStream`, is a cut frame.
-            Err(e) => {
-                return Err(match RpcError::from(e) {
-                    RpcError::EndOfStream => RpcError::Truncated,
-                    other => other,
-                })
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Read one length-prefixed frame from a blocking stream.
-pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
+/// One length-prefixed frame through `read_one` (as [`fill_exact`] takes it): the header, the
+/// cap on its length before any allocation, then the body.
+pub(crate) fn read_frame_with(
+    mut read_one: impl FnMut(&mut [u8]) -> RpcResult<usize>,
+) -> RpcResult<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    read_header(r, &mut len_buf)?;
+    fill_exact(&mut len_buf, false, UncleanEnd::Truncate, &mut read_one).map_err(|(e, _)| e)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_FRAME_LEN {
-        // Reject *before* allocating `len` bytes.
         return Err(RpcError::FrameTooLarge {
             declared: len,
             max: MAX_FRAME_LEN,
         });
     }
     let mut body = vec![0u8; len];
-    read_body(r, &mut body)?;
+    fill_exact(&mut body, true, UncleanEnd::Truncate, &mut read_one).map_err(|(e, _)| e)?;
     Ok(body)
+}
+
+/// Read one length-prefixed frame from a blocking stream.
+pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
+    read_frame_with(|buf| read_raw(r, buf))
 }
 
 /// Decode-only entrypoint for the `rpc_frame_decode` fuzz target and
@@ -1196,6 +1206,116 @@ pub fn __fuzz_decode_frame(input: &[u8]) -> RpcResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One read's outcome, scripted: bytes delivered, or an error.
+    enum Step {
+        Bytes(usize),
+        Fail(fn() -> RpcError),
+    }
+
+    /// The variant's name and the bytes before it, or `Ok`.
+    type Classified = Result<(), (String, usize)>;
+
+    /// `fill_exact` of a 4-byte buffer over `steps`.
+    fn classify(steps: &[Step], started: bool, unclean: UncleanEnd) -> Classified {
+        let mut steps = steps.iter();
+        let mut buf = [0u8; 4];
+        fill_exact(&mut buf, started, unclean, |b| match steps.next() {
+            Some(Step::Bytes(n)) => Ok((*n).min(b.len())),
+            Some(Step::Fail(e)) => Err(e()),
+            None => panic!("read past the script"),
+        })
+        .map_err(|(e, got)| {
+            let name = format!("{e:?}");
+            (name.split(['(', ' ']).next().unwrap_or("").to_owned(), got)
+        })
+    }
+
+    /// Every branch of the one short-read rule, by input and progress (module doc).
+    #[test]
+    fn a_short_read_is_classified_by_whether_the_frame_had_begun() {
+        use std::io::ErrorKind::*;
+        use Step::*;
+        use UncleanEnd::{Keep, Truncate};
+        let end: fn() -> RpcError = || RpcError::EndOfStream;
+        let timeout: fn() -> RpcError = || RpcError::Timeout;
+        let unclean: fn() -> RpcError = || RpcError::UncleanEndOfStream;
+        let protocol: fn() -> RpcError = || RpcError::Protocol("p");
+        let would_block: fn() -> RpcError = || RpcError::Io(WouldBlock.into());
+        let broken_pipe: fn() -> RpcError = || RpcError::Io(BrokenPipe.into());
+        let timed_out: fn() -> RpcError = || RpcError::Io(TimedOut.into());
+        let interrupted: fn() -> RpcError = || RpcError::Io(Interrupted.into());
+        let err = |name: &str, got| Err((name.to_owned(), got));
+        let table: &[(&[Step], bool, UncleanEnd, Classified)] = &[
+            (&[Bytes(0)], false, Keep, err("EndOfStream", 0)),
+            (&[Bytes(0)], true, Keep, err("Truncated", 0)),
+            (&[Bytes(2), Bytes(0)], false, Keep, err("Truncated", 2)),
+            (&[Fail(end)], false, Keep, err("EndOfStream", 0)),
+            (&[Bytes(1), Fail(end)], false, Keep, err("Truncated", 1)),
+            (&[Fail(timeout)], false, Keep, err("Timeout", 0)),
+            (&[Fail(timeout)], true, Keep, err("DeadlineMidFrame", 0)),
+            (
+                &[Bytes(3), Fail(timeout)],
+                false,
+                Keep,
+                err("DeadlineMidFrame", 3),
+            ),
+            (&[Fail(would_block)], false, Keep, err("Timeout", 0)),
+            (&[Fail(would_block)], true, Keep, err("DeadlineMidFrame", 0)),
+            (&[Fail(broken_pipe)], false, Keep, err("EndOfStream", 0)),
+            (&[Fail(broken_pipe)], true, Keep, err("Truncated", 0)),
+            (&[Fail(timed_out)], false, Keep, err("Io", 0)),
+            (&[Bytes(1), Fail(timed_out)], false, Keep, err("Io", 1)),
+            (
+                &[Fail(unclean)],
+                false,
+                Truncate,
+                err("UncleanEndOfStream", 0),
+            ),
+            (&[Fail(unclean)], true, Keep, err("UncleanEndOfStream", 0)),
+            (&[Fail(unclean)], true, Truncate, err("Truncated", 0)),
+            (
+                &[Bytes(2), Fail(unclean)],
+                false,
+                Truncate,
+                err("Truncated", 2),
+            ),
+            (
+                &[Bytes(2), Fail(protocol)],
+                false,
+                Truncate,
+                err("Protocol", 2),
+            ),
+            (&[Fail(interrupted), Bytes(4)], false, Keep, Ok(())),
+            (&[Bytes(1), Bytes(1), Bytes(2)], true, Keep, Ok(())),
+        ];
+        for (i, (steps, started, unclean, expected)) in table.iter().enumerate() {
+            assert_eq!(&classify(steps, *started, *unclean), expected, "row {i}");
+        }
+        // An empty buffer reads nothing, whatever the stream would say.
+        assert!(fill_exact(&mut [], true, Keep, |_| -> RpcResult<usize> {
+            panic!("no read")
+        })
+        .is_ok());
+    }
+
+    /// Fds with no byte are a cut frame; the cap counts every read's fds together.
+    #[test]
+    fn gathered_fds_are_capped_across_reads_and_a_bare_fd_is_a_cut() {
+        let null = || std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let mut fds = Vec::new();
+        let mut read = gathering_fds(|_| Ok((0, vec![null()])), &mut fds);
+        assert!(matches!(read(&mut [0; 4]), Err(RpcError::Truncated)));
+
+        let mut fds = Vec::new();
+        let per_read = unix::MAX_FDS_PER_FRAME / 2 + 1;
+        let mut read = gathering_fds(
+            |b| Ok((b.len(), (0..per_read).map(|_| null()).collect())),
+            &mut fds,
+        );
+        assert!(matches!(read(&mut [0; 1]), Ok(1)));
+        assert!(matches!(read(&mut [0; 1]), Err(RpcError::Protocol(_))));
+    }
 
     #[test]
     fn frame_roundtrip_over_cursor() {

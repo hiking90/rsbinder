@@ -116,12 +116,11 @@
 //! frame pending") or [`RpcError::Timeout`](crate::rpc::RpcError::Timeout) ("no frame boundary
 //! crossed") is documented to have left the stream at
 //! a frame boundary. Every other read failure lacks that guarantee — including ones that in
-//! fact consumed nothing — and is treated as a lost position. One caller asks through the
-//! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
-//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The transports'
-//! length-prefix readers and the serve loop reimplement the same split inline — against the io
-//! error kind and the `RpcError` variants respectively — so a change to the set has to be
-//! made in all three places.
+//! fact consumed nothing — and is treated as a lost position. Every frame reader, the
+//! AOSP-framing ones and the transports' length-prefix ones, fills its buffers through
+//! `transport::fill_exact`, which makes the split in one place: once the frame has begun,
+//! those two become `Truncated` and `DeadlineMidFrame`. The serve loop does not split again;
+//! `recv_end_reason` only says which `EndReason` each resulting variant ends the loop with.
 
 // Every public item of these is re-exported below: one path each, `rpc::*` (plan 17 R-9).
 pub(crate) mod address;
@@ -323,13 +322,6 @@ impl std::error::Error for RpcError {
             RpcError::Io(e) => Some(e),
             _ => None,
         }
-    }
-}
-
-impl RpcError {
-    /// `EndOfStream` or `Timeout`: a failed read left a frame boundary; see "Frame-boundary reads".
-    pub(crate) fn leaves_frame_boundary_intact(&self) -> bool {
-        matches!(self, RpcError::EndOfStream | RpcError::Timeout)
     }
 }
 

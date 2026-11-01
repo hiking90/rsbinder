@@ -822,89 +822,18 @@ impl RpcTransport for UnixTransport {
     /// fd-mode use this for *every* frame, so `recvmsg` and `Read` are never
     /// mixed on one fd.
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
-        use std::mem::MaybeUninit;
-
         // Whole frames under the lock: interleaved readers would hand one frame's fds to another.
         let _reader = self
             .fd_recv_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-        // Reused: a frame costs two or more `recvmsg`s and `RecvAncillaryBuffer::new` resets it.
-        let mut space = [MaybeUninit::uninit(); FD_SPACE];
         // Exact counts, header then body: never read past this frame (module doc).
-        let mut header = [0u8; 4];
-        let mut filled = 0;
-        while filled < header.len() {
-            filled += self.recv_fd_part(&mut header[filled..], &mut space, &mut fds, filled > 0)?;
-        }
-        let len = u32::from_le_bytes(header) as usize;
-        if len > MAX_FRAME_LEN {
-            // Reject *before* allocating `len` bytes.
-            return Err(RpcError::FrameTooLarge {
-                declared: len,
-                max: MAX_FRAME_LEN,
-            });
-        }
-        let mut frame = vec![0u8; len];
-        let mut filled = 0;
-        while filled < len {
-            filled += self.recv_fd_part(&mut frame[filled..], &mut space, &mut fds, true)?;
-        }
+        let frame = super::read_frame_with(super::gathering_fds(
+            |b| self.recv_raw_with_fds(b),
+            &mut fds,
+        ))?;
         Ok((frame, fds))
-    }
-}
-
-impl UnixTransport {
-    /// One `recvmsg` into non-empty `buf`; `started`: a byte was read, so an end or deadline cuts.
-    fn recv_fd_part(
-        &self,
-        buf: &mut [u8],
-        space: &mut [std::mem::MaybeUninit<u8>],
-        fds: &mut Vec<OwnedFd>,
-        started: bool,
-    ) -> RpcResult<usize> {
-        use rustix::net::RecvAncillaryBuffer;
-        use std::io::IoSliceMut;
-
-        let consumed = started || !fds.is_empty();
-        let mut anc = RecvAncillaryBuffer::new(space);
-        let r = loop {
-            match rustix::net::recvmsg(
-                &self.stream,
-                &mut [IoSliceMut::new(buf)],
-                &mut anc,
-                RECV_FLAGS,
-            ) {
-                Ok(r) => break r,
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(e) => {
-                    // As `read_header`: idle deadline is `Timeout`, mid-frame our cut.
-                    let io_err = std::io::Error::from(e);
-                    if super::is_timeout(&io_err) {
-                        return Err(if consumed {
-                            RpcError::DeadlineMidFrame
-                        } else {
-                            RpcError::Timeout
-                        });
-                    }
-                    // Past the first byte or fd, an `EndOfStream` is a cut.
-                    return Err(match RpcError::from(io_err) {
-                        RpcError::EndOfStream if consumed => RpcError::Truncated,
-                        other => other,
-                    });
-                }
-            }
-        };
-        take_scm_rights(r.flags, &mut anc, fds)?;
-        if r.bytes == 0 {
-            return Err(if consumed || !fds.is_empty() {
-                RpcError::Truncated
-            } else {
-                RpcError::EndOfStream
-            });
-        }
-        Ok(r.bytes)
     }
 }
 
