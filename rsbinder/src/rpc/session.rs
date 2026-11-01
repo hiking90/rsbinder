@@ -2395,24 +2395,20 @@ impl RpcSessionInner {
                 // `None` inside: past what an `Instant` holds, so wait without a deadline.
                 *wait_until.get_or_insert_with(|| Instant::now().checked_add(d))
             });
-            st = match (deadline, at) {
-                (Some(d), Some(at)) => {
-                    let remaining = at.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        log::warn!(
-                            "RPC: no connection slot became available within {d:?} \
-                             (every slot is driven by another thread — a session \
-                             served on one thread and transacted on another needs \
-                             more than one connection); nothing was sent"
-                        );
-                        return Err(StatusCode::WouldBlock);
-                    }
-                    self.slot_cv
-                        .wait_timeout(st, remaining)
-                        .expect("slot_cv poisoned")
-                        .0
+            let waited = crate::signal::wait_until(&self.slot_cv, st, at);
+            st = match waited.expect("slot_cv poisoned") {
+                Ok(st) => st,
+                // Only an `at` passes, and there is one only under a `deadline`.
+                Err(_) => {
+                    log::warn!(
+                        "RPC: no connection slot became available within {:?} \
+                         (every slot is driven by another thread — a session \
+                         served on one thread and transacted on another needs \
+                         more than one connection); nothing was sent",
+                        deadline.unwrap_or_default()
+                    );
+                    return Err(StatusCode::WouldBlock);
                 }
-                _ => self.slot_cv.wait(st).expect("slot_cv poisoned"),
             };
         }
     }
