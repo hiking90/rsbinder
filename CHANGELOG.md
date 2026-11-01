@@ -778,6 +778,12 @@ accepts both the 0.12.0 bytes and the new ones.
   the object, after the elements before it were written and with the
   position left inside the array; it is now refused before the first
   element, as every other array is (AOSP `writeInplace`).
+- **A panic while a kernel binder's death is delivered still answers the
+  driver.** A panic in that step (a death recipient's `Drop`, or rsbinder's
+  own lock checks) unwound past `BC_DEAD_BINDER_DONE`, so the driver held
+  the death's clear notification and the pin release behind it. The panic
+  is now caught and logged and the done is queued, as the frozen-binder
+  handshake already did.
 
 ### Security
 

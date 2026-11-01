@@ -239,6 +239,12 @@
 //!   priority over the flush error, which is logged so it is not lost when
 //!   both fail. A `queue_done` failure (only when `out_parcel` is unhealthy,
 //!   e.g. OOM) skips `flush`; the next ioctl on this thread fails anyway.
+//!   A panic in `obituary` is caught, as in the frozen handshake below, and
+//!   the done is still queued; `flush` is skipped, since the panic may have
+//!   come from `talk_with_driver` and a re-entry would unwind outside the
+//!   catch. The looper's next round trip, or `ThreadExitGuard`, writes the
+//!   done; AOSP queues it after `sendObituary` without a flush
+//!   (`IPCThreadState.cpp:1635`).
 //! - **Frozen-binder handshake.** For `BR_FROZEN_BINDER`,
 //!   `drive_frozen_binder_handshake` runs `notify` (the callbacks) and then
 //!   queues `BC_FREEZE_NOTIFICATION_DONE` whatever `notify` did, panic
@@ -1292,7 +1298,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
     })
 }
 
-/// `BR_DEAD_BINDER` phases; only a `queue_done` error skips `flush`. See module doc.
+/// `BR_DEAD_BINDER` phases; a `queue_done` error or an obituary panic skips `flush`. See module doc.
 fn drive_dead_binder_handshake<O, Q, F>(
     handle: binder::binder_uintptr_t,
     obituary: O,
@@ -1305,7 +1311,12 @@ where
     F: FnOnce() -> Result<()>,
 {
     // Phase 1: dispatch recipients; never short-circuit, the handshake must complete.
-    let obituary_result = obituary();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(obituary));
+    let panicked = caught.is_err();
+    let obituary_result = caught.unwrap_or_else(|_| {
+        error!("BR_DEAD_BINDER: obituary for handle {handle:X} panicked");
+        Err(StatusCode::Unknown)
+    });
 
     // Phase 2: a failure skips phase 3 (see fn doc); log the obituary error it would hide.
     if let Err(qe) = queue_done() {
@@ -1316,6 +1327,10 @@ where
             );
         }
         return Err(qe);
+    }
+    // The panic may have come from `talk_with_driver`: no re-entry; the next round trip sends it.
+    if panicked {
+        return obituary_result;
     }
 
     // Phase 3: always flush; log its error now, as the obituary error wins below.
@@ -3441,6 +3456,26 @@ mod tests {
             "obituary error must take priority over flush error, got {result:?}"
         );
         assert_eq!(*order.borrow(), vec!["obituary", "queue", "flush"]);
+        order.borrow_mut().clear();
+
+        // Case F: obituary panics → the done is still queued, no flush, `Unknown`.
+        let result = drive_dead_binder_handshake(
+            42,
+            || {
+                push("obituary");
+                panic!("a recipient's drop panics");
+            },
+            || {
+                push("queue");
+                Ok(())
+            },
+            || {
+                push("flush");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(StatusCode::Unknown));
+        assert_eq!(*order.borrow(), vec!["obituary", "queue"]);
     }
 
     /// The done is queued exactly once after the notification, even when it panics.
