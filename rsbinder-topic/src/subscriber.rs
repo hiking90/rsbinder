@@ -38,7 +38,7 @@ use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{refuse, status_of, Asking, Token};
 use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET, VERSION};
-use crate::link::{Dead, DeathLink};
+use crate::link::{link_death, Dead};
 use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
@@ -170,7 +170,7 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     /// The token the publisher links to; alive as long as the subscription.
     _token: SIBinder,
     /// On the publisher's binder; `None` when the publisher is in this process.
-    _death: Option<DeathLink<Died>>,
+    _death: Option<rsbinder::DeathLink>,
     /// Set by the death notice of the publisher's binder, which `DIED` alone does not tell.
     dead: Arc<Dead>,
     /// A look read the topic's end record: the publisher refuses every later subscription.
@@ -246,7 +246,7 @@ impl<T: Payload> Subscriber<T> {
             local: local.clone(),
             dead: dead.clone(),
         };
-        let death = DeathLink::new(topic, died)?;
+        let death = link_death(topic, died)?;
         let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         // `Wake::Fd`: a pair of this side's own; the publisher and this process send, it polls.
         let (fd_wake, sent) = match policy.wake {

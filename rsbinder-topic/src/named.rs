@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder::{
-    BinderResult, DeathRecipient, ExceptionCode, SIBinder, Status, StatusCode, WIBinder,
+    BinderResult, DeathLink, DeathRecipient, ExceptionCode, SIBinder, Status, StatusCode, WIBinder,
 };
 
 use crate::aidl::ITopic::{ERROR_CLOSED, ERROR_VERSION};
@@ -190,8 +190,8 @@ pub struct NamedSubscriber<T: Payload, M: Trust = Untrusted> {
     /// What the connections that ended counted.
     past: SubscriberStats,
     _watch: Watch,
-    /// The death link to the watch's host, when it has one.
-    _host: Option<HostLink>,
+    /// The death link to the watch's host, when it has one; unlinked as the subscriber drops.
+    _host: Option<DeathLink>,
 }
 
 /// Marks the name layer dropped when the subscriber drops: a connection thread then ends.
@@ -207,19 +207,6 @@ impl<T: Payload> Drop for Leave<T> {
         // A connection thread asleep before a retry looks at `dropped` and ends.
         self.0.signal();
         drop(ready);
-    }
-}
-
-/// Unlinks from the watch's host as the subscriber drops.
-struct HostLink {
-    host: SIBinder,
-    death: Arc<HostDeath>,
-}
-
-impl Drop for HostLink {
-    fn drop(&mut self) {
-        // A host that died has no link left to take back.
-        let _ = self.host.unlink_to_death_arc(&self.death);
     }
 }
 
@@ -1352,15 +1339,12 @@ impl<T: Payload> Named<T> {
 
 impl<T: Payload + 'static> Named<T> {
     /// Link to the death of the watch's host; one already dead closes the subscriber now.
-    fn link_host(self: &Arc<Self>, host: &SIBinder) -> Option<HostLink> {
+    fn link_host(self: &Arc<Self>, host: &SIBinder) -> Option<DeathLink> {
         let death = Arc::new(HostDeath {
             named: Arc::downgrade(self) as Weak<dyn ResolverDeath>,
         });
-        match host.link_to_death_arc(&death) {
-            Ok(()) => Some(HostLink {
-                host: host.clone(),
-                death,
-            }),
+        match DeathLink::new(host, death) {
+            Ok(link) => Some(link),
             Err(StatusCode::DeadObject) => {
                 self.resolver_died();
                 None

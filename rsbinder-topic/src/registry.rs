@@ -42,8 +42,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder::{
-    BinderResult, Caller, DeathRecipient, ExceptionCode, Interface, SIBinder, Status, StatusCode,
-    Strong, WIBinder,
+    BinderResult, Caller, DeathLink, DeathRecipient, ExceptionCode, Interface, SIBinder, Status,
+    StatusCode, Strong, WIBinder,
 };
 
 use crate::aidl::ITopic::ITopic;
@@ -242,15 +242,10 @@ struct Shared {
 
 struct Inner {
     table: Table<TopicKey, WatcherKey>,
-    /// The death link of each handle the table uses.
-    linked: BTreeMap<u32, Linked>,
+    /// The death link of each handle the table uses; dropping one unlinks it.
+    linked: BTreeMap<u32, DeathLink>,
     /// A retry thread runs: it ends once nothing is owed.
     retrying: bool,
-}
-
-struct Linked {
-    binder: SIBinder,
-    obituary: Arc<Obituary>,
 }
 
 /// The retry thread's sleep: a change of its ticket ends it.
@@ -331,7 +326,7 @@ fn handle_of(binder: &SIBinder) -> Option<u32> {
 
 /// The links of a change, made under `inner`: `link_to_death` waits for no answer.
 struct ShellLinks<'a> {
-    linked: &'a mut BTreeMap<u32, Linked>,
+    linked: &'a mut BTreeMap<u32, DeathLink>,
     this: &'a Weak<Shared>,
 }
 
@@ -341,8 +336,9 @@ impl ShellLinks<'_> {
             handle,
             shared: self.this.clone(),
         });
-        binder.link_to_death_arc(&obituary)?;
-        self.linked.insert(handle, Linked { binder, obituary });
+        let link = DeathLink::new(&binder, obituary)?;
+        // A link this replaces unlinks here, under `inner`, as `unlink` does.
+        self.linked.insert(handle, link);
         Ok(())
     }
 }
@@ -357,10 +353,8 @@ impl Links<TopicKey, WatcherKey> for ShellLinks<'_> {
     }
 
     fn unlink(&mut self, handle: u32) {
-        if let Some(linked) = self.linked.remove(&handle) {
-            // A binder that died meanwhile has no link left to take back.
-            let _ = linked.binder.unlink_to_death_arc(&linked.obituary);
-        }
+        // A binder that died meanwhile answers `DeadObject`, which the link logs at debug.
+        self.linked.remove(&handle);
     }
 }
 

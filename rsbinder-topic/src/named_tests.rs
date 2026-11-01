@@ -1799,6 +1799,40 @@ impl Resolver for OneEntry {
     }
 }
 
+/// A resolver with no names, on a host given by the test.
+struct Hosted(SIBinder);
+
+impl Resolver for Hosted {
+    fn advertise(&self, _: &str, _: SIBinder) -> BinderResult<Advertisement> {
+        Ok(Advertisement::none())
+    }
+
+    fn watch(
+        &self,
+        _name: &str,
+        _on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
+    ) -> BinderResult<Watch> {
+        Ok(Watch::new(()))
+    }
+
+    fn host(&self) -> Option<SIBinder> {
+        Some(self.0.clone())
+    }
+}
+
+/// The subscriber's link to the host unlinks once as it drops, and a panic there stays inside.
+#[test]
+fn the_host_link_unlinks_once_as_the_subscriber_drops() {
+    let unlinked = Arc::new(AtomicUsize::new(0));
+    let resolver = Hosted(crate::link::PanickingUnlink::binder(&unlinked));
+    let subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with(NAME, &SubscriberPolicy::default(), &resolver)
+            .unwrap();
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(subscriber)));
+    assert!(dropped.is_ok());
+    assert_eq!(unlinked.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn two_threads_giving_one_name_on_one_host_ask_once_and_leave_its_entry() {
     let host = Publisher::<Bytes>::new(&policy()).unwrap();
