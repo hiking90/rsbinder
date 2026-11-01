@@ -45,9 +45,9 @@
 //! body read has lost the position too: `Truncated` if the stream ended,
 //! [`RpcError::DeadlineMidFrame`] if a read deadline cut it.
 //!
-//! `write_all_reporting` is `write_all` that tells a failure which put
-//! nothing on the wire apart from one that stopped part-way; `write_all`
-//! reports the same error either way. A frame that stopped part-way left the
+//! Every send of the socket backends but `tls` is `unix::send_stream`, which
+//! tells a failure that put nothing on the wire apart from one that stopped
+//! part-way. A frame that stopped part-way left the
 //! peer a header it will complete out of whatever arrives next, while a frame
 //! that never started left the stream frame-synchronized. A send deadline
 //! (`SO_SNDTIMEO`) that expires before the first byte is therefore
@@ -64,7 +64,7 @@
 //!
 //! `is_timeout` decides whether an I/O operation failed on a deadline this
 //! end armed: `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
-//! `write_all_reporting` and for `tls`'s teardown control flush. On the
+//! `tls`'s teardown control flush. On the
 //! supported platforms both surface as `EAGAIN` (`WouldBlock`), and the
 //! `Read`/`Write` adapters carry `RpcError::Timeout` across the
 //! `RpcError` ⇄ `io::Error` boundary with that same kind, so the framing
@@ -121,18 +121,18 @@
 //!
 //! # Mutation gates
 //!
-//! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
-//!   `sent == 0` guard in `write_all_reporting` makes the second case report
-//!   `Timeout` as well, a frame-synchronized stream the peer was left half a
-//!   frame of.
+//! - `unix::tests::a_send_deadline_is_a_timeout_only_before_the_first_byte`:
+//!   dropping the `sent == 0` guard in `unix::send_stream` makes the cut send
+//!   report `Timeout` as well, in either send mode: a frame-synchronized
+//!   stream the peer was left half a frame of.
 //! - `the_kernels_etimedout_is_a_lost_connection_not_a_deadline`: counting
-//!   `TimedOut` in `is_timeout` makes a send that failed before its
-//!   first byte and a read that consumed nothing report `Timeout`: a serve
-//!   loop with an idle deadline armed reads the kernel's drop as its own
-//!   idle expiry (`Local`, `InSync`).
+//!   `TimedOut` in `is_timeout` makes a read that consumed nothing report
+//!   `Timeout`: a serve loop with an idle deadline armed reads the kernel's
+//!   drop as its own idle expiry (`Local`, `InSync`). A send names `EAGAIN`
+//!   by its errno, so `ETIMEDOUT` there is the transport error either way.
 
 use std::fmt;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 
 use super::{RpcError, RpcResult};
 
@@ -485,9 +485,7 @@ pub trait RpcTransport: Send + Sync {
         } else {
             // A `true` predicate here would advertise FD_PASSING for a send that always fails.
             debug_assert!(!self.supports_fd_passing());
-            Err(RpcError::Protocol(
-                "this transport cannot pass file descriptors (UDS only)",
-            ))
+            Err(cannot_pass_fds())
         }
     }
 
@@ -533,9 +531,7 @@ pub trait RpcTransport: Send + Sync {
             self.send_raw(buf)
         } else {
             debug_assert!(!self.supports_fd_passing());
-            Err(RpcError::Protocol(
-                "this transport cannot pass file descriptors (UDS only)",
-            ))
+            Err(cannot_pass_fds())
         }
     }
 
@@ -607,6 +603,11 @@ pub trait RpcTransport: Send + Sync {
         let _ = drain;
         self.send_raw_with_fds(buf, fds)
     }
+}
+
+/// The refusal of fds by a transport that cannot pass them; `SCM_RIGHTS` is `unix` only.
+pub(crate) fn cannot_pass_fds() -> RpcError {
+    RpcError::Protocol("this transport cannot pass file descriptors (UDS only)")
 }
 
 /// A draining send's read-side failure, kept out of the two "nothing was sent" variants.
@@ -772,49 +773,32 @@ impl fmt::Display for PeerIdentity {
 
 // --- Length-prefix framing shared by stream backends (module doc) ---
 
-/// `buf` behind its `u32` little-endian length; `FrameTooLarge` past [`MAX_FRAME_LEN`].
-fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
+/// The `u32` little-endian length in front of `buf`; `FrameTooLarge` past [`MAX_FRAME_LEN`].
+pub(crate) fn frame_header(buf: &[u8]) -> RpcResult<[u8; 4]> {
     if buf.len() > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
             declared: buf.len(),
             max: MAX_FRAME_LEN,
         });
     }
-    let mut framed = Vec::with_capacity(4 + buf.len());
-    framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+    Ok((buf.len() as u32).to_le_bytes())
+}
+
+/// `buf` behind its [`frame_header`], in one buffer.
+fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
+    let header = frame_header(buf)?;
+    let mut framed = Vec::with_capacity(header.len() + buf.len());
+    framed.extend_from_slice(&header);
     framed.extend_from_slice(buf);
     Ok(framed)
 }
 
 /// Write one length-prefixed frame to a blocking stream: what `send_frame` sends, for tests.
 #[cfg(test)]
-pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
+pub(crate) fn write_frame<W: std::io::Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     // One buffer, one `write_all`; the slot's single writer keeps the frame whole (module doc).
     let framed = encode_frame(buf)?;
     w.write_all(&framed)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// `write_all`, `Timeout` only before the first byte; see module doc "Short reads and writes".
-pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
-    let mut sent = 0;
-    while sent < buf.len() {
-        match w.write(&buf[sent..]) {
-            Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero).into()),
-            Ok(n) => sent += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if sent == 0 && is_timeout(&e) => return Err(RpcError::Timeout),
-            Err(e) => return Err(RpcError::from(e)),
-        }
-    }
-    Ok(())
-}
-
-/// `tcp_debug`'s blocking `send_raw` where sends do not wait in `poll` (`unix::WAITING_SENDS`).
-#[cfg(feature = "rpc-tcp-debug")]
-pub(crate) fn write_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
-    write_all_reporting(w, buf)?;
     w.flush()?;
     Ok(())
 }
@@ -1201,6 +1185,7 @@ pub fn __fuzz_decode_frame(input: &[u8]) -> RpcResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// One read's outcome, scripted: bytes delivered, or an error.
     enum Step {
@@ -1397,38 +1382,6 @@ mod tests {
         ));
     }
 
-    /// `Timeout` (stream in step) only while nothing went out; see module doc "Mutation gates".
-    #[test]
-    fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
-        struct Stall(usize);
-        impl Write for Stall {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                if self.0 == 0 {
-                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
-                }
-                let n = self.0.min(buf.len());
-                self.0 -= n;
-                Ok(n)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        assert!(matches!(
-            write_all_reporting(&mut Stall(0), b"frame"),
-            Err(RpcError::Timeout)
-        ));
-        assert!(
-            matches!(
-                write_all_reporting(&mut Stall(2), b"frame"),
-                Err(RpcError::Io(ref e)) if e.kind() == ErrorKind::WouldBlock
-            ),
-            "a deadline past the first byte left a partial frame on the wire"
-        );
-        assert!(write_all_reporting(&mut Stall(5), b"frame").is_ok());
-    }
-
     /// `tcp_liveness`'s socket options, read back with `getsockopt`.
     #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
     #[test]
@@ -1496,22 +1449,10 @@ mod tests {
                 Err(self.0.into())
             }
         }
-        impl Write for Fails {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(self.0.into())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let lost =
             |r: RpcResult<_>| matches!(r, Err(RpcError::Io(e)) if e.kind() == ErrorKind::TimedOut);
 
         let mut dead = Fails(ErrorKind::TimedOut);
-        assert!(
-            lost(write_all_reporting(&mut dead, b"frame")),
-            "nothing went out, yet the connection is gone"
-        );
         assert!(lost(read_frame(&mut dead).map(drop)));
         assert!(matches!(
             read_frame(&mut Fails(ErrorKind::WouldBlock)),

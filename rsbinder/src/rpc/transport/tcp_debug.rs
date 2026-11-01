@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::unix::send_waiting;
+use super::unix::send_raw_no_fds;
 use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
@@ -143,23 +143,13 @@ impl TcpDebugTransport {
 }
 
 impl RpcTransport for TcpDebugTransport {
-    // No fd passing: `fds` reaches only the trait's refusing default.
     fn send_raw_draining(
         &self,
         buf: &[u8],
         fds: &[std::os::fd::BorrowedFd<'_>],
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
-        if !fds.is_empty() {
-            return self.send_raw_with_fds(buf, fds);
-        }
-        send_waiting(
-            self.stream.as_fd(),
-            &self.queue,
-            &mut [std::io::IoSlice::new(buf)],
-            &[],
-            Some(drain),
-        )
+        send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, fds, Some(drain))
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android
@@ -169,11 +159,7 @@ impl RpcTransport for TcpDebugTransport {
     /// wraps an `AF_INET` fd in this transport and goes straight into the
     /// android-13+ handshake, whose first byte is a raw write.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        if super::unix::WAITING_SENDS {
-            let slices = &mut [std::io::IoSlice::new(buf)];
-            return send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None);
-        }
-        super::write_raw(&mut &self.stream, buf)
+        send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, &[], None)
     }
 
     /// Raw, unframed read: `read_raw`, shared by the stream backends.

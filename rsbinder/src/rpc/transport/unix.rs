@@ -60,9 +60,11 @@
 //! cannot split a frame's fds between them. `shutdown` does not take that
 //! lock: a reader parked in `recvmsg` holds it until the shutdown wakes it.
 //!
-//! The sender (`send_frame_vectored`) passes the length and the body as two
-//! slices of one `sendmsg`, so the body is not copied into a joined buffer,
-//! and attaches the fds to the first `sendmsg` only. It does not use std's
+//! Every send is `send_stream`, which attaches the fds to the first
+//! `sendmsg` only; `send_frame_with_fds` hands it the length and the body as
+//! two slices, so the body is not copied into a joined buffer. It waits for
+//! room in `poll` on Linux and Android and blocks in `sendmsg` on Apple
+//! unless a drain has to read (`SendMode`). It does not use std's
 //! `write_vectored`: that is `writev`, which takes no `MSG_NOSIGNAL`. Apple
 //! has no `MSG_NOSIGNAL` at all, so there `from_stream` sets `SO_NOSIGPIPE`
 //! on the socket; std sets it only on sockets std itself creates, not on a
@@ -88,7 +90,6 @@
 //!   harness ignores `SIGPIPE`, so the sends run in a child process that
 //!   restores `SIG_DFL`; a `SIGPIPE` there kills the child and fails the test.
 
-use std::io::Write;
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
 use std::os::fd::{AsFd, OwnedFd};
@@ -99,7 +100,7 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport, MAX_FRAME_LEN};
+use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Per-message fd cap (DoS bound, < `SCM_MAX_FD` 253); `wire_android13` applies it across recvmsgs.
@@ -120,64 +121,26 @@ const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
 /// Ancillary space for one `sendmsg`/`recvmsg` of a frame: `MAX_FDS_PER_FRAME` fds.
 const FD_SPACE: usize = rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME));
 
-/// Unframed bytes via `send(2)` with `SEND_FLAGS`, classified as `write_all_reporting`.
-pub(crate) fn send_raw_nosignal(sock: std::os::fd::BorrowedFd<'_>, buf: &[u8]) -> RpcResult<()> {
-    struct NoSignal<'a>(std::os::fd::BorrowedFd<'a>);
-    impl Write for NoSignal<'_> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            rustix::net::send(self.0, buf, SEND_FLAGS).map_err(std::io::Error::from)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    super::write_all_reporting(&mut NoSignal(sock), buf)
+/// How a [`send_stream`] waits for room in the socket's send buffer.
+pub(crate) enum SendMode<'a> {
+    /// In `sendmsg`, under `SO_SNDTIMEO`: Apple, with no drain (`WAITING_SENDS`).
+    Blocking,
+    /// In `poll` between sends that do not block (`SendWait`), handing input to the drain.
+    Waiting(&'a OutQueue, Option<&'a mut dyn FnMut() -> RpcResult<()>>),
 }
 
-/// One length-prefixed frame (module doc "fd passing"); rejects oversize or too many fds first.
-pub(crate) fn send_frame_vectored(
-    sock: std::os::fd::BorrowedFd<'_>,
-    buf: &[u8],
-    fds: &[std::os::fd::BorrowedFd<'_>],
-) -> RpcResult<()> {
-    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
-    use std::io::IoSlice;
-    use std::mem::MaybeUninit;
-
-    if fds.len() > MAX_FDS_PER_FRAME {
-        return Err(RpcError::Protocol("too many fds in one RPC frame"));
-    }
-    if buf.len() > MAX_FRAME_LEN {
-        return Err(RpcError::FrameTooLarge {
-            declared: buf.len(),
-            max: MAX_FRAME_LEN,
-        });
-    }
-    let header = (buf.len() as u32).to_le_bytes();
-    let mut slices = [IoSlice::new(&header), IoSlice::new(buf)];
-    let mut rest: &mut [IoSlice<'_>] = &mut slices;
-    let total = header.len() + buf.len();
-    let mut space = [MaybeUninit::uninit(); FD_SPACE];
-    let mut sent = 0;
-    while sent < total {
-        let mut anc = SendAncillaryBuffer::new(&mut space);
-        // Sending without the fds would leave the parcel's fd table pointing at nothing.
-        if sent == 0 && !fds.is_empty() && !anc.push(SendAncillaryMessage::ScmRights(fds)) {
-            return Err(RpcError::Protocol(
-                "failed to attach SCM_RIGHTS ancillary data",
-            ));
-        }
-        match rustix::net::sendmsg(sock, rest, &mut anc, SEND_FLAGS) {
-            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
-            Ok(n) => {
-                sent += n;
-                IoSlice::advance_slices(&mut rest, n);
-            }
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(std::io::Error::from(e).into()),
+impl<'a> SendMode<'a> {
+    /// `Waiting` where sends wait in `poll` or a drain has to read; `Blocking` otherwise.
+    pub(crate) fn of(
+        queue: &'a OutQueue,
+        drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
+    ) -> Self {
+        if WAITING_SENDS || drain.is_some() {
+            SendMode::Waiting(queue, drain)
+        } else {
+            SendMode::Blocking
         }
     }
-    Ok(())
 }
 
 /// A send that fails with `EAGAIN` instead of blocking; XNU ignores `MSG_DONTWAIT` on a send.
@@ -208,13 +171,17 @@ pub(crate) fn send_nonblocking<T>(
 /// Whether a send without `drain` waits in `poll`: not on Apple (no `SIOCOUTQ`, 2 `fcntl` a send).
 pub(crate) const WAITING_SENDS: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
-/// A stream-socket send waiting in `poll` (`SendWait`), `fds` on the first byte, `drain` meanwhile.
-pub(crate) fn send_waiting(
+/// Every stream-socket send: `slices` whole, `fds` on the first `sendmsg`, waiting as `mode` says.
+///
+/// The send rule of the `transport` module doc ("Short reads and writes"): a deadline that
+/// expires before the first byte is `Timeout`, after it `Io(WouldBlock)`; a `sendmsg` that takes
+/// nothing is `WriteZero`; any other failure is the transport error. Too many fds, or fds with
+/// nothing to carry them, are refused before anything is sent.
+pub(crate) fn send_stream(
     sock: std::os::fd::BorrowedFd<'_>,
-    queue: &OutQueue,
     slices: &mut [std::io::IoSlice<'_>],
     fds: &[std::os::fd::BorrowedFd<'_>],
-    mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
+    mode: SendMode<'_>,
 ) -> RpcResult<()> {
     use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
     use std::io::IoSlice;
@@ -230,10 +197,13 @@ pub(crate) fn send_waiting(
             "cannot attach fds to an empty RPC frame",
         ));
     }
+    let (mut waiting, mut drain) = match mode {
+        SendMode::Blocking => (None, None),
+        SendMode::Waiting(queue, drain) => (Some(SendWait::new(sock, queue)), drain),
+    };
     let mut rest: &mut [IoSlice<'_>] = slices;
     let mut space = [MaybeUninit::uninit(); FD_SPACE];
     let mut sent = 0;
-    let mut waiting = SendWait::new(sock, queue);
     while sent < total {
         let mut anc = SendAncillaryBuffer::new(&mut space);
         // Sending without the fds would leave the parcel's fd table pointing at nothing.
@@ -242,31 +212,63 @@ pub(crate) fn send_waiting(
                 "failed to attach SCM_RIGHTS ancillary data",
             ));
         }
-        match send_nonblocking(sock, |flags| {
-            rustix::net::sendmsg(sock, rest, &mut anc, flags)
-        }) {
+        let result = match waiting {
+            None => rustix::net::sendmsg(sock, rest, &mut anc, SEND_FLAGS),
+            Some(_) => send_nonblocking(sock, |flags| {
+                rustix::net::sendmsg(sock, rest, &mut anc, flags)
+            }),
+        };
+        match result {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
             Ok(n) => {
                 sent += n;
                 IoSlice::advance_slices(&mut rest, n);
-                waiting.progressed();
+                if let Some(waiting) = waiting.as_mut() {
+                    waiting.progressed();
+                }
             }
             Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::AGAIN) => match waiting.wait(drain.is_some())? {
-                Some(true) => {
-                    if let Some(drain) = drain.as_mut() {
-                        drain().map_err(super::read_side_failure)?;
+            // `SO_SNDTIMEO` expired in a blocking send, or the buffer is full for one that is not.
+            Err(rustix::io::Errno::AGAIN) => {
+                let woken = match waiting.as_mut() {
+                    None => None,
+                    Some(waiting) => waiting.wait(drain.is_some())?,
+                };
+                match woken {
+                    Some(true) => {
+                        if let Some(drain) = drain.as_mut() {
+                            drain().map_err(super::read_side_failure)?;
+                        }
                     }
+                    Some(false) => {}
+                    None if sent == 0 => return Err(RpcError::Timeout),
+                    None => return Err(RpcError::Io(std::io::ErrorKind::WouldBlock.into())),
                 }
-                Some(false) => {}
-                // As `write_all_reporting`: a deadline before any byte keeps frame sync.
-                None if sent == 0 => return Err(RpcError::Timeout),
-                None => return Err(RpcError::Io(std::io::ErrorKind::WouldBlock.into())),
-            },
+            }
             Err(e) => return Err(std::io::Error::from(e).into()),
         }
     }
     Ok(())
+}
+
+/// `send_raw` and `send_raw_draining` of a socket transport that passes no fds (`tcp_debug`,
+/// `vsock`): `fds` is refused as the trait's defaults refuse it.
+#[cfg(any(
+    feature = "rpc-tcp-debug",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+pub(crate) fn send_raw_no_fds<'a>(
+    sock: std::os::fd::BorrowedFd<'_>,
+    queue: &'a OutQueue,
+    buf: &[u8],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+    drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
+) -> RpcResult<()> {
+    if !fds.is_empty() {
+        return Err(super::cannot_pass_fds());
+    }
+    let slices = &mut [std::io::IoSlice::new(buf)];
+    send_stream(sock, slices, &[], SendMode::of(queue, drain))
 }
 
 /// The waits of one send: `SO_SNDTIMEO` counted from the last progress (`transport` "A slow peer").
@@ -609,14 +611,10 @@ fn peer_pid(_fd: std::os::fd::RawFd) -> i32 {
 
 impl RpcTransport for UnixTransport {
     /// Raw, unframed write (android-13+ profile — the real android RPC
-    /// wire has no length prefix). `send(2)` with `SEND_FLAGS` (no `SIGPIPE`)
-    /// needs only `&self`, so it stays full-duplex (same as `send_frame`).
+    /// wire has no length prefix). `sendmsg` with `SEND_FLAGS` (no `SIGPIPE`)
+    /// needs only `&self`, so it stays full-duplex.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        if WAITING_SENDS {
-            let slices = &mut [std::io::IoSlice::new(buf)];
-            return send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None);
-        }
-        send_raw_nosignal(self.stream.as_fd(), buf)
+        self.send_raw_with_fds(buf, &[])
     }
 
     /// Raw, unframed read (one `read`; `Ok(0)` = peer closed). The
@@ -637,64 +635,14 @@ impl RpcTransport for UnixTransport {
     /// `sentFds |= ret > 0`); the rest (rare — fd transactions are
     /// tiny) follow without ancillary.
     fn send_raw_with_fds(&self, buf: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> RpcResult<()> {
-        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
-        use std::io::IoSlice;
-        use std::mem::MaybeUninit;
-
-        if fds.is_empty() {
-            return self.send_raw(buf);
-        }
-        if WAITING_SENDS {
-            let slices = &mut [IoSlice::new(buf)];
-            return send_waiting(self.stream.as_fd(), &self.queue, slices, fds, None);
-        }
-        if buf.is_empty() {
-            // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
-            return Err(RpcError::Protocol(
-                "cannot attach fds to an empty RPC frame",
-            ));
-        }
-        if fds.len() > MAX_FDS_PER_FRAME {
-            return Err(RpcError::Protocol("too many fds in one RPC frame"));
-        }
-        // As `send_raw`, no length check: `write_aosp_message_with_fds` caps the body.
-        let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
-        let mut sent = 0;
-        while sent < buf.len() {
-            let mut anc = SendAncillaryBuffer::new(&mut space);
-            if sent == 0 {
-                // Sending without the fds would leave the parcel's fd table pointing at nothing.
-                if !anc.push(SendAncillaryMessage::ScmRights(fds)) {
-                    return Err(RpcError::Protocol(
-                        "failed to attach SCM_RIGHTS ancillary data",
-                    ));
-                }
-            }
-            let n = match rustix::net::sendmsg(
-                &self.stream,
-                &[IoSlice::new(&buf[sent..])],
-                &mut anc,
-                SEND_FLAGS,
-            ) {
-                Ok(n) => n,
-                // EINTR is benign — retry the syscall.
-                Err(rustix::io::Errno::INTR) => continue,
-                // As `write_all_reporting`: a deadline before any byte sent keeps frame sync.
-                Err(e) => {
-                    let e = std::io::Error::from(e);
-                    return Err(if sent == 0 && super::is_timeout(&e) {
-                        RpcError::Timeout
-                    } else {
-                        e.into()
-                    });
-                }
-            };
-            if n == 0 {
-                return Err(RpcError::EndOfStream);
-            }
-            sent += n;
-        }
-        Ok(())
+        // No length check: raw bytes have no frame; `write_aosp_message_with_fds` caps the body.
+        let slices = &mut [std::io::IoSlice::new(buf)];
+        send_stream(
+            self.stream.as_fd(),
+            slices,
+            fds,
+            SendMode::of(&self.queue, None),
+        )
     }
 
     /// Raw, **unframed** read (one `recvmsg`) + any `SCM_RIGHTS` fds.
@@ -786,7 +734,14 @@ impl RpcTransport for UnixTransport {
         buf: &[u8],
         fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> RpcResult<()> {
-        send_frame_vectored(self.stream.as_fd(), buf, fds)
+        let header = super::frame_header(buf)?;
+        let slices = &mut [std::io::IoSlice::new(&header), std::io::IoSlice::new(buf)];
+        send_stream(
+            self.stream.as_fd(),
+            slices,
+            fds,
+            SendMode::of(&self.queue, None),
+        )
     }
 
     fn send_raw_draining(
@@ -796,12 +751,12 @@ impl RpcTransport for UnixTransport {
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
         // No length check: raw bytes have no frame, and the caller caps the body.
-        send_waiting(
+        let slices = &mut [std::io::IoSlice::new(buf)];
+        send_stream(
             self.stream.as_fd(),
-            &self.queue,
-            &mut [std::io::IoSlice::new(buf)],
+            slices,
             fds,
-            Some(drain),
+            SendMode::of(&self.queue, Some(drain)),
         )
     }
 
@@ -862,6 +817,39 @@ mod tests {
     use super::*;
     use crate::rpc::RpcError;
     use std::sync::Arc;
+
+    /// A send deadline is `Timeout` while nothing went out and `Io(WouldBlock)` once a byte did,
+    /// waiting in `poll` or blocking in `sendmsg` (`transport` module doc "Mutation gates").
+    #[test]
+    fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
+        use std::io::IoSlice;
+        let queue = OutQueue::default();
+        for blocking in [false, true] {
+            // The peer stays open and never reads.
+            let (a, _peer) = UnixStream::pair().expect("socketpair");
+            rustix::net::sockopt::set_socket_send_buffer_size(&a, 4096).expect("SO_SNDBUF");
+            a.set_write_timeout(Some(std::time::Duration::from_millis(50)))
+                .expect("SO_SNDTIMEO");
+            let mode = || {
+                if blocking {
+                    SendMode::Blocking
+                } else {
+                    SendMode::Waiting(&queue, None)
+                }
+            };
+            let big = vec![0u8; 1 << 20];
+            let cut = send_stream(a.as_fd(), &mut [IoSlice::new(&big)], &[], mode());
+            assert!(
+                matches!(&cut, Err(RpcError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "blocking {blocking}: part of the frame went out: {cut:?}"
+            );
+            let none = send_stream(a.as_fd(), &mut [IoSlice::new(b"frame")], &[], mode());
+            assert!(
+                matches!(none, Err(RpcError::Timeout)),
+                "blocking {blocking}: the buffer was full, nothing went out: {none:?}"
+            );
+        }
+    }
 
     #[test]
     fn unix_roundtrip_all_sizes() {
@@ -1111,7 +1099,7 @@ mod tests {
         use crate::rpc::wire_android13::write_aosp_message_with_fds;
         use std::os::fd::AsFd;
         let (a, b) = UnixTransport::pair().expect("socketpair");
-        let msg = vec![0u8; 16 + MAX_FRAME_LEN];
+        let msg = vec![0u8; 16 + super::super::MAX_FRAME_LEN];
         let total = 2 * msg.len();
         let reader = std::thread::spawn(move || {
             let mut buf = vec![0u8; 1 << 20];
