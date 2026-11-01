@@ -1115,7 +1115,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         Failure::permanent(StatusCode::Unknown)
     }
 
-    /// Undo a link, then end the session (plan 10-10b K6): closed first, it would run the recipient.
+    /// Unlink, then end the session (plan 10-10b K6): a session closed first runs the recipient.
     fn end_parts(&self, parts: Parts) {
         drop(parts.link);
         #[cfg(feature = "rpc")]

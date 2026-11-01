@@ -149,6 +149,20 @@
 //! the two `Reconnecting` refusals. It checks text, not the thread a transaction
 //! leaves from: a thread made with `thread::Builder` that sends a lookup is
 //! not seen.
+//!
+//! # Death links
+//!
+//! A death link the library holds is a `DeathLink`, whose drop unlinks and
+//! drops the binder under `catch_unwind` (plan 18 U1). A hand-written unlink
+//! in a `Drop` is where a poisoned lock or a proxy's own drop panicking would
+//! unwind, and an unwind out of a drop during another one aborts.
+//! `death_links_go_through_death_link` finds every `.unlink_to_death(` and
+//! `.unlink_to_death_arc(` call in the code of `rsbinder` and
+//! `rsbinder-topic`, with the test-code mask of the thread-creation test, and
+//! allows only `death.rs` (the link itself), `binder.rs` (the `_arc`
+//! forwarders), `hub/accessor_16.rs` (an `IBinder` that forwards) and
+//! `bridge.rs`, whose entries hold the remote weakly and so cannot be a
+//! `DeathLink`, which holds it strongly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -764,6 +778,53 @@ fn library_threads_are_made_by_builder() {
         "a library thread is made by a call that panics on failure, or a pinned site moved — \
          use `thread::Builder` and return the error; see this test's doc.\n\
          unpinned: {found:#?}\nmissing: {missing:#?}"
+    );
+}
+
+/// Keeps the library's unlinks behind `DeathLink`; see module doc "Death links".
+#[test]
+fn death_links_go_through_death_link() {
+    const ALLOWED: &[(&str, &str)] = &[
+        ("rsbinder", "death.rs"),
+        ("rsbinder", "binder.rs"),
+        ("rsbinder", "hub/accessor_16.rs"),
+        ("rsbinder", "bridge.rs"),
+    ];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found = Vec::new();
+    for krate in ["rsbinder", "rsbinder-topic"] {
+        let src_root = workspace.join(krate).join("src");
+        if !src_root.is_dir() {
+            eprintln!(
+                "skipping {krate}: sources not reachable at {}",
+                src_root.display()
+            );
+            continue;
+        }
+        visit(&src_root, &mut |path, content| {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                return;
+            }
+            let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+            let rel = rel.replace('\\', "/");
+            if ALLOWED.iter().any(|&(k, f)| k == krate && f == rel) {
+                return;
+            }
+            let lines: Vec<&str> = content.lines().map(code_only).collect();
+            let test = test_module_lines(&lines);
+            for (i, line) in lines.iter().enumerate() {
+                let unlinks = line.matches(".unlink_to_death(").count()
+                    + line.matches(".unlink_to_death_arc(").count();
+                if !test[i] && unlinks > 0 {
+                    found.push(format!("{krate}/src/{rel}:{}", i + 1));
+                }
+            }
+        });
+    }
+    assert!(
+        found.is_empty(),
+        "an unlink outside `DeathLink`; hold the link as a `DeathLink`, see this test's doc:\n\
+         {found:#?}"
     );
 }
 
