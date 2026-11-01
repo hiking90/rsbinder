@@ -133,15 +133,16 @@
 //!
 //! # `obituary_sent` ordering
 //!
-//! `send_obituary` sets `obituary_sent` once to publish "this proxy is dead".
-//! Its three readers use three orderings, and all three are correct: changing
-//! the `Relaxed` loads to `Acquire` adds a fence with no effect.
+//! The obituary sets `obituary_sent` once to publish "this proxy is dead"
+//! (`death::DeathRecipients`, which an RPC proxy shares). Its readers use two
+//! orderings, and both are correct: changing the `Relaxed` loads to `Acquire`
+//! adds a fence with no effect.
 //!
 //! | Call site | Lock state | Ordering | Why |
 //! |---|---|---|---|
-//! | `submit_transact`, `dump` | none (lock-free) | `Acquire` | Pairs with the `Release` store in `send_obituary` that publishes the recipients teardown. |
-//! | `link_to_death` / `unlink_to_death` | inside `recipients` lock | `Relaxed` | The `Mutex` acquire/release orders it against `send_obituary`'s store. |
-//! | `send_obituary` | inside `recipients` lock | `Relaxed` | Same; the store's `Release` serves the lock-free readers only. |
+//! | `submit_transact`, `dump`, `try_descriptor` (`is_dead`) | none (lock-free) | `Acquire` | Pairs with the `Release` store in `take` that publishes the recipients teardown. |
+//! | `link` / `unlink` | inside the list's lock | `Relaxed` | The `Mutex` acquire/release orders it against `take`'s store. |
+//! | `take` | inside the list's lock | `Relaxed` | Same; the store's `Release` serves the lock-free readers only. |
 //!
 //! # Extension cache
 //!
@@ -177,11 +178,12 @@
 //!
 //! # Recipient panics
 //!
-//! `dispatch_obituary_callbacks` wraps each `binder_died` in `catch_unwind`, so
-//! one panicking recipient neither stops the worker thread nor starves later
-//! recipients. `AssertUnwindSafe` asserts that rsbinder does not repair user
-//! state across the unwind: the snapshot is already detached from
-//! `recipients` and `obituary_sent` already published, so rsbinder's own
+//! `death::DeathRecipients::dispatch` wraps each `binder_died`, and the drop
+//! of the recipient it upgraded, in `catch_unwind`, so one panicking recipient
+//! neither stops the worker thread nor starves later recipients.
+//! `AssertUnwindSafe` asserts that rsbinder does not repair user state across
+//! the unwind: the snapshot is already detached from the recipient list and
+//! `obituary_sent` already published, so rsbinder's own
 //! invariants are unaffected; the panicking recipient's own state is not
 //! guaranteed. With `panic = "abort"` the guard does nothing (documented on
 //! `DeathRecipient`).
@@ -190,8 +192,9 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, Arc, Mutex, PoisonError, RwLock};
+use std::sync::{self, Arc, RwLock};
 
+use crate::death::DeathRecipients;
 use crate::process_state::{HandlePin, ProcessState};
 use crate::{binder::*, error::*, parcel::*, parcelable::DeserializeOption, thread_state};
 
@@ -222,9 +225,8 @@ pub struct ProxyHandle {
     handle: u32,
     /// Shared `BC_INCREFS`, descriptor and stability; its generation is this proxy's (module doc).
     pin: Arc<HandlePin>,
-    /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
-    obituary_sent: AtomicBool,
-    recipients: Mutex<Vec<sync::Weak<dyn DeathRecipient>>>,
+    /// The recipient list and `obituary_sent`; see the module doc table.
+    death: DeathRecipients,
     extension: RwLock<ExtensionCache>,
     /// Set by every freeze-callback add, never cleared; while unset `Drop` skips the freeze lock.
     freeze_used: AtomicBool,
@@ -240,8 +242,7 @@ impl ProxyHandle {
         Ok(Arc::new_cyclic(|me| Self {
             handle,
             pin: Arc::clone(pin),
-            obituary_sent: AtomicBool::new(false),
-            recipients: Mutex::new(Vec::new()),
+            death: DeathRecipients::new(),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
             me: me.clone(),
@@ -300,7 +301,7 @@ impl ProxyHandle {
         if let Some(descriptor) = self.pin.cached_descriptor() {
             return Ok(descriptor);
         }
-        if self.obituary_sent.load(Ordering::Acquire) {
+        if self.death.is_dead() {
             return Err(StatusCode::DeadObject);
         }
         let descriptor = thread_state::query_interface(self.handle)?;
@@ -330,7 +331,7 @@ impl ProxyHandle {
         flags: TransactionFlags,
     ) -> Result<Option<Parcel>> {
         // Fast-fail after obituary, as C++ `BpBinder::transact`; pairs with `send_obituary`.
-        if self.obituary_sent.load(Ordering::Acquire) {
+        if self.death.is_dead() {
             return Err(StatusCode::DeadObject);
         }
         thread_state::transact(self.handle(), code, data, flags)
@@ -378,83 +379,30 @@ impl RemoteProxy for ProxyHandle {
 impl ProxyHandle {
     pub(crate) fn send_obituary(&self, who: &WIBinder) -> Result<()> {
         // Mirrors C++ `BpBinder::sendObituary`; see module doc "Death notifications".
-        let recipients_snapshot: Vec<sync::Weak<dyn DeathRecipient>> = {
-            // A list of pushes and removes stays valid across a panic: recover it.
-            let mut recipients = self
-                .recipients
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-
-            // Checked and set under the lock (as C++), so `Relaxed` suffices.
-            if self.obituary_sent.load(Ordering::Relaxed) {
-                return Ok(());
+        let snapshot = self.death.take(|| {
+            // Best effort, as AOSP: `BR_DEAD_BINDER` comes once; `take` catches a panic.
+            let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
+            if let Err(e) = unlinked {
+                log::error!(
+                    "clear_death_notification failed for handle {}: {e:?}; \
+                     delivering the obituary anyway",
+                    self.handle()
+                );
             }
-
-            if !recipients.is_empty() {
-                // Best effort, as AOSP, panic included: `BR_DEAD_BINDER` comes once.
-                let unlinked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    ProcessState::as_self().unlink_death(self.handle, self.owner_key())
-                }));
-                match unlinked {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::error!(
-                        "clear_death_notification failed for handle {}: {e:?}; \
-                         delivering the obituary anyway",
-                        self.handle()
-                    ),
-                    Err(_) => log::error!(
-                        "clear_death_notification panicked for handle {}; \
-                         delivering the obituary anyway",
-                        self.handle()
-                    ),
-                }
-            }
-
-            let snapshot = std::mem::take(&mut *recipients);
-
-            // `Release` for the lock-free `submit_transact` / `dump` Acquire loads.
-            self.obituary_sent.store(true, Ordering::Release);
-
-            snapshot
+        });
+        let Some(snapshot) = snapshot else {
+            return Ok(());
         };
 
         // Callbacks before the flush, so an ioctl failure cannot swallow the obituary.
-        self.dispatch_obituary_callbacks(&recipients_snapshot, who);
+        DeathRecipients::dispatch(&snapshot, who, format_args!("handle {:X}", self.handle));
 
         // On failure the command stays queued for `finish_obituary`'s phase-2 flush.
-        if !recipients_snapshot.is_empty() {
+        if !snapshot.is_empty() {
             thread_state::flush_commands()?;
         }
 
         Ok(())
-    }
-
-    /// `binder_died` on each live recipient, panics caught; see module doc "Recipient panics".
-    fn dispatch_obituary_callbacks(
-        &self,
-        snapshot: &[sync::Weak<dyn DeathRecipient>],
-        who: &WIBinder,
-    ) {
-        for weak in snapshot {
-            // Dead `Weak`s drop with the snapshot; `mem::take` already cleared the source.
-            let Some(recipient) = weak.upgrade() else {
-                continue;
-            };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                recipient.binder_died(who);
-            }));
-            if let Err(payload) = result {
-                let msg = payload
-                    .downcast_ref::<&'static str>()
-                    .copied()
-                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("<non-string panic payload>");
-                log::error!(
-                    "DeathRecipient panicked during binder_died for handle {:X}: {msg}",
-                    self.handle,
-                );
-            }
-        }
     }
 
     /// Send `DUMP_TRANSACTION` to the remote binder, which writes its
@@ -482,7 +430,7 @@ impl ProxyHandle {
     /// has finished writing.
     pub fn dump<F: Into<OwnedFd>>(&self, fd: F, args: &[String]) -> Result<()> {
         // A dead proxy drops `fd` here, which closes it.
-        if self.obituary_sent.load(Ordering::Acquire) {
+        if self.death.is_dead() {
             return Err(StatusCode::DeadObject);
         }
         let mut send = Parcel::new();
@@ -507,7 +455,7 @@ impl Debug for ProxyHandle {
                 &self.pin.cached_descriptor().unwrap_or("(not cached)"),
             )
             .field("stability", &IBinder::stability(self))
-            .field("obituary_sent", &self.obituary_sent)
+            .field("obituary_sent", &self.death.is_dead())
             .finish()
     }
 }
@@ -528,12 +476,7 @@ impl Drop for ProxyHandle {
     /// AOSP `onLastStrongRef`; the `pin` field drops after this, as `~BpBinder` follows it.
     fn drop(&mut self) {
         // Unlinks before `BC_RELEASE`, as `kDecStrongLast` builds do (`BpBinder.cpp:880`, `:907`).
-        let linked = !self
-            .recipients
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty();
-        if linked {
+        if self.death.has_recipients() {
             // Clears only if no newer proxy of the handle linked meanwhile (`death` module doc).
             let unlinked = ProcessState::as_self().unlink_death(self.handle, self.owner_key());
             if let Err(err) = unlinked {
@@ -601,24 +544,10 @@ impl IBinder for ProxyHandle {
 
     /// Register a death notification for this object.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        // Lock before checking `obituary_sent`; see module doc "Death notifications".
-        let mut recipients = self
-            .recipients
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if self.obituary_sent.load(Ordering::Relaxed) {
-            return Err(StatusCode::DeadObject);
-        }
-        // A dead weak would never fire; a count, as an `upgrade` could run its `Drop` here.
-        if recipient.strong_count() == 0 {
-            return Err(StatusCode::BadValue);
-        }
-        if recipients.is_empty() {
-            // Per handle, not per proxy (`death` module doc); errs only if nothing got registered.
-            ProcessState::as_self().link_death(self.handle, self.owner_key())?;
-        }
-        recipients.push(recipient);
-        Ok(())
+        // Per handle, not per proxy (`death` module doc); errs only if nothing got registered.
+        self.death.link(recipient, || {
+            ProcessState::as_self().link_death(self.handle, self.owner_key())
+        })
     }
 
     /// Remove a previously registered death notification.
@@ -632,28 +561,12 @@ impl IBinder for ProxyHandle {
     /// — a user that registered the same recipient twice and unlinks
     /// once expects one callback to remain.
     fn unlink_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        // Lock before checking `obituary_sent`, as C++ `BpBinder::unlinkToDeath`.
-        let mut recipients = self
-            .recipients
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if self.obituary_sent.load(Ordering::Relaxed) {
-            return Err(StatusCode::DeadObject);
-        }
-        // First match only (C++ `removeAt(i)`); BC_CLEAR only on the non-empty→empty edge.
-        let Some(i) = recipients
-            .iter()
-            .position(|r| sync::Weak::ptr_eq(r, &recipient))
-        else {
-            return Err(StatusCode::NameNotFound);
-        };
-        recipients.remove(i);
-        if recipients.is_empty() {
-            // Write errors propagate; flush errors are ignored, as C++ `unlinkToDeath`.
+        // BC_CLEAR only on the non-empty→empty edge; flush errors ignored, as C++ `unlinkToDeath`.
+        self.death.unlink(recipient, || {
             ProcessState::as_self().unlink_death(self.handle, self.owner_key())?;
             let _ = thread_state::flush_commands_if_alive();
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// AOSP `BpBinder::addFrozenStateChangeCallback`; see `process_state` "Freeze notifications".
@@ -769,7 +682,7 @@ mod tests {
     //! - `test_dump_fast_fails_and_closes_fd_when_obituary_sent`: `dump` takes a pipe's write
     //!   end and the test reads the read end. A fast-fail path that keeps the fd from dropping
     //!   (a `mem::forget`, a detach into a raw fd) leaves the read `EAGAIN` instead of EOF.
-    //! - `test_dispatch_obituary_callbacks_isolates_panic`: the panicking recipient is first in
+    //! - `test_death_dispatch_isolates_panic`: the panicking recipient is first in
     //!   the two-element snapshot. Without the `catch_unwind` guard the panic unwinds past the
     //!   loop and the counting recipient is never called. The default hook prints the panic to
     //!   stderr; cargo buffers it per test.
@@ -799,8 +712,7 @@ mod tests {
         Arc::new_cyclic(|me| ProxyHandle {
             handle: 1,
             pin,
-            obituary_sent: AtomicBool::new(obituary_sent),
-            recipients: Mutex::new(Vec::new()),
+            death: DeathRecipients::sent(obituary_sent),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
             me: me.clone(),
@@ -995,7 +907,7 @@ mod tests {
         let proxy = synthetic_proxy(false);
         let (_arc, weak) = live_recipient_pair();
         {
-            let mut recipients = proxy.recipients.lock().expect("recipients lock");
+            let mut recipients = proxy.death.list();
             recipients.push(weak.clone());
             recipients.push(weak.clone());
         }
@@ -1003,7 +915,7 @@ mod tests {
         let result = proxy.unlink_to_death(weak.clone());
         assert!(matches!(result, Ok(())), "expected Ok, got {result:?}");
 
-        let recipients = proxy.recipients.lock().expect("recipients lock");
+        let recipients = proxy.death.list();
         assert_eq!(
             recipients.len(),
             1,
@@ -1029,7 +941,7 @@ mod tests {
             "expected NameNotFound, got {result:?}"
         );
         assert!(
-            proxy.recipients.lock().expect("recipients lock").is_empty(),
+            proxy.death.list().is_empty(),
             "recipients vec must remain empty"
         );
         std::mem::forget(proxy);
@@ -1103,7 +1015,7 @@ mod tests {
             "expected BadValue, got {result:?}"
         );
         assert!(
-            proxy.recipients.lock().expect("recipients lock").is_empty(),
+            proxy.death.list().is_empty(),
             "dead-weak rejection must not push a recipient"
         );
         std::mem::forget(proxy);
@@ -1162,7 +1074,7 @@ mod tests {
         let (_a_arc, a_weak) = live_recipient_pair();
         let (_b_arc, b_weak) = live_recipient_pair();
         {
-            let mut recipients = proxy.recipients.lock().expect("recipients lock");
+            let mut recipients = proxy.death.list();
             recipients.push(a_weak.clone());
         }
 
@@ -1172,7 +1084,7 @@ mod tests {
             "expected NameNotFound, got {result:?}"
         );
 
-        let recipients = proxy.recipients.lock().expect("recipients lock");
+        let recipients = proxy.death.list();
         assert_eq!(recipients.len(), 1, "registered recipient must survive");
         assert!(
             sync::Weak::ptr_eq(&recipients[0], &a_weak),
@@ -1211,7 +1123,7 @@ mod tests {
 
     /// A panicking recipient does not starve the next one; see `# Mutation gates`.
     #[test]
-    fn test_dispatch_obituary_callbacks_isolates_panic() {
+    fn test_death_dispatch_isolates_panic() {
         use std::sync::Mutex;
 
         struct PanickingRecipient;
@@ -1242,8 +1154,7 @@ mod tests {
         let mock_strong = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
         let who = SIBinder::downgrade(&mock_strong);
 
-        let proxy = synthetic_proxy(false);
-        proxy.dispatch_obituary_callbacks(&snapshot, &who);
+        DeathRecipients::dispatch(&snapshot, &who, "handle 1");
 
         assert_eq!(
             *count.lock().expect("count lock"),
@@ -1251,8 +1162,6 @@ mod tests {
             "counting recipient must fire after panicking recipient \
              (catch_unwind guard regression)"
         );
-
-        std::mem::forget(proxy);
     }
 
     /// `ExtensionCache::Queried` holds both variants; see `# Mutation gates`.

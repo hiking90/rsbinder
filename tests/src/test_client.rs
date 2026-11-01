@@ -2995,7 +2995,7 @@ fn test_wibinder_upgrade_after_obituary() {
 /// worker thread. Two recipients are registered: a panicking one (which
 /// goes first in registration order) and a writing one. After `killService`
 /// the writing recipient's pipe-write must be observable — proof that
-/// `dispatch_obituary_callbacks`'s `catch_unwind` is in effect.
+/// the `catch_unwind` of rsbinder's obituary dispatch is in effect.
 #[test]
 #[ignore]
 fn test_death_recipient_panic_does_not_starve_others() {

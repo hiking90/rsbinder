@@ -227,7 +227,7 @@
 //!   `StatusCode::Unknown`, so the `BR_TRANSACTION` reply path sends the
 //!   client a deterministic error reply instead of leaving it waiting for
 //!   `BR_REPLY`. This mirrors the guard around `DeathRecipient` callbacks in
-//!   `ProxyHandle::dispatch_obituary_callbacks`; the `Transactable` trait doc
+//!   `death::DeathRecipients::dispatch`; the `Transactable` trait doc
 //!   states the full guarantee.
 //! - **Dead-binder handshake.** For `BR_DEAD_BINDER`,
 //!   `drive_dead_binder_handshake` runs three phases: `obituary` (the user

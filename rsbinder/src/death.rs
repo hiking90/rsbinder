@@ -1,8 +1,20 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-handle bookkeeping for the kernel death registration behind
-//! `IBinder::link_to_death`.
+//! Death notification bookkeeping behind `IBinder::link_to_death`: the
+//! recipient list each proxy keeps, kernel or RPC (`DeathRecipients`), and the
+//! per-handle kernel registration (`DeathRegistry`).
+//!
+//! # Recipient list
+//!
+//! `DeathRecipients` is the list and its `obituary_sent` latch, with the rules
+//! the `proxy` module doc "Death notifications" states: the latch is read and
+//! set only under the list's lock, the obituary detaches the list under the
+//! lock and runs the callbacks after it, each callback (and the drop of the
+//! recipient it upgraded) is caught. A kernel proxy passes its registry calls
+//! as the closures that run under the lock, since the registration order
+//! depends on them; an RPC proxy passes none. The lock recovers from poison
+//! (`proxy` module doc).
 //!
 //! # Why per handle
 //!
@@ -34,8 +46,146 @@
 
 use std::collections::hash_map::Entry as MapEntry;
 use std::collections::HashMap;
+use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
 
+use crate::binder::{DeathRecipient, WIBinder};
+use crate::error::{Result, StatusCode};
 use crate::freeze::ClearDone;
+
+/// A proxy's death recipients and its `obituary_sent` latch; see the module doc.
+pub(crate) struct DeathRecipients {
+    list: Mutex<Vec<Weak<dyn DeathRecipient>>>,
+    /// Written once, `Release`, under `list`; `is_dead` reads it without the lock.
+    obituary_sent: AtomicBool,
+}
+
+impl DeathRecipients {
+    pub(crate) fn new() -> Self {
+        Self {
+            list: Mutex::new(Vec::new()),
+            obituary_sent: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Weak<dyn DeathRecipient>>> {
+        self.list.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `DeadObject` after the obituary, `BadValue` for a dead `recipient`; `on_first` runs
+    /// under the lock when the list was empty, and its error leaves the list as it was.
+    pub(crate) fn link(
+        &self,
+        recipient: Weak<dyn DeathRecipient>,
+        on_first: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut list = self.lock();
+        if self.obituary_sent.load(Ordering::Relaxed) {
+            return Err(StatusCode::DeadObject);
+        }
+        // A count, as an `upgrade` could run the recipient's `Drop` under the lock.
+        if recipient.strong_count() == 0 {
+            return Err(StatusCode::BadValue);
+        }
+        if list.is_empty() {
+            on_first()?;
+        }
+        list.push(recipient);
+        Ok(())
+    }
+
+    /// `DeadObject` after the obituary; removes the first match only (AOSP `removeAt(i)`),
+    /// `NameNotFound` on none; `on_last` runs under the lock when the list became empty.
+    pub(crate) fn unlink(
+        &self,
+        recipient: Weak<dyn DeathRecipient>,
+        on_last: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut list = self.lock();
+        if self.obituary_sent.load(Ordering::Relaxed) {
+            return Err(StatusCode::DeadObject);
+        }
+        let Some(i) = list.iter().position(|r| Weak::ptr_eq(r, &recipient)) else {
+            return Err(StatusCode::NameNotFound);
+        };
+        list.remove(i);
+        if list.is_empty() {
+            on_last()?;
+        }
+        Ok(())
+    }
+
+    /// The list, detached and latched; `None` once sent. `on_nonempty` runs first under
+    /// the lock, its panic caught: the obituary comes once and must still go out.
+    pub(crate) fn take(&self, on_nonempty: impl FnOnce()) -> Option<Vec<Weak<dyn DeathRecipient>>> {
+        let mut list = self.lock();
+        if self.obituary_sent.load(Ordering::Relaxed) {
+            return None;
+        }
+        if !list.is_empty() && catch_unwind(AssertUnwindSafe(on_nonempty)).is_err() {
+            log::error!("the obituary's unlink panicked; delivering the obituary anyway");
+        }
+        let snapshot = std::mem::take(&mut *list);
+        // `Release` for the lock-free `is_dead` readers.
+        self.obituary_sent.store(true, Ordering::Release);
+        Some(snapshot)
+    }
+
+    /// `binder_died` on each live recipient with no lock held, its panic and the drop of the
+    /// recipient it upgraded caught; `target` names the proxy in the log.
+    pub(crate) fn dispatch(
+        snapshot: &[Weak<dyn DeathRecipient>],
+        who: &WIBinder,
+        target: impl fmt::Display,
+    ) {
+        for weak in snapshot {
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                if let Some(recipient) = weak.upgrade() {
+                    recipient.binder_died(who);
+                }
+            }));
+            if let Err(payload) = caught {
+                let msg = payload
+                    .downcast_ref::<&'static str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                log::error!("DeathRecipient panicked during binder_died for {target}: {msg}");
+            }
+        }
+    }
+
+    /// Whether the obituary went out; `Acquire`, for the readers that take no lock.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.obituary_sent.load(Ordering::Acquire)
+    }
+
+    /// Whether a recipient is linked, for a proxy's `Drop`, which needs no lock.
+    pub(crate) fn has_recipients(&mut self) -> bool {
+        !self
+            .list
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// A list whose obituary went out already when `obituary_sent`.
+    #[cfg(test)]
+    pub(crate) fn sent(obituary_sent: bool) -> Self {
+        let recipients = Self::new();
+        recipients
+            .obituary_sent
+            .store(obituary_sent, Ordering::Relaxed);
+        recipients
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list(&self) -> MutexGuard<'_, Vec<Weak<dyn DeathRecipient>>> {
+        self.lock()
+    }
+}
 
 /// A command the caller writes while still holding the registry lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,5 +352,112 @@ mod tests {
         assert_eq!(reg.kernel(H), Some(Kernel::Registered));
         reg.abort_request(H);
         assert_eq!(reg.kernel(H), None);
+    }
+
+    mod recipients {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        use super::super::*;
+        use crate::binder::{Interface, Remotable, TransactionCode};
+        use crate::{Binder, Parcel, SIBinder};
+
+        struct Local;
+        impl Interface for Local {}
+        impl Remotable for Local {
+            fn descriptor() -> &'static str {
+                "rsbinder.test.ILocal"
+            }
+            fn on_transact(
+                &self,
+                _: TransactionCode,
+                _: &mut Parcel,
+                _: &mut Parcel,
+            ) -> Result<()> {
+                Err(StatusCode::UnknownTransaction)
+            }
+            fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        fn who() -> (SIBinder, WIBinder) {
+            let strong = Interface::as_binder(&Binder::new(Local));
+            let weak = SIBinder::downgrade(&strong);
+            (strong, weak)
+        }
+
+        /// Counts its notifications.
+        struct Counting(Arc<AtomicUsize>);
+        impl DeathRecipient for Counting {
+            fn binder_died(&self, _: &WIBinder) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn counting() -> (Arc<dyn DeathRecipient>, Arc<AtomicUsize>) {
+            let count = Arc::new(AtomicUsize::new(0));
+            (Arc::new(Counting(count.clone())), count)
+        }
+
+        /// A panic under the lock poisons it for real; the list still links and notifies.
+        #[test]
+        fn a_poisoned_list_still_links_and_notifies() {
+            let list = DeathRecipients::new();
+            let (first, _) = counting();
+            let panicked = catch_unwind(AssertUnwindSafe(|| {
+                let _ = list.link(Arc::downgrade(&first), || panic!("the registry panics"));
+            }));
+            assert!(panicked.is_err());
+            assert!(list.list.is_poisoned());
+
+            let (recipient, count) = counting();
+            list.link(Arc::downgrade(&recipient), || Ok(()))
+                .expect("link");
+            let snapshot = list.take(|| {}).expect("first obituary");
+            let (_strong, who) = who();
+            DeathRecipients::dispatch(&snapshot, &who, "test");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
+
+        /// The obituary's unlink panicking still drains and latches the list.
+        #[test]
+        fn a_panicking_unlink_still_gives_the_obituary() {
+            let list = DeathRecipients::new();
+            let (recipient, _) = counting();
+            list.link(Arc::downgrade(&recipient), || Ok(()))
+                .expect("link");
+            let snapshot = list.take(|| panic!("the unlink panics"));
+            assert_eq!(snapshot.map(|s| s.len()), Some(1));
+            assert!(list.is_dead());
+            assert!(list.take(|| {}).is_none(), "once");
+        }
+
+        /// Drops its own last strong reference in `binder_died`, so its `Drop` runs in dispatch.
+        struct DropsItself(std::sync::Mutex<Option<Arc<DropsItself>>>);
+        impl DeathRecipient for DropsItself {
+            fn binder_died(&self, _: &WIBinder) {
+                drop(self.0.lock().expect("lock").take());
+            }
+        }
+        impl Drop for DropsItself {
+            fn drop(&mut self) {
+                panic!("the recipient's drop panics");
+            }
+        }
+
+        /// A recipient's `Drop` panicking in dispatch leaves the next one notified.
+        #[test]
+        fn a_panicking_recipient_drop_starves_no_other() {
+            let first = Arc::new(DropsItself(std::sync::Mutex::new(None)));
+            *first.0.lock().expect("lock") = Some(first.clone());
+            let weak_first: Weak<dyn DeathRecipient> = Arc::downgrade(&first) as _;
+            drop(first);
+            let (second, count) = counting();
+            let snapshot = vec![weak_first, Arc::downgrade(&second)];
+            let (_strong, who) = who();
+            DeathRecipients::dispatch(&snapshot, &who, "test");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+        }
     }
 }

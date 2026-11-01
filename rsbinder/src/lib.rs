@@ -270,7 +270,7 @@ pub mod bridge;
 mod command_stream;
 // Error types; private, `Result` and `StatusCode` are re-exported at the crate root.
 mod error;
-// Per-handle death-registration bookkeeping behind `IBinder::link_to_death`.
+// Death recipients of every proxy, and the per-handle kernel registration behind them.
 mod death;
 // `ParcelFileDescriptor`, re-exported at the crate root.
 mod file_descriptor;

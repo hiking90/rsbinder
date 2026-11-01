@@ -50,7 +50,7 @@
 //! defers via `postTask`; this is the equivalent.
 //!
 //! Callbacks run under `catch_unwind` (`fire_callback`), the same panic
-//! isolation as `ProxyHandle::dispatch_obituary_callbacks`: they run from
+//! isolation as `death::DeathRecipients::dispatch`: they run from
 //! `CallbackDeferGuard::drop`, where a panic escaping during an unwind aborts
 //! the process, and a panic in the first of several queued callbacks would
 //! otherwise discard the rest.
