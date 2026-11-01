@@ -356,8 +356,29 @@ impl Area {
         }
     }
 
+    /// The words `off..off + len` is, when it is whole words of the word part: the common copy
+    /// (a ring of 8-byte multiples), which then needs no cut. `None` otherwise.
+    #[inline]
+    fn whole_words(&self, off: usize, len: usize) -> Option<&[AtomicUsize]> {
+        let at = off.checked_sub(self.head)?;
+        let end = at.checked_add(len)?;
+        if at % WORD != 0 || len % WORD != 0 || end > self.words * WORD {
+            return None;
+        }
+        Some(self.words_at(at / WORD, len / WORD))
+    }
+
     #[inline]
     fn store(&self, off: usize, src: &[u8], order: Ordering) {
+        if let Some(words) = self.whole_words(off, src.len()) {
+            for (d, s) in words.iter().zip(src.chunks_exact(WORD)) {
+                d.store(
+                    usize::from_ne_bytes(s.try_into().expect("a whole word")),
+                    order,
+                );
+            }
+            return;
+        }
         let cut = self.cut(off, src.len());
         let (head, mut src) = src.split_at(cut.head.len());
         for (d, s) in self.bytes_at(cut.head.start, head.len()).iter().zip(head) {
@@ -394,6 +415,16 @@ impl Area {
     // Always `Relaxed`: the one load ordering defined on a read-only mapping.
     #[inline]
     fn load(&self, off: usize, dst: &mut [MaybeUninit<u8>]) {
+        if let Some(words) = self.whole_words(off, dst.len()) {
+            for (s, d) in words.iter().zip(dst.chunks_exact_mut(WORD)) {
+                let d: &mut [MaybeUninit<u8>; WORD] = d.try_into().expect("a whole word");
+                *d = s
+                    .load(Ordering::Relaxed)
+                    .to_ne_bytes()
+                    .map(MaybeUninit::new);
+            }
+            return;
+        }
         let cut = self.cut(off, dst.len());
         let (head, mut dst) = dst.split_at_mut(cut.head.len());
         for (s, d) in self.bytes_at(cut.head.start, head.len()).iter().zip(head) {

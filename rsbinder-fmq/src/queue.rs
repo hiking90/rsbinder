@@ -1095,12 +1095,17 @@ impl<T: Element> Regions<'_, T> {
         }
         let (first, second, head) = self.split(start, src.len());
         let (to_first, to_second) = src.split_at(head);
+        // The part after the wrap is most often empty; a copy of nothing is left out.
         if self.release {
             self.ring.store_release(first, to_first);
-            self.ring.store_release(second, to_second);
+            if !to_second.is_empty() {
+                self.ring.store_release(second, to_second);
+            }
         } else {
             self.ring.store(first, to_first);
-            self.ring.store(second, to_second);
+            if !to_second.is_empty() {
+                self.ring.store(second, to_second);
+            }
         }
         Ok(())
     }
@@ -1117,7 +1122,9 @@ impl<T: Element> Regions<'_, T> {
         let (first, second, head) = self.split(start, dst.len());
         let (to_first, to_second) = dst.split_at_mut(head);
         self.ring.load(first, to_first);
-        self.ring.load(second, to_second);
+        if !to_second.is_empty() {
+            self.ring.load(second, to_second);
+        }
         Ok(())
     }
 }
