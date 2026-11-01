@@ -450,10 +450,10 @@ fn refusal(status: &Status) -> Refusal {
 impl<T: Payload + 'static> NamedSubscriber<T> {
     /// Subscribe to the topic the service manager gives `name` to, now or later.
     ///
-    /// Returns once the name is watched (`rsbinder::hub::register_for_notifications`), without
-    /// waiting for a publisher. Fails when the watch does: a name the service manager refuses,
-    /// or Android 10's service manager, which has no registration notices. `policy` is used for
-    /// every connection, but for where each connection after the first starts (see the type's
+    /// Returns once the name is watched (`rsbinder::hub::watch`), without waiting for a
+    /// publisher. Fails when the watch does: a name the service manager refuses, or Android
+    /// 10's service manager, which has no registration notices. `policy` is used for every
+    /// connection, but for where each connection after the first starts (see the type's
     /// documentation).
     pub fn subscribe(name: &str, policy: &SubscriberPolicy) -> BinderResult<Self> {
         Self::subscribe_with(name, policy, &ServiceManager)

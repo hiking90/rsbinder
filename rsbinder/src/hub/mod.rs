@@ -129,6 +129,7 @@
 //! inbound notifications to the original binder node, never to this
 //! transient local object.
 
+use std::borrow::Borrow;
 use std::sync::{Arc, OnceLock};
 
 /// Common body of `servicemanager_{11..15}`, plus `$extra`; `include!` the AIDL bindings first.
@@ -1752,6 +1753,15 @@ impl ServiceManager {
             .ok()
     }
 
+    /// Calls `on_registered` with each binder registered under `name` until the guard drops.
+    pub(crate) fn watch_borrowed(
+        &self,
+        name: &str,
+        on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+    ) -> std::result::Result<WatchGuard<&Self>, Status> {
+        WatchGuard::register(self, name, on_registered)
+    }
+
     /// `wait_for_service` that `state.cancel()` ends at once; see its rustdoc "Cancellation".
     pub(crate) fn wait_for_service_cancellable(
         &self,
@@ -1768,21 +1778,16 @@ impl ServiceManager {
             return Err(WaitEnd::Cancelled);
         }
 
-        let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
-
-        if let Err(status) = self.register_for_notifications(name, &callback) {
+        let woken = Arc::clone(&state);
+        // Held to the end: every exit unregisters, a panic's too.
+        let _watch = match self.watch_borrowed(name, move |binder| woken.deliver(binder)) {
+            Ok(watch) => watch,
             #[cfg(all(target_os = "android", feature = "android_10"))]
-            if matches!(self, ServiceManager::Android10(_)) {
+            Err(_) if matches!(self, ServiceManager::Android10(_)) => {
                 return self.poll_for_service(name, &state);
             }
             // AOSP `waitForService`: a refused registration (bad name, SELinux) ends the wait.
-            return Err(WaitEnd::from_registration(status));
-        }
-        // Always unregister, even on early return / panic (AOSP's `Defer`).
-        let _unregister = UnregisterOnDrop {
-            sm: self,
-            name,
-            callback: &callback,
+            Err(status) => return Err(WaitEnd::from_registration(status)),
         };
 
         let mut waited_secs: u64 = 0;
@@ -1798,7 +1803,7 @@ impl ServiceManager {
                 if let Some(binder) = guard.binder.as_ref() {
                     return Ok(binder.clone());
                 }
-                // The caller gave up. `UnregisterOnDrop` fires on the way out.
+                // The caller gave up. `_watch` unregisters on the way out.
                 if guard.cancelled {
                     return Err(WaitEnd::Cancelled);
                 }
@@ -1917,36 +1922,76 @@ impl WaiterState {
             .unwrap_or_else(|e| e.into_inner())
             .cancelled
     }
-}
 
-/// One-shot callback waking the waiter; AOSP `waitForService`'s local `Waiter` class.
-struct Waiter(Arc<WaiterState>);
-
-impl Interface for Waiter {}
-
-impl IServiceCallback for Waiter {
-    fn onRegistration(&self, _name: &str, service: &SIBinder) -> crate::status::BinderResult<()> {
-        let mut guard = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.binder = Some(service.clone());
+    /// Wakes the wait with `binder`; AOSP `waitForService`'s local `Waiter::onRegistration`.
+    fn deliver(&self, binder: SIBinder) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.binder = Some(binder);
         drop(guard);
         // One waiter per state (its `wait_for_service` call), as AOSP's `mCv.notify_one()`.
-        self.0.cv.notify_one();
+        self.cv.notify_one();
+    }
+}
+
+/// The `IServiceCallback` of one [`WatchGuard`]: hands each registered binder to its closure.
+struct OnRegistration(Box<dyn Fn(SIBinder) + Send + Sync>);
+
+impl Interface for OnRegistration {}
+
+impl IServiceCallback for OnRegistration {
+    fn onRegistration(&self, _name: &str, service: &SIBinder) -> crate::status::BinderResult<()> {
+        (self.0)(service.clone());
         Ok(())
     }
 }
 
-/// Unregisters the wait callback on any exit, as AOSP `waitForService`'s `Defer unregister`.
-struct UnregisterOnDrop<'a> {
-    sm: &'a ServiceManager,
-    name: &'a str,
-    callback: &'a Strong<dyn IServiceCallback>,
+/// A registration callback that drop unregisters, as AOSP `waitForService`'s `Defer unregister`.
+pub(crate) struct WatchGuard<S: Borrow<ServiceManager>> {
+    sm: S,
+    name: String,
+    callback: Strong<dyn IServiceCallback>,
 }
 
-impl Drop for UnregisterOnDrop<'_> {
+impl<S: Borrow<ServiceManager>> WatchGuard<S> {
+    fn register(
+        sm: S,
+        name: &str,
+        on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+    ) -> std::result::Result<Self, Status> {
+        let callback = BnServiceCallback::new_binder(OnRegistration(Box::new(on_registered)));
+        sm.borrow().register_for_notifications(name, &callback)?;
+        Ok(Self {
+            sm,
+            name: name.to_owned(),
+            callback,
+        })
+    }
+}
+
+impl<S: Borrow<ServiceManager>> Drop for WatchGuard<S> {
     fn drop(&mut self) {
+        // A failure leaves a callback whose calls nothing waits for; nothing else to do.
         let _ = self
             .sm
-            .unregister_for_notifications(self.name, self.callback);
+            .borrow()
+            .unregister_for_notifications(&self.name, &self.callback);
+    }
+}
+
+/// A registration callback on the default service manager, from [`watch`].
+///
+/// Dropping it unregisters the callback (`unregisterForNotifications`) on
+/// the service manager it was registered with. A failed unregister is not
+/// reported: the service manager then keeps a callback whose calls reach a
+/// closure nobody holds a watch for, and drops it when this process ends.
+#[must_use = "dropping the watch unregisters its callback at once"]
+pub struct ServiceWatch(WatchGuard<Arc<ServiceManager>>);
+
+impl std::fmt::Debug for ServiceWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceWatch")
+            .field("name", &self.0.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1985,6 +2030,37 @@ pub fn unregister_for_notifications(
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> BinderResult<()> {
     default()?.unregister_for_notifications(name, callback)
+}
+
+/// Calls `on_registered` with the binder each time the default service
+/// manager registers a service under `name`, until the returned
+/// [`ServiceWatch`] is dropped.
+///
+/// This is [`register_for_notifications`] with a closure for the callback
+/// and the matching [`unregister_for_notifications`] in the guard's `Drop`,
+/// the pairing AOSP `waitForService` keeps with its `Defer`. A name already
+/// registered is reported at once, as the service manager does for every
+/// registration. The closure runs on a binder thread, so it hears nothing
+/// without the thread pool ([`ProcessState::start_thread_pool`]); a panic
+/// in it is caught and logged like any other transaction handler's.
+///
+/// The service manager's refusal keeps its exception, as for
+/// [`ServiceManager::register_for_notifications`]: `EX_SECURITY` for a name
+/// the caller may not find, `EX_ILLEGAL_ARGUMENT` for an invalid name, and
+/// `EX_UNSUPPORTED_OPERATION` on Android 10, whose service manager has no
+/// registration notices. A service manager that cannot be reached is a
+/// [`Status`] carrying [`default`]'s [`StatusCode`].
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
+pub fn watch(
+    name: &str,
+    on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+) -> std::result::Result<ServiceWatch, Status> {
+    Ok(ServiceWatch(WatchGuard::register(
+        default()?,
+        name,
+        on_registered,
+    )?))
 }
 
 /// Convenience function to register a client-presence callback on the default

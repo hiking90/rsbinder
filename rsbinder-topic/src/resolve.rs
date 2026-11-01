@@ -8,8 +8,8 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use rsbinder::hub::{self, BnServiceCallback, IServiceCallback};
-use rsbinder::{BinderResult, Interface, SIBinder, Strong};
+use rsbinder::hub;
+use rsbinder::{BinderResult, SIBinder};
 
 /// Turns topic names into topic binders, for [`Publisher::advertise_with`] and
 /// [`NamedSubscriber::subscribe_with`].
@@ -156,10 +156,10 @@ impl fmt::Debug for Watch {
 
 /// The service manager as a [`Resolver`]: a topic's name is a service name.
 ///
-/// `advertise` is `rsbinder::hub::add_service`, `watch` is
-/// `rsbinder::hub::register_for_notifications`, so the names follow the service manager's rules
-/// and its access control: who may add, and who may find, the name. Android 10's service
-/// manager has no registration notices, and there `watch` fails.
+/// `advertise` is `rsbinder::hub::add_service`, `watch` is `rsbinder::hub::watch`, so the names
+/// follow the service manager's rules and its access control: who may add, and who may find,
+/// the name. Android 10's service manager has no registration notices, and there `watch` fails
+/// with `EX_UNSUPPORTED_OPERATION`.
 ///
 /// The service manager has no way to take a service's name back: the [`Advertisement`] does
 /// nothing, and a name stays registered until its process ends. The watch's lookup is
@@ -183,40 +183,10 @@ impl Resolver for ServiceManager {
         name: &str,
         on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
     ) -> BinderResult<Watch> {
-        let callback = BnServiceCallback::new_binder(Notice(on_registered));
-        hub::register_for_notifications(name, &callback)?;
+        let watch = hub::watch(name, on_registered)?;
         let looked_up = name.to_owned();
-        Ok(Watch::with_lookup(
-            Registered {
-                name: name.to_owned(),
-                callback,
-            },
-            move || Ok(hub::check_service(&looked_up)),
-        ))
-    }
-}
-
-/// The service manager's callback for one watch.
-struct Notice(Box<dyn Fn(SIBinder) + Send + Sync>);
-
-impl Interface for Notice {}
-
-impl IServiceCallback for Notice {
-    fn r#onRegistration(&self, _name: &str, service: &SIBinder) -> BinderResult<()> {
-        (self.0)(service.clone());
-        Ok(())
-    }
-}
-
-/// Unregisters the callback when the watch is dropped.
-struct Registered {
-    name: String,
-    callback: Strong<dyn IServiceCallback>,
-}
-
-impl Drop for Registered {
-    fn drop(&mut self) {
-        // A failure leaves a callback whose calls find the subscriber gone; nothing else to do.
-        let _ = hub::unregister_for_notifications(&self.name, &self.callback);
+        Ok(Watch::with_lookup(watch, move || {
+            Ok(hub::check_service(&looked_up))
+        }))
     }
 }

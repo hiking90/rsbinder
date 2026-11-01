@@ -152,11 +152,13 @@ fn test_notifications() -> rsbinder::Result<()> {
             "mytest_service",
             &callback
         )));
+        assert!(unsupported(hub::watch("mytest_service", |_| {}).map(drop)));
         return Ok(());
     }
 
     hub::register_for_notifications("mytest_service", &callback)?;
     hub::unregister_for_notifications("mytest_service", &callback)?;
+    drop(hub::watch("mytest_service", |_| {})?);
 
     Ok(())
 }

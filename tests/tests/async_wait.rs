@@ -56,6 +56,30 @@ fn registrations_supported() -> bool {
     supported
 }
 
+/// `rsb_hub`'s `MAX_CALLBACKS_PER_NAME`.
+const CAP: usize = 256;
+
+/// A callback that exists only to occupy a slot in `rsb_hub`'s per-name list.
+struct Occupant;
+impl Interface for Occupant {}
+impl hub::IServiceCallback for Occupant {
+    fn onRegistration(&self, _name: &str, _binder: &SIBinder) -> rsbinder::BinderResult<()> {
+        Ok(())
+    }
+}
+
+/// Registers `CAP - 1` occupants for `name`, so the next registration takes the last slot.
+fn fill_to_one_below_the_cap(sm: &hub::ServiceManager, name: &str) -> Vec<SIBinder> {
+    (0..(CAP - 1))
+        .map(|i| {
+            let callback = hub::BnServiceCallback::new_binder(Occupant);
+            sm.register_for_notifications(name, &callback)
+                .unwrap_or_else(|e| panic!("occupant {i} could not register: {e:?}"));
+            callback.as_binder()
+        })
+        .collect()
+}
+
 struct Svc;
 impl Interface for Svc {}
 
@@ -376,28 +400,12 @@ fn a_timed_out_connect_async_returns_the_blocking_thread() {
 /// cannot be armed and the test says so and returns rather than reporting a
 /// pass it did not measure. It is listed for the Linux gate.
 ///
-/// Mutant: removing `UnregisterOnDrop` from the cancelled return path (or
-/// returning without dropping it) keeps the list at the cap, and the final
-/// registration stays rejected for the whole retry window.
+/// Mutant: a wait whose cancelled return skips its watch guard's `Drop` (a
+/// `mem::forget`) keeps the list at the cap, and the final registration stays
+/// rejected for the whole retry window.
 #[test]
 #[ignore = "needs a kernel binder device and a running rsb_hub"]
 fn a_dropped_wait_leaves_no_callback_registered() {
-    use rsbinder::hub::android_16::android::os::IServiceCallback::{
-        BnServiceCallback, IServiceCallback,
-    };
-
-    /// A callback that exists only to occupy a slot in the list.
-    struct Occupant;
-    impl Interface for Occupant {}
-    impl IServiceCallback for Occupant {
-        fn onRegistration(&self, _name: &str, _binder: &SIBinder) -> rsbinder::BinderResult<()> {
-            Ok(())
-        }
-    }
-
-    /// `rsb_hub`'s `MAX_CALLBACKS_PER_NAME`.
-    const CAP: usize = 256;
-
     if !registrations_supported() {
         return;
     }
@@ -409,13 +417,7 @@ fn a_dropped_wait_leaves_no_callback_registered() {
 
     // Hold the callbacks: the list in rsb_hub keeps its own references, but
     // dropping ours would only invite a death-driven prune mid-test.
-    let mut occupants = Vec::new();
-    for i in 0..(CAP - 1) {
-        let callback = BnServiceCallback::new_binder(Occupant);
-        sm.register_for_notifications(&name, &callback)
-            .unwrap_or_else(|e| panic!("occupant {i} could not register: {e:?}"));
-        occupants.push(callback);
-    }
+    let _occupants = fill_to_one_below_the_cap(&sm, &name);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -425,7 +427,7 @@ fn a_dropped_wait_leaves_no_callback_registered() {
 
     // Registered only to read the cap, never to occupy a slot for long: a
     // refusal leaves the list untouched, and an acceptance ends the test.
-    let arming_probe = BnServiceCallback::new_binder(Occupant);
+    let arming_probe = hub::BnServiceCallback::new_binder(Occupant);
 
     let armed = rt.block_on(async {
         let waiting_name = name.clone();
@@ -469,7 +471,7 @@ fn a_dropped_wait_leaves_no_callback_registered() {
     // unregister is a wire call the blocking thread makes on its way out, so
     // retry rather than assume it has already landed. On a leak every attempt
     // is refused and the loop runs out.
-    let extra = BnServiceCallback::new_binder(Occupant);
+    let extra = hub::BnServiceCallback::new_binder(Occupant);
     let mut last = None;
     for _ in 0..10 {
         match sm.register_for_notifications(&name, &extra) {
@@ -479,6 +481,72 @@ fn a_dropped_wait_leaves_no_callback_registered() {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!("the dropped wait kept its callback registered: the list stayed at the cap ({last:?})");
+}
+
+/// `hub::watch` hands its closure the binder registered under the name.
+///
+/// Mutant: a watch that registers no callback, or a callback that does not
+/// call the closure, leaves the channel empty.
+#[test]
+#[ignore = "needs a kernel binder device and a running service manager"]
+fn a_service_watch_hears_the_registration() {
+    if !registrations_supported() {
+        return;
+    }
+    ProcessState::init_default().expect("ProcessState::init_default");
+    ProcessState::start_thread_pool();
+
+    let name = service_name("watch");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<SIBinder>(1);
+    let watch = hub::watch(&name, move |binder| {
+        let _ = tx.try_send(binder);
+    })
+    .expect("hub::watch");
+
+    let service = BnAsyncRt::new_binder(Svc);
+    hub::add_service(&name, service.clone()).expect("add_service");
+
+    let heard = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the watch heard no registration");
+    let heard: Strong<dyn IAsyncRt> = heard.into_interface_checked().expect("the heard binder");
+    assert_eq!(heard.echo("watch").expect("echo"), "echo:watch");
+    drop(watch);
+}
+
+/// Dropping a `ServiceWatch` unregisters its callback before `drop` returns.
+///
+/// Same instrument as `a_dropped_wait_leaves_no_callback_registered`, and
+/// the same Linux/`rsb_hub` restriction. The unregister is a two-way call
+/// inside `drop`, so one registration right after it must be accepted.
+///
+/// Mutant: a `WatchGuard` without its `Drop` keeps the list at the cap.
+#[test]
+#[ignore = "needs a kernel binder device and a running rsb_hub"]
+fn a_dropped_service_watch_leaves_no_callback_registered() {
+    if !registrations_supported() {
+        return;
+    }
+    ProcessState::init_default().expect("ProcessState::init_default");
+    ProcessState::start_thread_pool();
+
+    let sm = hub::default().expect("service manager");
+    let name = service_name("watchleak");
+    let _occupants = fill_to_one_below_the_cap(&sm, &name);
+
+    let watch = hub::watch(&name, |_| {}).expect("hub::watch takes the last slot");
+    let probe = hub::BnServiceCallback::new_binder(Occupant);
+    if sm.register_for_notifications(&name, &probe).is_ok() {
+        if cfg!(target_os = "android") {
+            println!("skipped: no per-name callback cap on this service manager");
+            return;
+        }
+        panic!("the list never reached the cap ({CAP}): the watch registered no callback");
+    }
+
+    drop(watch);
+    sm.register_for_notifications(&name, &probe)
+        .expect("the dropped watch kept its callback registered");
 }
 
 /// AC-11-1.6 — both futures are `Send + 'static`, so they can be spawned and

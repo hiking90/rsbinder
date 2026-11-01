@@ -1156,10 +1156,9 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         }
         if mode == Mode::Build {
             // `getService` answers a denied name as an absent one; a registration tells them apart.
-            let probe = crate::hub::BnServiceCallback::new_binder(Unwatched);
-            return match sm.register_for_notifications(name, &probe) {
-                Ok(()) => {
-                    let _ = sm.unregister_for_notifications(name, &probe);
+            return match sm.watch_borrowed(name, |_| {}) {
+                Ok(probe) => {
+                    drop(probe);
                     Err(Failure::transient(StatusCode::NameNotFound))
                 }
                 Err(status) => Err(wait_failure(WaitEnd::from_registration(status))),
@@ -1372,17 +1371,6 @@ fn wait_failure(end: WaitEnd) -> Failure {
             })
         }
         WaitEnd::Cancelled => Failure::permanent(StatusCode::DeadObject),
-    }
-}
-
-/// The callback `build` registers only to learn whether the name may be watched.
-struct Unwatched;
-
-impl crate::Interface for Unwatched {}
-
-impl crate::hub::IServiceCallback for Unwatched {
-    fn onRegistration(&self, _name: &str, _service: &SIBinder) -> crate::status::BinderResult<()> {
-        Ok(())
     }
 }
 

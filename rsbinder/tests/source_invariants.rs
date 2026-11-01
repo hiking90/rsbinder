@@ -610,6 +610,8 @@ fn types_whose_drop_ends_something_are_must_use() {
             "hub/accessor_register.rs",
             "AccessorProviderHandle",
         ),
+        // Its `Drop` is `WatchGuard`'s, so the scan below cannot find it.
+        ("rsbinder", "hub/mod.rs", "ServiceWatch"),
         ("rsbinder", "reconnect.rs", "Reconnecting"),
         ("rsbinder", "rpc/server.rs", "RpcServerHandle"),
         ("rsbinder", "rt/tokio_rt.rs", "DeathSignal"),

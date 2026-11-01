@@ -13,6 +13,15 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Added
+
+- **`hub::watch`**: calls a closure with the binder each time the default
+  service manager registers a service under a name, until the returned
+  **`hub::ServiceWatch`** drops; the drop unregisters the callback. It is
+  `register_for_notifications` with the unregister held by a guard, the
+  pairing `wait_for_service` and `rsbinder-topic`'s service-manager
+  resolver now use.
+
 ## [0.13.0] - 2026-10-31
 
 ### Migrating from 0.12.0

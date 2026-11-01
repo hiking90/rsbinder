@@ -2142,6 +2142,16 @@ impl core::marker::Unpin for rsbinder::hub::android_16::android::os::ServiceDebu
 impl core::marker::UnsafeUnpin for rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo
+pub struct rsbinder::hub::ServiceWatch(_)
+impl core::fmt::Debug for rsbinder::hub::ServiceWatch
+pub fn rsbinder::hub::ServiceWatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::hub::ServiceWatch
+impl core::marker::Send for rsbinder::hub::ServiceWatch
+impl core::marker::Sync for rsbinder::hub::ServiceWatch
+impl core::marker::Unpin for rsbinder::hub::ServiceWatch
+impl core::marker::UnsafeUnpin for rsbinder::hub::ServiceWatch
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::ServiceWatch
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::ServiceWatch
 pub const rsbinder::hub::DUMP_FLAG_PRIORITY_ALL: i32
 pub const rsbinder::hub::DUMP_FLAG_PRIORITY_CRITICAL: i32
 pub const rsbinder::hub::DUMP_FLAG_PRIORITY_DEFAULT: i32
@@ -2221,6 +2231,7 @@ pub fn rsbinder::hub::try_unregister_service(&str, &rsbinder::SIBinder) -> rsbin
 pub fn rsbinder::hub::unregister_for_notifications(&str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::wait_for_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::wait_for_service(&str) -> core::option::Option<rsbinder::SIBinder>
+pub fn rsbinder::hub::watch(&str, impl core::ops::function::Fn(rsbinder::SIBinder) + core::marker::Send + core::marker::Sync + 'static) -> core::result::Result<rsbinder::hub::ServiceWatch, rsbinder::Status>
 pub mod rsbinder::lazy_service
 pub struct rsbinder::lazy_service::LazyServiceRegistrar
 impl rsbinder::lazy_service::LazyServiceRegistrar
