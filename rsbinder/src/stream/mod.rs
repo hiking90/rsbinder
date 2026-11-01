@@ -868,11 +868,7 @@ fn dropped_terminator(lost: i32) -> String {
 fn status_fields(status: &Status) -> Result<(i32, i32, Option<String>)> {
     let exception = status.exception_code();
     match exception {
-        // What `exception_from_i32` would refuse on the other side.
-        ExceptionCode::TransactionFailed
-        | ExceptionCode::HasNotedAppOpsReplyHeader
-        | ExceptionCode::HasReplyHeader
-        | ExceptionCode::JustError => {
+        exception if !ends_a_stream(exception) => {
             log::error!("Sink::end: {exception} cannot be carried as a stream terminator");
             Err(StatusCode::BadValue)
         }
@@ -902,23 +898,25 @@ fn status_from_fields(
 }
 
 fn exception_from_i32(exception: i32) -> Result<ExceptionCode> {
-    Ok(match exception {
-        0 => ExceptionCode::None,
-        -1 => ExceptionCode::Security,
-        -2 => ExceptionCode::BadParcelable,
-        -3 => ExceptionCode::IllegalArgument,
-        -4 => ExceptionCode::NullPointer,
-        -5 => ExceptionCode::IllegalState,
-        -6 => ExceptionCode::NetworkMainThread,
-        -7 => ExceptionCode::UnsupportedOperation,
-        -8 => ExceptionCode::ServiceSpecific,
-        -9 => ExceptionCode::Parcelable,
-        // -127/-128 are reply-header markers, -129 a binder-layer failure: none arrives in a call.
-        other => {
-            log::error!("stream: {other} is not a valid stream terminator exception code");
-            return Err(StatusCode::BadValue);
+    match ExceptionCode::try_from(exception) {
+        Ok(code) if ends_a_stream(code) => Ok(code),
+        _ => {
+            log::error!("stream: {exception} is not a valid stream terminator exception code");
+            Err(StatusCode::BadValue)
         }
-    })
+    }
+}
+
+/// Whether a terminator may carry `code`, sent or received: not the reply-header markers, the
+/// binder-layer failure (`-129`) or `JustError`, none of which a call ends with.
+fn ends_a_stream(code: ExceptionCode) -> bool {
+    !matches!(
+        code,
+        ExceptionCode::HasNotedAppOpsReplyHeader
+            | ExceptionCode::HasReplyHeader
+            | ExceptionCode::TransactionFailed
+            | ExceptionCode::JustError
+    )
 }
 
 // --- Producer ---

@@ -110,48 +110,81 @@ impl Serialize for ExceptionCode {
     }
 }
 
-impl Deserialize for ExceptionCode {
-    fn deserialize(parcel: &mut Parcel) -> error::Result<Self> {
-        let exception = parcel.read::<i32>()?;
-        let code = match exception {
-            exception if exception == ExceptionCode::None as i32 => ExceptionCode::None,
-            exception if exception == ExceptionCode::Security as i32 => ExceptionCode::Security,
-            exception if exception == ExceptionCode::BadParcelable as i32 => {
-                ExceptionCode::BadParcelable
-            }
-            exception if exception == ExceptionCode::IllegalArgument as i32 => {
-                ExceptionCode::IllegalArgument
-            }
-            exception if exception == ExceptionCode::NullPointer as i32 => {
-                ExceptionCode::NullPointer
-            }
-            exception if exception == ExceptionCode::IllegalState as i32 => {
-                ExceptionCode::IllegalState
-            }
-            exception if exception == ExceptionCode::NetworkMainThread as i32 => {
-                ExceptionCode::NetworkMainThread
-            }
-            exception if exception == ExceptionCode::UnsupportedOperation as i32 => {
-                ExceptionCode::UnsupportedOperation
-            }
-            exception if exception == ExceptionCode::ServiceSpecific as i32 => {
-                ExceptionCode::ServiceSpecific
-            }
-            exception if exception == ExceptionCode::Parcelable as i32 => ExceptionCode::Parcelable,
-            exception if exception == ExceptionCode::HasNotedAppOpsReplyHeader as i32 => {
-                ExceptionCode::HasNotedAppOpsReplyHeader
-            }
-            exception if exception == ExceptionCode::HasReplyHeader as i32 => {
-                ExceptionCode::HasReplyHeader
-            }
-            exception if exception == ExceptionCode::TransactionFailed as i32 => {
-                ExceptionCode::TransactionFailed
-            }
-            _ => ExceptionCode::JustError,
-        };
-        Ok(code)
+/// The variant whose wire value is `value`.
+///
+/// Every variant converts, the reply-header markers (`-127`, `-128`), `TransactionFailed`
+/// (`-129`) and `JustError` (`-256`) included, so this is the one table of wire values; which
+/// of them a reader accepts is that reader's policy. Any other value is the error. Nothing is
+/// logged.
+impl TryFrom<i32> for ExceptionCode {
+    type Error = i32;
+
+    fn try_from(value: i32) -> std::result::Result<Self, i32> {
+        Ok(match value {
+            0 => ExceptionCode::None,
+            -1 => ExceptionCode::Security,
+            -2 => ExceptionCode::BadParcelable,
+            -3 => ExceptionCode::IllegalArgument,
+            -4 => ExceptionCode::NullPointer,
+            -5 => ExceptionCode::IllegalState,
+            -6 => ExceptionCode::NetworkMainThread,
+            -7 => ExceptionCode::UnsupportedOperation,
+            -8 => ExceptionCode::ServiceSpecific,
+            -9 => ExceptionCode::Parcelable,
+            -127 => ExceptionCode::HasNotedAppOpsReplyHeader,
+            -128 => ExceptionCode::HasReplyHeader,
+            -129 => ExceptionCode::TransactionFailed,
+            -256 => ExceptionCode::JustError,
+            other => return Err(other),
+        })
     }
 }
+
+impl Deserialize for ExceptionCode {
+    /// A value with no variant reads as `JustError`.
+    fn deserialize(parcel: &mut Parcel) -> error::Result<Self> {
+        Ok(ExceptionCode::try_from(parcel.read::<i32>()?).unwrap_or(ExceptionCode::JustError))
+    }
+}
+
+/// The end record of a stream ring and a topic: `[i32 LE exception][i32 LE code][message]`, the
+/// UTF-8 message cut at a character boundary to at most `max_message` bytes and absent for
+/// `None`. Workspace-internal; what each field may hold is the caller's policy (plan 18 U3).
+#[doc(hidden)]
+pub fn __encode_end_record(
+    exception: i32,
+    code: i32,
+    message: Option<&str>,
+    max_message: usize,
+) -> Vec<u8> {
+    let message = message.map(|message| {
+        let mut end = message.len().min(max_message);
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        &message[..end]
+    });
+    let mut payload = Vec::with_capacity(END_RECORD_FIELDS + message.map_or(0, str::len));
+    payload.extend_from_slice(&exception.to_le_bytes());
+    payload.extend_from_slice(&code.to_le_bytes());
+    payload.extend_from_slice(message.unwrap_or_default().as_bytes());
+    payload
+}
+
+/// The three fields of a [`__encode_end_record`] payload, `None` when it is too short for the
+/// two words. Bytes past them are the message, read lossily; none is `None`.
+#[doc(hidden)]
+pub fn __decode_end_record(payload: &[u8]) -> Option<(i32, i32, Option<String>)> {
+    let (fields, message) = payload.split_at_checked(END_RECORD_FIELDS)?;
+    let (exception, code) = fields.split_at(4);
+    let exception = i32::from_le_bytes(exception.try_into().ok()?);
+    let code = i32::from_le_bytes(code.try_into().ok()?);
+    let message = (!message.is_empty()).then(|| String::from_utf8_lossy(message).into_owned());
+    Some((exception, code, message))
+}
+
+/// The two `i32` fields in front of an end record's message.
+const END_RECORD_FIELDS: usize = 8;
 
 /// Status information for binder operations.
 ///
@@ -606,6 +639,84 @@ impl Deserialize for Status {
 #[cfg(test)]
 mod tests {
     use crate::*;
+
+    /// Each variant's discriminant converts back to it, and nothing else converts.
+    #[test]
+    fn every_exception_code_round_trips_through_its_wire_value() {
+        // Exhaustive: a new variant fails to compile here until it is listed.
+        let listed = |code: ExceptionCode| match code {
+            ExceptionCode::None
+            | ExceptionCode::Security
+            | ExceptionCode::BadParcelable
+            | ExceptionCode::IllegalArgument
+            | ExceptionCode::NullPointer
+            | ExceptionCode::IllegalState
+            | ExceptionCode::NetworkMainThread
+            | ExceptionCode::UnsupportedOperation
+            | ExceptionCode::ServiceSpecific
+            | ExceptionCode::Parcelable
+            | ExceptionCode::HasNotedAppOpsReplyHeader
+            | ExceptionCode::HasReplyHeader
+            | ExceptionCode::TransactionFailed
+            | ExceptionCode::JustError => code,
+        };
+        let all = [
+            ExceptionCode::None,
+            ExceptionCode::Security,
+            ExceptionCode::BadParcelable,
+            ExceptionCode::IllegalArgument,
+            ExceptionCode::NullPointer,
+            ExceptionCode::IllegalState,
+            ExceptionCode::NetworkMainThread,
+            ExceptionCode::UnsupportedOperation,
+            ExceptionCode::ServiceSpecific,
+            ExceptionCode::Parcelable,
+            ExceptionCode::HasNotedAppOpsReplyHeader,
+            ExceptionCode::HasReplyHeader,
+            ExceptionCode::TransactionFailed,
+            ExceptionCode::JustError,
+        ];
+        for code in all.map(listed) {
+            assert_eq!(ExceptionCode::try_from(code as i32), Ok(code));
+        }
+        for value in -300..=10 {
+            if let Ok(code) = ExceptionCode::try_from(value) {
+                assert!(all.contains(&code) && code as i32 == value, "{value}");
+            } else {
+                assert_eq!(ExceptionCode::try_from(value), Err(value));
+                assert!(
+                    all.iter().all(|c| *c as i32 != value),
+                    "{value} has a variant"
+                );
+            }
+        }
+        assert_eq!(
+            from_bytes::<ExceptionCode>(&(-1000i32).to_le_bytes()),
+            Ok(ExceptionCode::JustError),
+            "a value with no variant deserializes as JustError"
+        );
+    }
+
+    /// The end record's two words and message, the cut at a character boundary, the short read.
+    #[test]
+    fn an_end_record_round_trips_and_cuts_its_message() {
+        let record = __encode_end_record(-8, 9, Some("가나"), 4);
+        assert_eq!(&record[..8], [0xf8, 0xff, 0xff, 0xff, 9, 0, 0, 0]);
+        assert_eq!(
+            &record[8..],
+            "가".as_bytes(),
+            "cut to a boundary under 4 bytes"
+        );
+        assert_eq!(
+            __decode_end_record(&record),
+            Some((-8, 9, Some("가".to_owned())))
+        );
+        assert_eq!(
+            __decode_end_record(&__encode_end_record(0, 0, None, 4)),
+            Some((0, 0, None))
+        );
+        assert_eq!(__decode_end_record(&[0; 7]), None);
+    }
 
     #[test]
     fn test_status() -> Result<()> {

@@ -459,36 +459,17 @@ fn end_header(len: usize) -> u32 {
     KIND_END | len as u32
 }
 
-/// The longest prefix of `message` within `max` bytes that ends on a character boundary.
-fn fitted(message: &str, max: usize) -> &str {
-    if message.len() <= max {
-        return message;
-    }
-    let mut end = max;
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    &message[..end]
-}
-
 /// The end record's payload: the three `onEnd` arguments, the message cut to fit the reserve.
 fn end_payload(exception: i32, service_specific: i32, message: Option<&str>) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(END_RESERVE - HEADER);
-    payload.extend_from_slice(&exception.to_le_bytes());
-    payload.extend_from_slice(&service_specific.to_le_bytes());
-    if let Some(message) = message {
-        payload.extend_from_slice(fitted(message, END_MESSAGE_MAX).as_bytes());
-    }
-    payload
+    crate::status::__encode_end_record(exception, service_specific, message, END_MESSAGE_MAX)
 }
 
 /// The status an end record carries; the reader checked `payload` holds `END_FIELDS`.
 fn end_status(payload: &[u8]) -> Status {
-    let exception = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let service_specific = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    let message = (payload.len() > END_FIELDS)
-        .then(|| String::from_utf8_lossy(&payload[END_FIELDS..]).into_owned());
-    match status_from_fields(exception, service_specific, message.as_deref()) {
+    let decoded = crate::status::__decode_end_record(payload).ok_or(StatusCode::BadValue);
+    match decoded.and_then(|(exception, service_specific, message)| {
+        status_from_fields(exception, service_specific, message.as_deref())
+    }) {
         Ok(status) => status,
         // Unreadable, yet the stream must stop; the decode failure is why.
         Err(code) => Status::from(code),

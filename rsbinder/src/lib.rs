@@ -446,6 +446,9 @@ pub use rt::{
 };
 // `status` stays private: the root re-exports are the only path to these types.
 pub use status::{BinderResult, ExceptionCode, ServiceSpecificError, Status};
+// `stream`'s ring and `rsbinder-topic` write and read one end-record format through these.
+#[doc(hidden)]
+pub use status::{__decode_end_record, __encode_end_record};
 pub use transport_caps::TransportCaps;
 
 /// Default path to the binder control device

@@ -4221,6 +4221,9 @@ impl core::convert::From<rsbinder::ExceptionCode> for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::from(rsbinder::ExceptionCode) -> Self
 impl core::convert::From<rsbinder::StatusCode> for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::from(rsbinder::StatusCode) -> Self
+impl core::convert::TryFrom<i32> for rsbinder::ExceptionCode
+pub type rsbinder::ExceptionCode::Error = i32
+pub fn rsbinder::ExceptionCode::try_from(i32) -> core::result::Result<Self, i32>
 impl core::fmt::Debug for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for rsbinder::ExceptionCode

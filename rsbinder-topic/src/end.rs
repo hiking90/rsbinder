@@ -18,9 +18,7 @@ use rsbinder::{ExceptionCode, Status, StatusCode};
 /// The longest message an end record carries; a longer one is cut at a character boundary.
 pub(crate) const MESSAGE_MAX: usize = 1024;
 
-const FIELDS: usize = 8;
-
-/// The end record's payload for `status`.
+/// The end record's payload for `status`; the byte layout is rsbinder's (`__encode_end_record`).
 pub(crate) fn payload(status: &Status) -> Vec<u8> {
     let exception = status.exception_code();
     let code = match exception {
@@ -28,18 +26,7 @@ pub(crate) fn payload(status: &Status) -> Vec<u8> {
         ExceptionCode::TransactionFailed => i32::from(status.transaction_error()),
         _ => 0,
     };
-    let message = status.message().map(|message| {
-        let mut end = message.len().min(MESSAGE_MAX);
-        while !message.is_char_boundary(end) {
-            end -= 1;
-        }
-        &message[..end]
-    });
-    let mut payload = Vec::with_capacity(FIELDS + message.map_or(0, str::len));
-    payload.extend_from_slice(&(exception as i32).to_le_bytes());
-    payload.extend_from_slice(&code.to_le_bytes());
-    payload.extend_from_slice(message.unwrap_or_default().as_bytes());
-    payload
+    rsbinder::__encode_end_record(exception as i32, code, status.message(), MESSAGE_MAX)
 }
 
 /// The status an end record's payload holds, or `None` when it is too short to hold one.
@@ -48,11 +35,8 @@ pub(crate) fn payload(status: &Status) -> Vec<u8> {
 /// message that is not UTF-8 is read lossily: the topic has ended either way. An
 /// `EX_TRANSACTION_FAILED` status carries no message, as one made from a status code has none.
 pub(crate) fn status(payload: &[u8]) -> Option<Status> {
-    let (fields, message) = payload.split_at_checked(FIELDS)?;
-    let (exception, code) = fields.split_at(4);
-    let exception = rsbinder::from_bytes::<ExceptionCode>(exception).ok()?;
-    let code = i32::from_le_bytes(code.try_into().ok()?);
-    let message = (!message.is_empty()).then(|| String::from_utf8_lossy(message).into_owned());
+    let (exception, code, message) = rsbinder::__decode_end_record(payload)?;
+    let exception = ExceptionCode::try_from(exception).unwrap_or(ExceptionCode::JustError);
     Some(match exception {
         ExceptionCode::ServiceSpecific => Status::new_service_specific_error(code, message),
         ExceptionCode::TransactionFailed => Status::from(StatusCode::from(code)),
