@@ -179,6 +179,13 @@ fn test_others() -> rsbinder::Result<()> {
     if get_android_sdk_version() == hub::sdk_versions::ANDROID_10 {
         assert!(!hub::is_declared("manager"));
         assert!(!hub::is_declared(""));
+        assert!(hub::get_declared_instances("android.os.IServiceManager").is_empty());
+        assert!(hub::get_connection_info("manager").is_none());
+        // A method the protocol lacks stays `UnknownTransaction`, not `FailedTransaction`.
+        assert_eq!(
+            hub::get_service_debug_info().err(),
+            Some(StatusCode::UnknownTransaction)
+        );
     }
 
     Ok(())

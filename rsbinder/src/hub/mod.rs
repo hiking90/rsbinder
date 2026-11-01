@@ -827,27 +827,16 @@ macro_rules! wrap_callback {
     };
 }
 
-/// Converts a pre-16 `Vec<android_N::ServiceDebugInfo>` to the unified type (16 returns it).
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15",
-    )
-))]
-macro_rules! collect_debug_info {
-    ($modu:ident, $sm:expr) => {{
-        let result = $modu::get_service_debug_info($sm)?;
-        Ok(result
-            .into_iter()
-            .map(|info| ServiceDebugInfo {
-                name: info.name,
-                debugPid: info.debugPid,
-            })
-            .collect())
-    }};
+/// A plain form's answer: the `try_` form's value, or `T::default()` after logging why not.
+fn or_default_logged<T: Default>(
+    method: &str,
+    arg: &dyn std::fmt::Display,
+    result: std::result::Result<T, Status>,
+) -> T {
+    result.unwrap_or_else(|status| {
+        log::error!("{method}({arg}): {status}");
+        T::default()
+    })
 }
 
 /// `EX_UNSUPPORTED_OPERATION` (AOSP "no such method") naming the first version with `method`.
@@ -1147,26 +1136,11 @@ impl ServiceManager {
 
     /// Checks if a service with the given name is declared.
     ///
-    /// Note: not supported on Android 10 - always returns false.
+    /// Not supported on Android 10, where it returns false. Any failure is
+    /// logged and returns false; [`try_is_declared`](Self::try_is_declared)
+    /// returns it instead.
     pub fn is_declared(&self, name: &str) -> bool {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("is_declared: not supported on Android 10");
-                false
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::is_declared(sm, name),
-            ServiceManager::Android16(sm) => android_16::is_declared(sm, name),
-        }
+        or_default_logged("is_declared", &name, self.try_is_declared(name))
     }
 
     /// Every declared instance of `iface`.
@@ -1174,27 +1148,11 @@ impl ServiceManager {
     /// Requires the Android 12 protocol or later; earlier ones have no
     /// `getDeclaredInstances`, and report none declared.
     pub fn get_declared_instances(&self, iface: &str) -> Vec<String> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("get_declared_instances: not supported on Android 10");
-                Vec::new()
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(_) => {
-                log::error!("get_declared_instances: not supported on Android 11");
-                Vec::new()
-            }
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::get_declared_instances(sm, iface),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::get_declared_instances(sm, iface),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::get_declared_instances(sm, iface),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::get_declared_instances(sm, iface),
-            ServiceManager::Android16(sm) => android_16::get_declared_instances(sm, iface),
-        }
+        or_default_logged(
+            "get_declared_instances",
+            &iface,
+            self.try_get_declared_instances(iface),
+        )
     }
 
     /// Connection info declared for `name`, if any.
@@ -1202,46 +1160,11 @@ impl ServiceManager {
     /// Requires the Android 13 protocol or later; earlier ones have no
     /// `getConnectionInfo`, and report none.
     pub fn get_connection_info(&self, name: &str) -> Option<ConnectionInfo> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("get_connection_info: not supported on Android 10");
-                None
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(_) => {
-                log::error!("get_connection_info: not supported on Android 11");
-                None
-            }
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(_) => {
-                log::error!("get_connection_info: not supported on Android 12");
-                None
-            }
-            // Per-version `ConnectionInfo`: rebuild field by field, as for `ServiceDebugInfo`.
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => {
-                android_13::get_connection_info(sm, name).map(|info| ConnectionInfo {
-                    ipAddress: info.ipAddress,
-                    port: info.port,
-                })
-            }
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => {
-                android_14::get_connection_info(sm, name).map(|info| ConnectionInfo {
-                    ipAddress: info.ipAddress,
-                    port: info.port,
-                })
-            }
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => {
-                android_15::get_connection_info(sm, name).map(|info| ConnectionInfo {
-                    ipAddress: info.ipAddress,
-                    port: info.port,
-                })
-            }
-            ServiceManager::Android16(sm) => android_16::get_connection_info(sm, name),
-        }
+        or_default_logged(
+            "get_connection_info",
+            &name,
+            self.try_get_connection_info(name),
+        )
     }
 
     /// Returns a list of all registered services with the specified dump priority.
@@ -1249,21 +1172,11 @@ impl ServiceManager {
     /// This method is version-agnostic and works across all supported Android versions.
     /// On Android 10, uses the iterative wire protocol internally.
     pub fn list_services(&self, dump_priority: i32) -> Vec<String> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(sm) => android_10::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::list_services(sm, dump_priority),
-            ServiceManager::Android16(sm) => android_16::list_services(sm, dump_priority),
-        }
+        or_default_logged(
+            "list_services",
+            &dump_priority,
+            self.try_list_services(dump_priority),
+        )
     }
 
     /// Registers a service with the service manager.
@@ -1321,35 +1234,24 @@ impl ServiceManager {
 
     /// Retrieves debug information about all currently registered services.
     ///
-    /// Note: not supported on Android 10 or Android 11 - returns an error on those versions.
+    /// Not supported on Android 10 or Android 11, where it returns
+    /// [`StatusCode::UnknownTransaction`]. Any other failure is
+    /// [`try_get_service_debug_info`](Self::try_get_service_debug_info)'s
+    /// `Status` flattened to a [`StatusCode`].
     pub fn get_service_debug_info(&self) -> Result<Vec<ServiceDebugInfo>> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!(
-                    "get_service_debug_info: Unsupported Android SDK version: {}",
-                    crate::get_android_sdk_version()
-                );
-                Err(StatusCode::UnknownTransaction)
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(_) => {
-                log::error!(
-                    "get_service_debug_info: Unsupported Android SDK version: {}",
-                    crate::get_android_sdk_version()
-                );
-                Err(StatusCode::UnknownTransaction)
-            }
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => collect_debug_info!(android_12, sm),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => collect_debug_info!(android_13, sm),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => collect_debug_info!(android_14, sm),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => collect_debug_info!(android_15, sm),
-            ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
-        }
+        self.try_get_service_debug_info()
+            .map_err(|status| match status.exception_code() {
+                // "No such method", which the flattening `From<Status>` makes `FailedTransaction`.
+                ExceptionCode::UnsupportedOperation => {
+                    #[cfg(target_os = "android")]
+                    log::error!(
+                        "get_service_debug_info: Unsupported Android SDK version: {}",
+                        crate::get_android_sdk_version()
+                    );
+                    StatusCode::UnknownTransaction
+                }
+                _ => status.into(),
+            })
     }
 
     /// Like [`get_service_debug_info`](Self::get_service_debug_info), but
