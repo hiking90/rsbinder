@@ -5,7 +5,7 @@
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder_fmq::shm::spin::{spin_budget, spin_until, SpinGauge, SPIN_CLOCK_EVERY};
@@ -17,6 +17,7 @@ use crate::error::{Result, StatusCode};
 use crate::fmq::{MQDescriptor, SynchronizedReadWrite};
 use crate::parcel::Parcel;
 use crate::parcelable::{Deserialize, Serialize};
+use crate::signal::PoolGate;
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
@@ -328,29 +329,24 @@ struct TransitState {
 
 #[derive(Default)]
 struct Transit {
-    state: Mutex<TransitState>,
-    /// Written under `state`'s lock; read without it on the fast path.
-    in_transit: std::sync::atomic::AtomicBool,
+    /// Up while a token is on the pool; lowered as it settles into the book.
+    gate: PoolGate<TransitState>,
     /// `unreported` or `broken` was ever set; never cleared, so while it is down neither is.
     flagged: std::sync::atomic::AtomicBool,
-    idle: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
 }
 
 impl Transit {
     fn lock(&self) -> std::sync::MutexGuard<'_, TransitState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.gate.lock()
     }
 
     #[cfg(feature = "tokio")]
     fn begin(&self) {
-        let _guard = self.lock();
-        self.in_transit.store(true, Ordering::SeqCst);
+        self.gate.begin();
     }
 
     fn in_transit(&self) -> bool {
-        self.in_transit.load(Ordering::SeqCst)
+        self.gate.busy()
     }
 
     fn lost(&self) -> i32 {
@@ -372,15 +368,14 @@ impl Transit {
 
     /// Nothing to wait out and nothing ever left to report: the owner may skip the lock.
     fn quiet(&self) -> bool {
-        // `settle` raises `flagged` before it lowers `in_transit`, so this order sees both.
-        !self.in_transit.load(Ordering::SeqCst) && !self.flagged.load(Ordering::SeqCst)
+        // `settle` raises `flagged` before it lowers the gate, so this order sees both.
+        !self.gate.busy() && !self.flagged.load(Ordering::SeqCst)
     }
 
     /// The token is done: leave `failure` for the next call; `lost` = its item did not go in.
     #[cfg(feature = "tokio")]
     fn settle(&self, failure: Option<StatusCode>, lost: bool, broken: bool) {
-        {
-            let mut state = self.lock();
+        self.gate.settle(|state| {
             if lost {
                 state.lost = state.lost.saturating_add(1);
             }
@@ -391,11 +386,7 @@ impl Transit {
                 }
                 self.flagged.store(true, Ordering::SeqCst);
             }
-            self.in_transit.store(false, Ordering::SeqCst);
-        }
-        self.idle.notify_all();
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        });
     }
 
     /// The awaiting future takes back its own record's timeout: reported to it, so not lost.
@@ -412,39 +403,16 @@ impl Transit {
 
     /// Block until nothing is in transit; `false` if `deadline` passes first.
     fn wait_idle_until(&self, deadline: Option<Instant>) -> bool {
-        let mut state = self.lock();
-        while self.in_transit.load(Ordering::SeqCst) {
-            let Some(deadline) = deadline else {
-                state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
-            };
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            state = self
-                .idle
-                .wait_timeout(state, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-        true
+        self.gate.join(deadline)
     }
 
     fn wait_idle(&self) {
-        self.wait_idle_until(None);
+        self.gate.join(None);
     }
 
     #[cfg(feature = "tokio")]
     async fn idle_async(&self) {
-        loop {
-            // Made before the check: a `Notified` gets `notify_waiters` from its creation on.
-            let notified = self.notify.notified();
-            if !self.in_transit.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        self.gate.join_async().await;
     }
 }
 

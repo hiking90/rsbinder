@@ -446,7 +446,9 @@ fn loom_wait_a_raise_that_wakes_another_bit_loses_the_wait() {
     a_bit_from_this_process_ends_a_wait(Flaw::OtherBit, INTERRUPTED, Received::Cancelled);
 }
 
-/// `Leftover`: whether a wait is out on the pool, the condvar its end signals, and who settled.
+/// `Leftover`'s `PoolGate<()>`, copied by hand: rsbinder's `loom` is a dev-dependency, so the
+/// gate itself cannot use loom's types. The copy keeps the argument's `Release`/`Acquire`, weaker
+/// than the gate's `SeqCst`, so a pass here holds for the gate. Also counts who settled.
 struct Out {
     busy: AtomicBool,
     idle_lock: Mutex<()>,
@@ -493,7 +495,7 @@ fn out() -> Arc<Out> {
     })
 }
 
-/// `Leftover::join` with no deadline, behind the look at `busy` that `wait_with` takes first.
+/// `PoolGate::join` with no deadline, behind the look at `busy` that `wait_with` takes first.
 fn join(out: &Out) {
     if !out.busy.load(Ordering::Acquire) {
         return;

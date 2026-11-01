@@ -456,7 +456,7 @@ pub use transport_caps::TransportCaps;
 /// The waits `stream` and `rsbinder-topic` share: not part of the API.
 #[doc(hidden)]
 pub mod __sync {
-    pub use crate::signal::{wait_until, Signal, Waited};
+    pub use crate::signal::{wait_until, PoolGate, Signal, Waited};
 }
 
 /// Default path to the binder control device

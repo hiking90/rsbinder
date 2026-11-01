@@ -9,14 +9,14 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 #[cfg(feature = "tokio")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::binder::{FromIBinder, Interface, Strong};
 use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
 use crate::parcelable::{Deserialize, Serialize};
-use crate::signal::Signal;
+use crate::signal::{PoolGate, Signal};
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
@@ -335,8 +335,6 @@ struct LedgerState {
     lost: i32,
     /// A send that failed with nobody told yet; the next call returns it.
     unreported: Option<StatusCode>,
-    /// A batch is on its way; nothing may be sent past it, or it would arrive out of order.
-    in_transit: bool,
     /// A failed send's delivery is unknown, so remaining credit is too; nothing more is sent.
     broken: Option<StatusCode>,
 }
@@ -344,15 +342,13 @@ struct LedgerState {
 /// Batch outcomes, written by the pool task: dropping a `*_async` future detaches, not cancels it.
 #[derive(Default)]
 struct Ledger {
-    state: Mutex<LedgerState>,
-    idle: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    /// Up while a batch is on its way; nothing may be sent past it, lest it arrive out of order.
+    gate: PoolGate<LedgerState>,
 }
 
 impl Ledger {
     fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.gate.lock()
     }
 
     fn lost(&self) -> i32 {
@@ -374,22 +370,12 @@ impl Ledger {
 
     /// Block until no batch is in transit.
     fn wait_idle(&self) {
-        let mut state = self.lock();
-        while state.in_transit {
-            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
+        self.gate.join(None);
     }
 
     #[cfg(feature = "tokio")]
     async fn idle_async(&self) {
-        loop {
-            // Created before the check, as in `wait_credit_async`.
-            let notified = self.notify.notified();
-            if !self.lock().in_transit {
-                return;
-            }
-            notified.await;
-        }
+        self.gate.join_async().await;
     }
 }
 
@@ -427,7 +413,7 @@ struct BatchInTransit {
 impl BatchInTransit {
     /// The caller has taken one credit for `count` items.
     fn new(credit: Arc<Credit>, ledger: Arc<Ledger>, count: i32) -> Self {
-        ledger.lock().in_transit = true;
+        ledger.gate.begin();
         BatchInTransit {
             credit,
             ledger,
@@ -461,8 +447,8 @@ impl Drop for BatchInTransit {
             // The consumer never grants this credit back; the items are counted lost, not resent.
             self.credit.grant(1);
         }
-        {
-            let mut state = self.ledger.lock();
+        // One critical section with the gate's lowering: a waiter that sees it down sees this.
+        self.ledger.gate.settle(|state| {
             if let Some(e) = failure {
                 state.lost = state.lost.saturating_add(self.count);
                 state.unreported = Some(e);
@@ -471,12 +457,7 @@ impl Drop for BatchInTransit {
                     state.broken = Some(e);
                 }
             }
-            // Same critical section: a waiter that sees the batch gone sees its outcome.
-            state.in_transit = false;
-        }
-        self.ledger.idle.notify_all();
-        #[cfg(feature = "tokio")]
-        self.ledger.notify.notify_waiters();
+        });
     }
 }
 
@@ -1900,7 +1881,7 @@ mod tests {
             assert!(credit.try_credit());
             let mut batch = BatchInTransit::new(credit.clone(), ledger.clone(), 3);
             batch.bytes = vec![0; 12];
-            assert!(ledger.lock().in_transit, "{way:?}");
+            assert!(ledger.gate.busy(), "{way:?}");
 
             match way {
                 Way::Accepted => batch.send(&peer),
@@ -1924,7 +1905,7 @@ mod tests {
 
             let delivered = matches!(way, Way::Accepted);
             let unknown = matches!(way, Way::FailedWithoutSayingWhich | Way::UnwoundInTheCall);
-            assert!(!ledger.lock().in_transit, "{way:?}: nothing may wait on it");
+            assert!(!ledger.gate.busy(), "{way:?}: nothing may wait on it");
             assert_eq!(
                 credit.lock().available,
                 u64::from(!delivered && !unknown),
