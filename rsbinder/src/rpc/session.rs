@@ -2477,12 +2477,11 @@ impl RpcSessionInner {
             if self.shared.lifecycle.is_torn_down() || st.slots.is_empty() {
                 return None;
             }
-            let free = |s: &ConnSlot| s.exclusive_tid == Some(tid) || s.exclusive_tid.is_none();
-            // `Outgoing` only, like every scan: module doc "Connection selection".
+            // `Outgoing`, unclaimed: `reaper_loop` drops each guard, so no claim is this thread's.
             let pick = st
                 .slots
                 .iter()
-                .position(|s| free(s) && s.role == SlotRole::Outgoing);
+                .position(|s| s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing);
             if let Some(idx) = pick {
                 return Some(self.claim_slot(&mut st.slots[idx], tid));
             }

@@ -421,10 +421,7 @@ impl Drop for HandlePin {
             return;
         };
         {
-            let mut handle_to_proxy = this
-                .handle_to_proxy
-                .write()
-                .expect("Handle to proxy lock poisoned");
+            let mut handle_to_proxy = this.proxies_mut();
             expunge_locked(&mut handle_to_proxy, self.handle, self);
         }
         let count = {
@@ -594,6 +591,22 @@ impl PinLedger {
     }
 }
 
+/// A pid the freeze ioctls take: positive, else `BadValue` before any ioctl.
+fn positive_pid(pid: i32) -> Result<u32> {
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or(StatusCode::BadValue)
+}
+
+/// `BINDER_SET_MAX_THREADS`, its failure logged.
+fn set_max_threads_ioctl(driver: &File, max_threads: u32) -> Result<()> {
+    binder::set_max_threads(driver, max_threads).map_err(|e| {
+        log::error!("Binder ioctl to set max threads failed: {e}");
+        errno_status(e)
+    })
+}
+
 /// `BC_DECREFS` for `count` pins; call with no lock held (module doc "Proxy cache entry").
 fn release_pins(handle: u32, count: u32) {
     for _ in 0..count {
@@ -645,6 +658,13 @@ pub(crate) struct PublishedNative {
     pub(crate) kernel_refs: u32,
     /// Dedup hits whose `incref_publish` is pending; removal needs 0 (module doc).
     pub(crate) pending_reservations: u32,
+}
+
+impl PublishedNative {
+    /// No parcel object, kernel ref or pending reservation holds the entry: it may go.
+    fn unreferenced(&self) -> bool {
+        self.publish_count == 0 && self.kernel_refs == 0 && self.pending_reservations == 0
+    }
 }
 
 /// How this process treats **blocking** (non-oneway) outgoing binder
@@ -1084,13 +1104,7 @@ impl ProcessState {
     /// The cached or new proxy for `handle`; its stability is the caller's to fill.
     pub(crate) fn proxy_for_handle(&self, handle: u32) -> Result<Arc<ProxyHandle>> {
         // Read-lock fast path: pure Arc::clone, no kernel command.
-        if let Some(arc) = self
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
-            .get(&handle)
-            .and_then(|e| e.weak.upgrade())
-        {
+        if let Some(arc) = self.proxies().get(&handle).and_then(|e| e.weak.upgrade()) {
             return Ok(arc);
         }
 
@@ -1110,10 +1124,7 @@ impl ProcessState {
     /// P1, under the write lock: decide the sub-case; case (a) pins (`BC_INCREFS` + flush).
     fn slow_path_p1(&self, handle: u32) -> Result<SlowPathDecision> {
         // Write lock though P1 only reads: it serializes the BC_INCREFS issue point.
-        let handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
+        let handle_to_proxy = self.proxies_mut();
 
         if let Some(entry) = handle_to_proxy.get(&handle) {
             // Case (c): another thread inserted/upgraded since the read-fast-path miss.
@@ -1164,10 +1175,7 @@ impl ProcessState {
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
         // Declared before the guard (and `ready` is a parameter) so every pin drops after the lock.
         let entry_pin: Option<Arc<HandlePin>>;
-        let mut handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
+        let mut handle_to_proxy = self.proxies_mut();
 
         let entry = handle_to_proxy.get(&handle);
         // Re-check (c): a concurrent slow path completed during our P2; ours is redundant.
@@ -1192,9 +1200,7 @@ impl ProcessState {
         // Pin compared before upgrading, so no other pin's proxy is upgraded and dropped here.
         Self::instance()
             .get()?
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
+            .proxies()
             .get(&pin.handle())
             .filter(|entry| std::ptr::eq(entry.pin.as_ptr(), Arc::as_ptr(pin)))
             .and_then(|entry| entry.weak.upgrade())
@@ -1204,12 +1210,7 @@ impl ProcessState {
     #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
         // The upgraded pin drops after the lock (module doc "Proxy cache entry").
-        let pin = self
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
-            .get(&handle)
-            .and_then(|e| e.pin.upgrade());
+        let pin = self.proxies().get(&handle).and_then(|e| e.pin.upgrade());
         pin.map(|pin| pin.generation())
     }
 
@@ -1217,10 +1218,7 @@ impl ProcessState {
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
         // Upgrade and remove under one lock: a P3 commit in between would lose its obituary.
         let removed = {
-            let mut handle_to_proxy = self
-                .handle_to_proxy
-                .write()
-                .expect("Handle to proxy lock poisoned");
+            let mut handle_to_proxy = self.proxies_mut();
             // Recipients live only on a live proxy; the pin stays with its holders (module doc).
             handle_to_proxy
                 .remove(&handle)
@@ -1248,6 +1246,32 @@ impl ProcessState {
     /// Obituary phase 2: flush `BC_DEAD_BINDER_DONE` and `send_obituary`'s clear; see module doc.
     pub(crate) fn finish_obituary(&self) -> Result<()> {
         thread_state::flush_commands()
+    }
+
+    /// The proxy cache, read; module doc "Proxy cache slow path" says when a write is needed.
+    fn proxies(&self) -> sync::RwLockReadGuard<'_, HashMap<u32, CacheEntry>> {
+        self.handle_to_proxy
+            .read()
+            .expect("Handle to proxy lock poisoned")
+    }
+
+    fn proxies_mut(&self) -> sync::RwLockWriteGuard<'_, HashMap<u32, CacheEntry>> {
+        self.handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned")
+    }
+
+    /// The published natives, read: the `BR_TRANSACTION` lookup's side.
+    fn natives(&self) -> sync::RwLockReadGuard<'_, HashMap<u64, PublishedNative>> {
+        self.published_natives
+            .read()
+            .expect("Published natives lock poisoned")
+    }
+
+    fn natives_mut(&self) -> sync::RwLockWriteGuard<'_, HashMap<u64, PublishedNative>> {
+        self.published_natives
+            .write()
+            .expect("Published natives lock poisoned")
     }
 
     fn pin_ledger_lock(&self) -> sync::MutexGuard<'_, PinLedger> {
@@ -1521,12 +1545,8 @@ impl ProcessState {
     }
 
     fn set_frozen(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
-        let pid = u32::try_from(pid)
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or(StatusCode::BadValue)?;
         let info = binder::binder_freeze_info {
-            pid,
+            pid: positive_pid(pid)?,
             enable: enable.into(),
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
         };
@@ -1544,12 +1564,8 @@ impl ProcessState {
     ///   which SELinux grants this ioctl alone, as for
     ///   [`freeze`](Self::freeze).
     pub fn process_freeze_info(&self, pid: i32) -> Result<ProcessFreezeInfo> {
-        let pid = u32::try_from(pid)
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or(StatusCode::BadValue)?;
         let mut info = binder::binder_frozen_status_info {
-            pid,
+            pid: positive_pid(pid)?,
             sync_recv: 0,
             async_recv: 0,
         };
@@ -1564,10 +1580,7 @@ impl ProcessState {
     /// Publish a native (dedup by `Arc::ptr_eq`) and return its id; see module doc.
     pub(crate) fn publish_native(&self, arc: Arc<dyn IBinder>) -> u64 {
         // One write lock for dedup + insert: a read-then-write split would duplicate entries.
-        let mut map = self
-            .published_natives
-            .write()
-            .expect("Published natives lock poisoned");
+        let mut map = self.natives_mut();
         for (existing_id, entry) in map.iter_mut() {
             if Arc::ptr_eq(entry.binder_pin.as_arc(), &arc) {
                 // Hold the entry until the matching `acquire`; a wrap to 0 would defeat that.
@@ -1590,10 +1603,7 @@ impl ProcessState {
 
     /// `acquire` arm for `BINDER_TYPE_BINDER`; `false` (a caller bug) for an unknown id.
     pub(crate) fn incref_publish(&self, id: u64) -> bool {
-        let mut map = self
-            .published_natives
-            .write()
-            .expect("Published natives lock poisoned");
+        let mut map = self.natives_mut();
         match map.get_mut(&id) {
             Some(entry) => {
                 entry.publish_count += 1;
@@ -1608,10 +1618,7 @@ impl ProcessState {
     /// `release` arm for `BINDER_TYPE_BINDER`; removes the entry at zero, `false` if unknown.
     pub(crate) fn decref_publish(&self, id: u64) -> bool {
         let trigger_remove = {
-            let mut map = self
-                .published_natives
-                .write()
-                .expect("Published natives lock poisoned");
+            let mut map = self.natives_mut();
             match map.get_mut(&id) {
                 Some(entry) => {
                     // Release builds clamp an unpaired release; debug builds assert on it.
@@ -1622,9 +1629,7 @@ impl ProcessState {
                          FlatBinderObject::release pairing)"
                     );
                     entry.publish_count = entry.publish_count.saturating_sub(1);
-                    entry.publish_count == 0
-                        && entry.kernel_refs == 0
-                        && entry.pending_reservations == 0
+                    entry.unreferenced()
                 }
                 None => return false,
             }
@@ -1637,10 +1642,7 @@ impl ProcessState {
 
     /// `BR_INCREFS`/`BR_ACQUIRE`/`BR_ATTEMPT_ACQUIRE`: bump `kernel_refs`; `None` if unknown.
     pub(crate) fn ref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
-        let mut map = self
-            .published_natives
-            .write()
-            .expect("Published natives lock poisoned");
+        let mut map = self.natives_mut();
         let entry = map.get_mut(&id)?;
         entry.kernel_refs += 1;
         Some(Arc::clone(entry.binder_pin.as_arc()))
@@ -1649,18 +1651,11 @@ impl ProcessState {
     /// Deferred `BR_RELEASE`/`BR_DECREFS`: decrement `kernel_refs`, removing the entry at zero.
     pub(crate) fn deref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
         let (arc, trigger_remove) = {
-            let mut map = self
-                .published_natives
-                .write()
-                .expect("Published natives lock poisoned");
+            let mut map = self.natives_mut();
             let entry = map.get_mut(&id)?;
             // Clamps a BR_DECREFS-before-BR_INCREFS race; see module doc "`kernel_refs` drift".
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
-            let arc = Arc::clone(entry.binder_pin.as_arc());
-            let trigger = entry.publish_count == 0
-                && entry.kernel_refs == 0
-                && entry.pending_reservations == 0;
-            (arc, trigger)
+            (Arc::clone(entry.binder_pin.as_arc()), entry.unreferenced())
         };
         if trigger_remove {
             self.remove_entry_if_zero(id);
@@ -1670,25 +1665,18 @@ impl ProcessState {
 
     /// Read-only lookup for `BR_TRANSACTION` and a round-trip `BINDER_TYPE_BINDER` read.
     pub(crate) fn lookup_native(&self, id: u64) -> Option<Arc<dyn IBinder>> {
-        let map = self
-            .published_natives
-            .read()
-            .expect("Published natives lock poisoned");
+        let map = self.natives();
         map.get(&id).map(|e| Arc::clone(e.binder_pin.as_arc()))
     }
 
     /// Removal phase 2: re-check the counters, remove, drop unlocked; see module doc.
     fn remove_entry_if_zero(&self, id: u64) {
         let entry = {
-            let mut map = self
-                .published_natives
-                .write()
-                .expect("Published natives lock poisoned");
+            let mut map = self.natives_mut();
             let Entry::Occupied(slot) = map.entry(id) else {
                 return;
             };
-            let e = slot.get();
-            if e.publish_count != 0 || e.kernel_refs != 0 || e.pending_reservations != 0 {
+            if !slot.get().unreferenced() {
                 return;
             }
             slot.remove()
@@ -1758,10 +1746,7 @@ impl ProcessState {
             );
             return Err(StatusCode::InvalidOperation);
         }
-        binder::set_max_threads(&self.driver, max_threads).map_err(|e| {
-            log::error!("Binder ioctl to set max threads failed: {e}");
-            errno_status(e)
-        })?;
+        set_max_threads_ioctl(&self.driver, max_threads)?;
         self.max_threads.store(max_threads, Ordering::Release);
         Self::log_max_threads(max_threads);
         Ok(())
@@ -1965,10 +1950,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> Result<File> {
         return Err(StatusCode::NoInit);
     }
 
-    binder::set_max_threads(&fd, max_threads).map_err(|e| {
-        log::error!("Binder ioctl to set max threads failed: {e}");
-        errno_status(e)
-    })?;
+    set_max_threads_ioctl(&fd, max_threads)?;
     log::info!("Binder driver max threads set to {max_threads}");
 
     let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
@@ -2240,10 +2222,7 @@ mod tests {
             );
         }
         // Exactly one cache entry for this handle.
-        let map = ProcessState::as_self()
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned");
+        let map = ProcessState::as_self().proxies();
         assert!(
             map.contains_key(&0),
             "case (a) winner must have installed an entry for handle 0"
