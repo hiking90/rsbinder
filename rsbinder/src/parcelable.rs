@@ -738,7 +738,7 @@ pub trait SerializeArray: Serialize + Sized {
 /// `size_of::<Self>()`: under a count-only clamp, a 64 MiB RPC frame declaring
 /// `len = 64_000_000` for `Vec<String>` (24 B each) requests about 1.5 GiB up
 /// front, and an allocation failure aborts the process. Valid input decodes
-/// identically; the loop still pushes exactly `len`, growing on demand.
+/// identically; each element read requires at least one complete wire word.
 pub trait DeserializeArray: Deserialize {
     /// Deserialize an array of type from the given parcel.
     fn deserialize_array(parcel: &mut Parcel) -> Result<Option<Vec<Self>>> {
@@ -761,6 +761,9 @@ pub trait DeserializeArray: Deserialize {
         let mut res: Vec<Self> = Vec::with_capacity(cap);
 
         for _ in 0..len {
+            if parcel.data_avail() < 4 {
+                return Err(StatusCode::NotEnoughData);
+            }
             res.push(parcel.read()?);
         }
 
@@ -1068,6 +1071,15 @@ mod tests {
         p.write(&1i32).unwrap();
         p.set_data_position(0);
         assert_eq!(p.read::<Vec<bool>>(), Err(StatusCode::NotEnoughData));
+
+        p.set_data_position(0);
+        p.write(&4i32).unwrap();
+        p.write(&-1i32).unwrap();
+        p.set_data_position(0);
+        assert_eq!(
+            p.read::<Vec<Option<String>>>(),
+            Err(StatusCode::NotEnoughData)
+        );
     }
 
     /// The default nullable codec treats every nonzero presence as present, as AOSP Rust does.

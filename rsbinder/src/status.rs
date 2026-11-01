@@ -547,8 +547,15 @@ impl Deserialize for Status {
         let status = if exception == ExceptionCode::None {
             exception.into()
         } else {
-            // Optional as in AOSP: a Java exception without a message sends a null string (-1).
-            let message: Option<String> = parcel.read::<Option<String>>()?;
+            // AOSP's Status reader peeks for null, then uses strict String16 decoding.
+            let message_start = parcel.data_position();
+            let message_length: i32 = parcel.read()?;
+            let message = if message_length == -1 {
+                None
+            } else {
+                parcel.set_data_position(message_start);
+                Some(parcel.read::<String>()?)
+            };
 
             // The trace header size includes its own i32 (AOSP): skip to `header_start + size`.
             let header_start = parcel.data_position();
@@ -807,6 +814,23 @@ mod tests {
             deserialized.to_string().ends_with("Parcelable"),
             "message did not round-trip: {deserialized}"
         );
+
+        for message in [
+            &[-2i32][..],
+            &[1, 0x0042_0041][..], // 'A' followed by a non-NUL terminator.
+        ] {
+            let mut parcel = Parcel::new();
+            parcel.write(&ExceptionCode::Security)?;
+            for word in message {
+                parcel.write(word)?;
+            }
+            parcel.write(&0i32)?;
+            parcel.set_data_position(0);
+            assert_eq!(
+                Status::deserialize(&mut parcel).err(),
+                Some(StatusCode::UnexpectedNull)
+            );
+        }
 
         Ok(())
     }
