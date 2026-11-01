@@ -4075,11 +4075,7 @@ impl RpcSessionInner {
                         target.rpc_transact(token, code, &mut reader, &mut reply)
                     }))
                     .unwrap_or_else(|payload| {
-                        let msg = payload
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("<non-string panic payload>");
+                        let msg = crate::error::panic_message(&payload);
                         log::error!("RPC on_transact panicked for code {code}: {msg}");
                         Err(crate::StatusCode::Unknown)
                     })

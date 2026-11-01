@@ -1439,11 +1439,7 @@ impl ProcessState {
                         callback.on_state_changed(&who, state);
                     }));
                     if let Err(payload) = result {
-                        let msg = payload
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("<non-string panic payload>");
+                        let msg = crate::error::panic_message(&payload);
                         log::error!(
                             "FrozenStateChangeCallback panicked for handle {handle:X}: {msg}"
                         );

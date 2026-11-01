@@ -170,11 +170,7 @@ impl Drop for CallbackDeferGuard {
 /// Run a user callback under `catch_unwind` (runs in `Drop`); module doc "Callback deferral".
 fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(event))) {
-        let msg = payload
-            .downcast_ref::<&'static str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
+        let msg = crate::error::panic_message(&payload);
         log::error!("ProxyCountCallback panicked for {event:?}: {msg}");
     }
 }

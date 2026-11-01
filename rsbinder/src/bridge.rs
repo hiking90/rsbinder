@@ -288,7 +288,10 @@ fn unlink_all(dead: &[Entry], resume: bool) {
     for e in dead {
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.unlink()))
         {
-            log::error!("Rewrap: unlink panicked; a death link is left registered on the remote");
+            log::error!(
+                "Rewrap: unlink panicked ({}); a death link is left registered on the remote",
+                crate::error::panic_message(&payload)
+            );
             if first.is_none() {
                 first = Some(payload);
             }

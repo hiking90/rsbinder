@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::binder::{DeathRecipient, SIBinder, WIBinder};
-use crate::error::{Result, StatusCode};
+use crate::error::{panic_message, Result, StatusCode};
 use crate::freeze::ClearDone;
 
 /// A death notification that is unregistered when this value drops.
@@ -105,10 +105,16 @@ impl Drop for DeathLink {
         match unlinked {
             Ok(Some(Err(err))) => log::debug!("death link: unlink_to_death returned {err:?}"),
             Ok(_) => {}
-            Err(_) => log::error!("death link: unlink_to_death panicked"),
+            Err(payload) => log::error!(
+                "death link: unlink_to_death panicked: {}",
+                panic_message(&payload)
+            ),
         }
-        if catch_unwind(AssertUnwindSafe(move || drop(binder))).is_err() {
-            log::error!("death link: the binder's drop panicked");
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(binder))) {
+            log::error!(
+                "death link: the binder's drop panicked: {}",
+                panic_message(&payload)
+            );
         }
     }
 }
@@ -190,8 +196,13 @@ impl DeathRecipients {
         if self.obituary_sent.load(Ordering::Relaxed) {
             return None;
         }
-        if !list.is_empty() && catch_unwind(AssertUnwindSafe(on_nonempty)).is_err() {
-            log::error!("the obituary's unlink panicked; delivering the obituary anyway");
+        if !list.is_empty() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(on_nonempty)) {
+                log::error!(
+                    "the obituary's unlink panicked ({}); delivering the obituary anyway",
+                    panic_message(&payload)
+                );
+            }
         }
         let snapshot = std::mem::take(&mut *list);
         // `Release` for the lock-free `is_dead` readers.
@@ -213,11 +224,7 @@ impl DeathRecipients {
                 }
             }));
             if let Err(payload) = caught {
-                let msg = payload
-                    .downcast_ref::<&'static str>()
-                    .copied()
-                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                    .unwrap_or("<non-string panic payload>");
+                let msg = panic_message(&payload);
                 log::error!("DeathRecipient panicked during binder_died for {target}: {msg}");
             }
         }

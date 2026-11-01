@@ -1313,8 +1313,9 @@ where
     // Phase 1: dispatch recipients; never short-circuit, the handshake must complete.
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(obituary));
     let panicked = caught.is_err();
-    let obituary_result = caught.unwrap_or_else(|_| {
-        error!("BR_DEAD_BINDER: obituary for handle {handle:X} panicked");
+    let obituary_result = caught.unwrap_or_else(|payload| {
+        let msg = crate::error::panic_message(&payload);
+        error!("BR_DEAD_BINDER: obituary for handle {handle:X} panicked: {msg}");
         Err(StatusCode::Unknown)
     });
 
@@ -1359,8 +1360,9 @@ where
     Q: FnOnce() -> Result<()>,
 {
     // User callbacks are caught one by one; this guards rsbinder's own code around them.
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify)).is_err() {
-        error!("BR_FROZEN_BINDER: notification for cookie {cookie:X} panicked");
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notify)) {
+        let msg = crate::error::panic_message(&payload);
+        error!("BR_FROZEN_BINDER: notification for cookie {cookie:X} panicked: {msg}");
     }
     queue_done()
 }
@@ -1378,11 +1380,7 @@ fn dispatch_transact_caught(
     match result {
         Ok(transact_result) => transact_result,
         Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&'static str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<non-string panic payload>");
+            let msg = crate::error::panic_message(&payload);
             error!("Transactable::transact panicked for code {code}: {msg}");
             // Discard the partial reply so the client never parses half-formed data.
             *reply = Parcel::with_capacity(0);
@@ -1593,12 +1591,13 @@ fn execute_command(cmd: i32) -> Result<()> {
                         "error in reply for code {}: {e}",
                         tr_secctx.transaction_data.code
                     ),
-                    Err(_payload) => {
+                    Err(payload) => {
                         // Rewind only this reply's bytes, no retry (module doc "Dispatch notes").
                         discard_unflushed_commands(thread_state, queued_at, false);
                         log::error!(
-                            "reply path panicked for code {}; reply dropped",
-                            tr_secctx.transaction_data.code
+                            "reply path panicked for code {}; reply dropped: {}",
+                            tr_secctx.transaction_data.code,
+                            crate::error::panic_message(&payload)
                         );
                     }
                 }

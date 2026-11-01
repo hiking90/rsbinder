@@ -1109,8 +1109,9 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             resume_unwind(payload);
         }
         log::error!(
-            "Reconnecting: a user closure panicked for {}; closing",
-            self.cfg
+            "Reconnecting: a user closure panicked for {}; closing: {}",
+            self.cfg,
+            crate::error::panic_message(&payload)
         );
         Failure::permanent(StatusCode::Unknown)
     }

@@ -436,9 +436,32 @@ fn unnamed_errno(raw: i32) -> StatusCode {
     }
 }
 
+/// The text of a caught panic. A `&dyn Any` parameter would take `&Box<dyn Any>` and read no text.
+pub(crate) fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caught_panic_reads_as_its_text() {
+        let caught = |f: fn()| std::panic::catch_unwind(f).expect_err("panicked");
+        assert_eq!(panic_message(&caught(|| panic!("plain"))), "plain");
+        assert_eq!(
+            panic_message(&caught(|| panic!("formatted {}", 7))),
+            "formatted 7"
+        );
+        assert_eq!(
+            panic_message(&caught(|| std::panic::panic_any(7u8))),
+            "<non-string panic payload>"
+        );
+    }
 
     #[test]
     fn test_status_code() {
