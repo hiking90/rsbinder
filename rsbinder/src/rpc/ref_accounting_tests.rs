@@ -923,8 +923,12 @@ fn t11_the_release_waits_on_the_wires_that_count_targets() {
 
 /// A proxy dropped by a thread-local's destructor after `DRIVING`'s is still released, and a
 /// call from there is refused (module doc "The `DRIVING` marker"). In a child: it aborted.
+/// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
 #[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(target_arch = "s390x")
+))]
 fn a_proxy_dropped_after_driving_is_destroyed_is_released() {
     crate::tests::in_child_process(
         "rpc::session::ref_accounting_tests::a_proxy_dropped_after_driving_is_destroyed_is_released",
