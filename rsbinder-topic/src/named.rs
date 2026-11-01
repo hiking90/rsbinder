@@ -18,9 +18,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::fd::BorrowedFd;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use rsbinder::__sync::Signal;
 use rsbinder::{
     BinderResult, DeathLink, DeathRecipient, ExceptionCode, SIBinder, Status, StatusCode, WIBinder,
 };
@@ -316,9 +317,7 @@ struct Named<T: Payload> {
     policy: SubscriberPolicy,
     state: Mutex<State<T>>,
     /// Each change of `state` is signalled to every kind of wait: a thread's, a future's, a poll's.
-    changed: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    changed: Signal,
     /// With [`Wake::Fd`]: the fds handed out, which hold the connection's.
     fds: Option<NamedFds>,
 }
@@ -473,9 +472,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         let named = Arc::new(Named {
             policy: policy.clone(),
             state: Mutex::new(State::new()),
-            changed: Condvar::new(),
-            #[cfg(feature = "tokio")]
-            notify: tokio::sync::Notify::new(),
+            changed: Signal::default(),
             fds,
         });
         let weak = Arc::downgrade(&named);
@@ -731,16 +728,10 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
             if state.closed.is_some() {
                 return false;
             }
-            state = match deadline {
-                None => self.named.changed.wait(state).expect("lock poisoned"),
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return false;
-                    }
-                    let waited = self.named.changed.wait_timeout(state, deadline - now);
-                    waited.expect("lock poisoned").0
-                }
+            let waited = self.named.changed.wait_until(state, deadline);
+            state = match waited.expect("lock poisoned") {
+                Ok(state) => state,
+                Err(_) => return false,
             };
         }
     }
@@ -776,16 +767,13 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
             if state.take_interrupt() {
                 return Err(RecvError::Cancelled);
             }
-            match deadline {
-                None => drop(named.changed.wait(state).expect("lock poisoned")),
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(RecvError::Timeout);
-                    }
-                    let waited = named.changed.wait_timeout(state, deadline - now);
-                    drop(waited.expect("lock poisoned"));
-                }
+            if named
+                .changed
+                .wait_until(state, deadline)
+                .expect("lock poisoned")
+                .is_err()
+            {
+                return Err(RecvError::Timeout);
             }
         }
     }
@@ -805,7 +793,7 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         loop {
             let named = self.named.clone();
             // Made before the look: a `Notified` gets `notify_waiters` from its creation on.
-            let notified = named.notify.notified();
+            let notified = named.changed.notified();
             // Decided before any await: the lock, and the type that holds it, end here.
             let connected = match self.step(named.lock(), false, look) {
                 Step::Done(received) => return received,
@@ -1317,9 +1305,7 @@ impl<T: Payload> Named<T> {
 
     /// Tell every wait that `state` changed; called after the change, with the lock released.
     fn signal(&self) {
-        Condvar::notify_all(&self.changed);
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.changed.wake_all();
         if let Some(fds) = &self.fds {
             fds.poke();
         }
@@ -1523,12 +1509,14 @@ impl<T: Payload + 'static> Named<T> {
         until: Instant,
     ) -> MutexGuard<'s, State<T>> {
         while !state.dropped && state.closed.is_none() && state.latest.as_ref() == Some(binder) {
-            let now = Instant::now();
-            if now >= until {
-                break;
-            }
-            let waited = self.changed.wait_timeout(state, until - now);
-            state = waited.expect("lock poisoned").0;
+            state = match self
+                .changed
+                .wait_until(state, Some(until))
+                .expect("lock poisoned")
+            {
+                Ok(state) => state,
+                Err(state) => return state,
+            };
         }
         state
     }

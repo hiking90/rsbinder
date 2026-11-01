@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use rsbinder::__sync::wait_until;
 use rsbinder::{
     BinderResult, Caller, DeathLink, DeathRecipient, ExceptionCode, Interface, SIBinder, Status,
     StatusCode, Strong, WIBinder,
@@ -269,15 +270,10 @@ impl Sleep {
     fn until(&self, until: Instant, ticket: u64) {
         let mut held = self.ticket.lock().expect("lock poisoned");
         while *held == ticket {
-            let now = Instant::now();
-            if now >= until {
-                break;
+            match wait_until(&self.woken, held, Some(until)).expect("lock poisoned") {
+                Ok(again) => held = again,
+                Err(_) => break,
             }
-            held = self
-                .woken
-                .wait_timeout(held, until - now)
-                .expect("lock poisoned")
-                .0;
         }
     }
 }

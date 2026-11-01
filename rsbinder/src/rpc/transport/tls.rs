@@ -182,15 +182,8 @@ impl WriteLock {
         let deadline = std::time::Instant::now() + wait;
         let mut busy = self.busy.lock().expect("tls wlock poisoned");
         while *busy {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let (guard, _) = self
-                .freed
-                .wait_timeout(busy, deadline - now)
-                .expect("tls wlock poisoned");
-            busy = guard;
+            let waited = crate::signal::wait_until(&self.freed, busy, Some(deadline));
+            busy = waited.expect("tls wlock poisoned").ok()?;
         }
         *busy = true;
         Some(WriteGuard(self))

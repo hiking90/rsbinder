@@ -303,6 +303,8 @@ pub mod proxy_count;
 /// stubs so a heap fd can travel over the kernel binder or
 /// Unix-socket RPC. See the module docs.
 pub mod shared_memory;
+// Condvar waits with a deadline and a thread-and-future signal; `__sync` is the topic's path.
+mod signal;
 // Status and exception handling, re-exported at the crate root.
 mod status;
 mod sys;
@@ -450,6 +452,12 @@ pub use status::{BinderResult, ExceptionCode, ServiceSpecificError, Status};
 #[doc(hidden)]
 pub use status::{__decode_end_record, __encode_end_record};
 pub use transport_caps::TransportCaps;
+
+/// The waits `stream` and `rsbinder-topic` share: not part of the API.
+#[doc(hidden)]
+pub mod __sync {
+    pub use crate::signal::{wait_until, Signal, Waited};
+}
 
 /// Default path to the binder control device
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";

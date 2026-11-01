@@ -1218,20 +1218,14 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
                         },
                         Wait::Connected(deadline) => deadline,
                     };
-                    st = match deadline {
-                        None => self.cv.wait(st).unwrap_or_else(|e| e.into_inner()),
-                        Some(d) => {
-                            let now = Instant::now();
-                            if now >= d {
-                                return Err(match wait {
-                                    Wait::Connected(_) => AcquireError::TimedOut,
-                                    _ => AcquireError::NoConnection,
-                                });
-                            }
-                            self.cv
-                                .wait_timeout(st, d - now)
-                                .unwrap_or_else(|e| e.into_inner())
-                                .0
+                    let waited = crate::signal::wait_until(&self.cv, st, deadline);
+                    st = match waited.unwrap_or_else(|e| e.into_inner()) {
+                        Ok(st) => st,
+                        Err(_) => {
+                            return Err(match wait {
+                                Wait::Connected(_) => AcquireError::TimedOut,
+                                _ => AcquireError::NoConnection,
+                            });
                         }
                     };
                 }

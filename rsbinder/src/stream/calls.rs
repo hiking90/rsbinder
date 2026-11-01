@@ -9,13 +9,14 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 #[cfg(feature = "tokio")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::binder::{FromIBinder, Interface, Strong};
 use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
 use crate::parcelable::{Deserialize, Serialize};
+use crate::signal::Signal;
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
@@ -32,10 +33,10 @@ use super::{
 
 // ---- Pinging a quiet peer (plan 2-24 D9) ----
 
-/// Wait on `cv` while `blocked` until `deadline` or `ping.every`; the ping goes out unlocked.
+/// Wait on `signal` while `blocked` until `deadline` or `ping.every`; the ping goes out unlocked.
 fn park<S>(
     mutex: &Mutex<S>,
-    cv: &Condvar,
+    signal: &Signal,
     blocked: impl Fn(&S) -> bool,
     deadline: Option<Instant>,
     ping: Option<&Ping>,
@@ -46,22 +47,19 @@ fn park<S>(
     let wake_at = if pings { quiet_until } else { deadline };
     let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
     while blocked(&state) {
-        let Some(at) = wake_at else {
-            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
-            continue;
-        };
-        let left = at.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            drop(state);
-            if let Some(ping) = ping.filter(|_| pings) {
-                ping.send();
+        state = match signal
+            .wait_until(state, wake_at)
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Ok(state) => state,
+            Err(state) => {
+                drop(state);
+                if let Some(ping) = ping.filter(|_| pings) {
+                    ping.send();
+                }
+                return;
             }
-            return;
-        }
-        state = cv
-            .wait_timeout(state, left)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        };
     }
 }
 
@@ -70,16 +68,16 @@ fn park<S>(
 struct Abandon<'a, S> {
     gone: Arc<AtomicBool>,
     mutex: &'a Mutex<S>,
-    cv: &'a Condvar,
+    signal: &'a Signal,
 }
 
 #[cfg(feature = "tokio")]
 impl<'a, S> Abandon<'a, S> {
-    fn new(mutex: &'a Mutex<S>, cv: &'a Condvar) -> Self {
+    fn new(mutex: &'a Mutex<S>, signal: &'a Signal) -> Self {
         Abandon {
             gone: Arc::default(),
             mutex,
-            cv,
+            signal,
         }
     }
 
@@ -95,7 +93,8 @@ impl<S> Drop for Abandon<'_, S> {
         self.gone.store(true, Ordering::Release);
         // Locked once, so the store cannot fall between the wait's check and its sleep.
         drop(self.mutex.lock().unwrap_or_else(|e| e.into_inner()));
-        self.cv.notify_all();
+        // Threads only: the future holds a `Notified` across this drop and must not wake from it.
+        self.signal.wake_threads();
     }
 }
 
@@ -118,10 +117,7 @@ struct CreditState {
 pub(super) struct Credit {
     state: Mutex<CreditState>,
     /// Woken by a grant, a cancel and the consumer's death.
-    wake: Condvar,
-    /// The same three, for a producer suspended in `wait_credit_async`.
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    wake: Signal,
 }
 
 impl Credit {
@@ -163,9 +159,7 @@ impl Credit {
     }
 
     fn wake_all(&self) {
-        self.wake.notify_all();
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.wake.wake_all();
     }
 
     /// One step of taking a credit: `None` if the caller has to wait.
@@ -249,7 +243,7 @@ impl Credit {
     ) -> Result<()> {
         loop {
             // Created first: a `Notified` sees every `notify_waiters` from its creation on.
-            let notified = self.notify.notified();
+            let notified = self.wake.notified();
             if let Some(answer) = Self::poll_credit(&mut self.lock()) {
                 return answer;
             }
@@ -1035,9 +1029,7 @@ impl StreamState {
 
 pub(super) struct Stream {
     state: Mutex<StreamState>,
-    arrived: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    arrived: Signal,
     /// The widest opening window this consumer takes from a producer.
     max_opening: u32,
 }
@@ -1046,9 +1038,7 @@ impl Stream {
     fn new(max_opening: u32) -> Self {
         Stream {
             state: Mutex::default(),
-            arrived: Condvar::new(),
-            #[cfg(feature = "tokio")]
-            notify: tokio::sync::Notify::new(),
+            arrived: Signal::default(),
             max_opening,
         }
     }
@@ -1058,9 +1048,7 @@ impl Stream {
     }
 
     fn wake(&self) {
-        self.arrived.notify_all();
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.arrived.wake_all();
     }
 
     /// End the stream with `status` unless something already has.
@@ -1443,7 +1431,7 @@ impl<T: Deserialize> Consumer<T> {
         let stream = self.stream.clone();
         loop {
             // Created before looking, so a batch landing before the await is not missed.
-            let notified = stream.notify.notified();
+            let notified = stream.arrived.notified();
             if let Some(done) = self.advance_async().await {
                 return done;
             }
@@ -3024,8 +3012,8 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[test]
     fn an_abandon_dropped_while_its_wait_sleeps_ends_the_wait() {
-        let (mutex, cv) = (Mutex::new(()), Condvar::new());
-        let abandon = Abandon::new(&mutex, &cv);
+        let (mutex, signal) = (Mutex::new(()), Signal::default());
+        let abandon = Abandon::new(&mutex, &signal);
         let gone = abandon.gone();
         let (asleep_tx, asleep) = mpsc::channel();
         thread::scope(|scope| {
@@ -3041,7 +3029,7 @@ mod tests {
                 };
                 park(
                     &mutex,
-                    &cv,
+                    &signal,
                     blocked,
                     Some(started + Duration::from_secs(5)),
                     None,
@@ -3058,6 +3046,65 @@ mod tests {
                 "the abandoned wait slept on: {slept:?}"
             );
         });
+    }
+
+    /// A pinged wait whose pool is gone waits for the next change rather than spin: the
+    /// pooled wait's `Abandon` wakes threads only, so the `Notified` made before it stays
+    /// pending and the first poll returns.
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
+    #[test]
+    fn a_consumer_whose_pool_is_gone_waits_unpinged_rather_than_spin() {
+        use crate::rpc::transport::MemTransport;
+        use crate::rpc::{AddressSpace, RpcSession};
+
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let source = BnStreamSource::new_binder(RefusingSource(Arc::default())).as_binder();
+        server.set_root(source).unwrap();
+        let serving = thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+        // A reply deadline gives the source a ping interval, which sends a quiet wait to the pool.
+        client
+            .set_reply_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let remote_source = client.get_root().unwrap();
+
+        let (rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(4, 4));
+        let sink: Strong<dyn IStreamSink> =
+            FromIBinder::try_from(sink_binder).expect("the consumer's own sink");
+        let local_source = BnStreamSource::new_binder(RefusingSource(Arc::default())).as_binder();
+        sink.r#onStart(&local_source, 4).expect("onStart");
+        // Only the ping target is remote: a death link on it would need incoming connections.
+        rx.stream.lock().source_binder = Some(remote_source);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let _entered = handle.enter();
+            let mut rx = rx;
+            let pending = {
+                let recv = std::pin::pin!(rx.recv_async());
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                std::future::Future::poll(recv, &mut cx).is_pending()
+            };
+            // Sent back alive: dropping the consumer cancels too.
+            let _ = done.send((pending, rx));
+        });
+        let (pending, rx) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receive spun: its first poll never returned");
+        assert!(pending, "nothing arrived, so the receive waits");
+        drop(rx);
+        client.close_session();
+        serving.join().unwrap();
     }
 
     /// Plan 16 D6: a peer of unknown interface is cast unasked; a known other one is refused.
