@@ -69,8 +69,15 @@
 //! or refcount data (those stay in the per-session `RpcState`), mirroring the kernel path's
 //! thread-local `IPCThreadState`; it is the documented exception in the
 //! `rpc_stack_has_no_globals` gate. It is bound by the borrow-discipline invariant R1
-//! (`thread_state` module doc): every `DRIVING.with` copies its answer out of the closure, and
-//! no borrow is held across the user callback a nested dispatch runs.
+//! (`thread_state` module doc): every access goes through the `stack_*` helpers, whose borrow
+//! ends inside them, and no borrow is held across the user callback a nested dispatch runs.
+//!
+//! A proxy kept in a user `thread_local!` may drop after `DRIVING` is destroyed. The helpers
+//! report that apart from an empty stack, and the rule follows the kernel path's
+//! `send_request_flushed`: a `DEC_STRONG` is still sent, on a free `Outgoing` slot claimed with
+//! no marker, and a new call or a reply is refused with `InvalidOperation`. Treating the stack as
+//! empty instead would let a nested call made from that destructor pick a slot this thread
+//! already holds and, on its guard's drop, release the outer frame's `exclusive_tid`.
 //!
 //! # Slot pool
 //!
@@ -605,6 +612,7 @@ use std::sync::atomic::{
 };
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::{AccessError, LocalKey};
 use std::time::{Duration, Instant};
 
 use super::deadline::PhaseDeadline;
@@ -1377,16 +1385,41 @@ thread_local! {
     static ARMED_READ: RefCell<Vec<(usize, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
 }
 
+/// `DRIVING` or `ARMED_READ`. Each helper's borrow ends inside it (R1), and each is `Err`
+/// once this thread's locals are being destroyed, which a caller tells from an empty stack.
+type Stack<T> = &'static LocalKey<RefCell<Vec<T>>>;
+type StackResult<T> = std::result::Result<T, AccessError>;
+
+fn stack_push<T>(key: Stack<T>, entry: T) -> StackResult<()> {
+    key.try_with(|s| s.borrow_mut().push(entry))
+}
+
+/// The value of the innermost entry keyed `k`.
+fn stack_find<K: PartialEq + Copy, V: Copy>(key: Stack<(K, V)>, k: K) -> StackResult<Option<V>> {
+    key.try_with(|s| s.borrow().iter().rev().find(|e| e.0 == k).map(|e| e.1))
+}
+
+fn stack_any<T>(key: Stack<T>, pred: impl FnMut(&T) -> bool) -> StackResult<bool> {
+    key.try_with(|s| s.borrow().iter().any(pred))
+}
+
+/// Remove the innermost entry `pred` matches; a destroyed stack has nothing to remove.
+fn stack_remove_last<T>(key: Stack<T>, mut pred: impl FnMut(&T) -> bool) {
+    let _ = key.try_with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(i) = s.iter().rposition(&mut pred) {
+            s.remove(i);
+        }
+    });
+}
+
 fn transport_key(t: &dyn RpcTransport) -> usize {
     t as *const dyn RpcTransport as *const () as usize
 }
 
 /// The read deadline this thread's innermost live guard set on `t`, else `baseline`.
 fn read_deadline_in_effect(t: &dyn RpcTransport, baseline: Option<Duration>) -> Option<Duration> {
-    let key = transport_key(t);
-    // R1: the borrow spans only this scan.
-    ARMED_READ
-        .try_with(|a| a.borrow().iter().rev().find(|e| e.0 == key).map(|e| e.1))
+    stack_find(&ARMED_READ, transport_key(t))
         .ok()
         .flatten()
         .unwrap_or(baseline)
@@ -1402,19 +1435,14 @@ fn push_read_deadline(t: &dyn RpcTransport, d: Option<Duration>) -> RpcResult<bo
             Err(e)
         };
     }
-    let _ = ARMED_READ.try_with(|a| a.borrow_mut().push((transport_key(t), d)));
+    let _ = stack_push(&ARMED_READ, (transport_key(t), d));
     Ok(true)
 }
 
 /// Drop the innermost record for `t` and set `restore` back on it.
 fn pop_read_deadline(t: &dyn RpcTransport, restore: Option<Duration>) {
     let key = transport_key(t);
-    let _ = ARMED_READ.try_with(|a| {
-        let mut a = a.borrow_mut();
-        if let Some(i) = a.iter().rposition(|e| e.0 == key) {
-            a.remove(i);
-        }
-    });
+    stack_remove_last(&ARMED_READ, |e| e.0 == key);
     // Best-effort: Drop cannot surface it, and the next caller re-arms or clears anyway.
     let _ = t.set_read_timeout(restore);
 }
@@ -1667,6 +1695,12 @@ impl Drop for NestedDeadlineGuard<'_> {
 thread_local! {
     /// This thread's `(session, slot)` pins, under R1; see module doc "The `DRIVING` marker".
     static DRIVING: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A call or reply on a thread whose `DRIVING` is destroyed (kernel `send_request_flushed`).
+fn refuse_without_driving() -> StatusCode {
+    log::error!("RPC: a call from a thread-local destructor, after `DRIVING` is gone; refused");
+    StatusCode::InvalidOperation
 }
 
 /// AOSP `mOutgoing`/`mIncoming` as a per-slot tag (plan 2-20); module doc "Connection selection".
@@ -1943,12 +1977,7 @@ impl Drop for ConnGuard<'_> {
             return;
         }
         let key = (self.inner as *const _ as usize, self.slot_id);
-        DRIVING.with(|d| {
-            let mut v = d.borrow_mut();
-            if let Some(pos) = v.iter().rposition(|&k| k == key) {
-                v.remove(pos);
-            }
-        });
+        stack_remove_last(&DRIVING, |&k| k == key);
         {
             // `notify_all`: `notify_one` may wake only a waiter pinned to another slot.
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
@@ -2011,13 +2040,7 @@ struct AllowNestedGuard<'a> {
 impl<'a> AllowNestedGuard<'a> {
     /// Arm on this thread's `DRIVING` slot; `None` only if the session ended mid-dispatch.
     fn arm(inner: &'a RpcSessionInner, allow: bool) -> Option<Self> {
-        let sess_ptr = inner as *const RpcSessionInner as usize;
-        let slot_id = DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .rev()
-                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
-        })?;
+        let slot_id = inner.driving_slot().ok().flatten()?;
         let mut st = inner.conn_state.lock().expect("conn_state poisoned");
         let slot = st.slots.iter_mut().find(|s| s.id == slot_id)?;
         let prev = std::mem::replace(&mut slot.allow_nested, allow);
@@ -2291,7 +2314,9 @@ impl RpcSessionInner {
         let mut wait_until: Option<Option<Instant>> = None;
         let tid = current_tid();
         // (1) Reentrant pin, innermost first; a serve-driven slot also needs `allow_nested`.
-        let pinned = self.driving_slot();
+        let Ok(pinned) = self.driving_slot() else {
+            return Err(refuse_without_driving());
+        };
         if let Some(slot_id) = pinned {
             let reusable = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
@@ -2403,22 +2428,17 @@ impl RpcSessionInner {
         }
     }
 
-    /// This thread's innermost `DRIVING` slot of this session, if it drives one.
-    fn driving_slot(&self) -> Option<u64> {
-        let sess_ptr = self as *const RpcSessionInner as usize;
-        DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .rev()
-                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
-        })
+    /// This thread's innermost `DRIVING` slot of this session; `Err` once `DRIVING` is destroyed.
+    fn driving_slot(&self) -> StackResult<Option<u64>> {
+        stack_find(&DRIVING, self as *const RpcSessionInner as usize)
     }
 
     /// Hold `slot` for `tid` and push it on `DRIVING`; dropping the guard undoes both.
     fn claim_slot(&self, slot: &mut ConnSlot, tid: Tid) -> ConnGuard<'_> {
         slot.exclusive_tid = Some(tid);
         let sess_ptr = self as *const RpcSessionInner as usize;
-        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot.id)));
+        // Without `DRIVING` only a `DEC_STRONG` gets here, which nests nothing on the slot.
+        let _ = stack_push(&DRIVING, (sess_ptr, slot.id));
         ConnGuard {
             inner: self,
             slot_id: slot.id,
@@ -2430,7 +2450,8 @@ impl RpcSessionInner {
     /// Non-blocking choice of a `DEC_STRONG`'s connection; module doc "Deferred `DEC_STRONG`".
     fn dec_route(&self) -> DecRoute<'_> {
         let tid = current_tid();
-        let pinned = self.driving_slot();
+        // A proxy dropped by a thread-local's destructor: no pin to write on, a free slot will do.
+        let pinned = self.driving_slot().ok().flatten();
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         let mut pending_on = None;
         if let Some(slot_id) = pinned {
@@ -2492,12 +2513,10 @@ impl RpcSessionInner {
     fn find_conn_pinned(&self, want_slot_id: u64) -> Result<ConnGuard<'_>> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
+        let key = (sess_ptr, want_slot_id);
         // Reentrant on the same slot.
-        if DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .any(|&(sp, sid)| sp == sess_ptr && sid == want_slot_id)
-        }) {
+        let reentrant = stack_any(&DRIVING, |&k| k == key).map_err(|_| refuse_without_driving())?;
+        if reentrant {
             let transport = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
                 match st.slots.iter().find(|s| s.id == want_slot_id) {
@@ -3006,17 +3025,15 @@ impl RpcSessionInner {
         let idle = self.shared.serve_read_deadline()?;
         let sess_ptr = self as *const RpcSessionInner as usize;
         let st = self.conn_state.lock().expect("conn_state poisoned");
-        // R1: the borrow spans only this scan, which runs no user code and enters no binder.
-        let serving = DRIVING.with(|d| {
-            d.borrow().iter().any(|&(sp, sid)| {
-                sp == sess_ptr
-                    && st
-                        .slots
-                        .iter()
-                        .any(|s| s.id == sid && s.role == SlotRole::Incoming)
-            })
+        // The scan runs no user code and enters no binder.
+        let serving = stack_any(&DRIVING, |&(sp, sid)| {
+            sp == sess_ptr
+                && st
+                    .slots
+                    .iter()
+                    .any(|s| s.id == sid && s.role == SlotRole::Incoming)
         });
-        serving.then_some(idle)
+        serving.unwrap_or(false).then_some(idle)
     }
 
     /// Whether a loss is noticed as it happens (AOSP `linkToDeath`'s max-incoming-threads test).
@@ -3978,7 +3995,7 @@ impl RpcSessionInner {
         if !oneway {
             // The target receipt, paid just before the `REPLY`; module doc "Deferred `DEC_STRONG`".
             if self.profile.pays_target_before_reply() {
-                if let Some(slot_id) = self.driving_slot() {
+                if let Ok(Some(slot_id)) = self.driving_slot() {
                     self.hold_dec_strong(slot_id, t.address, 1);
                 }
             }

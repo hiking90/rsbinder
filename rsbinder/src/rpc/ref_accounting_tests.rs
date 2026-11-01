@@ -920,3 +920,57 @@ fn t11_the_release_waits_on_the_wires_that_count_targets() {
         assert_eq!(dec_received(&p.server, &addr), (1, 1), "{wire:?}");
     }
 }
+
+/// A proxy dropped by a thread-local's destructor after `DRIVING`'s is still released, and a
+/// call from there is refused (module doc "The `DRIVING` marker"). In a child: it aborted.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn a_proxy_dropped_after_driving_is_destroyed_is_released() {
+    crate::tests::in_child_process(
+        "rpc::session::ref_accounting_tests::a_proxy_dropped_after_driving_is_destroyed_is_released",
+        || {
+            /// Run as this thread's locals are destroyed: `DRIVING`'s first, as it was made last.
+            struct Late {
+                made: Option<SIBinder>,
+                root: SIBinder,
+                told: std::sync::mpsc::Sender<(bool, Result<()>)>,
+            }
+            impl Drop for Late {
+                fn drop(&mut self) {
+                    let gone = DRIVING.try_with(|_| ()).is_err();
+                    let call = self.root.ping_binder();
+                    drop(self.made.take());
+                    let _ = self.told.send((gone, call));
+                }
+            }
+            thread_local! {
+                static LATE: std::cell::RefCell<Option<Late>> = const { std::cell::RefCell::new(None) };
+            }
+
+            let p = Pair::new(Wire::R34);
+            let made: SIBinder = p.call(TX_MAKE, None).expect("make").read().expect("binder");
+            let addr = rpc_of(&made).address();
+            let (told, heard) = std::sync::mpsc::channel();
+            let (root, client) = (p.root().clone(), p.client.clone());
+            std::thread::spawn(move || {
+                LATE.with(|l| {
+                    *l.borrow_mut() = Some(Late {
+                        made: Some(made),
+                        root,
+                        told,
+                    })
+                });
+                // Registers `DRIVING`'s destructor after `LATE`'s, so it runs first.
+                assert_eq!(client.inner.driving_slot(), Ok(None));
+            })
+            .join()
+            .expect("thread");
+            let (gone, call) = heard.recv_timeout(Duration::from_secs(10)).expect("told");
+            assert!(gone, "`DRIVING` outlived `LATE`: the test's premise");
+            assert_eq!(call, Err(StatusCode::InvalidOperation));
+            // r34 counts no targets, so the release went out at once; the ping is read after it.
+            p.root().ping_binder().expect("ping");
+            assert_eq!(dec_received(&p.server, &addr), (1, 1));
+        },
+    );
+}

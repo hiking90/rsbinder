@@ -784,6 +784,12 @@ accepts both the 0.12.0 bytes and the new ones.
   the death's clear notification and the pin release behind it. The panic
   is now caught and logged and the done is queued, as the frozen-binder
   handshake already did.
+- **An RPC proxy dropped by a `thread_local!` destructor no longer aborts
+  the process.** When the destructor ran after the RPC session's own
+  thread-local, the release panicked inside it, which aborts. The release is
+  now sent on a free connection, and a call (two-way or oneway) or a reply
+  made from such a destructor is refused with `InvalidOperation`, as a
+  kernel death or freeze request from one already was.
 
 ### Security
 

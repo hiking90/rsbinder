@@ -3983,37 +3983,8 @@ mod tests {
         }
     }
 
-    /// Runs this test's `body` in a child test process, so a fault fails the test, not the binary.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn in_child_process(test: &str, body: fn()) {
-        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
-        const CHILD: &str = "RSBINDER_THREAD_STATE_TEST_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let maximum = getrlimit(Resource::Core).maximum;
-            // A crash here is the regression under test; it should not leave a core file.
-            let _ = setrlimit(
-                Resource::Core,
-                Rlimit {
-                    current: Some(0),
-                    maximum,
-                },
-            );
-            body();
-            return;
-        }
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([test, "--exact", "--test-threads=1"])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "child {test}: {:?}\n{stdout}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr),
-        );
-    }
+    use crate::tests::in_child_process;
 
     /// A refused freeze request behind queued commands fails instead of aborting.
     #[test]

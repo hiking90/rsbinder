@@ -3107,6 +3107,8 @@ fn rpc_stack_has_no_globals() {
         ("session.rs", "static DRIVING:"),
         // `ARMED_READ`: this thread's live deadline guards, emptied as they drop.
         ("session.rs", "static ARMED_READ:"),
+        // A test's user `thread_local!`, whose destructor runs after `DRIVING`'s.
+        ("ref_accounting_tests.rs", "static LATE:"),
     ];
     fn scan(root: &std::path::Path, dir: &std::path::Path, offenders: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
