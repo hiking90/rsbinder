@@ -44,6 +44,9 @@
 //!   the release goes at once, on android-13+ with the server's receipt before its next reply.
 //! - `t12_a_proxy_in_a_v2_reply_waits_for_its_receipt`: a server's proxy returned in a v2
 //!   reply is released only after the raw caller pays that receipt.
+//! - `t13_a_twoway_handler_panic_is_unknown_and_the_session_serves_on`,
+//!   `t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on`: a handler panic is
+//!   contained on every wire; the twoway caller reads `Unknown`, the oneway is dropped.
 //!
 //! # Mutation gates
 //!
@@ -99,6 +102,8 @@ const TX_HOLDER: TransactionCode = FIRST_CALL_TRANSACTION + 3;
 const TX_KEEP: TransactionCode = FIRST_CALL_TRANSACTION + 4;
 /// Oneway: `Option<SIBinder>` in, dropped.
 const TX_TAKE: TransactionCode = FIRST_CALL_TRANSACTION + 5;
+/// Panics, twoway or oneway.
+const TX_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 6;
 
 #[derive(Default)]
 struct Acct {
@@ -154,6 +159,7 @@ impl Remotable for Acct {
                 let _b: Option<SIBinder> = reader.read()?;
                 Ok(())
             }
+            TX_PANIC => panic!("TX_PANIC"),
             _ => Err(StatusCode::UnknownTransaction),
         }
     }
@@ -918,6 +924,34 @@ fn t11_the_release_waits_on_the_wires_that_count_targets() {
         }
         assert!(released(Duration::from_secs(5)), "{wire:?}: never released");
         assert_eq!(dec_received(&p.server, &addr), (1, 1), "{wire:?}");
+    }
+}
+
+/// T13: a twoway handler panic is an `Unknown` reply, and the session keeps serving.
+#[test]
+fn t13_a_twoway_handler_panic_is_unknown_and_the_session_serves_on() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let p = Pair::new(wire);
+        assert_eq!(
+            p.call(TX_PANIC, None).map(drop),
+            Err(StatusCode::Unknown),
+            "{wire:?}"
+        );
+        p.call(TX_ECHO, None).expect("the next call");
+    }
+}
+
+/// T14: a oneway handler panic drops the call, and the session keeps serving.
+#[test]
+fn t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let p = Pair::new(wire);
+        let d = rpc_of(p.root()).request_parcel(DESC).expect("request");
+        assert!(rpc_of(p.root())
+            .send(TX_PANIC, &d, FLAG_ONEWAY)
+            .expect("oneway")
+            .is_none());
+        p.call(TX_ECHO, None).expect("the call after it");
     }
 }
 
