@@ -35,8 +35,9 @@ interface ITopic {
     /**
      * Take a subscription. A publisher that refuses the caller returns
      * `EX_SECURITY`; the other refusals are the constants above, `BAD_TYPE`
-     * for a payload type of another name and `BAD_VALUE` for a request it
-     * cannot use (SubscribeRequest names each).
+     * for a payload type of another name, `UNEXPECTED_NULL` for a null
+     * `token` or `control`, and `BAD_VALUE` for a request it cannot use
+     * (SubscribeRequest names each).
      */
     TopicEndpoint subscribe(in SubscribeRequest request);
 }

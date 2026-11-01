@@ -124,6 +124,25 @@ You do not need to run `rsb_hub` on Android — the system already provides serv
   [Shared Memory](./shared-memory.md).
 - **`@VintfStability`** is honored, including the stability check a
   `ParcelableHolder` carries on the wire.
+- **Binder stability is recorded, not enforced.** A binder's level
+  (`Stability`) is written after it on the wire and a proxy reports the
+  first declared level it was received with, but rsbinder checks neither
+  the level it receives nor the level a call needs. libbinder's
+  `BpBinder::transact` refuses a user transaction to a binder whose level
+  does not include the caller's (`BAD_TYPE`), and its parcel read refuses
+  an `UNDECLARED` or conflicting level; rsbinder sends the call and keeps
+  the first level. An unknown level is refused on kernel binder
+  (`BadValue`) and ignored over RPC.
+- **Vendor partition.** rsbinder has no vendor build, so every binder it
+  makes, generated ones included, is `System` unless it is
+  `@VintfStability` or marked otherwise. A vendor libbinder client
+  requires `VENDOR` and refuses every call to a non-VINTF `System` binder
+  with `BAD_TYPE`. A vendor-partition rsbinder process that serves a
+  non-`@VintfStability` interface to vendor libbinder clients (usually on
+  `/dev/vndbinder`) calls `force_downgrade_to_vendor_stability()` on each
+  binder it hands out, callbacks included, before the binder is first
+  written to a parcel, or builds it with
+  `Binder::new_with_stability(_, Stability::Vendor)`.
 
 ### JNI Integration
 

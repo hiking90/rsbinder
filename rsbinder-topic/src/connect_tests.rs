@@ -764,7 +764,7 @@ fn a_wake_socket_shut_down_without_an_end_ends_the_wait_as_the_publishers_death(
 }
 
 /// The publisher of a topic of one item, written as `Writer::put` writes, which tests drive.
-type Lapper = Arc<Mutex<crate::ring::Writer<layout::Stored<rsbinder::fmq::shm::Mapping>>>>;
+type Lapper = Arc<Mutex<crate::ring::Writer<layout::Stored>>>;
 
 /// A topic of one item at 0, and its publisher, which [`lap_each_judgment`] sets writing.
 fn lapped_topic() -> (SIBinder, Lapper) {

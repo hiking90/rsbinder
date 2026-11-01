@@ -40,17 +40,23 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 ///
 /// # Which thread a transact runs on
 ///
-/// A generated async proxy does not always call [`spawn`](Self::spawn). On a
-/// thread that is handling a transaction
-/// ([`is_handling_transaction`](crate::is_handling_transaction)), it runs the
-/// transact inline on that thread and returns a future of its result. Two
+/// A generated async proxy does not always call [`spawn`](Self::spawn), and
+/// neither do this crate's other async APIs: the lookups
+/// `try_get_interface_async`, `check_interface_async` and
+/// `wait_for_interface_async`, `connect_async`, and the waits of `stream`
+/// (and of `rsbinder-topic`, through the same helper). On a thread that is
+/// handling a transaction
+/// ([`is_handling_transaction`](crate::is_handling_transaction)), each runs
+/// its whole operation inline on that thread and returns a future of its
+/// result, as AOSP `binder_tokio` does; an operation that waits holds the
+/// thread until the wait ends, and dropping its future cannot end it. Two
 /// things need the nested call made from that thread: the kernel binder
 /// driver routes the callbacks of a nested call back to the thread that
 /// waits for it, which is what keeps a call back into the caller from
 /// deadlocking, and an RPC session drives a nested call on the thread that
-/// holds the outer one. The rule is fixed in the library, so a pool cannot
-/// lose it, and `spawn` is reached only from a thread that is not handling a
-/// transaction.
+/// holds the outer one. The rule is fixed in one function of the library, so
+/// a pool cannot lose it, and `spawn` is reached only from a thread that is
+/// not handling a transaction.
 ///
 /// The strict-mode policy and work source of the calling thread are written
 /// into the request header before `spawn` is called, so the pool thread that

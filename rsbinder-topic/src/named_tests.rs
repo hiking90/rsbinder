@@ -23,7 +23,6 @@ use crate::named::{
     BEFORE_DRAIN_ENDS, BEFORE_INTERRUPT, BEFORE_LOOKING, BEFORE_REPLACE, BETWEEN_LOOKS,
 };
 use crate::ring::{Kind, Stores, Writer, BEFORE_JUDGING};
-use rsbinder::fmq::shm::Mapping;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{
@@ -628,7 +627,7 @@ fn empty_item(index: u32) -> [u8; 8] {
 }
 
 /// `ByHand` memory as its publisher's [`Writer`] stores it, while a test stores beside it.
-struct Shared(Rc<Stored<Mapping>>);
+struct Shared(Rc<Stored>);
 
 impl Stores for Shared {
     fn capacity(&self) -> u64 {
@@ -692,7 +691,7 @@ fn lap(old: &Old, position: u64) {
 /// A name subscriber of `ByHand` memory, its old publisher, and the new one that took the name.
 struct Draining {
     subscriber: NamedSubscriber<Bytes>,
-    stored: Rc<Stored<Mapping>>,
+    stored: Rc<Stored>,
     writer: Old,
     old: SIBinder,
     _new: Publisher<Bytes>,
@@ -1745,6 +1744,78 @@ fn a_closed_publisher_gives_no_name() {
     let refused = publisher.advertise_on(NAME, &names).unwrap_err();
     assert_eq!(refused.service_specific_error(), ERROR_CLOSED);
     assert!(names.0.lock().unwrap().given.is_empty());
+}
+
+type Entries = Arc<Mutex<HashMap<String, SIBinder>>>;
+
+/// A registry of one entry per name, whose advertise waits up to 300 ms for a second one.
+struct OneEntry {
+    entries: Entries,
+    inside: AtomicUsize,
+    host: SIBinder,
+}
+
+/// Takes the entry back if it is still this name's and binder's, as `withdraw` does.
+struct Withdraw(Entries, String, SIBinder);
+
+impl Drop for Withdraw {
+    fn drop(&mut self) {
+        let mut entries = self.0.lock().unwrap();
+        if entries.get(&self.1) == Some(&self.2) {
+            entries.remove(&self.1);
+        }
+    }
+}
+
+impl Resolver for OneEntry {
+    fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<Advertisement> {
+        self.inside.fetch_add(1, Ordering::SeqCst);
+        let until = Instant::now() + Duration::from_millis(300);
+        while self.inside.load(Ordering::SeqCst) < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entries = self.entries.clone();
+        entries
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), topic.clone());
+        Ok(Advertisement::new(Withdraw(
+            entries,
+            name.to_owned(),
+            topic,
+        )))
+    }
+
+    fn watch(
+        &self,
+        _name: &str,
+        _on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
+    ) -> BinderResult<Watch> {
+        Ok(Watch::new(()))
+    }
+
+    fn host(&self) -> Option<SIBinder> {
+        Some(self.host.clone())
+    }
+}
+
+#[test]
+fn two_threads_giving_one_name_on_one_host_ask_once_and_leave_its_entry() {
+    let host = Publisher::<Bytes>::new(&policy()).unwrap();
+    let registry = OneEntry {
+        entries: Entries::default(),
+        inside: AtomicUsize::new(0),
+        host: host.as_binder(),
+    };
+    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| publisher.advertise_on(NAME, &registry).unwrap());
+        }
+    });
+    assert_eq!(registry.inside.load(Ordering::SeqCst), 1);
+    assert!(registry.entries.lock().unwrap().contains_key(NAME));
+    assert!(publisher.stats().advertised);
 }
 
 #[test]

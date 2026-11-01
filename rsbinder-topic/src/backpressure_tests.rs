@@ -526,6 +526,22 @@ fn a_lend_past_the_window_waits_though_a_slot_is_free() {
     assert_eq!(subscriber.recv_timeout(SPAN), evicted);
 }
 
+/// The loan limit is judged before the window: refused at once, with no wait and no eviction.
+#[test]
+fn a_lend_at_the_loan_limit_is_refused_at_once_though_the_window_is_full() {
+    let timeout = Duration::from_secs(2);
+    let publisher = pooled_within(1, timeout, NonZeroUsize::new(1));
+    let _subscriber = subscribe(&publisher, Wake::Futex);
+    let held = publisher.loan_slice(8).unwrap();
+    publisher.publish(&value(0)).unwrap();
+    let began = Instant::now();
+    let too_many = crate::PublishError::TooManyLoans { max: 1 };
+    assert_eq!(publisher.loan_slice(8).err(), Some(too_many));
+    assert!(began.elapsed() < timeout / 2, "{:?}", began.elapsed());
+    assert_eq!(publisher.stats().evicted, 0);
+    drop(held);
+}
+
 /// A loaned value counts as read once its sample drops: the lag covers its record until then.
 #[test]
 fn a_held_sample_leaves_its_record_unread_until_dropped() {

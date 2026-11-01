@@ -121,7 +121,7 @@ const FIRST_NAP: Duration = Duration::from_micros(50);
 /// The longest: a wake lost at most this long ago is sent again.
 const LAST_NAP: Duration = Duration::from_millis(1);
 
-/// Yield once, then sleep `FIRST_NAP` doubling to `LAST_NAP`: a sleep frees the core, a yield may not.
+/// Yield once, then sleep `FIRST_NAP` doubling to `LAST_NAP`: a yield may not free the core.
 fn pause(nap: &mut Duration) {
     if nap.is_zero() {
         yield_now();
@@ -601,7 +601,6 @@ mod real {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use rsbinder::fmq::shm::Mapping;
     use rsbinder::fmq::Error;
     use rsbinder::{DeathRecipient, WIBinder};
 
@@ -612,7 +611,7 @@ mod real {
 
     /// The words of one subscription: `seq` in the topic memory, `state` in the control page.
     pub(crate) struct Parts {
-        pub(crate) seq: Seq<Arc<Mapping>>,
+        pub(crate) seq: Seq,
         pub(crate) control: Arc<ControlPage>,
         /// The fds of a subscription the publisher wakes through its socket.
         pub(crate) fd: Option<FdWake>,

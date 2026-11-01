@@ -47,6 +47,7 @@ use std::borrow::Borrow;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{self, Arc};
 
 use crate::{error::*, parcel::*, proxy, sys};
@@ -68,7 +69,9 @@ pub const FLAG_ONEWAY: TransactionFlags = sys::TF_ONE_WAY;
 pub const FLAG_CLEAR_BUF: TransactionFlags = sys::TF_CLEAR_BUF;
 /// `FLAG_PRIVATE_LOCAL` — the vendor flag on a VNDK build, `0` otherwise
 /// (AOSP `IBinder.h`). rsbinder targets the system side, so it is `0`; this is
-/// the flag the AIDL codegen emits on outgoing transactions.
+/// the flag the AIDL codegen emits on outgoing transactions. For serving
+/// vendor libbinder clients from the vendor partition, see [`Stability`]
+/// "Vendor partition".
 pub const FLAG_PRIVATE_LOCAL: TransactionFlags = 0;
 /// `FLAG_PRIVATE_VENDOR` (`0x10000000`, AOSP `IBinder.h`) — unconditional,
 /// unlike [`FLAG_PRIVATE_LOCAL`]. Marks a transaction as vendor-private.
@@ -448,6 +451,10 @@ pub trait IBinder: Any + Send + Sync {
     fn is_remote(&self) -> bool;
 
     /// Retrieve the stability level of this binder object.
+    ///
+    /// Both wires write this value after the binder (kernel binder from Android 11
+    /// on; Android 10 has no stability word); rsbinder takes no other decision on it. See [`Stability`] for what a native binder and a proxy report
+    /// and for the checks libbinder makes on it that rsbinder does not.
     fn stability(&self) -> Stability {
         Stability::default()
     }
@@ -598,14 +605,12 @@ pub(crate) mod sealed {
 /// (`proxy::ProxyHandle`) and RPC (`rpc::RpcProxy`) stacks, returned by
 /// `<dyn IBinder>::as_remote()`. One generated `Bp*` drives either stack
 /// through this trait; it reaches it through a hidden accessor that also
-/// covers a local binder called in-process. The kernel-only `as_proxy()`
-/// is retained for any direct callers.
+/// covers a local binder called in-process. `<dyn IBinder>::as_proxy()`
+/// returns the kernel proxy itself.
 ///
-/// The signatures are exactly `ProxyHandle`'s existing inherent
-/// `prepare_transact`/`submit_transact` — `ProxyHandle` implements
-/// this by **delegating to those unchanged methods**, so the kernel
-/// proxy's runtime behavior is bit-identical by construction (no
-/// codegen change required for the kernel path).
+/// `ProxyHandle` implements this trait by delegating to its inherent
+/// `prepare_transact` / `prepare_request` / `submit_transact`, so a call
+/// through the trait and a direct call on the kernel proxy run the same code.
 pub trait RemoteProxy {
     /// Allocate the request `Parcel`, optionally writing the AIDL
     /// interface header.
@@ -739,8 +744,7 @@ impl dyn IBinder {
     /// [`proxy::ProxyHandle`] **or** (with the `rpc` feature) an
     /// `rpc::RpcProxy`, as a single
     /// [`RemoteProxy`] trait object. Lets one generated `Bp*` stub
-    /// call either stack. `as_proxy()` is retained unchanged so the
-    /// existing generated kernel code keeps working verbatim.
+    /// call either stack; `as_proxy()` returns only a kernel proxy.
     pub fn as_remote(&self) -> Option<&dyn RemoteProxy> {
         if let Some(p) = self.as_any().downcast_ref::<proxy::ProxyHandle>() {
             return Some(p as &dyn RemoteProxy);
@@ -968,8 +972,66 @@ where
 /// Interface stability promise
 ///
 /// An interface can promise to be a stable vendor interface ([`Stability::Vintf`]), or
-/// makes no stability guarantees ([`Stability::Local`]). [`Stability::System`] is
+/// promise only the compilation-unit level ([`Stability::Local`]). [`Stability::System`] is
 /// the default stability, matching Android's `getLocalLevel()` for non-VNDK builds.
+///
+/// For a binder the value is AOSP `Stability::Level`; for a
+/// [`ParcelableHolder`](crate::ParcelableHolder) it is `Parcelable::Stability`,
+/// where only `Local` and `Vintf` exist. A [`Binder`](crate::Binder) never holds `Local`: as in
+/// AOSP Rust, whose constructor calls `mark_local_stability`, a binder built
+/// with `Local` takes this process's level when it is constructed (`System` in
+/// rsbinder), reports it from `stability()` and writes it on the wire (every wire
+/// but Android 10 kernel binder, which carries no stability word). A proxy
+/// reports the first declared level (`Vendor`, `System` or `Vintf`) it
+/// received, kernel or RPC, and this process's level until one arrives; a
+/// received `UNDECLARED` (0) leaves it there. Unset is AOSP's initial
+/// `BpBinder::mStability` (`UNDECLARED`), and `setRepr` refuses that word (see
+/// "What rsbinder checks"). Over RPC, a word read back from a parcel this
+/// process wrote and did not receive fills nothing; a kernel parcel does not
+/// record where its bytes came from, so there such a read fills the level the
+/// proxy already reported. The level belongs
+/// to the remote object, not to one proxy value: a kernel proxy revived after
+/// every strong reference dropped, while a [`WIBinder`] kept the handle,
+/// reports the level the handle was received with, as AOSP revives the same
+/// `BpBinder`.
+///
+/// # What rsbinder checks
+///
+/// rsbinder records a binder's level and writes it after the binder, but takes
+/// no decision on it. libbinder does, so the two differ in three places:
+///
+/// - **A received level is not checked.** AOSP `Stability::setRepr` refuses
+///   `UNDECLARED` on a non-null binder, and a level other than the one a
+///   binder already has, with `BAD_TYPE`. rsbinder ignores the former and
+///   keeps the first level for the latter, logging the first such conflict
+///   for each remote object.
+/// - **A transaction is not checked.** AOSP `BpBinder::transact`
+///   (android17-release `BpBinder.cpp:396-416`) refuses a user transaction
+///   (`FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION`) with `BAD_TYPE` when
+///   the target's level does not include the caller's local level, or
+///   `VENDOR` under [`FLAG_PRIVATE_VENDOR`]. rsbinder sends it, whatever the
+///   level. The check is the caller's only, so a libbinder server does not
+///   rely on it.
+/// - **An unknown level differs by transport.** A word naming no level is
+///   refused on the kernel path with `BadValue` (AOSP answers `BAD_TYPE`) and
+///   ignored over RPC, where the proxy keeps the level it had.
+///
+/// # Vendor partition
+///
+/// AOSP picks the local level when the binary is built: `VENDOR` on a VNDK
+/// (vendor) build, `SYSTEM` otherwise. rsbinder has no vendor build, so every
+/// binder it makes, generated ones included, is `System` unless marked. A
+/// vendor libbinder client runs the transaction check above against `VENDOR`,
+/// which `System` does not include, and refuses every user call to such a
+/// binder with `BAD_TYPE`; a `@VintfStability` interface is not affected,
+/// since VINTF includes VENDOR. A process on the vendor partition that serves
+/// a non-VINTF interface to vendor libbinder clients (usually over
+/// `/dev/vndbinder`) calls [`SIBinder::force_downgrade_to_vendor_stability`]
+/// on each binder it hands out, callbacks included, before the binder's first
+/// parcel write, or builds it with `Binder::new_with_stability(_,
+/// Stability::Vendor)`. A generated `new_binder` takes no stability, so the
+/// downgrade is the way for generated services. rsbinder has no process-wide
+/// local-level setting.
 ///
 /// # Wire encoding
 ///
@@ -977,12 +1039,14 @@ where
 /// `Category::repr()` = `(level << 24) | version`, the level in the high
 /// byte and a nonzero wire-format version in the low byte. android-11,
 /// android-13+ and non-Android builds write the raw `Level`: the level value
-/// itself (0/3/12/63) in the low byte, high bytes zero. On Android the encoder
-/// picks by the runtime SDK version (`frameworks/native/libs/binder/include/binder/Stability.h`,
+/// itself (0/3/12/63) in the low byte, high bytes zero. On Android the kernel
+/// parcel picks by the runtime SDK version (`frameworks/native/libs/binder/include/binder/Stability.h`,
 /// android-11.0.0_r21 through android-14.0.0_r2). That choice is the kernel
-/// path's and the android-13+ RPC wire's: an RPC session on the r34 wire
-/// always writes the android-12 form, since its peer is android-12 libbinder
-/// whatever the host's SDK.
+/// path's only. An RPC session writes the form of its wire, whatever the
+/// host's SDK, since its peer is that wire's libbinder: the raw `Level` on
+/// the android-13+ wire, the android-12 form on the r34 wire. A parcel
+/// writes the word as part of a binder; there is no public `Stability` to
+/// `i32` conversion, since the word depends on the wire and the host.
 ///
 /// AOSP-12 declares `Category { uint8_t version; uint8_t reserved[2]; Level level; }`,
 /// builds it with `currentFromLevel` = `{ version: 1, reserved: 0, level }`, and
@@ -992,7 +1056,7 @@ where
 /// (`frameworks/native/libs/binder/{include/binder/Stability.h,Stability.cpp}`,
 /// android-12.0.0_r34).
 ///
-/// The decoder accepts both. If any bit above the low byte is set, the value
+/// `TryFrom<i32>` accepts both. If any bit above the low byte is set, the value
 /// is a Category and decodes by level whatever its version byte. Otherwise
 /// the low byte is the raw level — except the bare android-12 wire-format
 /// version `0x0000_0001` (Category with level 0), which decodes to `Local`. A
@@ -1000,8 +1064,16 @@ where
 /// level and cannot be distinguished; AOSP-12 only ever writes version 1.
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Stability {
-    /// Default stability, visible to other modules in the same compilation
-    /// context (e.g. modules on system.img)
+    /// The compilation-unit level: visible to other modules in the same
+    /// compilation context (e.g. modules on system.img).
+    ///
+    /// A binder built with it takes this process's level at construction
+    /// (`System` in rsbinder; see "Vendor partition" above), as AOSP Rust's
+    /// `mark_local_stability` does, so neither a [`Binder`](crate::Binder) nor
+    /// a proxy reports or sends `Local`. As a
+    /// [`ParcelableHolder`](crate::ParcelableHolder) stability it is AOSP
+    /// `STABILITY_LOCAL` (0). A null binder's kernel word is level 0
+    /// (`UNDECLARED`), which `Stability::try_from` decodes to `Local`.
     Local,
     Vendor,
     #[default]
@@ -1017,9 +1089,7 @@ impl Stability {
     /// Checks whether `self` (provider) includes the `required` stability level.
     /// e.g., Vintf includes all levels. System and Vendor are independent domains.
     pub fn includes(&self, required: Stability) -> bool {
-        let provided: i32 = (*self).into();
-        let required: i32 = required.into();
-        (provided & required) == required
+        (self.level() & required.level()) == required.level()
     }
 
     /// AOSP `Stability::Level`: the raw bitmask, `UNDECLARED` (0) for `Local`.
@@ -1031,42 +1101,120 @@ impl Stability {
             Stability::Vintf => 0b111111,
         }
     }
+
+    /// The `Stability` whose [`level`](Self::level) is `level`, `None` for any other value.
+    pub(crate) fn of_level(level: i32) -> Option<Stability> {
+        [
+            Stability::Local,
+            Stability::Vendor,
+            Stability::System,
+            Stability::Vintf,
+        ]
+        .into_iter()
+        .find(|s| s.level() == level)
+    }
+}
+
+/// This process's binder stability level: AOSP `Stability::getLocalLevel()`.
+///
+/// AOSP picks it at build time (`VENDOR` on a VNDK build, `SYSTEM` otherwise);
+/// rsbinder has no vendor build, so it is `System` (`Stability` rustdoc,
+/// "Vendor partition"). A [`Stability::Local`] binder at construction and a
+/// proxy with no declared level take their level from it. `Stability::default()`,
+/// which `Binder::new`, a generated non-VINTF binder and the default
+/// `IBinder::stability` use, is a separate `System` that does not read this
+/// function; the two agree only because both are `System`.
+pub(crate) const fn local_level() -> Stability {
+    Stability::System
+}
+
+/// A proxy's stability level, filled once by the first received word naming a
+/// declared level (AOSP `Stability::setRepr` on a `BpBinder`).
+///
+/// The kernel parcel's binder read and the RPC `read_binder` are the only
+/// callers of [`fill`](Self::fill); proxy construction never sets it. That is
+/// what lets a proxy made before its word was read (a `ParcelableHolder`
+/// payload's, pinned by `append_from`, or one from
+/// `ProcessState::strong_proxy_for_handle`) take the level that word carries.
+/// `read_binder` fills it only from a position the parcel received, so a word
+/// this process wrote is never taken as received.
+///
+/// A kernel proxy's cell is on its `HandlePin`, with the cached descriptor,
+/// so a case-(b) revival keeps it and a new pin starts unset (`process_state`
+/// module doc "Interface descriptor"). An RPC proxy's is on the `RpcProxy`.
+///
+/// The cell holds the raw level, `0` (`UNDECLARED`) while unset, as AOSP's
+/// `BpBinder::mStability` does; [`get`](Self::get) answers [`local_level`]
+/// until it is filled. Bit 7, above every level, records that a conflicting
+/// word has been logged.
+pub(crate) struct ReceivedStability(AtomicU8);
+
+impl ReceivedStability {
+    const UNSET: u8 = 0;
+    const CONFLICT_LOGGED: u8 = 0x80;
+
+    pub(crate) const fn unset() -> Self {
+        Self(AtomicU8::new(Self::UNSET))
+    }
+
+    /// Records the received raw `level` if the cell is unset; see the type doc.
+    ///
+    /// `UNDECLARED` and a level naming no `Stability` fill nothing. A declared
+    /// level other than the recorded one keeps the recorded one (AOSP answers
+    /// `BAD_TYPE` there) and is logged once per cell.
+    pub(crate) fn fill(&self, level: i32) {
+        let Some(received) = Stability::of_level(level).filter(|s| *s != Stability::Local) else {
+            return;
+        };
+        // Every declared level is below bit 7: `level()` is 3, 12 or 63.
+        let tag = received.level() as u8;
+        // `Relaxed`: the cell publishes no other memory; the first fill wins.
+        let mut current = self.0.load(Ordering::Relaxed);
+        if current == Self::UNSET {
+            match self
+                .0
+                .compare_exchange(Self::UNSET, tag, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(now) => current = now,
+            }
+        }
+        if current & !Self::CONFLICT_LOGGED == tag || current & Self::CONFLICT_LOGGED != 0 {
+            return;
+        }
+        if self.0.fetch_or(Self::CONFLICT_LOGGED, Ordering::Relaxed) & Self::CONFLICT_LOGGED == 0 {
+            log::warn!(
+                "binder proxy received stability {received:?} but is already {:?}; keeping the \
+                 first (libbinder refuses this with BAD_TYPE)",
+                Self::stability_of(current)
+            );
+        }
+    }
+
+    /// The recorded level, or [`local_level`] while unset.
+    pub(crate) fn get(&self) -> Stability {
+        Self::stability_of(self.0.load(Ordering::Relaxed))
+    }
+
+    fn stability_of(raw: u8) -> Stability {
+        match Stability::of_level(i32::from(raw & !Self::CONFLICT_LOGGED)) {
+            Some(Stability::Local) | None => local_level(),
+            Some(declared) => declared,
+        }
+    }
 }
 
 /// AOSP `Stability::kBinderWireFormatVersion` (`Stability.cpp:31`), stamped into a `Category`.
 const BINDER_WIRE_FORMAT_VERSION: i32 = 1;
 
 /// android-12 `Category::repr()` for a raw `Level`; see `Stability` doc "Wire encoding".
-// The `target_os = "android"` encode branch and the r34 RPC wire, which always speaks it.
-#[cfg(any(target_os = "android", feature = "rpc", test))]
 pub(crate) const fn android12_category_repr(level: i32) -> i32 {
     (level << 24) | BINDER_WIRE_FORMAT_VERSION
-}
-
-// Encoding chosen by SDK version: see the `Stability` rustdoc, "Wire encoding".
-impl From<Stability> for i32 {
-    fn from(stability: Stability) -> i32 {
-        let level = stability.level();
-
-        #[cfg(target_os = "android")]
-        {
-            let android_sdk_version = crate::get_android_sdk_version();
-            if android_sdk_version == 31 || android_sdk_version == 32 {
-                android12_category_repr(level)
-            } else {
-                level
-            }
-        }
-        #[cfg(not(target_os = "android"))]
-        level
-    }
 }
 
 impl TryFrom<i32> for Stability {
     type Error = StatusCode;
     fn try_from(stability: i32) -> Result<Stability> {
-        use Stability::*;
-
         // Raw level or android-12 Category: see the `Stability` rustdoc, "Wire encoding".
         let level = if stability & !0xFF != 0 {
             (stability >> 24) & 0xFF
@@ -1076,16 +1224,10 @@ impl TryFrom<i32> for Stability {
             stability
         };
 
-        match level {
-            0 => Ok(Local),
-            0b000011 => Ok(Vendor),
-            0b001100 => Ok(System),
-            0b111111 => Ok(Vintf),
-            _ => {
-                log::error!("Stability value is invalid: {stability:#X}");
-                Err(StatusCode::BadValue)
-            }
-        }
+        Stability::of_level(level).ok_or_else(|| {
+            log::error!("Stability value is invalid: {stability:#X}");
+            StatusCode::BadValue
+        })
     }
 }
 
@@ -1099,8 +1241,7 @@ impl SIBinder {
     ///
     /// The `Arc` alone decides the binder's lifetime: wrapping counts
     /// nothing and sends no kernel command (a proxy's kernel reference is
-    /// owned by its `ProxyHandle`). This never returns `Err`; the `Result`
-    /// is kept so existing `?` callers compile.
+    /// owned by its `ProxyHandle`). This never returns `Err`.
     pub fn new(data: Arc<dyn IBinder>) -> Result<Self> {
         Ok(Self::from_arc(data))
     }
@@ -1119,7 +1260,7 @@ impl SIBinder {
     /// No kernel command, no trait dispatch.
     ///
     /// For proxies, the resulting `WIBinder` is genuinely weak: it
-    /// snapshots `(handle, stability, generation)` for identity
+    /// snapshots `(handle, generation)` for identity
     /// (`PartialEq`), and holds the handle's cache entry the way a
     /// `wp<BpBinder>` does (see [`WIBinder`]), but upgrades only while
     /// some `Arc<ProxyHandle>` for the handle is still alive (kernel
@@ -1153,7 +1294,6 @@ impl SIBinder {
             WIBinder {
                 inner: WIBinderInner::Proxy {
                     handle: proxy_handle.handle(),
-                    stability: proxy_handle.stability(),
                     generation: proxy_handle.generation(),
                     weak,
                     pin: Arc::clone(proxy_handle.pin()),
@@ -1167,6 +1307,8 @@ impl SIBinder {
     }
 
     /// Retrieve the stability level of the underlying binder object.
+    ///
+    /// See [`IBinder::stability`] and [`Stability`] "What rsbinder checks".
     pub fn stability(&self) -> Stability {
         self.inner.stability()
     }
@@ -1369,7 +1511,6 @@ pub(crate) enum WIBinderInner {
     /// `weak` upgrades; `(handle, generation)` is the identity, stable across a re-resolve.
     Proxy {
         handle: u32,
-        stability: Stability,
         generation: u64,
         weak: sync::Weak<dyn IBinder>,
         /// Keeps the cache entry and its `BC_INCREFS`, as a `wp<BpBinder>` keeps the `BpBinder`.
@@ -1413,7 +1554,7 @@ impl WIBinder {
                 .map(SIBinder::from_arc)
                 .ok_or(StatusCode::DeadObject),
             WIBinderInner::Proxy { weak, pin, .. } => {
-                // Never re-acquires a strong-0 handle; only a proxy revived by a delivery (rustdoc).
+                // Never re-acquires a strong-0 handle; only a delivery-revived proxy (rustdoc).
                 weak.upgrade()
                     .or_else(|| {
                         crate::process_state::ProcessState::live_proxy_for_pin(pin)
@@ -1436,14 +1577,14 @@ impl Debug for WIBinder {
                 .finish(),
             WIBinderInner::Proxy {
                 handle,
-                stability,
                 generation,
                 weak,
-                ..
+                pin,
             } => f
                 .debug_struct("WIBinder::Proxy")
                 .field("handle", handle)
-                .field("stability", stability)
+                // Read from the pin, which a later parcel read of the handle may have filled.
+                .field("stability", &pin.received_stability().get())
                 .field("generation", generation)
                 // Not the revived proxy's count, which `upgrade()` also reaches; reading it locks.
                 .field("downgraded_from_strong_count", &weak.strong_count())
@@ -1458,13 +1599,11 @@ impl Clone for WIBinder {
             WIBinderInner::Native(weak) => WIBinderInner::Native(sync::Weak::clone(weak)),
             WIBinderInner::Proxy {
                 handle,
-                stability,
                 generation,
                 weak,
                 pin,
             } => WIBinderInner::Proxy {
                 handle: *handle,
-                stability: *stability,
                 generation: *generation,
                 weak: sync::Weak::clone(weak),
                 pin: Arc::clone(pin),
@@ -1862,8 +2001,7 @@ mod tests {
         fn on_state_changed(&self, _: &WIBinder, _: FrozenState) {}
     }
 
-    /// Anything but a kernel proxy refuses freeze callbacks and records nothing (AOSP
-    /// `INVALID_OPERATION` for a local binder; RPC proxies take the same default).
+    /// A non-kernel binder refuses freeze callbacks and keeps no weak (AOSP `INVALID_OPERATION`).
     #[test]
     fn non_kernel_binders_refuse_freeze_callbacks() {
         let binder = SIBinder::new(Arc::new(MockBinder)).expect("SIBinder::new");
@@ -1952,48 +2090,19 @@ mod tests {
 mod stability_tests {
     use super::*;
 
-    // === Wire value tests ===
+    // === TryFrom round-trip tests ===
     #[test]
-    fn test_stability_wire_values() {
-        // SDK 31/32 devices wire `(level << 24) | 1`, other targets the raw level.
+    fn test_stability_roundtrip() {
         for (s, level) in [
             (Stability::Local, 0),
             (Stability::Vendor, 0b000011),
             (Stability::System, 0b001100),
             (Stability::Vintf, 0b111111),
         ] {
-            let wire: i32 = s.into();
-            #[cfg(target_os = "android")]
-            let expected = {
-                let sdk = crate::get_android_sdk_version();
-                if sdk == 31 || sdk == 32 {
-                    android12_category_repr(level)
-                } else {
-                    level
-                }
-            };
-            #[cfg(not(target_os = "android"))]
-            let expected = level;
-            assert_eq!(wire, expected, "wire encoding for {s:?}");
-            assert_eq!(
-                Stability::try_from(wire).unwrap(),
-                s,
-                "round-trip for {s:?}"
-            );
-        }
-    }
-
-    // === TryFrom round-trip tests ===
-    #[test]
-    fn test_stability_roundtrip() {
-        for s in [
-            Stability::Local,
-            Stability::Vendor,
-            Stability::System,
-            Stability::Vintf,
-        ] {
-            let wire: i32 = s.into();
-            assert_eq!(Stability::try_from(wire).unwrap(), s);
+            assert_eq!(s.level(), level, "{s:?}");
+            assert_eq!(Stability::try_from(level).unwrap(), s, "raw {s:?}");
+            let category = android12_category_repr(level);
+            assert_eq!(Stability::try_from(category).unwrap(), s, "Category {s:?}");
         }
     }
 
@@ -2054,5 +2163,28 @@ mod stability_tests {
         // Self-inclusion
         assert!(Stability::Vendor.includes(Stability::Vendor));
         assert!(Stability::System.includes(Stability::System));
+    }
+
+    /// Unset (AOSP `mStability` = 0) is the local level; 0 and unknown fill nothing; first wins.
+    #[test]
+    fn a_received_stability_is_filled_once_by_a_declared_level() {
+        let cell = ReceivedStability::unset();
+        assert_eq!(cell.get(), local_level(), "unset");
+        for ignored in [0, 0b00_0101, 0b111_1111, -1] {
+            cell.fill(ignored);
+            assert_eq!(cell.get(), local_level(), "{ignored:#x} fills nothing");
+        }
+        cell.fill(Stability::Vintf.level());
+        assert_eq!(
+            cell.get(),
+            Stability::Vintf,
+            "the first declared level fills it"
+        );
+        for later in [Stability::Vendor, Stability::System, Stability::Vintf] {
+            cell.fill(later.level());
+            assert_eq!(cell.get(), Stability::Vintf, "{later:?} after Vintf");
+        }
+        cell.fill(0);
+        assert_eq!(cell.get(), Stability::Vintf, "0 does not clear it");
     }
 }

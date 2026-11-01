@@ -145,8 +145,7 @@ pub(crate) struct Table<T, W> {
     generation: u64,
     /// The uses of each linked handle by the two maps, none empty: a death visits these alone.
     links: BTreeMap<u32, Uses>,
-    /// The watches owed a notice, by name, apart from `watchers` so that a round visits these
-    /// alone: each one a watch's, at most [`MAX_OWED`] in all, and no list empty.
+    /// Owed watches, apart from `watchers` for a round: each a watch's, at most [`MAX_OWED`].
     owed: BTreeMap<String, Vec<Owed<W>>>,
     counts: Counts,
 }
@@ -474,7 +473,7 @@ impl<T: Key, W: Key> Table<T, W> {
         }
     }
 
-    /// One use more of `handle`, under `name`, linked on its first: the link runs before any change.
+    /// One use more of `handle` under `name`, linked on its first use before any change.
     fn retain(
         &mut self,
         handle: Option<u32>,

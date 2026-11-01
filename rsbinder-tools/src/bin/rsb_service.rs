@@ -379,11 +379,10 @@ fn main() -> ExitCode {
         return ExitCode::from(exit::ERR);
     }
 
-    let name_of = |m: &clap::ArgMatches| {
+    fn name_of(m: &clap::ArgMatches) -> &str {
         m.get_one::<String>("name")
             .expect("name is a required argument")
-            .clone()
-    };
+    }
 
     match matches.subcommand() {
         Some(("list", m)) => {
@@ -401,17 +400,17 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some(("check", m)) => cmd_check(&name_of(m)),
+        Some(("check", m)) => cmd_check(name_of(m)),
         Some(("info", _)) => cmd_info(),
-        Some(("declared", m)) => cmd_declared(&name_of(m)),
-        Some(("instances", m)) => cmd_instances(&name_of(m)),
-        Some(("connection", m)) => cmd_connection(&name_of(m)),
+        Some(("declared", m)) => cmd_declared(name_of(m)),
+        Some(("instances", m)) => cmd_instances(name_of(m)),
+        Some(("connection", m)) => cmd_connection(name_of(m)),
         Some(("dump", m)) => {
             let args: Vec<String> = m
                 .get_many::<String>("args")
                 .map(|v| v.cloned().collect())
                 .unwrap_or_default();
-            cmd_dump(&name_of(m), &args)
+            cmd_dump(name_of(m), &args)
         }
         #[cfg(feature = "topic")]
         Some(("topics", m)) => cmd_topics(

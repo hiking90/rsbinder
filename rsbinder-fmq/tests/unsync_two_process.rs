@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::{Access, Mapping};
+use rsbinder_fmq::shm::Mapping;
 use rsbinder_fmq::{
     AttachPolicy, Error, UnsyncCreate, UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriter,
 };
@@ -261,7 +261,7 @@ fn a_reader_process_cannot_map_the_queue_writable() {
         for grantor in &desc.grantors {
             let offset = u64::from(grantor.offset);
             assert_eq!(
-                Mapping::map(fd, offset, grantor.extent, Access::ReadWrite).err(),
+                Mapping::map(fd, offset, grantor.extent).err(),
                 Some(Error::Os(rsbinder_fmq::Errno::from_raw(
                     rustix::io::Errno::PERM.raw_os_error()
                 ))),

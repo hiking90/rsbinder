@@ -563,12 +563,7 @@ fn implicit_import_warning(scope: &Namespace, name: &Namespace, imported: &Names
     )
 }
 
-/// Collect, until [`take_generation_warnings`], a warning for each input that
-/// generates here but fails AOSP's `aidl` in an Android build: a name bound only
-/// by the same-package extension of [`bind_type_name`] (AOSP resolves it only
-/// through an `import`, `AidlDocument::ResolveName`,
-/// `aidl_language.cpp:1930-1957`), and a bare `@nullable` field on a cycle
-/// (`TypeGenerator::ensure_sized`).
+/// Collect [`note_generation_warning`] messages until [`take_generation_warnings`].
 pub(crate) fn collect_generation_warnings() {
     GENERATION_WARNINGS.with(|set| *set.borrow_mut() = Some(BTreeSet::new()));
 }
@@ -1805,8 +1800,10 @@ pub fn get_backing_type(
             }
             for param in &annotation.parameter_list {
                 if param.identifier == "type" {
-                    let type_name: String =
-                        param.const_expr.to_value_string().trim_matches('"').into();
+                    // AOSP `Autofill` reads `ParamValue<std::string>`: the folded string.
+                    let type_name = const_expr_as_string(&param.const_expr).unwrap_or_else(|| {
+                        param.const_expr.to_value_string().trim_matches('"').into()
+                    });
 
                     // AOSP `AidlEnumDeclaration::Autofill()`: only byte, int, long.
                     if !matches!(type_name.as_str(), "byte" | "int" | "long") {

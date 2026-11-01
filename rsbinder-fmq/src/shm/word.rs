@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::num::NonZeroU32;
-use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
 
 use super::Deadline;
 use crate::error::Result;
 
-/// A 32-bit word of shared memory that this process reads and never writes.
+/// A 32-bit word of shared memory that this process reads and never writes:
+/// what a [`Word`](super::Word) of a [`RoCarve`](super::RoCarve) derefs to.
 ///
-/// A word in an [`Access::ReadOnly`](super::Access::ReadOnly) mapping must
-/// not be handed around as `&AtomicU32`: `store` and `fetch_add` are safe
-/// methods of that type, and either one on a read-only page is a `SIGSEGV`.
-/// This type has the loads, the futex wait and the futex wake, and nothing
-/// that stores, so code that holds one cannot write the peer's memory:
+/// A word in a [`RoMapping`](super::RoMapping) must not be handed around as
+/// `&AtomicU32`: `store` and `fetch_add` are safe methods of that type, and
+/// either one on a read-only page is a `SIGSEGV`. This type has the loads,
+/// the futex wait and the futex wake, and nothing that stores, so code that
+/// holds one cannot write the peer's memory:
 ///
 /// ```compile_fail,E0599
 /// fn overwrite(word: &rsbinder_fmq::shm::RoWord32) {
@@ -35,31 +35,6 @@ use crate::error::Result;
 pub struct RoWord32(AtomicU32);
 
 impl RoWord32 {
-    /// View the 4 bytes at `at` as a read-only word.
-    ///
-    /// # Safety
-    ///
-    /// During the whole lifetime `'a` the caller picks:
-    ///
-    /// * `at` is aligned to 4 bytes. In a [`Mapping`](super::Mapping) that
-    ///   is `(offset + n) % 4 == 0` for the word `n` bytes past
-    ///   [`as_ptr`](super::Mapping::as_ptr), `offset` being the one given to
-    ///   [`map`](super::Mapping::map).
-    /// * The 4 bytes lie within one allocation, which is not freed or
-    ///   unmapped meanwhile, and are valid for reads and initialized.
-    /// * Every access to them from this process is atomic, and through
-    ///   addresses derived from the same allocation every such access is
-    ///   4 bytes wide: no [`Run`](super::Run) covers them, and no word of
-    ///   another size overlaps them.
-    ///
-    /// What another process does to the word is not part of the contract; it
-    /// is what the word is read for.
-    #[inline]
-    pub unsafe fn from_ptr<'a>(at: NonNull<u8>) -> &'a Self {
-        // SAFETY: contract above; `repr(transparent)` over `AtomicU32`, so the layouts match.
-        unsafe { at.cast::<Self>().as_ref() }
-    }
-
     /// The word's value now (a `Relaxed` load).
     #[inline]
     pub fn load(&self) -> u32 {
@@ -144,15 +119,16 @@ mod wide {
     ///   writes.
     ///
     /// On every other target neither ground holds, and the name is a type
-    /// with no value: [`PRESENT`](Self::PRESENT) is `false` there and
-    /// `from_ptr` panics, so code that names `RoWord64` compiles on every
-    /// target and asks `PRESENT` before it maps a peer's memory. `x86`
+    /// with no value: [`PRESENT`](Self::PRESENT) is `false` there, and
+    /// [`RoCarve::word64`](crate::shm::RoCarve::word64) returns
+    /// [`Error::Unsupported`](crate::Error::Unsupported), so code that names
+    /// `RoWord64` compiles on every target and refuses at run time. `x86`
     /// without SSE2 is among those targets: its load is `fild`/`fistp` with
     /// x87 alone and `movlps` with SSE, and no test of this crate runs
-    /// either. There a 64-bit counter is read as an `AtomicU64` through an
-    /// [`Access::ReadWrite`](crate::shm::Access::ReadWrite) mapping, on a
-    /// target that has `AtomicU64` (`target_has_atomic = "64"`); a target
-    /// without 64-bit atomics has no such type.
+    /// either. There a 64-bit counter is read as an `AtomicU64` through a
+    /// writable [`Mapping`](crate::shm::Mapping), on a target that has
+    /// `AtomicU64` (`target_has_atomic = "64"`); a target without 64-bit
+    /// atomics has no such type.
     ///
     /// ```compile_fail,E0599
     /// fn overwrite(word: &rsbinder_fmq::shm::RoWord64) {
@@ -166,20 +142,8 @@ mod wide {
         /// Whether this target has the type: `true` here, `false` where the
         /// name is the type with no value. A caller that reads a peer's
         /// 64-bit counter through a read-only mapping returns its own
-        /// "unsupported" error when this is `false`, before it calls
-        /// [`from_ptr`](Self::from_ptr).
+        /// "unsupported" error when this is `false`, before it maps.
         pub const PRESENT: bool = true;
-
-        /// View the 8 bytes at `at` as a read-only word.
-        ///
-        /// # Safety
-        ///
-        /// The contract of [`RoWord32::from_ptr`], for 8 bytes aligned to 8.
-        #[inline]
-        pub unsafe fn from_ptr<'a>(at: NonNull<u8>) -> &'a Self {
-            // SAFETY: contract above; `repr(transparent)` over `AtomicU64`, so the layouts match.
-            unsafe { at.cast::<Self>().as_ref() }
-        }
 
         /// The word's value now (a `Relaxed` load).
         #[inline]
@@ -205,14 +169,15 @@ mod wide {
 
     #[cfg(test)]
     mod tests {
-        use super::*;
-        use std::sync::atomic::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        use crate::shm::Mapping;
 
         #[test]
         fn a_wide_word_reads_what_the_owner_stores() {
-            let owner = AtomicU64::new(1 << 40);
-            // SAFETY: a live aligned `AtomicU64`, borrowed for the test, atomic-only, one size.
-            let word = unsafe { RoWord64::from_ptr(NonNull::from(&owner).cast()) };
+            let owner = Mapping::heap(8).unwrap().carve().word64(0).unwrap();
+            let word = owner.as_ro().unwrap();
+            owner.store(1 << 40, Ordering::Relaxed);
             assert_eq!(word.load(), 1 << 40);
             owner.store(u64::MAX, Ordering::Release);
             assert_eq!(word.load_acquire(), u64::MAX);
@@ -221,14 +186,8 @@ mod wide {
         /// What the type's `cfg` rests on for 32-bit targets: a load that wrote would fault here.
         #[test]
         fn a_read_only_page_takes_the_wide_load() {
-            let (writable, read_only) = crate::shm::word::tests::two_mappings();
-            // SAFETY: byte 0 of two live page-aligned mappings, atomic-only, one size.
-            let (owner, word) = unsafe {
-                (
-                    writable.as_ptr().cast::<AtomicU64>().as_ref(),
-                    RoWord64::from_ptr(read_only.as_ptr()),
-                )
-            };
+            let (mut writable, mut read_only) = crate::shm::word::tests::two_mappings();
+            let (owner, word) = (writable.word64(0).unwrap(), read_only.word64(0).unwrap());
             // A load compiled as compare-exchange expects 0, and on ARM stores only on a match.
             assert_eq!(word.load(), 0);
             assert_eq!(word.load_acquire(), 0);
@@ -255,16 +214,14 @@ mod wide {
 pub use wide::RoWord64;
 
 mod absent {
-    use std::ptr::NonNull;
-
     /// A 64-bit word of shared memory that this process reads and never
     /// writes, on a target where no 8-byte load is known not to write: a
     /// type with no value.
     ///
     /// It has the methods of the type it stands in for, so that code naming
     /// `RoWord64` compiles on every target. [`PRESENT`](Self::PRESENT) is
-    /// `false` and [`from_ptr`](Self::from_ptr) panics, so no reference to
-    /// one exists and its loads are never called.
+    /// `false` and [`RoCarve::word64`](crate::shm::RoCarve::word64) refuses,
+    /// so no reference to one exists and its loads are never called.
     #[allow(dead_code, reason = "named only where the real type is absent")]
     #[derive(Debug)]
     pub enum RoWord64 {}
@@ -273,20 +230,6 @@ mod absent {
     impl RoWord64 {
         /// Whether this target has the type: `false` here.
         pub const PRESENT: bool = false;
-
-        /// Panics: there is no read-only 8-byte load on this target.
-        ///
-        /// # Safety
-        ///
-        /// None: it panics before it looks at `at`. It is `unsafe` because
-        /// the method it stands in for is.
-        ///
-        /// # Panics
-        ///
-        /// Always. Callers check [`PRESENT`](Self::PRESENT) first.
-        pub unsafe fn from_ptr<'a>(_at: NonNull<u8>) -> &'a Self {
-            panic!("no `RoWord64` on this target: `RoWord64::PRESENT` is false")
-        }
 
         /// Never called: no value of this type exists.
         pub fn load(&self) -> u64 {
@@ -307,10 +250,10 @@ pub use absent::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shm::{Access, Mapping};
+    use crate::shm::{Carve, Mapping, RoCarve, RoMapping};
 
-    /// The first page of one unlinked file, mapped read-write and read-only.
-    pub(super) fn two_mappings() -> (Mapping, Mapping) {
+    /// The first page of one unlinked file, mapped read-write and read-only, each carved.
+    pub(super) fn two_mappings() -> (Carve, RoCarve) {
         use std::os::fd::AsFd;
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let page = rustix::param::page_size();
@@ -326,20 +269,15 @@ mod tests {
             .open(&path)
             .unwrap();
         std::fs::remove_file(&path).unwrap();
-        let map = |access| Mapping::map(file.as_fd(), 0, page as u64, access).unwrap();
-        (map(Access::ReadWrite), map(Access::ReadOnly))
+        let rw = Mapping::map(file.as_fd(), 0, page as u64).unwrap();
+        let ro = RoMapping::map(file.as_fd(), 0, page as u64).unwrap();
+        (rw.carve(), ro.carve())
     }
 
     #[test]
     fn a_read_only_page_takes_the_load() {
-        let (writable, read_only) = two_mappings();
-        // SAFETY: byte 0 of two live page-aligned mappings, atomic-only, one size.
-        let (owner, word) = unsafe {
-            (
-                writable.as_ptr().cast::<AtomicU32>().as_ref(),
-                RoWord32::from_ptr(read_only.as_ptr()),
-            )
-        };
+        let (mut writable, mut read_only) = two_mappings();
+        let (owner, word) = (writable.word32(0).unwrap(), read_only.word32(0).unwrap());
         owner.store(0x89ab_cdef, Ordering::Release);
         assert_eq!(word.load(), 0x89ab_cdef);
         assert_eq!(word.load_acquire(), 0x89ab_cdef);
@@ -347,29 +285,26 @@ mod tests {
 
     #[test]
     fn a_word_reads_what_the_owner_stores() {
-        let owner = AtomicU32::new(7);
-        // SAFETY: a live aligned `AtomicU32`, borrowed for the test, atomic-only, one size.
-        let word = unsafe { RoWord32::from_ptr(NonNull::from(&owner).cast()) };
+        let owner = Mapping::heap(4).unwrap().carve().word32(0).unwrap();
+        let word = owner.as_ro();
+        owner.store(7, Ordering::Relaxed);
         assert_eq!(word.load(), 7);
         owner.store(9, Ordering::Release);
         assert_eq!(word.load_acquire(), 9);
-        assert_eq!(format!("{word:?}"), "RoWord32(9)");
+        assert_eq!(format!("{:?}", *word), "RoWord32(9)");
     }
 
-    /// Where the gate on `PRESENT` is missed, the stand-in panics and views nothing.
     #[test]
-    #[should_panic(expected = "`RoWord64::PRESENT` is false")]
-    fn the_stand_in_for_an_absent_wide_word_panics() {
-        // SAFETY: the stand-in's `from_ptr` has no contract.
-        let _ = unsafe { absent::RoWord64::from_ptr(NonNull::dangling()) };
+    fn the_stand_in_for_an_absent_wide_word_says_so() {
+        const { assert!(!absent::RoWord64::PRESENT) };
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_wait_on_a_changed_word_returns_at_once() {
-        let owner = AtomicU32::new(1);
-        // SAFETY: as above.
-        let word = unsafe { RoWord32::from_ptr(NonNull::from(&owner).cast()) };
+        let owner = Mapping::heap(4).unwrap().carve().word32(0).unwrap();
+        owner.store(1, Ordering::Relaxed);
+        let word = owner.as_ro();
         // The kernel compares first: `expected` is stale, so there is no sleep and no error.
         word.wait(0, NonZeroU32::MAX, None).unwrap();
         word.wake(NonZeroU32::MAX).unwrap();

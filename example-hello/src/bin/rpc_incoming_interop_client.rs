@@ -35,7 +35,7 @@
 //!
 //! Exit code 0 = PASS; non-zero = the failing step.
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rsbinder::rpc::{RpcClientConfig, RpcProxy, RpcSession};
@@ -59,9 +59,9 @@ struct Cb {
     /// The server root, so the oneway handler can call back into the
     /// session it was dispatched from.
     root: SIBinder,
-    /// What that nested call returned, shared with `main`. `None` while
+    /// What that nested call returned, shared with `main`. Unset while
     /// it is still running — the shape of the regression this checks for.
-    nested: Arc<Mutex<Option<std::result::Result<String, StatusCode>>>>,
+    nested: Arc<OnceLock<std::result::Result<String, StatusCode>>>,
 }
 
 impl Cb {
@@ -109,7 +109,7 @@ impl Remotable for Cb {
                 // its own reply wait, and it is not waiting for anything.
                 let nested = self.call_server("from-oneway");
                 eprintln!("[rsbinder-cb] nested call from the oneway handler: {nested:?}");
-                *self.nested.lock().expect("nested poisoned") = Some(nested);
+                let _ = self.nested.set(nested);
                 // Bumped last, so a nested call that never returns leaves
                 // the main thread's wait to time out with a diagnosis.
                 self.notify_seen.fetch_add(1, Ordering::SeqCst);
@@ -337,8 +337,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Schedule.
     let echo_seen = Arc::new(AtomicI32::new(0));
     let notify_seen = Arc::new(AtomicI32::new(0));
-    let nested_result: Arc<Mutex<Option<std::result::Result<String, StatusCode>>>> =
-        Arc::new(Mutex::new(None));
+    let nested_result: Arc<OnceLock<std::result::Result<String, StatusCode>>> =
+        Arc::new(OnceLock::new());
     let cb: SIBinder = Interface::as_binder(&Binder::new(Cb {
         echo_seen: Arc::clone(&echo_seen),
         notify_seen: Arc::clone(&notify_seen),
@@ -391,7 +391,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // (3) The nested call the oneway handler made must have reached the
     // server. Pinned to the incoming connection it would still be
     // blocked here, and `notify_seen` above would never have risen.
-    match nested_result.lock().expect("nested poisoned").as_ref() {
+    match nested_result.get() {
         Some(Ok(got)) if got == "from-oneway" => {
             eprintln!("[rsbinder-client] (3) nested call from the oneway handler round-tripped")
         }

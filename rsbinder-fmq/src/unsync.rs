@@ -5,19 +5,17 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::fd::AsFd;
-use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 
 use crate::descriptor::{
     default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor, Grantor,
 };
-use crate::error::{Error, Result, EINVAL};
+use crate::error::{received, Error, Result, EINVAL};
 use crate::queue::{
-    allocate_shared, check_target, map_grantor, ring_bytes, AtomicU64, Counter, Element, Regions,
-    Ring,
+    allocate_shared, check_target, map_counter, map_grantor_ro, map_ring, ring_bytes, AtomicU64,
+    Element, Regions,
 };
-use crate::ring;
-use crate::shm::{self, Access, Mapping, RoRun, RoWord64, Seals};
+use crate::shm::{self, Bytes, RoBytes, RoWord64, Seals, Word};
 
 mod rules;
 
@@ -102,23 +100,16 @@ pub struct UnsyncLatest {
     pub copied: usize,
 }
 
-/// A counter the writer stores: 8 bytes it mapped read-write, or an `AtomicU64` of a test.
-struct Stored {
-    ptr: NonNull<AtomicU64>,
-}
-
-impl Stored {
-    fn get(&self) -> &AtomicU64 {
-        // SAFETY: `WriterCore::new`'s contract: an `AtomicU64` for as long as the core lives.
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
 /// The writer's protocol over two counters and a ring, mapped or not (a test has them on the heap).
 struct WriterCore {
-    end: Stored,
-    write: Stored,
-    ring: NonNull<u8>,
+    ring: Bytes,
+    counters: WriterCounters,
+}
+
+/// The writer's counters, which a transaction borrows apart from the ring.
+struct WriterCounters {
+    end: Word<AtomicU64>,
+    write: Word<AtomicU64>,
     shape: Shape,
     /// The write counter. The shared word is only stored, so what a peer does to it is not read.
     written: u64,
@@ -127,23 +118,36 @@ struct WriterCore {
 }
 
 impl WriterCore {
-    /// # Safety: for `self`'s life, `AtomicU64`s and `shape.bytes` of writable ring per `Run::new`.
-    unsafe fn new(
-        end: NonNull<AtomicU64>,
-        write: NonNull<AtomicU64>,
-        ring: NonNull<u8>,
-        shape: Shape,
-    ) -> Self {
+    /// The writer of a queue whose ring is `ring`, `shape.bytes` long.
+    fn new(end: Word<AtomicU64>, write: Word<AtomicU64>, ring: Bytes, shape: Shape) -> Self {
+        debug_assert_eq!(ring.len() as u64, shape.bytes);
         Self {
-            end: Stored { ptr: end },
-            write: Stored { ptr: write },
             ring,
-            shape,
-            written: 0,
-            reserved: 0,
+            counters: WriterCounters {
+                end,
+                write,
+                shape,
+                written: 0,
+                reserved: 0,
+            },
         }
     }
 
+    /// Reserve `n` elements, fewer than the ring holds, and hand out their ring bytes.
+    fn begin<T: Element>(&mut self, n: usize) -> Result<UnsyncWriteTxn<'_, T>> {
+        let bytes = self.counters.shape.bytes as usize;
+        if n >= bytes / size_of::<T>() {
+            return Err(Error::BadValue("more elements than the capacity less one"));
+        }
+        let position = self.counters.reserve((n * size_of::<T>()) as u64)?;
+        Ok(UnsyncWriteTxn {
+            core: &mut self.counters,
+            regions: Regions::over(&self.ring, position, n, true),
+        })
+    }
+}
+
+impl WriterCounters {
     /// Announce a write of `bytes` at the write counter, whose value is returned.
     fn reserve(&mut self, bytes: u64) -> Result<u64> {
         // `View::new` refuses a counter above this, so the writer never stores one.
@@ -154,7 +158,7 @@ impl WriterCore {
             .ok_or(Error::Corrupted("counter too close to wrapping"))?;
         self.reserved = self.reserved.max(upto);
         // Before any byte of the write: a reader that copies one of them then loads this value.
-        self.end.get().store(self.reserved, Ordering::Release);
+        self.end.store(self.reserved, Ordering::Release);
         Ok(self.written)
     }
 
@@ -163,23 +167,8 @@ impl WriterCore {
             return Err(Error::BadValue("commit exceeds the elements reserved"));
         }
         self.written += bytes;
-        self.write.get().store(self.written, Ordering::Release);
+        self.write.store(self.written, Ordering::Release);
         Ok(())
-    }
-
-    /// Reserve `n` elements, fewer than the ring holds, and hand out their ring bytes.
-    fn begin<T: Element>(&mut self, n: usize) -> Result<UnsyncWriteTxn<'_, T>> {
-        let bytes = self.shape.bytes as usize;
-        if n >= bytes / size_of::<T>() {
-            return Err(Error::BadValue("more elements than the capacity less one"));
-        }
-        let position = self.reserve((n * size_of::<T>()) as u64)?;
-        // SAFETY: `new`'s contract for the ring, borrowed with `self`; `n` elements fit in it.
-        let regions = unsafe { Regions::over(self.ring, bytes, position, n, true) };
-        Ok(UnsyncWriteTxn {
-            core: self,
-            regions,
-        })
     }
 }
 
@@ -214,7 +203,7 @@ impl WriterCore {
 /// publish elements that were never written.
 #[must_use = "dropping a write transaction publishes nothing; `commit` makes the elements visible"]
 pub struct UnsyncWriteTxn<'a, T: Element> {
-    core: &'a mut WriterCore,
+    core: &'a mut WriterCounters,
     regions: Regions<'a, T>,
 }
 
@@ -321,7 +310,7 @@ impl<T: Element> std::fmt::Debug for UnsyncWriteTxn<'_, T> {
 /// position it read from, and discards what it copied
 /// ([`UnsyncRead::Lost`]). The stores into the ring are `Release` and the
 /// reader's loads end with an acquire fence
-/// ([`Run::store_release`](shm::Run::store_release)), so that check is
+/// ([`Bytes::store_release`](shm::Bytes::store_release)), so that check is
 /// ordered in Rust's memory model and not only on the processors it was
 /// tested on.
 ///
@@ -372,15 +361,10 @@ pub struct UnsyncWriter<T: Element> {
     core: WriterCore,
     desc: Descriptor,
     capacity: usize,
-    _end: Counter,
-    _write: Counter,
-    _ring: Ring,
     _not_sync: PhantomData<Cell<()>>,
-    _element: PhantomData<T>,
+    // No `T` is held, so `T` decides no auto trait.
+    _element: PhantomData<fn() -> T>,
 }
-
-// SAFETY: pointers into owned `Mapping`s (`Send`), reached only via atomics (`Stored`, `Run`).
-unsafe impl<T: Element> Send for UnsyncWriter<T> {}
 
 impl<T: Element> UnsyncWriter<T> {
     /// Allocate a queue of `capacity` elements in a new memfd.
@@ -424,9 +408,9 @@ impl<T: Element> UnsyncWriter<T> {
             quantum: size_of::<T>() as u32,
             flavor: Flavor::UnsynchronizedWrite,
         };
-        let end = Counter::map(&desc, desc.grantors[Descriptor::WRITE_REGION_END])?;
-        let write = Counter::map(&desc, desc.grantors[Descriptor::WRITE_COUNTER])?;
-        let ring = Ring::map(&desc, desc.grantors[Descriptor::DATA], Access::ReadWrite)?;
+        let end = map_counter(&desc, desc.grantors[Descriptor::WRITE_REGION_END])?;
+        let write = map_counter(&desc, desc.grantors[Descriptor::WRITE_COUNTER])?;
+        let ring = map_ring(&desc, desc.grantors[Descriptor::DATA])?;
         // After the mappings: `FUTURE_WRITE` refuses every writable mapping made from here on.
         let mut seals = Seals::GROW | Seals::SHRINK | Seals::SEAL;
         if options.read_only_readers {
@@ -441,15 +425,10 @@ impl<T: Element> UnsyncWriter<T> {
             bytes: data_bytes,
             quantum: size_of::<T>() as u64,
         };
-        // SAFETY: words and ring of the three mappings `self` owns; fresh memfd pages are zero.
-        let core = unsafe { WriterCore::new(end.address(), write.address(), ring.base, shape) };
         Ok(Self {
-            core,
+            core: WriterCore::new(end, write, ring, shape),
             desc,
             capacity,
-            _end: end,
-            _write: write,
-            _ring: ring,
             _not_sync: PhantomData,
             _element: PhantomData,
         })
@@ -494,7 +473,7 @@ impl<T: Element> UnsyncWriter<T> {
 
     /// Elements committed since the queue was created.
     pub fn written(&self) -> u64 {
-        self.core.written / size_of::<T>() as u64
+        self.core.counters.written / size_of::<T>() as u64
     }
 
     /// Reserve `n` elements at the write position and announce the write to
@@ -543,9 +522,9 @@ impl<T: Element> std::fmt::Debug for UnsyncWriter<T> {
 
 /// The reader's protocol over two counters and a ring it only loads, mapped or not.
 struct ReaderCore {
-    end: NonNull<u8>,
-    write: NonNull<u8>,
-    ring: NonNull<u8>,
+    end: Word<RoWord64>,
+    write: Word<RoWord64>,
+    ring: RoBytes,
     shape: Shape,
     /// This reader's read counter. It lives here, not in shared memory.
     read: u64,
@@ -556,8 +535,9 @@ struct ReaderCore {
 }
 
 impl ReaderCore {
-    /// # Safety: as `WriterCore::new`, but words per `RoWord64::from_ptr` and a readable ring.
-    unsafe fn new(end: NonNull<u8>, write: NonNull<u8>, ring: NonNull<u8>, shape: Shape) -> Self {
+    /// The reader of a queue whose ring is `ring`, `shape.bytes` long.
+    fn new(end: Word<RoWord64>, write: Word<RoWord64>, ring: RoBytes, shape: Shape) -> Self {
+        debug_assert_eq!(ring.len() as u64, shape.bytes);
         Self {
             end,
             write,
@@ -574,12 +554,9 @@ impl ReaderCore {
         if let Some(what) = self.failed.get() {
             return Err(Error::Corrupted(what));
         }
-        // SAFETY: `new`'s contract: both words meet `RoWord64::from_ptr` while `self` lives.
-        let (end, write) =
-            unsafe { (RoWord64::from_ptr(self.end), RoWord64::from_ptr(self.write)) };
         // `end` first: the `write` loaded after it is at least the one `end` was reserved from.
-        let end = end.load_acquire();
-        let write = write.load_acquire();
+        let end = self.end.load_acquire();
+        let write = self.write.load_acquire();
         let view = View::new(self.seen.get(), write, end, self.shape).inspect_err(|e| {
             if let Error::Corrupted(what) = e {
                 self.failed.set(Some(what));
@@ -595,11 +572,8 @@ impl ReaderCore {
         assert!(dst.len() <= bytes, "a copy longer than the ring");
         let offset = (position % self.shape.bytes) as usize;
         let (head, tail) = dst.split_at_mut(dst.len().min(bytes - offset));
-        // SAFETY: `new`'s contract; `offset < bytes` and the assert put both runs inside the ring.
-        unsafe {
-            RoRun::new(self.ring.add(offset), head.len()).load_acquire(head);
-            RoRun::new(self.ring, tail.len()).load_acquire(tail);
-        }
+        self.ring.load_acquire(offset, head);
+        self.ring.load_acquire(0, tail);
     }
 
     /// Move to `resume`, where `View::lapped` put this reader.
@@ -664,21 +638,11 @@ impl ReaderCore {
     }
 }
 
-/// A read-only 8-byte word of a queue's fd.
-struct Word {
-    _mapping: Mapping,
-    at: NonNull<u8>,
-}
-
-impl Word {
-    fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
-        // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
-        let mapping = map_grantor(desc, g, 8, Access::ReadOnly)?;
-        Ok(Self {
-            at: mapping.as_ptr(),
-            _mapping: mapping,
-        })
-    }
+/// The 8-byte counter at grantor `g`, mapped read-only.
+fn map_counter_ro(desc: &Descriptor, g: Grantor) -> Result<Word<RoWord64>> {
+    // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
+    let mut carve = map_grantor_ro(desc, g, 8)?.carve();
+    carve.word64(0).map_err(received)
 }
 
 /// A reading end of an unsynchronized Fast Message Queue: it reads what the
@@ -696,7 +660,7 @@ impl Word {
 ///
 /// The reader maps both counters and the ring `PROT_READ`, whether or not
 /// the fd would allow more, and reaches them through
-/// `shm::RoWord64` and [`RoRun`], which have no method that
+/// `shm::RoWord64` and [`RoBytes`](shm::RoBytes), which have no method that
 /// stores. A reader cannot disturb the queue.
 /// [`attach`](Self::attach) stores nothing either, where libfmq's
 /// constructor resets the shared counters by default.
@@ -715,7 +679,7 @@ impl Word {
 /// region end is more than one ring past the position it copied from
 /// (libfmq `processOverflow`). The copy's loads end with an acquire fence
 /// and the writer's stores are `Release`
-/// ([`Run::store_release`](shm::Run::store_release)), so a reader that
+/// ([`Bytes::store_release`](shm::Bytes::store_release)), so a reader that
 /// copied even one overwritten byte then loads a region end that covers it.
 ///
 /// That holds against an [`UnsyncWriter`]. Against a libfmq writer the
@@ -766,15 +730,10 @@ impl Word {
 pub struct UnsyncReader<T: Element> {
     core: ReaderCore,
     capacity: usize,
-    _end: Word,
-    _write: Word,
-    _ring: Ring,
     _not_sync: PhantomData<Cell<()>>,
-    _element: PhantomData<T>,
+    // No `T` is held, so `T` decides no auto trait.
+    _element: PhantomData<fn() -> T>,
 }
-
-// SAFETY: pointers into owned `Mapping`s (`Send`), reached only via atomic loads.
-unsafe impl<T: Element> Send for UnsyncReader<T> {}
 
 impl<T: Element> UnsyncReader<T> {
     /// Map a queue a peer described, read-only, after checking the
@@ -807,25 +766,23 @@ impl<T: Element> UnsyncReader<T> {
             return Err(Error::Unsupported);
         }
         let geo = validate(desc, size_of::<T>(), policy, Flavor::UnsynchronizedWrite)?;
-        let end = Word::map(desc, geo.read)?;
-        let write = Word::map(desc, geo.write)?;
-        let ring = Ring::map(desc, geo.data, Access::ReadOnly)?;
+        let end = map_counter_ro(desc, geo.read)?;
+        let write = map_counter_ro(desc, geo.write)?;
+        let mut carve = map_grantor_ro(desc, geo.data, geo.data.extent)?.carve();
+        // ≤ i32::MAX: checked by `validate`.
+        let ring = carve.bytes(0, geo.data.extent as usize).map_err(received)?;
         recheck_ashmem_sizes(desc, &geo)?;
         let shape = Shape {
-            bytes: ring.bytes as u64,
+            bytes: ring.len() as u64,
             quantum: size_of::<T>() as u64,
         };
-        // SAFETY: words and ring of the three read-only mappings `self` owns, each at one size.
-        let mut core = unsafe { ReaderCore::new(end.at, write.at, ring.base, shape) };
+        let mut core = ReaderCore::new(end, write, ring, shape);
         if start == UnsyncStart::Now {
             core.start_now()?;
         }
         Ok(Self {
             core,
             capacity: geo.capacity,
-            _end: end,
-            _write: write,
-            _ring: ring,
             _not_sync: PhantomData,
             _element: PhantomData,
         })
@@ -866,7 +823,7 @@ impl<T: Element> UnsyncReader<T> {
     /// [`capacity`](Self::capacity), which no read could fill, and
     /// [`Error::Corrupted`] when the counters fail their check.
     pub fn read(&mut self, out: &mut [T]) -> Result<UnsyncRead> {
-        self.core.take(ring::bytes_of_mut(out))
+        self.core.take(shm::bytes_of_mut(out))
     }
 
     /// Copy the newest elements into the front of `out` — as many as it
@@ -895,7 +852,7 @@ impl<T: Element> UnsyncReader<T> {
     ///
     /// [`Error::Corrupted`] when the counters fail their check.
     pub fn read_latest(&mut self, out: &mut [T]) -> Result<UnsyncLatest> {
-        let copied = self.core.take_latest(ring::bytes_of_mut(out))?;
+        let copied = self.core.take_latest(shm::bytes_of_mut(out))?;
         Ok(UnsyncLatest {
             copied: copied / size_of::<T>(),
         })

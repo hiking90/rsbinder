@@ -49,9 +49,11 @@
 //!   gate in `RpcServer::run` serves the third client at once, so its
 //!   bounded-timeout `get_root` succeeds and the test fails.
 //! - `silent_r34_peer_released_by_handshake_deadline`: clearing the read
-//!   deadline before the r34 serve loop leaves the silent c1 worker blocked
-//!   in `recv`; the single `max_connections` slot never frees and c2's
-//!   bounded `get_root` times out.
+//!   deadline and disarming the admission `PhaseDeadline` before the r34
+//!   serve loop leaves the silent c1 worker blocked in `recv`; the single
+//!   `max_connections` slot never frees and c2's bounded `get_root` times
+//!   out. Either deadline alone releases c1, so a mutant that turns off only
+//!   one of them passes.
 //! - `tls_android13plus_nested_callback_e2e`: the nested server→client
 //!   callback needs full duplex on one `TlsTransport`. A single mutex over
 //!   the TLS stream, held by a blocked `recv`, deadlocks it; the split
@@ -213,7 +215,7 @@
 //!   handshake starts with a raw write, so the adopted `AF_INET` fd must be
 //!   wrapped by a transport whose `send_raw`/`recv_raw` reach the socket.
 //! - `terminate_ends_every_session_and_joins_workers`: only the android-13+
-//!   session has an id (the r34 one was never in the id registry), and it is
+//!   session is in the 32-byte id registry (r34's `int32` id is not), and it is
 //!   `Live(2)`; the test checks that `terminate` still returns and that
 //!   session dies whole instead of being skipped as "still live".
 //! - `a_reply_timeout_ends_a_session_with_a_callback_slot`: the callback
@@ -907,8 +909,7 @@ fn silent_r34_peer_released_by_handshake_deadline() {
     let _cu = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
     wait_for_sock(&path);
 
-    // An r34 connect writes only its session-id preamble, so c1 is a silent peer holding the
-    // only slot.
+    // An r34 connect writes only its id preamble: c1 is a silent peer holding the only slot.
     let c1 = RpcSession::setup_unix_client(&path).expect("connect c1 (silent)");
 
     // c2 waits in the backlog until c1's worker hits the first-frame deadline.
@@ -2072,8 +2073,7 @@ fn r34_server_reports_an_android13plus_client_as_a_dead_peer() {
     }
 }
 
-/// The bytes an android-12 libbinder client writes, built by hand: the `-1` session id, then
-/// `GET_ROOT` as a bare `RpcWireHeader` + `RpcWireTransaction` (no length prefix).
+/// An android-12 client's first bytes: id `-1`, then a bare-header `GET_ROOT` (no length).
 fn aosp12_get_root() -> Vec<u8> {
     let mut msg = (-1i32).to_le_bytes().to_vec();
     msg.extend_from_slice(&0u32.to_le_bytes()); // command = TRANSACT
@@ -2112,16 +2112,14 @@ fn r34_server_answers_an_aosp12_shaped_client() {
     let body_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
     let mut body = vec![0u8; body_size];
     s.read_exact(&mut body).expect("reply body");
-    // `RpcWireReply.status`, then the parcel: a non-null binder's type word, its 32-byte
-    // address and its stability as an android-12 `Category` (System, version 1).
+    // Status, then a binder's type word, 32-byte address, android-12 `Category` (System, v1).
     assert_eq!(body.len(), 4 + 4 + 32 + 4);
     assert_eq!(body[..4], 0i32.to_le_bytes(), "status OK");
     assert_eq!(body[4..8], 1i32.to_le_bytes(), "a non-null root");
     assert_eq!(body[40..], 0x0c00_0001i32.to_le_bytes(), "stability");
 }
 
-/// An rsbinder r34 client from before AOSP framing leads with a `u32` frame length, which the
-/// server reads as the id of a session it does not have.
+/// A client that leads with a `u32` frame length names an id no session has: refused.
 #[test]
 fn r34_server_refuses_a_length_prefixed_client() {
     use std::io::{Read, Write};
@@ -2139,9 +2137,9 @@ fn r34_server_refuses_a_length_prefixed_client() {
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("read timeout");
     let frame = &aosp12_get_root()[4..];
-    let mut old = (frame.len() as u32).to_le_bytes().to_vec();
-    old.extend_from_slice(frame);
-    s.write_all(&old).expect("old frame");
+    let mut prefixed = (frame.len() as u32).to_le_bytes().to_vec();
+    prefixed.extend_from_slice(frame);
+    s.write_all(&prefixed).expect("length-prefixed frame");
     let mut rest = Vec::new();
     match s.read_to_end(&mut rest) {
         Ok(_) => assert!(rest.is_empty(), "no reply, the connection is closed"),
@@ -2154,23 +2152,22 @@ fn r34_server_refuses_a_length_prefixed_client() {
     assert_eq!(server.rejected_unknown_id_count(), before + 1);
 }
 
-/// The reverse: a server from before AOSP framing reads the `-1` preamble as a frame length
-/// past `MAX_FRAME_LEN` and refuses it before allocating.
+/// The reverse: a length-prefixed reader takes the `-1` preamble as a length past the cap.
 #[test]
 fn a_length_prefixed_server_refuses_the_r34_preamble() {
     use rsbinder::rpc::transport::UnixTransport;
     use rsbinder::rpc::{AddressSpace, RpcError, RpcTransport};
-    let (a, old_server) = UnixTransport::pair().expect("socketpair");
+    let (a, prefixed_reader) = UnixTransport::pair().expect("socketpair");
     let client = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("client");
     client
         .set_reply_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     let caller = std::thread::spawn(move || client.get_root().map(|_| ()));
     assert!(matches!(
-        old_server.recv_frame(),
+        prefixed_reader.recv_frame(),
         Err(RpcError::FrameTooLarge { .. })
     ));
-    drop(old_server);
+    drop(prefixed_reader);
     assert!(caller.join().expect("caller").is_err());
 }
 
@@ -2260,8 +2257,7 @@ fn echo2_request(args: &[u8]) -> Vec<u8> {
     data
 }
 
-/// An android-12 client's session on an r34 server, as `RpcSession::setupSocketClient` builds
-/// it: the founding connection, then `maxThreads - 1` more that write the id it read.
+/// An android-12 client's session (`setupSocketClient`): founding, then `maxThreads - 1` joins.
 fn aosp12_session(path: &std::path::Path) -> (Vec<Aosp12Conn>, [u8; 32], i32) {
     let mut founding = Aosp12Conn::connect(path, -1);
     let (status, root) = founding.call(&[0; 32], 0, &[]);
@@ -2324,7 +2320,10 @@ fn r34_server_joins_an_aosp12_clients_connections() {
         Aosp12Conn::connect(&path, id ^ 1).refused(),
         "an unknown id"
     );
-    assert_eq!(server.rejected_unknown_id_count(), rejected + 2);
+    assert!(
+        poll_until(|| server.rejected_unknown_id_count() == rejected + 2),
+        "both refusals are counted"
+    );
 }
 
 /// Joined connections serve at once: three slow calls, one per connection, overlap.
@@ -2358,8 +2357,7 @@ fn r34_joined_connections_serve_concurrently() {
     );
 }
 
-/// A joined connection may idle past the handshake deadline: AOSP 12 uses it only for
-/// concurrent calls.
+/// A joined connection may idle past the handshake deadline (AOSP 12: concurrent calls only).
 #[test]
 fn r34_joined_connection_outlives_the_handshake_deadline() {
     let path = tmp_sock("aosp12idle");
@@ -2381,9 +2379,7 @@ fn r34_joined_connection_outlives_the_handshake_deadline() {
     assert_eq!(status, 0, "the idle joined connection still serves");
 }
 
-/// Oneways spread over joined connections all run, although each pair arrives higher
-/// `asyncNumber` first: the early one waits in `asyncTodo` for its predecessor, and none is
-/// left waiting.
+/// Oneways spread over joined connections, each pair higher `asyncNumber` first, all run.
 #[test]
 fn r34_oneways_across_joined_connections_all_run() {
     let counter = Arc::new(AtomicI64::new(0));
@@ -2407,10 +2403,13 @@ fn r34_oneways_across_joined_connections_all_run() {
     );
 }
 
-/// A Unix connection that reports `uid` as its peer, everything else as the socket does.
-struct PeerUid(rsbinder::rpc::transport::UnixTransport, u32);
+/// A Unix connection that reports `.1` as its peer, everything else as the socket does.
+struct PeerAs(
+    rsbinder::rpc::transport::UnixTransport,
+    rsbinder::rpc::PeerIdentity,
+);
 
-impl rsbinder::rpc::RpcTransport for PeerUid {
+impl rsbinder::rpc::RpcTransport for PeerAs {
     fn send_frame(&self, buf: &[u8]) -> rsbinder::rpc::RpcResult<()> {
         self.0.send_frame(buf)
     }
@@ -2424,15 +2423,10 @@ impl rsbinder::rpc::RpcTransport for PeerUid {
         self.0.recv_raw(buf)
     }
     fn peer_identity(&self) -> rsbinder::rpc::PeerIdentity {
-        match self.0.peer_identity() {
-            rsbinder::rpc::PeerIdentity::Local { pid, .. } => {
-                rsbinder::rpc::PeerIdentity::local(self.1, pid)
-            }
-            other => other,
-        }
+        self.1.clone()
     }
     fn describe(&self) -> &str {
-        "peer-uid"
+        "peer-as"
     }
     fn supports_fd_passing(&self) -> bool {
         self.0.supports_fd_passing()
@@ -2448,39 +2442,161 @@ impl rsbinder::rpc::RpcTransport for PeerUid {
     }
 }
 
+/// A connection to `server` whose server end reports `peer`; its client end writes `id` first.
+fn r34_conn_as(server: &Arc<RpcServer>, peer: rsbinder::rpc::PeerIdentity, id: i32) -> Aosp12Conn {
+    use std::io::Write;
+    let (a, mut client) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    client.write_all(&id.to_le_bytes()).expect("id");
+    let a = rsbinder::rpc::transport::UnixTransport::from_stream(a).expect("transport");
+    server.serve_connection(Box::new(PeerAs(a, peer)));
+    Aosp12Conn(client)
+}
+
+/// Joins `founder`'s r34 session as each `(joiner, admitted)`; see `ConnState::admits`.
+fn assert_r34_joins(
+    server: &Arc<RpcServer>,
+    founder: rsbinder::rpc::PeerIdentity,
+    joiners: &[(rsbinder::rpc::PeerIdentity, bool)],
+) {
+    // Held to the end: one connection's close ends the session.
+    let mut founding = r34_conn_as(server, founder.clone(), -1);
+    let id = founding.special_i32(2);
+    for (joiner, admitted) in joiners {
+        let rejected = server.rejected_unknown_id_count();
+        let mut joined = r34_conn_as(server, joiner.clone(), id);
+        if *admitted {
+            assert_eq!(joined.special_i32(2), id, "{joiner} joins {founder}");
+        } else {
+            assert!(joined.refused(), "{joiner} must not join {founder}");
+            // The transport closes inside `add_incoming_slot_capped`, before `refuse` counts.
+            assert!(
+                poll_until(|| server.rejected_unknown_id_count() == rejected + 1),
+                "{joiner}'s refusal is counted"
+            );
+        }
+    }
+}
+
 /// rsbinder only: a local connection joins an r34 session only from the founding peer's uid.
 #[test]
 fn r34_join_from_another_uid_is_refused() {
+    use rsbinder::rpc::PeerIdentity;
+    let (server, _cu, _path) = r34_server("aosp12uid", 3, Arc::new(AtomicI64::new(0)));
+    let founder = PeerIdentity::local(1000, -1);
+    let joiners = [
+        (PeerIdentity::local(1001, -1), false),
+        (PeerIdentity::local(1000, 7), true),
+    ];
+    assert_r34_joins(&server, founder, &joiners);
+}
+
+/// A non-local joiner must be the founding principal: the same certificate or the same VM.
+#[test]
+fn r34_join_from_another_principal_is_refused() {
+    use rsbinder::rpc::{CertId, PeerIdentity};
+    let cert = |label: &str, byte: u8| PeerIdentity::Certificate(CertId::new(label, [byte; 32]));
+    let (server, _cu, _path) = r34_server("aosp12principal", 3, Arc::new(AtomicI64::new(0)));
+    let cert_joiners = [
+        (cert("<mtls-client>", 2), false),
+        (PeerIdentity::local(1000, -1), false),
+        (cert("another label", 1), true),
+    ];
+    assert_r34_joins(&server, cert("<mtls-client>", 1), &cert_joiners);
+    let vsock_joiners = [
+        (PeerIdentity::Vsock { cid: 4 }, false),
+        (PeerIdentity::Anonymous, false),
+        (PeerIdentity::Vsock { cid: 3 }, true),
+    ];
+    assert_r34_joins(&server, PeerIdentity::Vsock { cid: 3 }, &vsock_joiners);
+    // No identity to compare: plaintext TCP joins on the id, as AOSP 12 `setupInetClient` does.
+    let anonymous_joiners = [
+        (cert("<mtls-client>", 1), false),
+        (PeerIdentity::Anonymous, true),
+    ];
+    assert_r34_joins(&server, PeerIdentity::Anonymous, &anonymous_joiners);
+}
+
+/// An android-13+ attach passes the same admission: a fan-out from another uid is refused.
+#[test]
+fn android13plus_attach_from_another_uid_is_refused() {
     use rsbinder::rpc::transport::UnixTransport;
     use rsbinder::rpc::{PeerIdentity, RpcTransport};
-    let (server, _cu, path) = r34_server("aosp12uid", 3, Arc::new(AtomicI64::new(0)));
-    let mut founding = Aosp12Conn::connect(&path, -1);
-    let id = founding.special_i32(2);
-    let (a, _) = UnixTransport::pair().expect("socketpair");
-    let PeerIdentity::Local { uid: mine, .. } = a.peer_identity() else {
-        panic!("a socketpair's peer is local");
-    };
-    for (uid, admitted) in [(mine.wrapping_add(1), false), (mine, true)] {
-        use std::io::Write;
+    let path = tmp_sock("a13uid");
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(1);
+    server.set_max_threads(2).expect("set_max_threads");
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background().expect("run_background");
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path);
+    for (second_uid, admitted) in [(1001, false), (1000, true)] {
         let rejected = server.rejected_unknown_id_count();
-        let (a, mut client) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("timeout");
-        client.write_all(&id.to_le_bytes()).expect("id");
-        let a = UnixTransport::from_stream(a).expect("transport");
-        server.serve_connection(Box::new(PeerUid(a, uid)));
-        let mut joined = Aosp12Conn(client);
+        let uids = Arc::new(Mutex::new(vec![second_uid, 1000]));
+        let dial_server = Arc::clone(&server);
+        let config = RpcClientConfig::new(1, move || {
+            let uid = uids.lock().unwrap().pop().expect("two connections");
+            let (a, b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let a = UnixTransport::from_stream(a).expect("server end");
+            dial_server.serve_connection(Box::new(PeerAs(a, PeerIdentity::local(uid, -1))));
+            Ok(Box::new(UnixTransport::from_stream(b).expect("client end"))
+                as Box<dyn RpcTransport>)
+        })
+        .outgoing_connections(2)
+        .timeout(Duration::from_secs(5));
+        let slots = RpcSession::setup_client_android13plus_with_config(config)
+            .map(|s| s.__slot_count())
+            .ok();
         if admitted {
-            assert_eq!(joined.special_i32(2), id, "the founding uid joins");
+            assert_eq!(slots, Some(2), "the founding uid's fan-out joins");
         } else {
-            assert!(
-                joined.refused(),
-                "uid {uid} must not join a session of uid {mine}"
+            assert_ne!(
+                slots,
+                Some(2),
+                "uid {second_uid} must not join uid 1000's session"
             );
-            assert_eq!(server.rejected_unknown_id_count(), rejected + 1);
+            assert!(
+                poll_until(|| server.rejected_unknown_id_count() == rejected + 1),
+                "the refusal is counted"
+            );
         }
     }
+}
+
+/// A TLS server's r34 session keeps its founding connection alone: AOSP 12 has no TLS.
+#[cfg(feature = "rpc-tls")]
+#[test]
+fn r34_join_on_a_tls_server_is_refused() {
+    use rsbinder::rpc::rustls::pki_types::pem::PemObject;
+    use rsbinder::rpc::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use rsbinder::rpc::rustls::ServerConfig;
+    use rsbinder::rpc::{CertId, PeerIdentity};
+
+    let certs = CertificateDer::pem_slice_iter(include_str!("tls_fixtures/srv.crt").as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("parse certs");
+    let key = PrivateKeyDer::from_pem_slice(include_str!("tls_fixtures/srv.key").as_bytes())
+        .expect("parse key");
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server config");
+    let path = tmp_sock("r34tls");
+    let server = RpcServer::setup_unix_server_tls(&path, Arc::new(config)).expect("bind");
+    server.set_max_threads(3).expect("set_max_threads");
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    let bg = server.run_background().expect("run_background");
+    let _cu = ServeCleanup::new(Arc::clone(&server), bg, path);
+    // `serve_connection` skips the handshake, so only the server's TLS setting differs.
+    let cert = PeerIdentity::Certificate(CertId::new("<mtls-client>", [1; 32]));
+    assert_r34_joins(&server, cert.clone(), &[(cert, false)]);
+    let anonymous = PeerIdentity::Anonymous;
+    assert_r34_joins(&server, anonymous.clone(), &[(anonymous, false)]);
 }
 
 /// An rsbinder r34 client reads the server-minted id as android-12's `int32`.
@@ -2983,17 +3099,27 @@ fn rpc_stack_has_no_globals() {
     // src/rpc owns no process-global state; the exemptions below hold no session data.
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rpc");
     let mut offenders = Vec::new();
-    fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) {
+    // (file under `src/rpc`, declaration start through the `:` after its name, no comment).
+    const EXEMPT: &[(&str, &str)] = &[
+        // tcp_debug's insecure-transport warning latch is the documented exception.
+        ("transport/tcp_debug.rs", "static INSECURE_WARNED:"),
+        // `DRIVING`: a per-thread nesting marker with no session data.
+        ("session.rs", "static DRIVING:"),
+        // `ARMED_READ`: this thread's live deadline guards, emptied as they drop.
+        ("session.rs", "static ARMED_READ:"),
+    ];
+    fn scan(root: &std::path::Path, dir: &std::path::Path, offenders: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let p = entry.unwrap().path();
             if p.is_dir() {
-                scan(&p, offenders);
+                scan(root, &p, offenders);
                 continue;
             }
             if p.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let name = p.strip_prefix(root).unwrap().to_string_lossy();
+            let name = name.replace('\\', "/");
             let src = std::fs::read_to_string(&p).unwrap();
             for (lineno, line) in src.lines().enumerate() {
                 let l = line.trim_start();
@@ -3009,20 +3135,15 @@ fn rpc_stack_has_no_globals() {
                     || l.contains("lazy_static")
                     || l.contains("OnceCell");
                 if has_global {
-                    // tcp_debug's INSECURE_WARNED latch is the documented exception.
-                    if name == "tcp_debug.rs" && line.contains("INSECURE_WARNED") {
+                    let decl = l.split("//").next().unwrap_or(l).trim_end();
+                    if EXEMPT
+                        .iter()
+                        .any(|&(f, d)| name == f && decl.starts_with(d))
+                    {
                         continue;
                     }
                     // proxy.rs `OnceLock` is a per-`RpcProxy` descriptor cache.
-                    if name == "proxy.rs" && l.contains("OnceLock") && !static_item {
-                        continue;
-                    }
-                    // `DRIVING`: a per-thread nesting marker with no session data.
-                    if name == "session.rs" && line.contains("DRIVING") {
-                        continue;
-                    }
-                    // `ARMED_READ`: this thread's live deadline guards, emptied as they drop.
-                    if name == "session.rs" && line.contains("ARMED_READ") {
+                    if name == "proxy.rs" && decl.contains("OnceLock") && !static_item {
                         continue;
                     }
                     offenders.push(format!("{name}:{}: {}", lineno + 1, line.trim()));
@@ -3030,7 +3151,7 @@ fn rpc_stack_has_no_globals() {
             }
         }
     }
-    scan(&dir, &mut offenders);
+    scan(&dir, &dir, &mut offenders);
     assert!(
         offenders.is_empty(),
         "RPC stack must own all state per-session, found globals:\n{}",
@@ -4291,7 +4412,7 @@ fn preconnected_inet_fd_handshakes_over_tcp_debug() {
 /// Plan 2-21 B-2: `terminate` ends connected r34 and android-13+ sessions and joins the workers.
 #[test]
 fn terminate_ends_every_session_and_joins_workers() {
-    // r34 mints no session id (absent from the id registry); one profile per server.
+    // r34's int32 id is not in the 32-byte id registry; one profile per server.
     let r34_path = tmp_sock("term34");
     let r34_server = RpcServer::setup_unix_server(&r34_path).expect("bind r34");
     r34_server

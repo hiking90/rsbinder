@@ -64,7 +64,9 @@ use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, Arc, Mutex, OnceLock};
 
-use crate::binder::{DeathRecipient, IBinder, Stability, Transactable, WIBinder};
+use crate::binder::{
+    DeathRecipient, IBinder, ReceivedStability, Stability, Transactable, WIBinder,
+};
 use crate::binder::{TransactionCode, TransactionFlags};
 use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
@@ -82,6 +84,8 @@ pub struct RpcProxy {
     /// Set once the obituary is dispatched; only under the `recipients` lock, so `Relaxed`.
     obituary_sent: AtomicBool,
     recipients: Mutex<Vec<sync::Weak<dyn DeathRecipient>>>,
+    /// AOSP `BpBinder::mStability`: filled by `read_binder` alone; see `ReceivedStability`.
+    received_level: ReceivedStability,
 }
 
 impl RpcProxy {
@@ -97,7 +101,13 @@ impl RpcProxy {
             session,
             obituary_sent: AtomicBool::new(false),
             recipients: Mutex::new(Vec::new()),
+            received_level: ReceivedStability::unset(),
         }
+    }
+
+    /// AOSP `Stability::setRepr` on a proxy: the first received declared level sticks.
+    pub(crate) fn record_received_stability(&self, level: i32) {
+        self.received_level.fill(level);
     }
 
     /// Fire `binder_died` on each recipient (AOSP `BpBinder::sendObituary`, RPC); idempotent.
@@ -433,7 +443,8 @@ impl IBinder for RpcProxy {
         true
     }
 
+    /// AOSP `getRepr` on a `BpBinder`: the first declared level received, this process's before.
     fn stability(&self) -> Stability {
-        Stability::default()
+        self.received_level.get()
     }
 }

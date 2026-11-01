@@ -185,7 +185,7 @@ impl Shared {
         };
         let n = HEADER + payload.len();
         let spin_deadline = wait.spin_deadline();
-        // The last wait returned: a bit the consumer left set ends a wait at once, so no second spin.
+        // After a wait, a bit the consumer left set ends the next wait at once: no second spin.
         let mut woke = false;
         loop {
             if self.dead.load(Ordering::SeqCst) {
@@ -579,7 +579,7 @@ impl Drop for Unhanded<'_> {
 pub(super) struct Producer<T: ?Sized> {
     shared: Arc<Shared>,
     transit: Arc<Transit>,
-    /// Reused encoding buffer, new after a refusal or a pool hand-off; boxed: `Parcel` is `!Freeze`.
+    /// Reused encoding buffer, new after a refusal or pool hand-off; boxed: `Parcel` is `!Freeze`.
     scratch: Box<Parcel>,
     /// Set once the end record is in, so `Drop` does not write a second.
     ended: bool,
@@ -922,7 +922,7 @@ impl crate::DeathRecipient for ConsumerDeath {
 struct RingSink(Weak<Shared>);
 
 impl RingSink {
-    /// End with `EX_ILLEGAL_STATE` (records already in the ring still come first) and stop the producer.
+    /// End with `EX_ILLEGAL_STATE` (ring records still come first) and stop the producer.
     fn refuse(&self, call: &str) {
         log::error!(
             "stream: {call} on a ring endpoint; the producer ignored the ring, ending the stream"
@@ -1312,7 +1312,7 @@ impl<T: Deserialize> Consumer<T> {
         Ok(Some((is_end, payload)))
     }
 
-    /// Copy every committed byte out of the ring, free it and wake once: `false` if there were none.
+    /// Copy every committed byte out of the ring, free it and wake once; `false` if none were.
     fn refill(&mut self) -> std::result::Result<bool, String> {
         let mut queue = self.shared.queue();
         let available = queue

@@ -462,6 +462,27 @@ impl Serialize for SIBinder {
     }
 }
 
+/// The kernel parcel's stability word on a host of SDK `sdk`: `Stability` rustdoc "Wire encoding".
+fn kernel_stability_word(stability: Stability, sdk: u32) -> i32 {
+    if sdk == 31 || sdk == 32 {
+        crate::binder::android12_category_repr(stability.level())
+    } else {
+        stability.level()
+    }
+}
+
+/// The SDK `kernel_stability_word` is given: the device's on Android, 0 off it.
+fn host_sdk() -> u32 {
+    #[cfg(target_os = "android")]
+    {
+        crate::get_android_sdk_version()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        0
+    }
+}
+
 impl SerializeOption for SIBinder {
     fn serialize_option(this: Option<&Self>, parcel: &mut Parcel) -> Result<()> {
         // No hooks = data-only mode: refuse before `binder.into()`, which panics without a driver.
@@ -487,7 +508,7 @@ impl SerializeOption for SIBinder {
                 }
                 parcel.write_binder_object(&binder.into(), binder)?;
                 if crate::sdk_at_least(30) {
-                    parcel.write::<i32>(&binder.stability().into())?;
+                    parcel.write(&kernel_stability_word(binder.stability(), host_sdk()))?;
                 }
                 // Freeze stability once parceled (AOSP `BBinder::setParceled`); no-op for proxies.
                 binder.set_parceled();
@@ -497,7 +518,7 @@ impl SerializeOption for SIBinder {
             None => {
                 parcel.write::<FlatBinderObject>(&FlatBinderObject::default())?;
                 if crate::sdk_at_least(30) {
-                    parcel.write::<i32>(&Stability::Local.into())?;
+                    parcel.write(&kernel_stability_word(Stability::Local, host_sdk()))?;
                 }
 
                 Ok(())
@@ -533,10 +554,10 @@ impl DeserializeOption for SIBinder {
         }
 
         let flat: FlatBinderObject = parcel.read()?;
-        let stability: i32 = if crate::sdk_at_least(30) {
-            parcel.read()?
+        let stability: Option<i32> = if crate::sdk_at_least(30) {
+            Some(parcel.read()?)
         } else {
-            Stability::Local.into()
+            None
         };
 
         match flat.header_type() {
@@ -555,9 +576,17 @@ impl DeserializeOption for SIBinder {
             }
 
             BINDER_TYPE_HANDLE => {
-                let res = ProcessState::as_self()
-                    .strong_proxy_for_handle_stability(flat.handle(), stability.try_into()?)?;
-                Ok(Some(res))
+                // Decoded before the lookup, so a level naming no `Stability` creates no proxy.
+                let level = stability
+                    .map(Stability::try_from)
+                    .transpose()?
+                    .map(Stability::level);
+                let proxy = ProcessState::as_self().proxy_for_handle(flat.handle())?;
+                // The kernel path's one fill: a cached proxy (e.g. pinned by `append_from`) too.
+                if let Some(level) = level {
+                    proxy.record_received_stability(level);
+                }
+                Ok(Some(SIBinder::from_arc(proxy)))
             }
 
             _ => {
@@ -876,6 +905,26 @@ mod tests {
 
     use super::*;
 
+    /// The kernel word is android-12's `Category` on SDK 31/32 alone, the raw level elsewhere.
+    #[test]
+    fn kernel_stability_word_is_the_category_on_sdk_31_and_32_only() {
+        for (s, level) in [
+            (Stability::Local, 0),
+            (Stability::Vendor, 0b00_0011),
+            (Stability::System, 0b00_1100),
+            (Stability::Vintf, 0b11_1111),
+        ] {
+            for sdk in [0, 29, 30, 33, 34, 36] {
+                assert_eq!(kernel_stability_word(s, sdk), level, "{s:?} on SDK {sdk}");
+            }
+            for sdk in [31, 32] {
+                let word = kernel_stability_word(s, sdk);
+                assert_eq!(word, (level << 24) | 1, "{s:?} on SDK {sdk}");
+                assert_eq!(Stability::try_from(word), Ok(s), "{s:?} on SDK {sdk}");
+            }
+        }
+    }
+
     /// A hostile String16 length is an `Err`, not a panic; see this module's doc.
     #[test]
     fn hostile_string16_length_returns_err_not_panic() {
@@ -1081,5 +1130,180 @@ mod tests {
         assert_eq!(p.read::<Option<Tiny>>(), Ok(None));
         // Any non-{0,1} flag is UNEXPECTED_NULL, as in AOSP `Parcel::readData`.
         assert_eq!(p.read::<Option<Tiny>>(), Err(StatusCode::UnexpectedNull));
+    }
+
+    /// A kernel parcel holding `handle` followed by its stability `word`; writing it pins a proxy.
+    fn kernel_handle_parcel(handle: u32, word: i32) -> Parcel {
+        let mut p = Parcel::new();
+        p.write(&FlatBinderObject::new_handle(handle, 0))
+            .expect("handle");
+        p.write(&word).expect("stability");
+        p.set_data_position(0);
+        p
+    }
+
+    /// The stability word `binder` is written with into a kernel parcel.
+    fn kernel_word_sent_for(binder: &SIBinder) -> i32 {
+        let mut p = Parcel::new();
+        p.write(binder).expect("write");
+        p.set_data_position(FlatBinderObject::SIZE);
+        p.read::<i32>().expect("stability")
+    }
+
+    /// Whether a kernel stability-word test can run: a binder driver opens and the word exists.
+    fn kernel_stability_word_testable() -> bool {
+        if !ProcessState::is_initialized() && ProcessState::init_default().is_err() {
+            eprintln!("skipped: no kernel binder driver");
+            return false;
+        }
+        crate::sdk_at_least(30)
+    }
+
+    // The handles below name no node: the driver logs and skips their refcounts, which is enough.
+
+    /// A proxy revived from a `WIBinder` (cache case (b)) keeps the level its handle received.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
+    #[serial_test::serial(binder)]
+    fn a_revived_kernel_proxy_keeps_its_received_level() {
+        if !kernel_stability_word_testable() {
+            return;
+        }
+        let handle = 0x5AB0_0004;
+        let word = kernel_stability_word(Stability::Vintf, host_sdk());
+        let received: SIBinder = kernel_handle_parcel(handle, word).read().expect("vintf");
+        let weak = SIBinder::downgrade(&received);
+        drop(received);
+        let revived = ProcessState::as_self()
+            .strong_proxy_for_handle(handle)
+            .expect("revive");
+        assert!(weak == revived, "the same (handle, generation): case (b)");
+        assert_eq!(revived.stability(), Stability::Vintf, "getter");
+        assert_eq!(kernel_word_sent_for(&revived), word, "sent back");
+    }
+
+    /// A proxy pinned before its word is read (a `ParcelableHolder` payload) takes its level.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
+    #[serial_test::serial(binder)]
+    fn a_relayed_kernel_proxy_reports_and_sends_back_its_level() {
+        if !kernel_stability_word_testable() {
+            return;
+        }
+        for (handle, stability) in [
+            (0x5AB0_0001, Stability::Vendor),
+            (0x5AB0_0002, Stability::Vintf),
+        ] {
+            let word = kernel_stability_word(stability, host_sdk());
+            let mut source = kernel_handle_parcel(handle, word);
+            // `ParcelableHolder::read_from_parcel`'s cut: `append_from` pins the handle again.
+            let mut payload = source
+                .sub_parcel(0, source.data_size())
+                .expect("sub-parcel");
+            payload.set_data_position(0);
+            let proxy: SIBinder = payload.read().expect("proxy");
+            assert_eq!(proxy.stability(), stability, "{stability:?} getter");
+            assert_eq!(
+                kernel_word_sent_for(&proxy),
+                word,
+                "{stability:?} sent back"
+            );
+            // A fresh source pins through the public lookup, then is read: the same answer.
+            let again: SIBinder = kernel_handle_parcel(handle, word).read().expect("again");
+            assert_eq!(again.stability(), stability, "{stability:?} read again");
+        }
+    }
+
+    /// An `UNDECLARED` word leaves a kernel proxy unset (AOSP `mStability` = 0); the first sticks.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
+    #[serial_test::serial(binder)]
+    fn a_kernel_proxy_is_filled_by_its_first_declared_word() {
+        if !kernel_stability_word_testable() {
+            return;
+        }
+        let handle = 0x5AB0_0003;
+        let word = |s: Stability| kernel_stability_word(s, host_sdk());
+
+        let first: SIBinder = kernel_handle_parcel(handle, word(Stability::Local))
+            .read()
+            .expect("undeclared");
+        assert_eq!(
+            first.stability(),
+            Stability::System,
+            "unset: the local level"
+        );
+        assert_eq!(kernel_word_sent_for(&first), word(Stability::System));
+
+        let filled: SIBinder = kernel_handle_parcel(handle, word(Stability::Vintf))
+            .read()
+            .expect("vintf");
+        assert!(
+            std::sync::Arc::ptr_eq(first.as_arc(), filled.as_arc()),
+            "one cached proxy"
+        );
+        assert_eq!(
+            first.stability(),
+            Stability::Vintf,
+            "the first declared word fills it"
+        );
+
+        let conflicting: SIBinder = kernel_handle_parcel(handle, word(Stability::Vendor))
+            .read()
+            .expect("vendor");
+        assert_eq!(
+            conflicting.stability(),
+            Stability::Vintf,
+            "the first one stays"
+        );
+        assert_eq!(kernel_word_sent_for(&first), word(Stability::Vintf));
+    }
+
+    /// A binder built with `Stability::Local` goes out with this process's level.
+    #[test]
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        ignore = "requires /dev/binder"
+    )]
+    #[serial_test::serial(binder)]
+    fn a_local_binder_is_sent_with_the_local_level_on_kernel_binder() {
+        struct Svc;
+        impl crate::Interface for Svc {}
+        impl crate::Remotable for Svc {
+            fn descriptor() -> &'static str {
+                "rsbinder.test.parcelable.ILocal"
+            }
+            fn on_transact(
+                &self,
+                _code: crate::TransactionCode,
+                _reader: &mut Parcel,
+                _reply: &mut Parcel,
+            ) -> Result<()> {
+                Err(StatusCode::UnknownTransaction)
+            }
+            fn on_dump(&self, _w: &mut dyn std::io::Write, _args: &[String]) -> Result<()> {
+                Ok(())
+            }
+        }
+        let local =
+            crate::Interface::as_binder(&crate::Binder::new_with_stability(Svc, Stability::Local));
+        // The level `serialize_option` writes; no driver needed to read it.
+        assert_eq!(local.stability(), Stability::System);
+        if !kernel_stability_word_testable() {
+            return;
+        }
+        assert_eq!(
+            kernel_word_sent_for(&local),
+            kernel_stability_word(Stability::System, host_sdk())
+        );
     }
 }

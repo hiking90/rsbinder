@@ -41,12 +41,8 @@ use android::aidl::versioned::tests::{
 };
 use rustix::fd::OwnedFd;
 use std::io::{Read, Write};
-use std::os::unix::io::FromRawFd;
 use std::sync::{Arc, Mutex};
-use std::{
-    fs::File,
-    os::fd::{AsRawFd, IntoRawFd},
-};
+use std::{fs::File, os::fd::AsRawFd};
 
 fn init_logger() {
     let _ = env_logger::Builder::from_env(Env::default().default_filter_or("debug")).try_init();
@@ -3256,9 +3252,8 @@ fn test_dump_fast_fails_on_dead_proxy_closes_fd() {
     // Now `obituary_sent` is published on the proxy. Build a fresh
     // pipe; the write end is handed to `dump`, the read end stays in
     // the test for EOF observation.
-    let (dump_read_owned, dump_write_owned) = rustix::pipe::pipe().expect("pipe for dump");
-    let dump_write = unsafe { File::from_raw_fd(dump_write_owned.into_raw_fd()) };
-    let mut dump_read = unsafe { File::from_raw_fd(dump_read_owned.into_raw_fd()) };
+    let (dump_read, dump_write) = rustix::pipe::pipe().expect("pipe for dump");
+    let mut dump_read = File::from(dump_read);
 
     // `dump` is a `ProxyHandle` inherent method (not on the `IBinder`
     // trait), so we go through `as_proxy` to reach it. Holding the

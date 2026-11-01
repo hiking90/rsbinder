@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicU64;
 
 use rsbinder::{Status, StatusCode};
 
-use crate::pool::{PoolReader, Unpinned};
+use crate::pool::{Loan, PoolReader, Unpinned};
 use crate::ring::{Corrupted, Loads, Reader, Taken};
 use crate::{end, Payload, Record, Sample, Trust};
 
@@ -238,17 +238,21 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     ///
     /// [`PoolReader::copy_vouched`]'s: the subscriber is [`Trusted`](crate::Trusted).
     pub(crate) unsafe fn recv_vouched(&mut self, latest: bool) -> Result<T, RecvError> {
-        // SAFETY: the caller's word for the publisher.
-        unsafe { self.typed_as(latest, true) }
+        self.typed_with(latest, |pool, loan, into| {
+            // SAFETY: the caller's word for the publisher.
+            unsafe { pool.copy_vouched(loan, into) }
+        })
     }
 
     fn typed(&mut self, latest: bool) -> Result<T, RecvError> {
-        // SAFETY: not vouched: the copy is by atomic loads, which ask nothing of the publisher.
-        unsafe { self.typed_as(latest, false) }
+        self.typed_with(latest, PoolReader::copy)
     }
 
-    /// # Safety: with `vouched`, [`recv_vouched`](Self::recv_vouched)'s.
-    unsafe fn typed_as(&mut self, latest: bool, vouched: bool) -> Result<T, RecvError> {
+    fn typed_with(
+        &mut self,
+        latest: bool,
+        copy: impl Fn(&PoolReader, Loan, &mut Vec<u8>) -> Result<(), Unpinned>,
+    ) -> Result<T, RecvError> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
@@ -269,9 +273,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
                 other => return Err(not_a_value(other)),
             };
             let copied = match &self.pool {
-                // SAFETY: `vouched` is the caller's word for the publisher.
-                Some(pool) if vouched => unsafe { pool.copy_vouched(loan, &mut self.loaned) },
-                Some(pool) => pool.copy(loan, &mut self.loaned),
+                Some(pool) => copy(pool, loan, &mut self.loaned),
                 None => Err(NO_POOL),
             };
             if goes_on(latest, &copied, &mut retries) {

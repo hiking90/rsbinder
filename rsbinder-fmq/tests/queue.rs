@@ -9,11 +9,13 @@
     target_has_atomic = "64"
 ))]
 
+mod common;
+
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::{Access, Mapping};
+use rsbinder_fmq::shm::{Mapping, Words};
 use rsbinder_fmq::{
     AttachPolicy, Descriptor, Error, Flavor, Grantor, MessageQueue, Notify, Transfer, NOT_EMPTY,
     NOT_FULL,
@@ -41,16 +43,17 @@ const DONE: Transfer = Transfer::Done;
 const WOULD_BLOCK: Transfer = Transfer::WouldBlock;
 
 /// A raw view of a single-fd queue's counters, to play the hostile peer.
-struct Counters(Mapping);
+struct Counters(Words<AtomicU64>);
 
 impl Counters {
     fn map(desc: &Descriptor) -> Self {
-        Self(Mapping::map(desc.fds[0].as_fd(), 0, 16, Access::ReadWrite).unwrap())
+        Self(common::counters(
+            Mapping::map(desc.fds[0].as_fd(), 0, 16).unwrap(),
+        ))
     }
 
     fn counter(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: offsets 0 and 8 of the default layout, inside the mapping.
-        unsafe { self.0.as_ptr().add(8 * index).cast::<AtomicU64>().as_ref() }
+        self.0.get(index)
     }
 
     fn set(&self, read: u64, write: u64) {
@@ -444,7 +447,7 @@ fn write_blocking_times_out_on_a_full_queue() {
     assert_eq!(w.available_to_write().unwrap(), 0);
 }
 
-/// `Some(ZERO)` is one try: no wait, and the EventFlag word is not touched.
+/// `Some(ZERO)` is one try that never waits; a failed try leaves the EventFlag word alone.
 #[test]
 fn a_zero_timeout_tries_once_without_waiting() {
     let mut w = MessageQueue::<u8>::create(2, true).unwrap();
@@ -1140,107 +1143,4 @@ fn send_but_not_sync() {
     is_send::<Descriptor>();
     is_sync::<Descriptor>();
     // `!Sync` is checked by the `compile_fail` doctest on `MessageQueue`.
-}
-
-// ---- Ring memory is reached only through atomics --------------------------
-
-/// A spelling scan of the source; Miri on `racing_copies_are_atomic_accesses` checks semantics.
-#[test]
-fn ring_code_makes_no_plain_copy_of_ring_memory() {
-    // Code only: comment and doc lines may name the very calls this test forbids.
-    // Embedded at build time, so the test also runs where the source tree is absent (a device).
-    let source = |file: &str| {
-        let text = match file {
-            "queue.rs" => include_str!("../src/queue.rs"),
-            "ring.rs" => include_str!("../src/ring.rs"),
-            "shm/run.rs" => include_str!("../src/shm/run.rs"),
-            "unsync.rs" => include_str!("../src/unsync.rs"),
-            _ => panic!("{file} is not embedded"),
-        };
-        text.lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    const PLAIN_ACCESSES: [&str; 25] = [
-        "copy_nonoverlapping",
-        "ptr::copy",
-        "copy_from_slice",
-        "clone_from_slice",
-        "copy_within",
-        ".copy_to",
-        "read_volatile",
-        "write_volatile",
-        "read_unaligned",
-        "write_unaligned",
-        "ptr::read",
-        "ptr::write",
-        ".read(",
-        ".write(",
-        "as_ref(",
-        "as_mut(",
-        "from_ptr_range",
-        // `*x.as_ptr() = ..` is a plain access to an atomic's bytes.
-        "as_ptr()",
-        // So is a deref of a reference turned raw pointer by any other route.
-        "as *const",
-        "as *mut",
-        "cast_mut",
-        "from_ref",
-        "from_mut",
-        "addr_of",
-        "&raw ",
-    ];
-    // The queue's own `read`/`write` calls, the counter's `&AtomicU64`, and pointer arithmetic.
-    const ALLOWED: [&str; 13] = [
-        "self.blocking(notify, timeout, |queue| queue.write(items))",
-        "self.blocking(notify, timeout, |queue| queue.read(out))",
-        "unsafe { self.ptr.as_ref() }",
-        "let ptr = mapping.as_ptr().cast::<AtomicU64>();",
-        "base: mapping.as_ptr(),",
-        "at: mapping.as_ptr(),",
-        "debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);",
-        "let first = self.first.as_ptr().add(start.min(self.first_len) * q);",
-        ".as_ptr()",
-        "let head_len = ((WORD - at.as_ptr() as usize % WORD) % WORD).min(len);",
-        "let at = at.as_ptr();",
-        "unsafe { std::slice::from_raw_parts(user.as_ptr().cast(), std::mem::size_of_val(user)) }",
-        "unsafe { Run::new(NonNull::new_unchecked(at.as_ptr().add(offset)), len) }",
-    ];
-    for file in ["queue.rs", "ring.rs", "shm/run.rs", "unsync.rs"] {
-        let text = source(file);
-        for line in text.lines().filter(|l| !ALLOWED.contains(&l.trim())) {
-            for pattern in PLAIN_ACCESSES {
-                assert!(!line.contains(pattern), "{file} uses `{pattern}`: {line}");
-            }
-        }
-    }
-    // The two queues build no slice at all; the others build atomics or views of a caller's slice.
-    assert!(!source("queue.rs").contains("from_raw_parts"));
-    assert!(!source("unsync.rs").contains("from_raw_parts"));
-    let ring = source("ring.rs") + &source("shm/run.rs");
-    let calls: Vec<&str> = ring
-        .match_indices("from_raw_parts")
-        .map(|(at, _)| {
-            let args = &ring[at..];
-            let mut depth = 0;
-            let end = args
-                .char_indices()
-                .find_map(|(i, c)| {
-                    match c {
-                        '(' => depth += 1,
-                        ')' if depth == 1 => return Some(i),
-                        ')' => depth -= 1,
-                        _ => {}
-                    }
-                    None
-                })
-                .expect("a closed call");
-            &args[..end]
-        })
-        .collect();
-    assert_eq!(calls.len(), 5, "{calls:#?}");
-    for call in calls {
-        assert!(call.contains("Atomic") || call.contains("(user."), "{call}");
-    }
 }

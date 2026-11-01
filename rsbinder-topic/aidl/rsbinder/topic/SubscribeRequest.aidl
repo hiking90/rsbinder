@@ -34,9 +34,11 @@ parcelable SubscribeRequest {
      * as its death says nothing about the caller, unless the call came from
      * that process itself. A binder of a third process cannot be told from
      * the caller's own; `ITopic.ERROR_FULL` per uid bounds what a caller
-     * holds that way. It is an `ISubscription`, refused with `BAD_VALUE`
-     * otherwise: a topic with backpressure tells the subscriber through it
-     * that the subscription was taken out.
+     * holds that way. It is an `ISubscription`: a topic with backpressure
+     * tells the subscriber through it that the subscription was taken out.
+     * A binder of the publisher's process that is not one is refused with
+     * `BAD_VALUE`; a binder of another process is not asked for its
+     * interface (plan 16).
      */
     IBinder token;
 

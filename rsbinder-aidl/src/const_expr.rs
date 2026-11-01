@@ -223,8 +223,7 @@ pub enum ValueType {
     Holder,
     UserDefined(String),
     Reference {
-        // Full AIDL enum type. Short enum names can collide across packages.
-        // A union's `Tag` carries the union's name here (its module); `enum_name` is `Tag`.
+        // Full AIDL enum type (short names collide); a union `Tag` carries the union's name.
         enum_type: String,
         enum_name: String,
         member_name: String,
@@ -334,7 +333,7 @@ impl ValueType {
             ValueType::Char(_) => Err(ConstExprError::new(
                 "can't apply unary operator '~' to a char",
             )),
-            ValueType::Void => Ok(ConstExpr::new(self.clone())),
+            ValueType::Void => Ok(ConstExpr::new(ValueType::Void)),
             ValueType::Byte(v) => Ok(ConstExpr::new(ValueType::Byte(!*v))),
             ValueType::Int32(v) => Ok(ConstExpr::new(ValueType::Int32(!*v))),
             ValueType::Int64(v) => Ok(ConstExpr::new(ValueType::Int64(!*v))),
@@ -392,7 +391,7 @@ impl ValueType {
             ValueType::Char(_) => Err(ConstExprError::new(
                 "can't apply unary operator '-' to a char",
             )),
-            ValueType::Void => Ok(ConstExpr::new(self.clone())),
+            ValueType::Void => Ok(ConstExpr::new(ValueType::Void)),
             // AOSP `OverflowGuard<bool>`: `-true` stays true, `-false` negates the minimum.
             ValueType::Bool(true) => Ok(ConstExpr::new(ValueType::Bool(true))),
             ValueType::Bool(false) => Err(overflow(false)),
@@ -513,7 +512,7 @@ impl ValueType {
         }
     }
 
-    pub(crate) fn to_init(&self, param: InitParam) -> String {
+    pub(crate) fn to_init(&self, param: &InitParam) -> String {
         match self {
             ValueType::String(s) => {
                 let s: String = s
@@ -607,7 +606,7 @@ impl ValueType {
                     let init_str = match &v.value {
                         // Byte arrays are `u8` in Rust: emit -1 as 255 (AOSP `aidl_to_rust.cpp`).
                         ValueType::Byte(b) => (*b as u8).to_string(),
-                        _ => v.value.to_init(param.clone()),
+                        _ => v.value.to_init(param),
                     };
 
                     let some_str = if let ValueType::Array(_) = v.value {
@@ -721,12 +720,15 @@ impl ValueType {
         );
 
         match operator {
-            "||" => Ok(ConstExpr::new(ValueType::Bool(
-                lhs.to_bool()? || rhs.to_bool()?,
-            ))),
-            "&&" => Ok(ConstExpr::new(ValueType::Bool(
-                lhs.to_bool()? && rhs.to_bool()?,
-            ))),
+            // AOSP evaluates both operands first, so `true || TYPO` still fails on `TYPO`.
+            "||" | "&&" => {
+                let (l, r) = (lhs.to_bool()?, rhs.to_bool()?);
+                Ok(ConstExpr::new(ValueType::Bool(if operator == "||" {
+                    l || r
+                } else {
+                    l && r
+                })))
+            }
             "|" => {
                 arithmetic_bit_op!(lhs, |, rhs, "|", promoted)
             }

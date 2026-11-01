@@ -20,11 +20,13 @@
     )
 ))]
 
+mod common;
+
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::{self, Access, CreateOptions, Mapping, Run, Seals};
+use rsbinder_fmq::shm::{self, Bytes, CreateOptions, Mapping, Seals, Words};
 use rsbinder_fmq::{
     AttachPolicy, Descriptor, Errno, Error, Flavor, Grantor, MessageQueue, UnsyncCreate,
     UnsyncRead, UnsyncReader, UnsyncStart, UnsyncWriter,
@@ -46,16 +48,16 @@ fn reader<T: rsbinder_fmq::Element>(writer: &UnsyncWriter<T>) -> UnsyncReader<T>
 }
 
 /// The first 16 bytes of a queue's fd through a writable mapping: what another process could do.
-struct Counters(Mapping);
+struct Counters(Words<AtomicU64>);
 
 impl Counters {
     fn of(desc: &Descriptor) -> Self {
-        Self(Mapping::map(desc.fds[0].as_fd(), 0, 16, Access::ReadWrite).expect("map"))
+        let mapping = Mapping::map(desc.fds[0].as_fd(), 0, 16).expect("map");
+        Self(common::counters(mapping))
     }
 
     fn word(&self, index: usize) -> &AtomicU64 {
-        // SAFETY: an 8-aligned word of a live page-aligned mapping, reached only through atomics.
-        unsafe { self.0.as_ptr().add(8 * index).cast::<AtomicU64>().as_ref() }
+        self.0.get(index)
     }
 
     fn end(&self) -> &AtomicU64 {
@@ -107,7 +109,7 @@ fn read_only_readers_seals_the_fd_against_writable_mappings() {
     );
     let fd = desc.fds[0].as_fd();
     assert_eq!(
-        Mapping::map(fd, 0, 16, Access::ReadWrite).err(),
+        Mapping::map(fd, 0, 16).err(),
         Some(Error::Os(Errno::from_raw(
             rustix::io::Errno::PERM.raw_os_error()
         )))
@@ -438,7 +440,7 @@ fn attach_applies_the_policy_and_the_quantum() {
 struct Foreign {
     desc: Descriptor,
     counters: Counters,
-    ring: Mapping,
+    ring: Bytes,
 }
 
 impl Foreign {
@@ -465,7 +467,11 @@ impl Foreign {
             quantum: 4,
             flavor: Flavor::UnsynchronizedWrite,
         };
-        let ring = Mapping::map(desc.fds[0].as_fd(), 16, Self::BYTES, Access::ReadWrite).unwrap();
+        let ring = Mapping::map(desc.fds[0].as_fd(), 16, Self::BYTES)
+            .unwrap()
+            .carve()
+            .bytes(0, Self::BYTES as usize)
+            .unwrap();
         Self {
             counters: Counters::of(&desc),
             desc,
@@ -478,9 +484,7 @@ impl Foreign {
         self.counters.end().store(end, Ordering::Release);
         for (index, value) in values.iter().enumerate() {
             let offset = ((position + index as u64) * 4 % Self::BYTES) as usize;
-            // SAFETY: four bytes inside the ring's mapping, written by this thread alone.
-            let run = unsafe { Run::new(self.ring.as_ptr().add(offset), 4) };
-            run.store_release(&value.to_ne_bytes());
+            self.ring.store_release(offset, &[*value]);
         }
         self.counters.write().store(write, Ordering::Release);
     }

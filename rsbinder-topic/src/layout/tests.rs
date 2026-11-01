@@ -13,11 +13,9 @@ const EPERM: Errno = Errno::from_raw(rustix::io::Errno::PERM.raw_os_error());
 /// A populated, sealed memfd of `size` bytes holding the 4-byte `words` and zeros.
 fn sealed(size: u64, words: &[(usize, u32)]) -> OwnedFd {
     let fd = shm::create(size, &CreateOptions::new("forged").populate(true)).unwrap();
-    let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite).unwrap();
+    let mut carve = Mapping::map(fd.as_fd(), 0, size).unwrap().carve();
     for (at, value) in words {
-        // SAFETY: an aligned word inside the page-aligned mapping made above; atomics only.
-        let word = unsafe { mapping.as_ptr().add(*at).cast::<AtomicU32>().as_ref() };
-        word.store(*value, Ordering::Relaxed);
+        carve.word32(*at).unwrap().store(*value, Ordering::Relaxed);
     }
     seal(fd.as_fd()).unwrap();
     fd
@@ -71,7 +69,7 @@ fn a_subscriber_can_neither_write_nor_resize_topic_memory() {
     let (fd, _stored) = create_topic(MIN_RING).unwrap();
     let sealed = shm::seals(fd.as_fd()).unwrap();
     assert!(sealed.contains(Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL));
-    let writable = Mapping::map(fd.as_fd(), 0, TOPIC_SIZE, Access::ReadWrite);
+    let writable = Mapping::map(fd.as_fd(), 0, TOPIC_SIZE);
     assert_eq!(writable.err(), Some(Error::Os(EPERM)));
     // What `shm::verify_received` asks of a peer's memfd is what this crate makes.
     assert_eq!(shm::verify_received(fd.as_fd()), Ok(TOPIC_SIZE));
@@ -128,7 +126,7 @@ fn a_control_page_is_written_by_the_subscriber_and_read_by_the_publisher() {
     assert_eq!((view.read(), view.lost()), (1 << 40, 7));
 
     // The publisher's side has no way to a writable mapping.
-    let writable = Mapping::map(fd.as_fd(), 0, 0x80, Access::ReadWrite);
+    let writable = Mapping::map(fd.as_fd(), 0, 0x80);
     assert_eq!(writable.err(), Some(Error::Os(EPERM)));
 }
 
@@ -214,7 +212,7 @@ fn pool_memory_is_written_through_one_mapping_and_read_through_another() {
     assert_eq!(shm::verify_received(fd.as_fd()), Ok(size));
     let sealed = shm::seals(fd.as_fd()).unwrap();
     assert!(sealed.contains(Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL));
-    let writable = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite);
+    let writable = Mapping::map(fd.as_fd(), 0, size);
     assert_eq!(writable.err(), Some(Error::Os(EPERM)));
 
     let loaded = map_pool(fd.as_fd(), 3, 64, size as usize).unwrap();
@@ -273,9 +271,9 @@ fn an_fd_that_is_not_the_pool_its_endpoint_states_is_not_mapped() {
 }
 
 /// The `VmFlags` line `/proc/self/smaps` gives the mapping that starts at `at`.
-fn vm_flags(at: NonNull<u8>) -> String {
+fn vm_flags(at: usize) -> String {
     let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-    let start = format!("{:x}-", at.as_ptr() as usize);
+    let start = format!("{at:x}-");
     let entry = smaps.split_once(&*start).expect("the mapping in smaps").1;
     let flags = entry.lines().find(|line| line.starts_with("VmFlags:"));
     flags.expect("a VmFlags line").to_owned()
@@ -289,13 +287,13 @@ fn a_pool_on_huge_pages_is_advised_so_and_holds_data_on_every_page() {
     assert_eq!(shm::verify_received(fd.as_fd()), Ok(size));
     let thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled");
     if thp.is_ok_and(|thp| !thp.contains("[never]")) {
-        let flags = vm_flags(stored.mapping.as_ptr());
+        let flags = vm_flags(stored.mapping_start());
         assert!(flags.split_whitespace().any(|flag| flag == "hg"), "{flags}");
     }
     let loaded = map_pool(fd.as_fd(), 4, 1 << 20, size as usize).unwrap();
     assert_eq!(loaded.load_generation(3), 0);
     let (_fd, small) = create_pool(4, 1 << 20, false).unwrap();
-    let flags = vm_flags(small.mapping.as_ptr());
+    let flags = vm_flags(small.mapping_start());
     assert!(
         !flags.split_whitespace().any(|flag| flag == "hg"),
         "{flags}"

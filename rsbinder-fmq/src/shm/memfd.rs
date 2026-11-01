@@ -262,7 +262,7 @@ pub fn create_mapped(
         ));
     }
     let fd = create(size, options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size, super::Access::ReadWrite)?;
+    let mapping = Mapping::map(fd.as_fd(), 0, size)?;
     add_seals(fd.as_fd(), seals)?;
     Ok((fd, mapping))
 }
@@ -297,7 +297,7 @@ pub fn create_mapped(
 ///   `MFD_ALLOW_SEALING` does ([`seals`] names the exception).
 /// * `EBUSY` — [`Seals::WRITE`] while a shared mapping made through an fd
 ///   that is open for writing exists, an
-///   [`Access::ReadOnly`](super::Access::ReadOnly) one included: the kernel
+///   [`RoMapping`](super::RoMapping) included: the kernel
 ///   counts every mapping `mprotect` could still make writable. Add the
 ///   seal before mapping, or unmap first.
 ///
@@ -457,22 +457,33 @@ pub fn verify_received(_fd: BorrowedFd<'_>) -> Result<u64> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests {
-    use super::super::{Access, Mapping};
+    use super::super::{Bytes, Mapping, RoBytes, RoMapping};
     use super::*;
     use crate::error::os;
     use crate::Error;
     use rustix::io::Errno;
     use std::os::fd::AsFd;
-    use std::sync::atomic::{AtomicU8, Ordering};
 
     fn page() -> u64 {
         rustix::param::page_size() as u64
     }
 
-    fn byte(map: &Mapping, index: usize) -> &AtomicU8 {
-        assert!(index < map.len());
-        // SAFETY: a byte inside a live mapping that outlives the borrow; tests use atomics only.
-        unsafe { map.as_ptr().add(index).cast::<AtomicU8>().as_ref() }
+    /// The whole of a writable mapping, as one area.
+    fn whole(mapping: Mapping) -> Bytes {
+        let len = mapping.len();
+        mapping.carve().bytes(0, len).unwrap()
+    }
+
+    /// The whole of a read-only mapping, as one area.
+    fn whole_ro(mapping: RoMapping) -> RoBytes {
+        let len = mapping.len();
+        mapping.carve().bytes(0, len).unwrap()
+    }
+
+    fn byte_at(bytes: &RoBytes, index: usize) -> u8 {
+        let mut byte = [0u8];
+        bytes.load(index, &mut byte);
+        byte[0]
     }
 
     /// `seals`, less `F_SEAL_EXEC`: a host with `vm.memfd_noexec` set puts it on every new memfd.
@@ -539,15 +550,15 @@ mod tests {
     #[test]
     fn future_write_keeps_the_earlier_mapping_and_refuses_a_new_writable_one() {
         let fd = create(page(), &CreateOptions::new("unit")).unwrap();
-        let owner = Mapping::map(fd.as_fd(), 0, page(), Access::ReadWrite).unwrap();
+        let owner = whole(Mapping::map(fd.as_fd(), 0, page()).unwrap());
         add_seals(fd.as_fd(), Seals::FUTURE_WRITE).unwrap();
         assert_eq!(
-            Mapping::map(fd.as_fd(), 0, page(), Access::ReadWrite).unwrap_err(),
+            Mapping::map(fd.as_fd(), 0, page()).unwrap_err(),
             os(Errno::PERM)
         );
-        let reader = Mapping::map(fd.as_fd(), 0, page(), Access::ReadOnly).unwrap();
-        byte(&owner, 0).store(0x5a, Ordering::Relaxed);
-        assert_eq!(byte(&reader, 0).load(Ordering::Relaxed), 0x5a);
+        let reader = whole_ro(RoMapping::map(fd.as_fd(), 0, page()).unwrap());
+        owner.store(0, &[0x5au8]);
+        assert_eq!(byte_at(&reader, 0), 0x5a);
     }
 
     #[test]
@@ -559,13 +570,13 @@ mod tests {
         assert_eq!(named_seals(&fd), seals);
         assert_eq!(verify_received(fd.as_fd()).unwrap(), 2 * page());
         assert_eq!(
-            Mapping::map(fd.as_fd(), 0, page(), Access::ReadWrite).unwrap_err(),
+            Mapping::map(fd.as_fd(), 0, page()).unwrap_err(),
             os(Errno::PERM)
         );
-        let reader = Mapping::map(fd.as_fd(), 0, 2 * page(), Access::ReadOnly).unwrap();
+        let reader = whole_ro(RoMapping::map(fd.as_fd(), 0, 2 * page()).unwrap());
         let last = 2 * page() as usize - 1;
-        byte(&owner, last).store(0xa5, Ordering::Relaxed);
-        assert_eq!(byte(&reader, last).load(Ordering::Relaxed), 0xa5);
+        whole(owner).store(last, &[0xa5u8]);
+        assert_eq!(byte_at(&reader, last), 0xa5);
     }
 
     #[test]
@@ -573,7 +584,7 @@ mod tests {
         let options = CreateOptions::new("unit");
         let (fd, _owner) = create_mapped(page(), &options, Seals::GROW | Seals::SHRINK).unwrap();
         assert_eq!(named_seals(&fd), Seals::GROW | Seals::SHRINK);
-        Mapping::map(fd.as_fd(), 0, page(), Access::ReadWrite).unwrap();
+        Mapping::map(fd.as_fd(), 0, page()).unwrap();
         add_seals(fd.as_fd(), Seals::SEAL).unwrap();
     }
 
@@ -598,7 +609,7 @@ mod tests {
     #[test]
     fn write_is_ebusy_while_a_read_only_mapping_through_a_writable_fd_lives() {
         let fd = create(page(), &CreateOptions::new("unit")).unwrap();
-        let reader = Mapping::map(fd.as_fd(), 0, page(), Access::ReadOnly).unwrap();
+        let reader = RoMapping::map(fd.as_fd(), 0, page()).unwrap();
         assert_eq!(
             add_seals(fd.as_fd(), Seals::WRITE).unwrap_err(),
             os(Errno::BUSY)
@@ -665,9 +676,9 @@ mod tests {
     #[test]
     fn pages_that_were_written_count_as_allocated() {
         let fd = create(2 * page(), &CreateOptions::new("unit")).unwrap();
-        let owner = Mapping::map(fd.as_fd(), 0, 2 * page(), Access::ReadWrite).unwrap();
+        let owner = whole(Mapping::map(fd.as_fd(), 0, 2 * page()).unwrap());
         for index in [0, page() as usize] {
-            byte(&owner, index).store(1, Ordering::Relaxed);
+            owner.store(index, &[1u8]);
         }
         add_seals(fd.as_fd(), PEER_SEALS).unwrap();
         assert_eq!(verify_received(fd.as_fd()).unwrap(), 2 * page());
@@ -684,9 +695,9 @@ mod tests {
         );
         // Pages 0, 1 and 3 written, page 2 left out.
         let fd = create(4 * page(), &CreateOptions::new("unit")).unwrap();
-        let owner = Mapping::map(fd.as_fd(), 0, 4 * page(), Access::ReadWrite).unwrap();
+        let owner = whole(Mapping::map(fd.as_fd(), 0, 4 * page()).unwrap());
         for index in [0, 1, 3] {
-            byte(&owner, index * page() as usize).store(1, Ordering::Relaxed);
+            owner.store(index * page() as usize, &[1u8]);
         }
         add_seals(fd.as_fd(), PEER_SEALS).unwrap();
         assert_eq!(

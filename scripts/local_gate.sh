@@ -163,19 +163,17 @@ public_api() {
         diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
 }
 
-# `shm::Run` and the unsynchronized queue's two cores under Miri, in two passes. The copies that
-# race need Miri's weak-memory emulation, and it is what tells `Release`/`Acquire` from `Relaxed`
-# (x86 runs both as the same code); the round trip makes sequential accesses at two sizes, on
-# which that emulation panics.
+# The carved pieces (`shm::piece`), the queue's `Regions` and the unsynchronized queue's two
+# cores under Miri. The copies that race need Miri's weak-memory emulation, and it is what tells
+# `Release`/`Acquire` from `Relaxed` (x86 runs both as the same code); it also refuses a byte
+# accessed at two sizes, which the pieces never do.
 miri_fmq() {
     local seed dir=CARGO_TARGET_DIR=target/miri
     local miri=(cargo +nightly-2026-05-25 miri test -p rsbinder-fmq --lib --)
     for seed in 0 1 2 3 4 5 6 7; do
         tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" "${miri[@]}" \
-            shm::run unsync::tests --skip round_trip || return 1
+            shm::piece unsync::tests queue::tests || return 1
     done
-    tpass env "$dir" MIRIFLAGS="-Zmiri-disable-weak-memory-emulation" "${miri[@]}" \
-        shm::run::tests::round_trip
 }
 
 # The topic ring over heap memory under Miri: the two tests in which a reader copies records while
@@ -219,7 +217,7 @@ tier_hermetic() {
     linux_run "tests: c_stream_header" tpass cargo test -p tests --test c_stream_header
     run "rsbinder-fmq" tpass cargo test -p rsbinder-fmq
     # CI does not run loom; a target dir of its own, since the cfg rebuilds every dependency.
-    run "rsbinder-fmq loom (EventFlag, Run order, unsync reader)" tpass env CARGO_TARGET_DIR=target/loom \
+    run "rsbinder-fmq loom (EventFlag, Bytes order, unsync reader)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
     run "rsbinder-topic" tpass cargo test -p rsbinder-topic
     run "rsbinder-topic loom (ring writer and reader, wait and wake)" tpass env CARGO_TARGET_DIR=target/loom \
@@ -229,10 +227,10 @@ tier_hermetic() {
         cargo +nightly-2026-05-25 miri --version >/dev/null 2>&1 &&
         rustup +nightly-2026-05-25 component list --installed 2>/dev/null |
         grep -q '^rust-src'; then
-        run "rsbinder-fmq Miri (shm::Run, unsync)" miri_fmq
+        run "rsbinder-fmq Miri (shm pieces, queues)" miri_fmq
         run "rsbinder-topic Miri (ring over heap memory)" miri_topic
     else
-        skip "rsbinder-fmq Miri (shm::Run, unsync)" \
+        skip "rsbinder-fmq Miri (shm pieces, queues)" \
             "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
         skip "rsbinder-topic Miri (ring over heap memory)" \
             "rustup toolchain install nightly-2026-05-25 --component miri,rust-src"
@@ -374,6 +372,9 @@ tier_kernel() {
         return
     fi
     run "rsbinder (unit + doc + default targets)" tpass cargo test -p rsbinder
+    # With a hub up, the handle-0 proxy stays pinned, so the process_state tests check the isolation.
+    run "rsbinder lib (rpc)" tpass cargo test -p rsbinder --features rpc --lib
+    run "rsbinder lib (all features)" tpass cargo test -p rsbinder --all-features --lib
     run "rsbinder parcel_alloc (ignored)" tpass cargo test -p rsbinder --test parcel_alloc -- --ignored
     local i
     for ((i = 1; i <= ITERATIONS; i++)); do

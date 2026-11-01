@@ -6,62 +6,52 @@
 
 #![cfg(target_pointer_width = "64")]
 
-use std::sync::atomic::AtomicUsize;
-
 use super::*;
+use crate::shm::Mapping;
 
 // The `cfg` above stands for "has `RoWord64`", which `Heap::reader` views the counters as.
 const _: () = assert!(RoWord64::PRESENT);
 
-/// Counters and a ring of `u64` elements on the heap; every run covers whole words.
+/// Counters and a ring of `u64` elements in one heap mapping, carved as `UnsyncWriter` lays it out.
 struct Heap {
-    end: AtomicU64,
-    write: AtomicU64,
-    ring: Box<[AtomicUsize]>,
+    end: Word<AtomicU64>,
+    write: Word<AtomicU64>,
+    ring: Bytes,
 }
 
 impl Heap {
     fn new(capacity: usize) -> Self {
+        let mut carve = Mapping::heap(16 + capacity * 8).unwrap().carve();
         Self {
-            end: AtomicU64::new(0),
-            write: AtomicU64::new(0),
-            ring: (0..capacity).map(|_| AtomicUsize::new(0)).collect(),
+            end: carve.word64(0).unwrap(),
+            write: carve.word64(8).unwrap(),
+            ring: carve.bytes(16, capacity * 8).unwrap(),
         }
     }
 
     fn shape(&self) -> Shape {
         Shape {
-            bytes: self.ring.len() as u64 * 8,
+            bytes: self.ring.len() as u64,
             quantum: 8,
         }
     }
 
-    fn ring(&self) -> NonNull<u8> {
-        NonNull::from(&*self.ring).cast()
-    }
-
     fn writer(&self) -> WriterCore {
-        // SAFETY: atomics of `self`, which outlives every core; a `u64` run covers whole words.
-        unsafe {
-            WriterCore::new(
-                NonNull::from(&self.end),
-                NonNull::from(&self.write),
-                self.ring(),
-                self.shape(),
-            )
-        }
+        WriterCore::new(
+            self.end.clone(),
+            self.write.clone(),
+            self.ring.clone(),
+            self.shape(),
+        )
     }
 
     fn reader(&self) -> ReaderCore {
-        // SAFETY: as in `writer`; the reader only loads.
-        unsafe {
-            ReaderCore::new(
-                NonNull::from(&self.end).cast(),
-                NonNull::from(&self.write).cast(),
-                self.ring(),
-                self.shape(),
-            )
-        }
+        ReaderCore::new(
+            self.end.as_ro().unwrap(),
+            self.write.as_ro().unwrap(),
+            self.ring.as_ro(),
+            self.shape(),
+        )
     }
 }
 
@@ -72,7 +62,7 @@ fn put(writer: &mut WriterCore, items: &[u64]) {
 }
 
 fn take(reader: &mut ReaderCore, out: &mut [u64]) -> UnsyncRead {
-    reader.take(ring::bytes_of_mut(out)).unwrap()
+    reader.take(shm::bytes_of_mut(out)).unwrap()
 }
 
 #[test]
@@ -114,7 +104,7 @@ fn a_reservation_makes_the_reader_discard_what_it_covers() {
     let (mut writer, mut reader) = (heap.writer(), heap.reader());
     put(&mut writer, &[0, 1, 2, 3, 4, 5, 6]);
     // Nothing is committed past element 6, but three more are reserved: elements 0 and 1 go.
-    writer.reserve(24).unwrap();
+    writer.counters.reserve(24).unwrap();
     let mut out = [0u64; 1];
     // Half the ring is kept: elements 3 to 6.
     assert_eq!(
@@ -131,7 +121,7 @@ fn a_reservation_into_the_kept_half_leaves_the_reader_at_the_writer() {
     let (mut writer, mut reader) = (heap.writer(), heap.reader());
     put(&mut writer, &[0, 1, 2, 3, 4, 5, 6]);
     // Five reserved elements leave room for three, fewer than the half a lapped reader keeps.
-    writer.reserve(40).unwrap();
+    writer.counters.reserve(40).unwrap();
     let mut out = [0u64; 1];
     assert_eq!(
         take(&mut reader, &mut out),
@@ -161,7 +151,7 @@ fn the_region_end_stays_where_a_partly_committed_write_put_it() {
     txn.write_at(0, &[100; 8]).unwrap();
     txn.commit_first(2).unwrap();
     // A shorter reservation from the new write counter does not lower the end.
-    writer.reserve(8).unwrap();
+    writer.counters.reserve(8).unwrap();
     assert_eq!(heap.end.load(Ordering::Relaxed), 24 * 8);
     assert_eq!(heap.write.load(Ordering::Relaxed), 18 * 8);
 
@@ -175,9 +165,9 @@ fn the_region_end_stays_where_a_partly_committed_write_put_it() {
     assert_eq!(rest, [2, 3, 4, 5, 6, 7, 100, 100]);
 
     // The rest of the reservation can still be committed, and a new one moves the end on.
-    writer.commit(48).unwrap();
-    assert!(matches!(writer.commit(8), Err(Error::BadValue(_))));
-    writer.reserve(8).unwrap();
+    writer.counters.commit(48).unwrap();
+    assert!(matches!(writer.counters.commit(8), Err(Error::BadValue(_))));
+    writer.counters.reserve(8).unwrap();
     assert_eq!(heap.end.load(Ordering::Relaxed), 25 * 8);
 }
 
@@ -186,20 +176,14 @@ fn latest_copies_the_newest_and_consumes_the_rest() {
     let heap = Heap::new(8);
     let (mut writer, mut reader) = (heap.writer(), heap.reader());
     let mut out = [0u64; 3];
-    assert_eq!(reader.take_latest(ring::bytes_of_mut(&mut out)).unwrap(), 0);
+    assert_eq!(reader.take_latest(shm::bytes_of_mut(&mut out)).unwrap(), 0);
     put(&mut writer, &[1, 2]);
-    assert_eq!(
-        reader.take_latest(ring::bytes_of_mut(&mut out)).unwrap(),
-        16
-    );
+    assert_eq!(reader.take_latest(shm::bytes_of_mut(&mut out)).unwrap(), 16);
     assert_eq!(out[..2], [1, 2]);
     for value in 3..30u64 {
         put(&mut writer, &[value]);
     }
-    assert_eq!(
-        reader.take_latest(ring::bytes_of_mut(&mut out)).unwrap(),
-        24
-    );
+    assert_eq!(reader.take_latest(shm::bytes_of_mut(&mut out)).unwrap(), 24);
     assert_eq!(out, [27, 28, 29]);
     assert_eq!(reader.pending().unwrap(), 0);
     assert_eq!(take(&mut reader, &mut out[..1]), UnsyncRead::Empty);
@@ -216,12 +200,12 @@ fn a_counter_that_moved_backwards_ends_the_reader() {
     heap.write.store(0, Ordering::Release);
     heap.end.store(0, Ordering::Release);
     let corrupted = Error::Corrupted("write counter moved backwards");
-    assert_eq!(reader.take(ring::bytes_of_mut(&mut out)), Err(corrupted));
+    assert_eq!(reader.take(shm::bytes_of_mut(&mut out)), Err(corrupted));
     // The writer's next write restores both words; the reader stays failed.
     put(&mut writer, &[4]);
     assert_eq!(heap.write.load(Ordering::Relaxed), 32);
     assert_eq!(reader.pending(), Err(corrupted));
-    let latest = reader.take_latest(ring::bytes_of_mut(&mut out));
+    let latest = reader.take_latest(shm::bytes_of_mut(&mut out));
     assert_eq!(latest, Err(corrupted));
 }
 
@@ -231,20 +215,17 @@ fn a_read_longer_than_the_ring_is_refused() {
     let mut reader = heap.reader();
     let mut out = [0u64; 5];
     assert!(matches!(
-        reader.take(ring::bytes_of_mut(&mut out)),
+        reader.take(shm::bytes_of_mut(&mut out)),
         Err(Error::BadValue(_))
     ));
     // The latest read takes what fits and is not an error.
-    assert_eq!(reader.take_latest(ring::bytes_of_mut(&mut out)).unwrap(), 0);
+    assert_eq!(reader.take_latest(shm::bytes_of_mut(&mut out)).unwrap(), 0);
     // Lapped, it takes one ring: the copy starts at element 6 and wraps.
     let mut writer = heap.writer();
     for value in 0..10u64 {
         put(&mut writer, &[value]);
     }
-    assert_eq!(
-        reader.take_latest(ring::bytes_of_mut(&mut out)).unwrap(),
-        32
-    );
+    assert_eq!(reader.take_latest(shm::bytes_of_mut(&mut out)).unwrap(), 32);
     assert_eq!(out[..4], [6, 7, 8, 9]);
 }
 
@@ -279,7 +260,7 @@ fn a_copy_that_caught_a_write_is_followed_by_a_view_of_its_reservation() {
                 let mut cells = [0u64; 4];
                 // A writer that panicked is finished too, and the scope reports it.
                 while !writer.is_finished() {
-                    reader.copy_out(0, ring::bytes_of_mut(&mut cells));
+                    reader.copy_out(0, shm::bytes_of_mut(&mut cells));
                     let view = reader.view().unwrap();
                     // Element `e` went into the cell of element `e - 4`: that position is lapped.
                     let newest = cells.into_iter().max().unwrap();

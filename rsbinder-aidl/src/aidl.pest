@@ -112,8 +112,7 @@ variable_decl = {
 
 parcelable_members = { (variable_decl | constant_decl | decl)+ }
 
-// AOSP `aidl_language_l.ll` tokens that `identifier` (`aidl_language_y.yy`) does not accept.
-// A longer word precedes its prefix (`inout`, `interface` before `in`): no backtracking.
+// AOSP `aidl_language_l.ll` keywords; a longer word precedes its prefix (`inout` before `in`).
 keywords = @{
     (
         "interface" | "parcelable" | "package" | "import" | "inout" | "in" | "out" | "oneway" |

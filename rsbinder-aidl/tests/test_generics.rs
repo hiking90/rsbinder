@@ -45,7 +45,7 @@ fn error_message(input: &str) -> String {
     }
 }
 
-/// As AOSP's Rust backend: unbounded parameters, since they never reach the parcel.
+/// AOSP bounds `Default` on every parameter and keeps the phantoms private; rsbinder does neither.
 #[test]
 fn generic_parcelable_emits_phantom_fields() {
     assert_generated(

@@ -54,7 +54,7 @@ rsbinder = { version = "0.13.0", path = "../rsbinder", default-features = false,
 # `setrlimit`, for a subscriber that cannot take the reply's fd. `pipe` and
 # `param`: an fd of the wrong kind for a wake, and the page a fault is held in.
 rustix = { workspace = true, features = ["process", "pipe", "param"] }
-# `userfaultfd` and `SIGPIPE`'s default, which rustix does not offer.
+# `SIGPIPE`'s default and the `userfaultfd` ioctls, which rustix does not offer.
 libc = { workspace = true }
 # A runtime for `recv_async`'s tests; `time` bounds a wait that a mutant would lose.
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }

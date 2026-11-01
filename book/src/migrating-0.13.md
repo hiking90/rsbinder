@@ -1,8 +1,13 @@
 # Migrating from 0.12 to 0.13
 
 Every change in 0.13.0 that can break a program built against 0.12.0: a
-compile error or behavior a running program can observe. Entries are grouped
-by area. None of them changes the bytes between peers.
+compile error, a different value on the wire, or behavior a running program
+can observe. Entries are grouped by area. Four of them change the bytes
+between peers and say so: two under *Binder objects and process state*
+(the stability word of a `Stability::Local` binder and of a relayed kernel
+proxy) and two under *RPC transport*. An rsbinder peer of either release
+accepts both the 0.12.0 bytes and the new ones, so none needs both ends
+upgraded together.
 
 The additions and fixes themselves are listed in
 [`CHANGELOG.md`](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md);
@@ -152,11 +157,55 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   is in neither crate's public API. Convert an errno with
   `StatusCode::from(std::io::Error::from_raw_os_error(n))`; the mapping is
   unchanged.
+- **`impl From<Stability> for i32` is removed.** Its value was the kernel
+  wire word of the host the program ran on (the raw level, or android-12's
+  `Category`, `(level << 24) | 1`, on an Android SDK 31/32 device), which
+  is not the word an RPC session writes. A parcel writes a binder's
+  stability word itself, in its wire's form, when it writes the binder
+  (`parcel.write(&binder)`). Compare levels with `Stability::includes` or
+  `==`; `Stability::try_from(i32)` still decodes either form read from a
+  parcel. Code that needs AOSP's raw `Stability::Level` matches the
+  variant: `Local` 0, `Vendor` `0b000011`, `System` `0b001100`, `Vintf`
+  `0b111111`.
 - **`ParcelableHolder::new(Stability)` is deprecated; use
   `ParcelableHolder::local()` or `vintf()`.** A holder's wire stability is
   LOCAL or VINTF only: `new(Stability::Vendor)` and `new(Stability::System)`
   now panic (they wrote LOCAL while behaving otherwise, and `Vendor` refused
   non-VINTF parcelables). Generated code uses `vintf()`.
+- **A binder built with `Stability::Local` holds this process's level,
+  `System`, and goes out with it** (CHANGELOG *Changed*); this changes the
+  bytes on the wire. `Binder::new_with_stability(_, Stability::Local)` and
+  the `stability:` argument of `declare_binder_interface!` resolve `Local`
+  when the binder is built, as AOSP Rust's constructor does
+  (`mark_local_stability`). `stability()` on it returns `System`, not
+  `Local`, and the stability word after it is `System`'s: `0x0c`, or
+  `0x0c000001` on an Android SDK 31/32 kernel and on the r34 RPC wire.
+  0.12.0 wrote level 0 (`UNDECLARED`), which libbinder refuses on a
+  non-null binder with `BAD_TYPE` on either wire, so such a binder never
+  reached a libbinder peer; an rsbinder peer of either release accepts
+  both. Over Android 10 kernel binder, whose parcel carries no stability
+  word, the bytes stay the same and only `stability()` changes. Code that
+  compares a native binder's `stability()` with
+  `Stability::Local` compares with `System` instead. `Stability::Local`
+  stays for a `ParcelableHolder` (`STABILITY_LOCAL`) and as the
+  constructor argument.
+- **A kernel proxy reports and sends back the first declared level it was
+  received with, also when the proxy existed before that word was read**
+  (CHANGELOG *Fixed*); this changes the bytes on the wire for such a
+  binder. Reading a `ParcelableHolder` from a kernel parcel looks up the
+  handles in its payload first, and so does
+  `ProcessState::strong_proxy_for_handle`; 0.12.0 fixed those proxies at
+  `System`, so a vendor or VINTF binder inside a holder reported `System`
+  and was relayed with `System`'s word, which its libbinder owner refuses
+  with `BAD_TYPE`. It now reports and is relayed with the level it arrived
+  with. A kernel proxy that received `UNDECLARED` (0) reports `System`, not
+  `Local`, and goes back with `System`'s word; on Android 10, which writes
+  no stability word, every kernel proxy reports `System`, not `Local`. A
+  later read of the same handle with another level keeps the first one
+  and logs a warning once per handle, where libbinder refuses the parcel
+  with `BAD_TYPE`. A proxy revived after its last strong reference dropped,
+  while a `WIBinder` kept the handle, keeps the level the handle was
+  received with.
 - **`TransactionObserver`'s tag is `Option<Box<dyn Any>>`**, not
   `Option<Box<dyn Any + Send>>`: `on_transact` and `on_reply` run on the
   serving thread, so the tag may be a thread-bound guard; a
@@ -236,6 +285,37 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   nested-call pin. Code that called `<Tokio as BinderAsyncPool>::spawn`
   directly inside a handler and relied on it running inline checks
   `is_handling_transaction()` itself.
+- **In a handler, `wait_for_interface_async` runs inline.** Called while
+  handling a transaction (`is_handling_transaction()`), the wait, the
+  lookups it re-polls with and the interface check run on the handler's
+  binder thread, as `try_get_interface_async` (0.12.0's
+  `get_interface_async`), `check_interface_async`, `connect_async` and the
+  generated async proxies already did, and as AOSP
+  `binder_tokio::wait_for_interface` does. The first poll returns only when
+  the service appears or the wait gives up, so `tokio::time::timeout`,
+  `select!` and dropping the future do not end it there, and the handler's
+  thread and its caller's reply stay held until then — for good, if the
+  name is never registered. 0.12.0 ran the wait on the blocking pool, where
+  a `timeout` around it fired while the runtime's timer advanced. For a
+  bounded wait inside a handler, loop over `try_get_interface_async` under
+  the `timeout`; each try is bounded and runs on the handler's thread:
+
+  ```rust
+  let svc = tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+          if let Some(svc) = rsbinder::try_get_interface_async::<dyn IFoo>(name).await? {
+              break Ok::<_, rsbinder::Status>(svc);
+          }
+          tokio::time::sleep(Duration::from_millis(100)).await;
+      }
+  })
+  .await;
+  ```
+
+  `check_interface_async` does not work in that loop: `checkService` never
+  starts a lazy service, which registers only once something calls
+  `getService` for it. The `sleep` needs a runtime whose timer advances
+  (`TokioRuntime`'s *Stalls*). Outside a handler nothing changes.
 
 ## Code generation (`rsbinder-aidl`, macros)
 
@@ -259,6 +339,12 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `.aidl`. Its `native` block takes `adapter:` and `r#async:` together or
   neither; one of them alone, or an async interface without them, is a
   `compile_error!` naming what is missing.
+- **A constant expression whose `||` or `&&` the left operand decides is a
+  diagnostic when the right operand is an unresolved name.**
+  `const boolean X = true || TYPO;` and `false && TYPO` generated code in
+  0.12.0, which never evaluated the right operand. AOSP's `aidl` evaluates
+  both operands and rejects the name, so such a file never built for
+  Android. Fix the name or add the missing `import`.
 
 ## RPC transport
 
@@ -384,6 +470,67 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   incoming connections (`RpcClientConfig::incoming_connections`,
   `ClientOptions::incoming_connections`); the `link_to_death` refusal
   message now says when `spawn_serve` fits.
+- **On an Android SDK 31/32 host the stability word after a binder on the
+  android-13+ RPC wire changed** (CHANGELOG *Fixed*). It is the bare level
+  (`0x0c` for a system binder), as on every other host; 0.12.0 wrote the
+  android-12 `Category` (`0x0c000001`), the encoding that host's kernel
+  binder uses. libbinder 13+ reads the word as an `int16_t` and refused
+  every non-null binder of such a session (the root, arguments and replies)
+  with `BAD_TYPE`; it now accepts a vendor, system or VINTF binder. An
+  rsbinder peer of either release accepts both forms. Other hosts, the r34
+  wire and kernel binder write the same bytes as 0.12.0.
+- **An RPC proxy reports and sends back the stability level it arrived
+  with**, as libbinder's `BpBinder` does (CHANGELOG *Fixed*).
+  `SIBinder::stability()` and `IBinder::stability()` on the proxy, an
+  android-16 accessor's root included, return that level: `Vintf` for a
+  `@VintfStability` service, `Vendor` from a vendor libbinder peer; the
+  first declared one (vendor, system or VINTF) if the proxy arrived more
+  than once. The proxy goes back to its peer with the same level: the bare
+  level on the android-13+ wire, the android-12 `Category` on r34. A proxy
+  that has received only `UNDECLARED` (0), as a 0.12.0 rsbinder peer sends
+  a `Stability::Local` binder, or levels naming no `Stability` reports and
+  goes back as `System`. 0.12.0
+  returned and wrote `System` for every RPC proxy, so code that filters
+  proxies with `stability().includes(Stability::System)` now gets `false`
+  for a `Vendor` one. libbinder refuses its own binder coming home with a
+  level other than its own (`Stability::setRepr`), so handing a vendor or
+  VINTF binder of a libbinder peer back to it, a callback or a token passed
+  on in a later call, failed with `BAD_TYPE`. An rsbinder peer of either
+  release does not check a non-null binder's level, so it accepts both.
+  Kernel proxies follow the same rule now, except that a level naming no
+  `Stability` is `BadValue` there (*Binder objects and process state*).
+- **A session admits a further connection only from its founding
+  connection's peer.** The rule is one check for every connection added to
+  a session: an r34 join, an android-13+ attach (an incoming or a callback
+  connection) and a client's own fan-out (`outgoing_connections`,
+  `add_outgoing_connection()`, `add_incoming_connection()`). The peer must
+  be the founding connection's: the same uid over a Unix socket, the same
+  certificate fingerprint over mTLS, the same cid over vsock (a cid names a
+  VM, not a process). An anonymous peer (plaintext TCP, or on the
+  android-13+ wire a TLS server that asks no client certificate) joins an
+  anonymous founder on the id alone, since there is nothing to compare: a
+  peer that learns such a session's id can still join it. 0.12.0 compared the uid on an r34 join
+  only: an android-13+ attach from another uid, and every vsock, TLS or TCP
+  join or attach of the founder's transport kind, was admitted on the
+  session id alone (CHANGELOG *Security*). A refused connection is closed
+  and counted in `RpcServer::rejected_unknown_id_count` on the server, and
+  is `BadType` on a client whose server answers from another peer. AOSP
+  13+ checks only the 32-byte id; a libbinder or rsbinder client opens
+  every connection of one session from one process with one TLS config, so
+  it is not affected. A client whose fan-out reaches servers with different
+  certificates (several backends behind one address) is refused the second
+  connection; give each backend its own session.
+- **An `RpcServer` set up with TLS (`setup_unix_server_tls`,
+  `setup_tcp_server_tls`, `setup_vsock_server_tls`) refuses every r34
+  join.** A connection whose r34 preamble names a session id is closed and
+  counted in `rejected_unknown_id_count`; the founding connection serves as
+  before. Android 12 libbinder has no TLS and an rsbinder r34 client opens
+  one connection, so no client of either sends such a join.
+- An RPC session on the android-13+ wire takes a null binder's stability
+  from the low 16 bits of the word, as libbinder 13+ does, and accepts a
+  word such as `0x00010000`; 0.12.0 compared all 32 bits with `UNDECLARED`
+  and refused it with `BAD_TYPE` (CHANGELOG *Fixed*). A null binder whose
+  low 16 bits are not zero is still `BAD_TYPE`.
 
 ## Streams and topics
 
@@ -451,9 +598,11 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `*_with(.., Notify::new(wait, wake), t)` with `wait` a `NonZeroU32`.
   libfmq's `readBlocking` lists the wake mask before the wait mask, the
   reverse of the 0.12.0 positions; named fields cannot be swapped by
-  position. `Some(Duration::ZERO)` tries once and returns `TimedOut`
-  without touching the EventFlag word; 0.12.0 waited on a deadline already
-  past, which cleared the wait bits it found set.
+  position. `Some(Duration::ZERO)` tries once, never waits on the
+  EventFlag word, and returns `TimedOut` when the transfer does not fit; a
+  transfer that succeeds sets the wake bits, as with any timeout. 0.12.0
+  waited on a deadline already past, which cleared the wait bits it found
+  set.
 - **`shm::futex_wait`, `shm::futex_wake`, `shm::RoWord32::wait` and `wake`
   take the bit mask as `NonZeroU32`**; the `BadValue("empty bit mask")`
   for `0` is gone. `EventFlag::wait(0)` is still `BadValue` and
@@ -475,6 +624,13 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   rustix major release is no longer a semver break of this crate.
   `Errno::raw()` gives the number and `Errno::from_raw` builds one;
   `std::io::Error::from` takes both `Errno` and `Error`.
+- **`rsbinder_fmq::Error` has no `source()`.** 0.12.0's `Error::Os`
+  returned its errno as the source while its `Display` was already the
+  errno's message, so a reporter that walks the source chain (`anyhow`'s
+  `{:#}`, `eyre`, `tracing`) printed it twice (CHANGELOG *Changed*). Code that took
+  the errno through `err.source()` and a downcast now gets `None` without a
+  build error; match `Error::Os(errno)` instead, or convert with
+  `std::io::Error::from(err)` and read `raw_os_error()`.
 - **`rsbinder_fmq::Regions::write_at` is no longer public**; write through
   `WriteTxn::write_at` / `UnsyncWriteTxn::write_at`. No transaction hands
   out a `&mut Regions`, so it could not be called.
@@ -659,3 +815,24 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
 - `example-hello`'s `rpc_accessor_register_interop_server` takes an
   optional fourth argument, the name to register the accessor under; it
   registers under the instance name without one, as before.
+- **`notify::Notifier::from_environment` leaves `$NOTIFY_SOCKET` set**
+  instead of removing it from the process environment, so
+  `std::env::var_os("NOTIFY_SOCKET")` after the call still returns the
+  socket (CHANGELOG *Fixed*). `config::SystemRunner` builds every command
+  it spawns without the variable, whether or not the program called
+  `from_environment`. 0.12.0's `SystemRunner` passed the process
+  environment on, so in a program that did not call `from_environment` an
+  `exec` start received the variable. A program that calls
+  `from_environment` and spawns children itself — its own
+  `config::ActivationRunner`, for one — calls
+  `Command::env_remove("NOTIFY_SOCKET")` on each; a child that inherits the
+  variable can report the program's unit ready or stopping.
+- **A filtered `dump` of `rsb_hub` counts every withheld name**
+  (CHANGELOG *Security*). `rsb_service dump manager <substring>` prints
+  `hidden by policy: N name(s)` when N is above 0, with N the number of
+  names, registered or awaited, that the policy keeps from the caller's
+  `find`, whatever the substring. 0.12.0 counted only the withheld names
+  the substring matched, and printed no such line when none did. A script
+  that read the filtered count as the number of hidden names under that
+  substring now reads the total; an unfiltered `dump` prints the same count
+  as 0.12.0.

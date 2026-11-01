@@ -169,7 +169,14 @@ jobs:
           # test stays reliably non-vacuous (no sibling keeps the handle-0
           # Weak upgradeable). If this step flakes, the bug is a missing
           # `#[serial(binder)]`, not a reason to re-add `--test-threads=1`.
+          #
+          # The `rpc` / all-features lib runs add the in-handler async lookup
+          # tests (default features do not compile them). With rsb_hub up they
+          # pin the handle-0 proxy, so each runs in its own child process and
+          # the handle-0 process_state tests here check that isolation.
           { RUST_BACKTRACE=1 cargo test --package rsbinder &&
+            RUST_BACKTRACE=1 cargo test --package rsbinder --features rpc --lib &&
+            RUST_BACKTRACE=1 cargo test --package rsbinder --all-features --lib &&
             RUST_BACKTRACE=1 cargo test --package rsbinder --test parcel_alloc -- --ignored; } || {
             echo "::error::rsbinder unit tests failed — capturing dmesg"
             sudo dmesg | tail -200

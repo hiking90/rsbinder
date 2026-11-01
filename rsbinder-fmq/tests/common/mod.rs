@@ -27,6 +27,15 @@ use std::time::{Duration, Instant};
 
 use rsbinder_fmq::{Descriptor, Flavor, Grantor};
 
+/// The whole of `map` as 8-byte words: the counters a peer that breaks the protocol rewrites.
+#[cfg(target_has_atomic = "64")]
+pub fn counters(
+    map: rsbinder_fmq::shm::Mapping,
+) -> rsbinder_fmq::shm::Words<std::sync::atomic::AtomicU64> {
+    let words = map.len() / 8;
+    map.carve().words64(0, words).expect("8-aligned words")
+}
+
 pub fn send_descriptor(sock: &UnixStream, desc: &Descriptor) {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&desc.quantum.to_le_bytes());

@@ -676,11 +676,19 @@ fn a_subscriber_that_waits_anew_at_every_commit_and_never_reads_holds_no_publish
     const COMMITS: u64 = 100_000;
     let publisher = topic(64 << 10);
     let subscriber = fd_subscriber(&publisher);
-    let words = subscriber.local().words();
-    for n in 0..COMMITS {
-        words.begin_wait(words.seq());
-        publisher.publish(&num(n as u32)).unwrap();
-    }
+    // One open file with the publisher's end: made blocking, only the send's own flags stop a wait.
+    let sender = subscriber.local().words().fd.as_ref().unwrap().sender();
+    rustix::io::ioctl_fionbio(sender, false).unwrap();
+    let publishing = thread::spawn(move || {
+        let words = subscriber.local().words();
+        for n in 0..COMMITS {
+            words.begin_wait(words.seq());
+            publisher.publish(&num(n as u32)).unwrap();
+        }
+        (publisher, subscriber)
+    });
+    eventually("the publishes return", || publishing.is_finished());
+    let (publisher, subscriber) = publishing.join().unwrap();
     assert_eq!(publisher.sends(), COMMITS);
     let socket = subscriber.wait_fd().unwrap();
     let queued = rustix::io::ioctl_fionread(socket).unwrap();
@@ -738,8 +746,6 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
     target_arch = "arm"
 ))]
 fn a_receive_held_in_a_page_fault_holds_no_publish() {
-    use std::os::fd::{FromRawFd, OwnedFd};
-
     // `_IOWR(0xAA, nr, size)` of `linux/userfaultfd.h`, in the encoding of these architectures.
     const UFFDIO_API: u32 = 0xC018_AA3F;
     const UFFDIO_REGISTER: u32 = 0xC020_AA00;
@@ -757,18 +763,17 @@ fn a_receive_held_in_a_page_fault_holds_no_publish() {
         ioctls: u64,
     }
 
-    // SAFETY: a system call that takes flags alone.
-    let uffd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC) };
-    if uffd < 0 {
-        let why = std::io::Error::last_os_error();
-        println!(
-            "skipped: holding a fault in kernel mode needs root or \
-             vm.unprivileged_userfaultfd=1 ({why})"
-        );
-        return;
-    }
-    // SAFETY: the system call returned this fd and nothing else owns it.
-    let uffd = unsafe { OwnedFd::from_raw_fd(uffd as i32) };
+    // SAFETY: the fd is registered only on the private page this test maps and unmaps below.
+    let uffd = match unsafe { rustix::mm::userfaultfd(rustix::mm::UserfaultfdFlags::CLOEXEC) } {
+        Ok(fd) => fd,
+        Err(why) => {
+            println!(
+                "skipped: holding a fault in kernel mode needs root or \
+                 vm.unprivileged_userfaultfd=1 ({why})"
+            );
+            return;
+        }
+    };
     let mut api = Api {
         api: 0xAA,
         features: 0,
@@ -1057,8 +1062,7 @@ mod reactor {
         }
     }
 
-    /// A reactor that refuses the fd (registered by the caller already) is a runtime error, each
-    /// time, apart from an interrupt; once it takes the fd, the wait goes on.
+    /// The caller registered the fd already; each refusal errs until the reactor takes the fd.
     #[test]
     fn a_reactor_that_refuses_the_fd_is_a_runtime_error_and_not_a_cancel() {
         use tokio::io::{unix::AsyncFd, Interest};
@@ -1071,8 +1075,11 @@ mod reactor {
             // SAFETY: the subscriber, which owns the fd, outlives this registration.
             let theirs = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) };
             let theirs = theirs.unwrap();
-            assert_eq!(subscriber.recv_async().await.map(drop), refused);
-            assert_eq!(subscriber.recv_async().await.map(drop), refused);
+            for _ in 0..2 {
+                let refused_now = tokio::time::timeout(WAIT, subscriber.recv_async()).await;
+                let refused_now = refused_now.expect("a refusal that did not return");
+                assert_eq!(refused_now.map(drop), refused);
+            }
             theirs
         });
         drop(theirs);

@@ -211,8 +211,8 @@ mod imp {
 /// The futex is not private (`FUTEX_PRIVATE_FLAG` is not set): `word` is
 /// normally in a shared mapping, and a waiter in one process is woken from
 /// another. A read-only mapping is enough to wait on; the caller's own loads
-/// of `word` are then `Relaxed` ones, the only atomic access
-/// [`Access::ReadOnly`](super::Access::ReadOnly) allows.
+/// of `word` are then `Relaxed` ones, the only atomic access a
+/// [`RoMapping`](super::RoMapping) allows.
 ///
 /// `Ok` means "look again", not "the word changed": it is returned for a
 /// wake, for a word that no longer held `expected` when the kernel checked

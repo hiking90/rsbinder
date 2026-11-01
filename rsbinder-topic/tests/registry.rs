@@ -180,8 +180,7 @@ fn a_closed_or_dropped_publishers_name_is_gone_from_the_next_call() {
     assert!(listed(&resolver, &name).is_none());
 }
 
-/// The registry keeps one entry for a name and binder given twice: giving it again on the same
-/// host keeps it, and a name given anew moves without a gap.
+/// The same host is not asked again for the name it holds, and a new name moves without a gap.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_name_given_again_on_the_same_host_stays_and_a_new_name_takes_its_place() {
@@ -315,7 +314,6 @@ fn a_failed_advertise_withdraws_its_name() {
 }
 
 /// AC-15.5.6, plan 15 D8: connections outlive the host; a new one knows only new publishers.
-/// A name subscriber of the dead host is closed once its connection ends.
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_new_host_knows_only_the_publishers_made_again() {

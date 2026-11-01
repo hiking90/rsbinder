@@ -27,16 +27,16 @@
 //!
 //! A holder's stability is written as AOSP's `Parcelable::Stability` enum
 //! (`STABILITY_LOCAL = 0`, `STABILITY_VINTF = 1`). This is a *different* wire value from the
-//! binder-object `internal::Stability::Level` bitmask (0/3/12/63 via
-//! `From<Stability> for i32`) used on the `writeStrongBinder` path, and it is
+//! binder-object `internal::Stability::Level` bitmask (0/3/12/63, android-12's `Category`
+//! on an SDK 31/32 kernel parcel) used on the `writeStrongBinder` path, and it is
 //! version-independent: `frameworks/native/libs/binder/ParcelableHolder.cpp` writes
 //! `writeInt32(static_cast<int32_t>(getStability()))` unchanged on every Android version
-//! (byte-identical between android-12 and android-16), with no `Category` repr or Android-12
-//! `0x0c000000` adjustment. The AIDL `@VintfStability` annotation maps a holder field to
+//! (byte-identical between android-12 and android-16), with no android-12 `Category` repr
+//! (`(level << 24) | 1`). The AIDL `@VintfStability` annotation maps a holder field to
 //! `STABILITY_VINTF` (`system/tools/aidl` `generate_cpp.cpp`); everything else is
-//! `STABILITY_LOCAL`. The binder-object encoding would put 63 (`0x0c00003f` on Android 12) on
-//! the wire where a real libbinder peer expects 1, and the peer rejects any `@VintfStability`
-//! holder field with `BAD_VALUE`.
+//! `STABILITY_LOCAL`. The binder-object encoding would put 63 (`0x3f000001`, the `Category`
+//! of level 63, on Android 12) on the wire where a real libbinder peer expects 1, and the peer
+//! rejects any `@VintfStability` holder field with `BAD_VALUE`.
 //!
 //! # Data-only payloads
 //!
@@ -112,7 +112,7 @@ enum ParcelableHolderData {
 /// A holder writes AOSP's `Parcelable::Stability` enum (`STABILITY_LOCAL = 0`,
 /// `STABILITY_VINTF = 1`), not the binder-object `Stability` level bitmask
 /// (0/3/12/63). A `@VintfStability` holder therefore puts `1` on the wire, and
-/// a libbinder peer rejects any other value (63, or `0x0c00003f` on Android 12)
+/// a libbinder peer rejects any other value (63, or `0x3f000001` on Android 12)
 /// with `BAD_VALUE`. The values are checked against android-12 and android-16
 /// `frameworks/native/libs/binder/ParcelableHolder.cpp` and `Parcelable.h`, and
 /// `system/tools/aidl` `generate_cpp.cpp` (vintf holder field init). An

@@ -317,42 +317,22 @@ fn make_queue(capacity: i32) -> Result<(MessageQueue<i32>, Desc)> {
 
 /// The queue's two counters, through a mapping of our own, as a hostile peer would reach them.
 struct Counters {
-    base: *mut u8,
-    len: usize,
+    words: rsbinder::fmq::shm::Words<AtomicU64>,
 }
 
 impl Counters {
     fn map(desc: &Descriptor) -> Result<Self> {
-        let len = rsbinder::fmq::shm::region_size(desc.fds[0].as_fd())? as usize;
-        // SAFETY: a fresh shared mapping of the whole fd; unmapped in Drop.
-        let base = unsafe {
-            rustix::mm::mmap(
-                std::ptr::null_mut(),
-                len,
-                rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-                rustix::mm::MapFlags::SHARED,
-                &desc.fds[0],
-                0,
-            )
-        }
-        .map_err(|_| StatusCode::NoMemory)?
-        .cast::<u8>();
-        Ok(Self { base, len })
+        let fd = desc.fds[0].as_fd();
+        // Offsets 0 and 8 of the layout `create` made: the read and the write counter.
+        let words = rsbinder::fmq::shm::Mapping::map(fd, 0, 16)
+            .and_then(|mapping| mapping.carve().words64(0, 2))
+            .map_err(|_| StatusCode::NoMemory)?;
+        Ok(Self { words })
     }
 
     fn set(&self, read: u64, write: u64) {
-        // SAFETY: offsets 0 and 8 of the layout `create` made, inside the mapping.
-        unsafe {
-            (*self.base.cast::<AtomicU64>()).store(read, Ordering::SeqCst);
-            (*self.base.add(8).cast::<AtomicU64>()).store(write, Ordering::SeqCst);
-        }
-    }
-}
-
-impl Drop for Counters {
-    fn drop(&mut self) {
-        // SAFETY: exactly what `mmap` returned.
-        let _ = unsafe { rustix::mm::munmap(self.base.cast(), self.len) };
+        self.words.get(0).store(read, Ordering::SeqCst);
+        self.words.get(1).store(write, Ordering::SeqCst);
     }
 }
 

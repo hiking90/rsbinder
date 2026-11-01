@@ -24,7 +24,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 
 /// The environment variable systemd sets for a `Type=notify` service.
-const NOTIFY_SOCKET: &str = "NOTIFY_SOCKET";
+pub(crate) const NOTIFY_SOCKET: &str = "NOTIFY_SOCKET";
 
 /// Sends readiness and status to whatever supervises this process — or
 /// nothing at all, when nothing does.
@@ -36,21 +36,19 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    /// Take `$NOTIFY_SOCKET` from the environment, **removing it**.
+    /// Read `$NOTIFY_SOCKET` from the environment, leaving the variable in
+    /// place.
     ///
-    /// Removing is what `sd_notify(3)`'s `unset_environment` flag does, and
-    /// it matters more here than in a typical daemon: `rsb_hub` starts
-    /// declared services itself, and a child that inherited the variable
-    /// could report *this* unit ready, or stopping, on its own schedule.
-    ///
-    /// Call before any other thread exists: it calls `std::env::remove_var`,
-    /// which races libc `getenv` in other threads.
+    /// `rsb_hub` starts declared services itself, and a child that inherited
+    /// the variable could report *this* unit ready, or stopping, on its own
+    /// schedule. `sd_notify(3)`'s `unset_environment` flag prevents that by
+    /// removing the variable from the process environment, which races libc
+    /// `getenv` in any other thread. Here the process environment is not
+    /// modified; instead every command
+    /// [`SystemRunner`](crate::config::SystemRunner) spawns is built without
+    /// the variable. A child spawned by other code still inherits it.
     pub fn from_environment() -> Notifier {
-        let socket = std::env::var_os(NOTIFY_SOCKET);
-        if socket.is_some() {
-            std::env::remove_var(NOTIFY_SOCKET);
-        }
-        Notifier::with_socket(socket)
+        Notifier::with_socket(std::env::var_os(NOTIFY_SOCKET))
     }
 
     /// A notifier aimed at an explicit socket, or at nothing when `None`.

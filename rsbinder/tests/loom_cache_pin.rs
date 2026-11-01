@@ -214,7 +214,7 @@ impl SharedProcess for Arc<Process> {
         }
     }
 
-    /// `strong_proxy_for_handle_stability`.
+    /// `proxy_for_handle`.
     fn lookup(&self, handle: u32) -> StrongRef {
         {
             let cache = self.cache.read().unwrap();

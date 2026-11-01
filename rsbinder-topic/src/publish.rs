@@ -11,13 +11,13 @@ use std::sync::atomic::{fence, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use rsbinder::fmq::shm::Mapping;
 use rsbinder::{CallingContext, Status, StatusCode};
 
 use crate::backpressure::{wait_for, wait_until, Room};
-use crate::layout::{self, LentSlot, Stored, StoredPool, MIN_RING};
+use crate::layout::{self, Stored, StoredPool, MIN_RING};
 use crate::link::{Eviction, Link, Links};
 use crate::payload::{relabel, Piece};
+use crate::pool::LentSlot;
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
 use crate::{end, Backpressure, Encoding, Payload, PublisherStats};
@@ -404,6 +404,10 @@ impl<S: Stores> State<S> {
             ..
         } = self;
         let lending = lending.as_mut().expect("a lend asks a topic with a pool");
+        // Before the window: no wait or eviction changes the loans held, which only this lock does.
+        if lending.slots.at_loan_limit() {
+            return Err(LendError::TooMany);
+        }
         // Under this lock nothing is written, so the floor holds for the whole wait.
         let floor = window.map_or(0, |window| writer.window_floor(window));
         let mut lend = |links: &Links| {
@@ -461,7 +465,7 @@ pub(crate) struct TypedWriter<T, S> {
     _payload: PhantomData<fn(&T)>,
 }
 
-impl<T: Payload> TypedWriter<T, Stored<Mapping>> {
+impl<T: Payload> TypedWriter<T, Stored> {
     /// Make topic memory for `policy`, and its pool if it has one: the fds to hand to
     /// subscribers, and the writer. `BadValue` for a pool past 4 GiB.
     pub(crate) fn create(

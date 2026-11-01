@@ -104,10 +104,15 @@
 
 #[cfg(loom)]
 use loom::sync::atomic::fence;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::ops::Range;
 #[cfg(not(loom))]
 use std::sync::atomic::fence;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+
+use rsbinder::fmq::shm::Lendable;
 
 use crate::layout::{ControlPage, LoadedPool};
 
@@ -347,6 +352,11 @@ impl Slots {
         self.lent -= 1;
     }
 
+    /// Whether `max_loans` loans are held, so a lend is refused whatever the slots.
+    pub(crate) fn at_loan_limit(&self) -> bool {
+        self.lent >= self.max_loans
+    }
+
     /// The loans held and not published.
     #[cfg(test)]
     pub(crate) fn lent(&self) -> usize {
@@ -421,6 +431,58 @@ pub(crate) fn take_ended<T: Clone>(subscribers: &mut Vec<T>, ended: impl Fn(&T) 
     gone
 }
 
+/// The bytes of a slot the publisher lent: `Slots` lends it to this value alone until the slot
+/// is published or given back, which takes the value.
+///
+/// `Send`, not `Sync` (plan 17 T-8): the value may move to another thread, and `bytes_mut` hands
+/// out the slot's bytes only through `&mut self`.
+///
+/// # Safety
+///
+/// `bytes` and `bytes_mut` rely on three things. The slot is lent to this value alone, so no
+/// other reference to its bytes exists in this process, on this thread or another, and the
+/// publisher makes no other access to them: the pool's other accesses are to its generations,
+/// and slots start on multiples of 64, so no store to another slot shares a word with this one.
+/// `range` lies inside the slots `area` holds, which keeps the mapping alive wherever the value
+/// moves. What is done with the value on another thread (`TypedWriter::publish_loan`,
+/// `TypedWriter::give_back`) takes the writer's mutex, as a call from the thread that lent it
+/// does, so publishing or giving the slot back is ordered after every write through the value.
+/// `_not_sync` keeps the value `!Sync` (plan 17 T-8) and nothing else: the `Cell` is never made,
+/// so `AssertUnwindSafe` leaves the value `UnwindSafe` and `RefUnwindSafe`, which the public
+/// `LoanMut` holding it is.
+pub(crate) struct LentSlot {
+    area: Lendable,
+    slot: u32,
+    range: Range<usize>,
+    _not_sync: PhantomData<std::panic::AssertUnwindSafe<Cell<()>>>,
+}
+
+impl LentSlot {
+    /// The bytes `range` of `area`, which hold slot `slot`; `Slots::lend` lent it to this value.
+    pub(crate) fn new(area: Lendable, slot: u32, range: Range<usize>) -> Self {
+        Self {
+            area,
+            slot,
+            range,
+            _not_sync: PhantomData,
+        }
+    }
+
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the type's contract: a slot lent to this value alone, in memory `area` keeps.
+        unsafe { self.area.slice(self.range.clone()) }
+    }
+
+    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `bytes`, and `&mut self` makes this the only reference.
+        unsafe { self.area.slice_mut(self.range.clone()) }
+    }
+}
+
 /// A subscriber's way to the values of a pool: the pool mapped read-only, and its pin word.
 pub(crate) struct PoolReader {
     pool: LoadedPool,
@@ -468,9 +530,8 @@ impl PoolReader {
     ///
     /// # Safety
     ///
-    /// The publisher keeps the pin protocol, and this process reads this pool through no run
-    /// ([`LoadedPool::slot_slice`]'s contract): the subscriber is
-    /// [`Trusted`](crate::Trusted).
+    /// The publisher keeps the pin protocol ([`slot_slice`](Self::slot_slice)'s contract): the
+    /// subscriber is [`Trusted`](crate::Trusted).
     pub(crate) unsafe fn copy_vouched(
         &self,
         loan: Loan,
@@ -479,9 +540,22 @@ impl PoolReader {
         self.pin(loan)?;
         into.clear();
         // SAFETY: the pin this call holds, and the caller's word for the publisher.
-        into.extend_from_slice(unsafe { self.pool.slot_slice(loan.slot, loan.len as usize) });
+        into.extend_from_slice(unsafe { self.slot_slice(loan.slot, loan.len as usize) });
         self.unpin();
         Ok(())
+    }
+
+    /// The first `len` bytes of `slot`, in place.
+    ///
+    /// # Safety
+    ///
+    /// While the slice lives, no process writes those bytes: the publisher keeps the pin
+    /// protocol (plan 15 §6.2) and the caller holds the pin. This process cannot write them, as
+    /// it maps the pool read-only; its atomic loads of the same bytes are reads too.
+    pub(crate) unsafe fn slot_slice(&self, slot: u32, len: usize) -> &[u8] {
+        let range = self.pool.slot_range(slot, len);
+        // SAFETY: the caller's contract, which is `RoLendable::slice`'s.
+        unsafe { self.pool.area().slice(range) }
     }
 }
 

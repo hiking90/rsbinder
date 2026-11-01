@@ -652,8 +652,7 @@ parcelable Node {
     );
 }
 
-/// A boxed field already cuts the cycle, so the other fields on it stay inline: AOSP
-/// `CheckNoRecursiveDefinition` (`parser.cpp:144-195`) skips `@nullable(heap=true)` edges.
+/// AOSP `CheckNoRecursiveDefinition` (`parser.cpp:144-195`) skips `@nullable(heap=true)` edges.
 #[test]
 fn fields_on_a_boxed_cycle_stay_inline() -> Result<(), Box<dyn Error>> {
     for (input, inline) in [
@@ -702,8 +701,7 @@ fn generate(input: &str) -> Result<String, Box<dyn Error>> {
     Ok(out)
 }
 
-/// A `heap=true` field is `Option<Box<T>>` on a cycle or off one, as AOSP's Rust backend renders
-/// it (`aidl_to_rust.cpp:305-306`); a method argument keeps its type.
+/// AOSP `aidl_to_rust.cpp:305-306`: a `heap=true` field boxes, a method argument does not.
 #[test]
 fn heap_nullable_boxes_a_field_wherever_it_is() -> Result<(), Box<dyn Error>> {
     let out = generate("parcelable B { int x; } parcelable A { @nullable(heap=true) B b; }")?;
@@ -722,7 +720,7 @@ fn heap_nullable_boxes_a_field_wherever_it_is() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// A `heap=true` field is no inline edge, so a bare `@nullable` field it cuts off stays `Option<T>`.
+/// A `heap=true` field is no inline edge; the bare `@nullable` field behind it stays `Option<T>`.
 #[test]
 fn a_heap_field_cuts_the_cycle_for_the_bare_field_behind_it() -> Result<(), Box<dyn Error>> {
     let out =

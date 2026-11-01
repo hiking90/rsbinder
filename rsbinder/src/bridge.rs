@@ -227,11 +227,10 @@ impl<I: FromIBinder + std::fmt::Debug + ?Sized, H: std::fmt::Debug> std::fmt::De
 ///   Nothing prunes a dead `Weak` from a proxy's recipient list, and
 ///   `link_to_death` queues `BC_REQUEST_DEATH_NOTIFICATION` only while that
 ///   list is empty, so one skipped unlink costs an unrelated later caller its
-///   death notification on that proxy. The panic is reachable without a bug
-///   here: `ProxyHandle::link_to_death` holds its `recipients` write guard
-///   across `talk_with_driver`, which panics if the driver under-consumes,
-///   and that poisons the guard so every later unlink on that proxy panics
-///   too. The first panic is re-raised once the list is finished, so a
+///   death notification on that proxy. An unlink panics on a poisoned
+///   `recipients` lock, which any earlier panic under that lock leaves
+///   behind, so once one unlink on a proxy panics every later one on it
+///   panics too. The first panic is re-raised once the list is finished, so a
 ///   non-`Drop` caller still fails; `Drop` swallows it, since unwinding out of
 ///   a drop during another unwind aborts.
 /// - There is no `Default`: the only argument-free factory is `|p| p`, which
@@ -550,6 +549,7 @@ mod tests {
 
     /// One entry panicking must not cost the rest their unlink; `resume = true` re-raises it.
     #[test]
+    #[serial_test::serial(panic_hook)]
     fn unlink_all_finishes_the_list_after_a_panic() {
         let unlinked = Arc::new(AtomicUsize::new(0));
         let (_k0, e0) = entry(false, &unlinked);
@@ -612,6 +612,7 @@ mod tests {
 
     /// `Drop` swallows the panic: unwinding out of a drop during another unwind aborts.
     #[test]
+    #[serial_test::serial(panic_hook)]
     fn unlink_all_swallows_the_panic_for_drop() {
         let unlinked = Arc::new(AtomicUsize::new(0));
         let (_k0, e0) = entry(true, &unlinked); // panics first

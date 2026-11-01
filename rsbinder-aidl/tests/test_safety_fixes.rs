@@ -284,6 +284,8 @@ fn test_unresolvable_const_reference_is_diagnostic() {
     for input in [
         "package test.u;\ninterface IFoo { const int A = TYPO_NAME; }",
         "package test.u;\ninterface IFoo { const int A = TYPO_NAME + 1; }",
+        "package test.u;\ninterface IFoo { const boolean A = true || TYPO_NAME; }",
+        "package test.u;\ninterface IFoo { const boolean A = false && TYPO_NAME; }",
     ] {
         assert!(
             test_aidl_generation(input).is_err(),

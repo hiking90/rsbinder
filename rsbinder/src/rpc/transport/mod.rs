@@ -3,15 +3,18 @@
 
 //! Transport abstraction for the RPC stack.
 //!
-//! A [`RpcTransport`] carries **length-framed byte messages** for one
-//! RPC connection and reports the [`PeerIdentity`] of the other end.
+//! A [`RpcTransport`] carries one RPC connection's bytes
+//! ([`send_raw`](RpcTransport::send_raw) / [`recv_raw`](RpcTransport::recv_raw);
+//! AOSP frames each message by its own header) and reports the
+//! [`PeerIdentity`] of the other end.
 //! The implementation *defines the trust boundary*: a `unix` socket
 //! trusts filesystem permissions + `SO_PEERCRED`; `vsock` trusts
 //! hypervisor VM isolation; `tls` trusts a certificate; the gated
 //! `tcp_debug` backend trusts **nothing** and is debug/interop only.
 //!
-//! Framing is the transport's responsibility (not the wire codec's), so
-//! the wire layer can think purely in whole messages. Stream backends
+//! The separate frame API ([`send_frame`](RpcTransport::send_frame) /
+//! [`recv_frame`](RpcTransport::recv_frame)), which no session calls,
+//! frames on the transport side. Stream backends
 //! (`unix`, `tcp_debug`) share the length-prefix helpers in this
 //! module; the in-process `mem` backend frames implicitly (one channel
 //! message == one frame).
@@ -226,8 +229,8 @@ pub trait RpcTransport: Send + Sync {
     /// (e.g. socket path, `"mem"`, vsock cid). Never carries secrets.
     fn describe(&self) -> &str;
 
-    /// Set a read deadline for subsequent [`RpcTransport::recv_frame`]
-    /// calls. `None` clears it (fully blocking). The
+    /// Set a read deadline for subsequent receives ([`recv_raw`](Self::recv_raw)
+    /// and the forms built on it). `None` clears it (fully blocking). The
     /// default is a no-op for backends with no read-timeout notion;
     /// `unix` / `mem` / `tcp_debug` / `vsock` / `tls` override it. A deadline that
     /// elapses with **nothing consumed** surfaces as
@@ -639,9 +642,13 @@ pub enum PeerIdentity {
         /// Peer process PID (`-1` if unavailable on this platform).
         pid: i32,
     },
-    /// A vsock peer, identified by its context id. **Not an ACL
-    /// basis** — `cid` is a routing address, and the trust boundary is
-    /// hypervisor VM isolation. Logged with the cid.
+    /// A vsock peer, identified by its context id. The hypervisor assigns
+    /// the cid, so it tells one VM from another, and an ACL by VM can rest
+    /// on it (AOSP `ARpcServer_newVsock` filters by cid). It does not tell
+    /// processes apart: every process in one VM has that VM's cid, every
+    /// host process reaches a guest as cid 2 (`VMADDR_CID_HOST`), and every
+    /// local process is cid 1 over vsock loopback. A session admits a later
+    /// connection only from its founding connection's cid.
     Vsock {
         /// vsock context id of the peer VM/host.
         cid: u32,
@@ -666,7 +673,7 @@ pub enum PeerIdentity {
 /// different sides compare unequal.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CertId {
-    subject: String,
+    subject: std::sync::Arc<str>,
     fingerprint: [u8; 32],
 }
 
@@ -674,7 +681,7 @@ impl CertId {
     /// Construct from a subject string and the leaf cert SHA-256.
     pub fn new(subject: impl Into<String>, fingerprint: [u8; 32]) -> Self {
         CertId {
-            subject: subject.into(),
+            subject: std::sync::Arc::from(subject.into()),
             fingerprint,
         }
     }
@@ -744,7 +751,7 @@ impl fmt::Display for PeerIdentity {
         match self {
             PeerIdentity::Local { uid, pid } => write!(f, "local(uid={uid}, pid={pid})"),
             PeerIdentity::Vsock { cid } => {
-                write!(f, "vsock(cid={cid}; routing only, NOT an ACL basis)")
+                write!(f, "vsock(cid={cid}; a VM, not a process)")
             }
             PeerIdentity::Certificate(c) => {
                 write!(
@@ -1350,7 +1357,7 @@ mod tests {
             let cap = Duration::from_secs(MAX_KEEPALIVE_SECS);
             assert_eq!(sockopt::tcp_keepidle(fd).unwrap(), cap);
             assert_eq!(sockopt::tcp_keepintvl(fd).unwrap(), cap);
-            // A kernel keeping it in jiffies (4.14, HZ >= 100) reads back up to one 10 ms tick more.
+            // A jiffies kernel (4.14, HZ >= 100) reads back up to one 10 ms tick more.
             let (max, got) = (i32::MAX as u32, user_timeout());
             assert!((max..=max + 10).contains(&got), "{got}");
         }

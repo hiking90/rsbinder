@@ -3,11 +3,10 @@
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::shm::{self, Deadline, Mapping};
+use crate::shm::{self, Deadline, Word};
 
 /// libfmq `FMQ_NOT_FULL`: the reader sets it after consuming, the writer
 /// waits on it when the ring is full.
@@ -15,10 +14,6 @@ pub const NOT_FULL: u32 = 0x01;
 /// libfmq `FMQ_NOT_EMPTY`: the writer sets it after producing, the reader
 /// waits on it when the ring is empty.
 pub const NOT_EMPTY: u32 = 0x02;
-
-struct Inner {
-    mapping: Mapping,
-}
 
 /// A handle on the queue's 32-bit EventFlag word: the futex both peers wait
 /// on and wake through (libfmq `EventFlag`, `EventFlag.cpp`).
@@ -46,23 +41,16 @@ struct Inner {
 /// mask erases its own signal.
 #[derive(Clone)]
 pub struct EventFlag {
-    inner: Arc<Inner>,
+    word: Word<AtomicU32>,
 }
 
 impl EventFlag {
-    pub(crate) fn from_mapping(mapping: Mapping) -> Self {
-        debug_assert_eq!(
-            mapping.as_ptr().as_ptr() as usize % std::mem::align_of::<AtomicU32>(),
-            0
-        );
-        Self {
-            inner: Arc::new(Inner { mapping }),
-        }
+    pub(crate) fn from_word(word: Word<AtomicU32>) -> Self {
+        Self { word }
     }
 
     fn word(&self) -> &AtomicU32 {
-        // SAFETY: in `inner`'s mapping, 4-aligned (grantor offsets are 8-aligned), atomic-only.
-        unsafe { self.inner.mapping.as_ptr().cast::<AtomicU32>().as_ref() }
+        &self.word
     }
 
     pub(crate) fn reset(&self) {

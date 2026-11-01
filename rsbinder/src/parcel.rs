@@ -2414,8 +2414,8 @@ impl Parcel {
 
         // Every fallible RPC step runs here, before a byte moves; see module doc "append_from".
         #[cfg(feature = "rpc")]
-        let staged = match self.rpc.as_ref().and_then(|r| r.ops.clone()) {
-            Some(ops) => Some(self.stage_rpc_copy(&*ops, other, offset, size)?),
+        let staged = match self.rpc.as_ref().and_then(|r| r.ops.as_deref()) {
+            Some(ops) => Some(self.stage_rpc_copy(ops, other, offset, size)?),
             None => None,
         };
 
@@ -3246,8 +3246,7 @@ mod tests {
         let base = backing.as_mut_ptr() as *mut u8;
         // Half the alignment: 4 bytes where `u64` aligns to 8, 2 on i686 where it aligns to 4.
         let skew = std::mem::align_of::<crate::sys::binder::binder_size_t>() / 2;
-        // SAFETY: at most 4 bytes into a 24-byte allocation; the rest holds two unaligned `u64`s.
-        let objects = unsafe { base.add(skew) } as *mut crate::sys::binder::binder_size_t;
+        let objects = base.wrapping_add(skew) as *mut crate::sys::binder::binder_size_t;
         // SAFETY: both writes stay inside `backing`, and `write_unaligned` needs no alignment.
         unsafe {
             objects.write_unaligned(8);
@@ -4100,19 +4099,9 @@ mod wire_golden {
 
     #[test]
     fn stability_word_is_little_endian() {
-        // The category repr varies by platform (android-12), so only the byte order is pinned.
-        let level = i32::from(crate::Stability::Vintf);
-        assert_eq!(
-            enc(&level),
-            [
-                (level & 0xFF) as u8,
-                ((level >> 8) & 0xFF) as u8,
-                ((level >> 16) & 0xFF) as u8,
-                ((level >> 24) & 0xFF) as u8,
-            ]
-        );
-        #[cfg(not(target_os = "android"))]
-        assert_eq!(enc(&level), [0x3F, 0x00, 0x00, 0x00]);
+        // VINTF as the raw level and as android-12's `Category`, the two forms a binder carries.
+        assert_eq!(enc(&0b11_1111i32), [0x3F, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&0x3F00_0001i32), [0x01, 0x00, 0x00, 0x3F]);
     }
 
     #[test]
