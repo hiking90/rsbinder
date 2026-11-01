@@ -157,8 +157,13 @@ pub fn permission_authority() -> Option<Arc<dyn PermissionAuthority>> {
 /// unreachable service manager arrives as `NameNotFound` there — but
 /// only once the service manager proxy has been built; a first lookup
 /// with no reachable service manager still fails inside `hub::default()`
-/// with its own transport error. A descriptor mismatch propagates from
-/// the `FromIBinder` cast.
+/// with its own transport error.
+///
+/// The cast asks the service nothing ([`crate::FromIBinder::try_from`]): a
+/// `"permission"` entry of another interface is refused here only when it
+/// is a local binder of this process (`BadType`). A remote one converts,
+/// and its first call returns what its server answers to the wrong
+/// interface token (`BAD_TYPE` from an AIDL-generated stub).
 ///
 /// This is a thin wrapper; consumers needing custom error mapping or
 /// caching should call [`crate::hub::try_get_service`] directly.
