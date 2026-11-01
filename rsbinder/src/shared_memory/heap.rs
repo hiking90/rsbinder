@@ -64,8 +64,7 @@ impl Mapping {
         }
         let (fd, at, extent) = (fd.as_fd(), offset as u64, len as u64);
         Ok(if writable {
-            let mut carve = shm::Mapping::map(fd, at, extent, shm::Access::ReadWrite)?.carve();
-            Self::Rw(carve.bytes(0, len)?)
+            Self::Rw(shm::Mapping::map(fd, at, extent)?.carve().bytes(0, len)?)
         } else {
             Self::Ro(shm::RoMapping::map(fd, at, extent)?.carve().bytes(0, len)?)
         })

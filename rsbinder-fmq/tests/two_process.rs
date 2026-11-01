@@ -209,8 +209,8 @@ fn wake_crosses_the_process_boundary() {
 /// The child maps the parent's memfd read-only, sleeps on one `RoWord32` and wakes another.
 #[test]
 fn a_read_only_word_waits_and_wakes_across_processes() {
-    use rsbinder_fmq::shm::{self, Access, CreateOptions, Deadline, Mapping, RoWord32, Seals};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use rsbinder_fmq::shm::{self, CreateOptions, Deadline, Mapping, RoMapping, Seals};
+    use std::sync::atomic::Ordering;
 
     const BITS: std::num::NonZeroU32 = match std::num::NonZeroU32::new(0x4) {
         Some(bits) => bits,
@@ -218,24 +218,16 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
     };
     let limit = Duration::from_secs(10);
     let page = rustix::param::page_size() as u64;
-    let word_at = |mapping: &Mapping, index: usize| {
-        let at = mapping
-            .as_ptr()
-            .map_addr(|addr| addr.saturating_add(4 * index));
-        assert_eq!(at.addr().get() % 4, 0, "word {index} is not 4-aligned");
-        at
-    };
 
     if is_child() {
         let mut sock = child_sock();
         let desc = common::recv_descriptor(&sock);
         let fd = desc.fds[0].as_fd();
         assert_eq!(shm::verify_received(fd).expect("verify_received"), page);
-        Mapping::map(fd, 0, page, Access::ReadWrite).expect_err("the memfd is write-sealed");
-        let mapping = Mapping::map(fd, 0, page, Access::ReadOnly).expect("map read-only");
-        // SAFETY: 4-aligned words (`word_at` asserts it) of a live mapping, loads only, one size.
-        let [gate, sleeper, done] =
-            [0, 1, 2].map(|index| unsafe { RoWord32::from_ptr(word_at(&mapping, index)) });
+        Mapping::map(fd, 0, page).expect_err("the memfd is write-sealed");
+        let mapping = RoMapping::map(fd, 0, page).expect("map read-only");
+        let words = mapping.carve().words32(0, 3).expect("three words");
+        let [gate, sleeper, done] = [0, 1, 2].map(|index| words.get(index));
 
         let deadline = Deadline::after(limit);
         sock.write_all(&[1]).expect("ready");
@@ -262,11 +254,10 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
     let mut sock = common::accept_from(&listener, &mut child);
 
     let fd = shm::create(page, &CreateOptions::new("ro-word").populate(true)).expect("create");
-    let mapping = Mapping::map(fd.as_fd(), 0, page, Access::ReadWrite).expect("map");
+    let mapping = Mapping::map(fd.as_fd(), 0, page).expect("map");
     shm::add_seals(fd.as_fd(), Seals::SHRINK | Seals::FUTURE_WRITE).expect("seal");
-    // SAFETY: 4-aligned words (`word_at` asserts it) of a live mapping, atomics only, one size.
-    let [gate, sleeper, done] =
-        [0, 1, 2].map(|index| unsafe { word_at(&mapping, index).cast::<AtomicU32>().as_ref() });
+    let words = mapping.carve().words32(0, 3).expect("three words");
+    let [gate, sleeper, done] = [0, 1, 2].map(|index| words.get(index));
     common::send_descriptor(
         &sock,
         &rsbinder_fmq::Descriptor {

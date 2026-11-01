@@ -89,17 +89,21 @@ full contract.
 
 The pieces the queue is built from are public as `rsbinder_fmq::shm`, for
 shared-memory protocols other than FMQ: `create` / `add_seals` / `seals` (a
-memfd and its seals), `Mapping` (a shared mapping at any byte offset,
-read-only or read-write), `Run` (copies in and out of shared memory through
-atomics, so a peer's concurrent store is not a data race), `futex_wait` /
-`futex_wake` (non-private, so they cross processes), `RoRun` / `RoWord32` /
-`RoWord64` (bytes or a word in a read-only mapping, with no method that
-stores) and
+memfd and its seals), `Mapping` / `RoMapping` (a shared mapping at any byte
+offset, read-write or read-only) and the pieces their `carve` splits them
+into by the protocol's layout — `Word` / `Words` (atomic words), `Bytes`
+(copies in and out of shared memory through atomics, so a peer's concurrent
+store is not a data race) and `Lendable` (bytes lent in place through
+`unsafe`), with read-only `RoWord32` / `RoWord64` / `RoBytes` / `RoLendable`
+that have no method that stores. A mapping gives out no address: no two
+pieces share a byte, and each piece accesses its bytes at one size, so code
+built on them needs no `unsafe` to reach shared memory. Then `futex_wait` /
+`futex_wake` (non-private, so they cross processes) and
 `verify_received` (refuses a peer's fd unless it is a sealed memfd with every
 page in place, so that the peer cannot shrink the file or leave a page
 missing under the mapping). memfd, seals and futex
 are Linux and Android. `Mapping` needs only `mmap`, so it works on macOS too
-(on WASI `Mapping::map` returns `Unsupported`), and `Run` only atomics.
+(on WASI `Mapping::map` returns `Unsupported`), and `Bytes` only atomics.
 `RoWord64` exists on the 64-bit architectures, on 32-bit x86 with SSE2 and on
 32-bit ARM with 64-bit atomics.
 

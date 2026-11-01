@@ -1,9 +1,9 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The scheme `Run::store_release` and `Run::load_acquire` follow, as a loom model on one data
-//! word: a `Release` store, a `Relaxed` load, an `Acquire` fence. It checks the scheme and does
-//! not run `Run`'s code; the test that does is in `run.rs` and decides under Miri
+//! The scheme `Bytes::store_release` and `Bytes::load_acquire` follow, as a loom model on one
+//! data word: a `Release` store, a `Relaxed` load, an `Acquire` fence. It checks the scheme and
+//! does not run `Bytes`' code; the test that does is in `piece/tests.rs` and decides under Miri
 //! (`a_byte_read_orders_the_reader_after_the_writers_announcement`). Run: see `Cargo.toml`
 //! (`--cfg loom`).
 

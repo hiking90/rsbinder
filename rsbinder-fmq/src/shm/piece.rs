@@ -281,6 +281,10 @@ impl Area {
 
     #[inline]
     fn words_at(&self, first: usize, n: usize) -> &[AtomicUsize] {
+        // Where an area has no whole word, the address past its head need not be aligned.
+        if n == 0 {
+            return &[];
+        }
         let at = self
             .at
             .map_addr(|a| a.saturating_add(self.head + first * WORD));
@@ -1028,3 +1032,6 @@ impl RoCarve {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, loom))]
+mod loom_tests;

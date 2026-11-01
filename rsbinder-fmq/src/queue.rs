@@ -16,7 +16,7 @@ use crate::error::{received, Error, Result};
 use crate::event_flag::{EventFlag, NOT_EMPTY, NOT_FULL};
 pub(crate) use crate::shm::AtomicU64;
 pub use crate::shm::Element;
-use crate::shm::{self, Access, Bytes, CreateOptions, Deadline, Mapping, RoMapping, Seals, Word};
+use crate::shm::{self, Bytes, CreateOptions, Deadline, Mapping, RoMapping, Seals, Word};
 
 /// `Unsupported` where no queue can exist: off Linux and Android, or without 64-bit atomics.
 pub(crate) fn check_target() -> Result<()> {
@@ -50,7 +50,7 @@ pub(crate) fn map_ring(desc: &Descriptor, g: Grantor) -> Result<Bytes> {
 /// `len` bytes at grantor `g`; what `Mapping::map` refuses of it is the descriptor's failure.
 pub(crate) fn map_grantor(desc: &Descriptor, g: Grantor, len: u64) -> Result<Mapping> {
     let fd = desc.fds[g.fd_index as usize].as_fd();
-    Mapping::map(fd, u64::from(g.offset), len, Access::ReadWrite).map_err(received)
+    Mapping::map(fd, u64::from(g.offset), len).map_err(received)
 }
 
 /// [`map_grantor`], read-only.

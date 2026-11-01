@@ -529,14 +529,35 @@ accepts both the 0.12.0 bytes and the new ones.
   so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle);
   `create_mapped` (create, map writable, then seal, the one order in which
   the owner keeps a writable mapping under `FUTURE_WRITE`);
-  `Mapping` with `Access` (a shared mapping at any byte offset, read-only or
-  read-write, on macOS as well as Linux and Android); `Run` (copies in and
-  out of shared memory through atomics); `futex_wait`, `futex_wake` and
-  `Deadline` (non-private bitset futex against one absolute
+  `Mapping` and `RoMapping` (a shared mapping at any byte offset, read-write
+  or read-only, on macOS as well as Linux and Android), and `Mapping::heap`
+  (the same over heap memory, for tests and Miri); `futex_wait`,
+  `futex_wake` and `Deadline` (non-private bitset futex against one absolute
   `CLOCK_MONOTONIC` deadline). The four functions the module had in 0.12.0
   are unchanged, and `ashmem_write_protected` joins them: libcutils
   `ashmem_get_prot_region` without `PROT_WRITE`, which is to an ashmem
   region what the write seals are to a memfd.
+- **A mapping is reached through the pieces it is carved into, never through
+  an address.** `Mapping::carve` / `RoMapping::carve` consume the mapping and
+  hand out `Word` / `Words` (4- and 8-byte words, deref to `AtomicU32` /
+  `AtomicU64`, or to `RoWord32` / `RoWord64` read-only), `Bytes` / `RoBytes`
+  (an area copied in and out through atomics) and `Lendable` / `RoLendable`
+  (an area whose bytes may also be lent in place through `unsafe` slices,
+  for a protocol that gives a region to one party at a time). A piece off its
+  alignment, past the mapping or over a byte another piece holds is
+  `BadValue`. No two pieces share a byte, and a piece's kind fixes the size
+  of every access to its bytes, so no byte is accessed at two sizes — which
+  Rust's memory model makes undefined behavior unless both are loads — and
+  no plain access is made to memory a peer can write; pieces keep the
+  mapping alive, and are `Send + Sync`. `Bytes` gives each byte one size
+  from the area's address and length: the bytes before the first `usize`
+  boundary and after the last whole word one at a time, every other byte as
+  part of its word, and a copy that covers part of a word stores it with a
+  compare-exchange that writes the other bytes back. Two threads may copy
+  overlapping ranges of one area at once.
+  `Mapping::populate_huge_pages` asks for transparent huge pages before the
+  mapping is carved. `Element` lives in `shm` now and is still exported at
+  the crate root.
 - **For memory a peer owns, in `rsbinder_fmq::shm`:**
   - `verify_received` checks an fd from a peer before it is mapped — a
     tmpfs memfd, sealed against shrinking and writing, every page holding
@@ -548,27 +569,28 @@ accepts both the 0.12.0 bytes and the new ones.
   - `CreateOptions::populate` makes the memfd that passes: it writes zeros
     over the whole file. `allocate` (`fallocate`) alone does not, because
     the kernel reports a reserved page nothing has touched as a hole.
-  - `RoWord32`, `RoWord64` and `RoRun` view a word, or a run of bytes, in a
-    read-only mapping. They have loads, and `RoWord32` the futex wait and
-    wake, and no method that stores, so code that holds one cannot fault on
-    a write — `AtomicU32::store` and `Run::store` are safe methods that do
-    on a read-only page. `RoWord64` exists where an 8-byte load does not
-    write: the 64-bit architectures, for which the standard library defines
-    it on read-only memory, and 32-bit x86 with SSE2 and 32-bit ARM with
-    64-bit atomics, where it is the instruction the compiler emits (`movq`,
-    `ldrexd`) and a test loads through a read-only mapping. On every other
-    target `RoWord64` is a type with no value, with the same methods, so
-    that code naming it compiles everywhere: `RoWord64::PRESENT` tells the
-    two apart, and there `from_ptr` panics.
-  - `Run::store_release` and `Run::load_acquire` copy with an order: a
-    reader that got any byte of a `store_release` is ordered after what the
-    writer did before it, which lets a reader detect that its copy was
-    overwritten. `load_acquire` is relaxed loads and one acquire fence, so
-    it is defined through a read-only mapping.
-  - `Run::load_extend` and `RoRun::load_extend` append the run to a
-    `Vec<u8>`: the loads of `load`, relaxed and with no fence, written into
-    the vector's spare capacity without zeroing it first. The vector's
-    length grows by the run's length, and the bytes it held stay in front.
+  - A `RoMapping`'s pieces view words as `RoWord32` / `RoWord64` and areas
+    as `RoBytes` / `RoLendable`. They have loads, and `RoWord32` the futex
+    wait and wake, and no method that stores, so code that holds one cannot
+    fault on a write — `AtomicU32::store` and `Bytes::store` are safe
+    methods that do on a read-only page. `RoWord64` exists where an 8-byte
+    load does not write: the 64-bit architectures, for which the standard
+    library defines it on read-only memory, and 32-bit x86 with SSE2 and
+    32-bit ARM with 64-bit atomics, where it is the instruction the compiler
+    emits (`movq`, `ldrexd`) and a test loads through a read-only mapping.
+    On every other target `RoWord64` is a type with no value, with the same
+    methods, so that code naming it compiles everywhere:
+    `RoWord64::PRESENT` tells the two apart, and there `RoCarve::word64`
+    returns `Unsupported`.
+  - `Bytes::store_release` and `load_acquire` copy with an order: a reader
+    that got any byte of a `store_release` is ordered after what the writer
+    did before it, which lets a reader detect that its copy was overwritten.
+    `load_acquire` is relaxed loads and one acquire fence, so it is defined
+    through a read-only mapping.
+  - `Bytes::load_extend` and `RoBytes::load_extend` append bytes of the
+    area to a `Vec<u8>`: the loads of `load`, relaxed and with no fence,
+    written into the vector's spare capacity without zeroing it first. The
+    vector's length grows by the count, and the bytes it held stay in front.
     A caller that receives into a new or reused buffer no longer writes
     every byte twice, once with zeros and once with the copy.
 - **`rsbinder_fmq::shm::spin`** (workspace-internal, `#[doc(hidden)]`, not
@@ -608,6 +630,16 @@ accepts both the 0.12.0 bytes and the new ones.
   receiving `onStart` asks nothing. An RPC proxy follows the same rules,
   without the `CallRestriction`: it asks when its descriptor is first
   needed, and a typed cast neither asks nor fixes its interface.
+- **`Regions` is `Send + Sync`, and `WriteTxn`, `ReadTxn` and `UnsyncWriteTxn`
+  are `Send`.** They were not so that no two copies through one mapping ran
+  at once: two copies that start at different bytes split them into
+  different access sizes. A queue's ring is a `shm::Bytes` now, which gives
+  every byte one size, so the types take the auto traits of their fields.
+  A transaction borrows the queue's ring apart from its counters, and
+  `MessageQueue`, `UnsyncWriter` and `UnsyncReader` are `Send` whatever the
+  element type. The queues, `rsbinder::shared_memory` and `rsbinder-topic`'s
+  memory layouts reach shared memory only through `shm` pieces;
+  `rsbinder-fmq` denies `unsafe` code outside `shm`.
 - **The `tokio` floor is 1.53.3**, the first release with
   `AsyncFd::register_with_interest`; the constructors it replaces are
   deprecated there as unsound (tokio #8587). `rsbinder` itself makes no new

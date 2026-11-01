@@ -104,8 +104,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rsbinder::fmq::shm::{
-    self, Access, Bytes, Carve, CreateOptions, Lendable, Mapping, RoBytes, RoCarve, RoLendable,
-    RoMapping, RoWord32, RoWord64, Seals, Word, Words,
+    self, Bytes, Carve, CreateOptions, Lendable, Mapping, RoBytes, RoCarve, RoLendable, RoMapping,
+    RoWord32, RoWord64, Seals, Word, Words,
 };
 use rsbinder::fmq::{Descriptor, Errno, Error, Flavor, Grantor, Result};
 
@@ -445,7 +445,7 @@ pub(crate) fn create_topic(ring_bytes: usize) -> Result<(OwnedFd, Stored)> {
     let size = (topic::RING + capacity) as u64;
     let options = CreateOptions::new("rsbinder-topic").populate(true);
     let fd = shm::create(size, &options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
+    let mapping = Mapping::map(fd.as_fd(), 0, size)?;
     let stored = Stored::carve(mapping.carve(), capacity)?;
     stored.mark();
     // After the mapping: `FUTURE_WRITE` refuses every writable mapping made from here on.
@@ -518,7 +518,7 @@ impl ControlPage {
         let size = control_size(pins);
         let options = CreateOptions::new("rsbinder-topic-control").populate(true);
         let fd = shm::create(size, &options)?;
-        let mut carve = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?.carve();
+        let mut carve = Mapping::map(fd.as_fd(), 0, size)?.carve();
         carve
             .word32(control::MAGIC)?
             .store(CONTROL_MAGIC, Ordering::Relaxed);
@@ -764,7 +764,7 @@ pub(crate) fn create_pool(
     // Huge pages come with the first write through a mapping advised so, not with `pwrite`.
     let options = CreateOptions::new("rsbinder-topic-pool").populate(!huge);
     let fd = shm::create(size, &options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
+    let mapping = Mapping::map(fd.as_fd(), 0, size)?;
     if huge {
         mapping.populate_huge_pages();
     }

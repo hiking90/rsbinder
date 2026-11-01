@@ -25,7 +25,7 @@ use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rsbinder_fmq::shm::{Access, Mapping};
+use rsbinder_fmq::shm::Mapping;
 use rsbinder_fmq::{AttachPolicy, Descriptor, Flavor, Grantor, MessageQueue};
 
 const COUNT: u32 = 5000;
@@ -336,9 +336,9 @@ fn c_refuses_hostile_counters() {
         let (_q, desc) = rust_queue();
         let fd = desc.fds[0].try_clone().unwrap();
         let out = probe(tag, &desc, CAPACITY, move || {
-            let map = Mapping::map(fd.as_fd(), 0, 16, Access::ReadWrite).unwrap();
+            let counters = common::counters(Mapping::map(fd.as_fd(), 0, 16).unwrap());
             for (index, value) in [read, write].into_iter().enumerate() {
-                common::counter(&map, index).store(value, Ordering::SeqCst);
+                counters.get(index).store(value, Ordering::SeqCst);
             }
         });
         assert!(

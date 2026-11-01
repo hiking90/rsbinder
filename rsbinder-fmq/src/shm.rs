@@ -15,10 +15,13 @@
 //! |---|---|
 //! | Make the memory | [`create`] (a memfd), [`add_seals`], [`seals`], [`Seals`] |
 //! | Make it, map it writable and seal it, in that order | [`create_mapped`] |
-//! | Map it | [`Mapping`], [`Access`] |
-//! | Copy bytes in and out without a data race | [`Run`] |
+//! | Map it | [`Mapping`], [`RoMapping`], and [`Mapping::heap`] for tests |
+//! | Split it by its layout | [`Carve`], [`RoCarve`] |
+//! | Load and store a word, an array of words | [`Word`], [`Words`] |
+//! | Copy bytes in and out without a data race | [`Bytes`] |
+//! | Lend bytes to be read or written in place, through `unsafe` | [`Lendable`] |
 //! | Sleep until a peer changes a word, and wake a peer | [`futex_wait`], [`futex_wake`], [`Deadline`] |
-//! | Read memory this process may not write | [`RoRun`], [`RoWord32`], [`RoWord64`] |
+//! | Read memory this process may not write | [`RoBytes`], [`RoLendable`], [`RoWord32`], [`RoWord64`] |
 //! | Refuse a peer's fd whose pages the peer could take away | [`verify_received`] |
 //! | Ask about an fd that arrived from a peer | [`region_size`], [`shrink_sealed`], [`is_ashmem_fd`], [`ashmem_size`], [`ashmem_write_protected`] |
 //!
@@ -30,16 +33,19 @@
 //!
 //! # What is safe and what is not
 //!
-//! Creating, sealing and mapping are safe: they hand back an fd or an
-//! address. The `unsafe` boundary is where an address becomes a reference —
-//! [`Run::new`], [`RoWord32::from_ptr`], or a `&AtomicU32` the caller forms
-//! for [`futex_wait`]. The rule there is the same for every user of shared
-//! memory in Rust: all access is atomic, and no byte is accessed at two
-//! sizes at once through one mapping (see [`Mapping`]). A peer that ignores
-//! the protocol can then make the data wrong, not the program undefined.
+//! Creating, sealing, mapping, carving, and every access through a piece
+//! are safe. A mapping gives out no address: its bytes are reached only
+//! through the pieces [`Carve`] hands out, and the module holds the rule
+//! every user of shared memory in Rust must keep — every access is atomic,
+//! and no byte is accessed at two sizes at once through one mapping — so
+//! that its users need not (see [`Mapping`]). A peer that ignores the
+//! protocol can then make the data wrong, not the program undefined. The
+//! `unsafe` that remains is a protocol's own: [`Lendable`]'s slices, for a
+//! protocol that lends a region to one party at a time, and [`Element`],
+//! the promise that any bytes are a valid value of a type.
 //!
 //! [`Mapping::map`] validates nothing a peer sent: the mapping is as large
-//! as the caller asks, readable or writable as the caller asks. Check the fd
+//! as the caller asks. Check the fd
 //! first — [`verify_received`] for a memfd whose pages the peer must not be
 //! able to take away, or size and seals one by one ([`region_size`],
 //! [`seals`]) for a protocol with other rules, as libfmq's are.
@@ -62,12 +68,15 @@
 //! [`Mapping`] needs only `mmap` and [`Deadline`] only `CLOCK_MONOTONIC`,
 //! which macOS has too. On WASI (`wasm32-wasip1`), where this crate has
 //! neither, [`Mapping::map`] returns `Unsupported` and [`Deadline::after`]
-//! returns `None`. [`Run`] is atomic loads and stores and has no condition
-//! of its own. [`RoWord64`] has a value where an 8-byte load does not write:
-//! the 64-bit architectures, 32-bit x86 with SSE2 and 32-bit ARM with 64-bit
-//! atomics (its documentation gives the grounds for each). On any other
-//! target the name is a type with no value and [`RoWord64::PRESENT`] is
-//! `false`, so a caller compiles everywhere and refuses at run time.
+//! returns `None`; [`Mapping::heap`] works everywhere. [`Bytes`] is atomic
+//! loads and stores and has no condition of its own. [`RoWord64`] has a
+//! value where an 8-byte load does not write: the 64-bit architectures,
+//! 32-bit x86 with SSE2 and 32-bit ARM with 64-bit atomics (its
+//! documentation gives the grounds for each). On any other target the name
+//! is a type with no value, [`RoWord64::PRESENT`] is `false` and
+//! [`RoCarve::word64`] returns `Unsupported`, so a caller compiles
+//! everywhere and refuses at run time; likewise [`Carve::word64`] on a
+//! target without 64-bit atomics.
 
 #![expect(
     unsafe_code,
@@ -83,7 +92,6 @@ mod futex;
 mod mapping;
 mod memfd;
 mod piece;
-mod run;
 // Workspace-internal (`rsbinder::stream`, `rsbinder-topic`), outside the tier; see its module doc.
 #[doc(hidden)]
 pub mod spin;
@@ -92,12 +100,11 @@ mod word;
 pub(crate) use element::bytes_of_mut;
 pub use element::Element;
 pub use futex::{futex_wait, futex_wake, Deadline};
-pub use mapping::{Access, Mapping, RoMapping};
+pub use mapping::{Mapping, RoMapping};
 pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
 pub use piece::{
     AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType, Words,
 };
-pub use run::{RoRun, Run};
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.
 pub use word::*;
 

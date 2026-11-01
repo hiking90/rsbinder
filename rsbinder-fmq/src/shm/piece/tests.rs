@@ -120,6 +120,57 @@ fn a_copy_whose_end_overflows_panics() {
 }
 
 #[test]
+fn copies_of_no_byte_touch_nothing() {
+    let mut c = carve(16);
+    let empty = c.bytes(3, 0).unwrap();
+    let bytes = c.bytes(8, 8).unwrap();
+    assert!(empty.is_empty());
+    for area in [&empty, &bytes] {
+        area.store(area.len(), &[0u8; 0]);
+        area.store_release(0, &[0u8; 0]);
+        area.load(area.len(), &mut [0u8; 0]);
+        area.load_acquire(0, &mut [0u8; 0]);
+        let mut held = vec![1u8, 2, 3];
+        area.load_extend(area.len(), 0, &mut held);
+        assert_eq!(held, [1, 2, 3]);
+    }
+}
+
+/// An area shorter than the bytes to its first word boundary is all head: no word to reach.
+#[test]
+fn an_area_of_head_bytes_alone_round_trips() {
+    for area_at in 1..WORD {
+        for len in 1..=WORD - area_at {
+            let bytes = carve(2 * WORD).bytes(area_at, len).unwrap();
+            let src: Vec<u8> = (0..len).map(|i| i as u8 + 1).collect();
+            bytes.store(0, &src);
+            let mut out = vec![0u8; len];
+            bytes.as_ro().load(0, &mut out);
+            assert_eq!(out, src, "area {area_at}+{len}");
+        }
+    }
+}
+
+/// An extend into enough spare capacity reallocates nothing: a reused buffer stays where it is.
+#[test]
+fn an_extend_into_spare_capacity_keeps_the_buffer() {
+    let bytes = carve(64).bytes(3, 2 * WORD + 7).unwrap();
+    let len = bytes.len();
+    let src: Vec<u8> = (0..len).map(|i| i as u8 ^ 0x3c).collect();
+    bytes.store(0, &src);
+    let mut out = Vec::with_capacity(5 + 2 * len);
+    out.extend_from_slice(&[0x77; 5]);
+    let (at, capacity) = (out.as_ptr(), out.capacity());
+    bytes.load_extend(0, len, &mut out);
+    bytes.as_ro().load_extend(0, len, &mut out);
+    assert_eq!((out.as_ptr(), out.capacity()), (at, capacity));
+    assert_eq!(
+        (&out[..5], &out[5..5 + len], &out[5 + len..]),
+        (&[0x77; 5][..], &src[..], &src[..])
+    );
+}
+
+#[test]
 fn an_extend_past_the_area_leaves_the_vector_as_it_was() {
     let bytes = carve(16).bytes(0, 16).unwrap();
     let mut held = vec![1u8, 2];
@@ -195,8 +246,8 @@ fn pieces_go_to_other_threads_and_keep_the_memory() {
         .unwrap();
 }
 
-/// Exists for Miri: two threads copy overlapping bytes split at different places. With `Run`,
-/// which splits by the copy's start, Miri reports a 1-byte store racing an 8-byte load.
+/// Exists for Miri: two threads copy overlapping bytes from different starts. A split taken from
+/// a copy's start, not the area's, would make Miri report a 1-byte store racing an 8-byte load.
 #[test]
 fn copies_at_different_starts_race_as_atomics() {
     let rounds = if cfg!(miri) { 12 } else { 5_000 };

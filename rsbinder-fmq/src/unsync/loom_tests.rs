@@ -4,7 +4,7 @@
 //! The unsynchronized reader's rule as a loom model: a ring of one-byte cells, a writer that
 //! announces, stores and commits as `WriterCore` does, and a reader that judges the counters
 //! with the functions `ReaderCore` calls (`rules.rs`). It checks the rule — the order of the
-//! loads and the judgement after the copy — and does not run the copies of `Run`; the test that
+//! loads and the judgement after the copy — and does not run the copies of `Bytes`; the test that
 //! does is `tests.rs` under Miri. Run: see `Cargo.toml` (`--cfg loom`).
 
 use loom::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};

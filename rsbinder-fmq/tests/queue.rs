@@ -15,7 +15,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::{Access, Mapping};
+use rsbinder_fmq::shm::{Mapping, Words};
 use rsbinder_fmq::{
     AttachPolicy, Descriptor, Error, Flavor, Grantor, MessageQueue, Notify, Transfer, NOT_EMPTY,
     NOT_FULL,
@@ -43,15 +43,17 @@ const DONE: Transfer = Transfer::Done;
 const WOULD_BLOCK: Transfer = Transfer::WouldBlock;
 
 /// A raw view of a single-fd queue's counters, to play the hostile peer.
-struct Counters(Mapping);
+struct Counters(Words<AtomicU64>);
 
 impl Counters {
     fn map(desc: &Descriptor) -> Self {
-        Self(Mapping::map(desc.fds[0].as_fd(), 0, 16, Access::ReadWrite).unwrap())
+        Self(common::counters(
+            Mapping::map(desc.fds[0].as_fd(), 0, 16).unwrap(),
+        ))
     }
 
     fn counter(&self, index: usize) -> &AtomicU64 {
-        common::counter(&self.0, index)
+        self.0.get(index)
     }
 
     fn set(&self, read: u64, write: u64) {
