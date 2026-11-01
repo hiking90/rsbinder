@@ -30,6 +30,8 @@ This changelog starts at 0.9.0. For earlier releases, see the
   targets whose code for a libfmq waiter orders it too (x86, x86-64,
   AArch64, 32-bit ARM, RISC-V 64), `wake` elsewhere; the wake the stream
   ring sends after each committed record.
+- **`rsbinder_fmq::shm::Deadline::until`**: the futex deadline at an
+  `Instant`, as `Deadline::after` the time left until it.
 
 ### Changed
 

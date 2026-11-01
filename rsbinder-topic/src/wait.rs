@@ -156,7 +156,7 @@ impl Until {
     pub(crate) fn new(at: Instant) -> Self {
         Self {
             at,
-            futex: Deadline::after(at.saturating_duration_since(Instant::now())),
+            futex: Deadline::until(at),
         }
     }
 }

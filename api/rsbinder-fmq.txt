@@ -64,6 +64,7 @@ impl<'a> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::CreateOptio
 pub struct rsbinder_fmq::shm::Deadline(_)
 impl rsbinder_fmq::shm::Deadline
 pub fn rsbinder_fmq::shm::Deadline::after(core::time::Duration) -> core::option::Option<Self>
+pub fn rsbinder_fmq::shm::Deadline::until(std::time::Instant) -> core::option::Option<Self>
 impl core::clone::Clone for rsbinder_fmq::shm::Deadline
 pub fn rsbinder_fmq::shm::Deadline::clone(&self) -> rsbinder_fmq::shm::Deadline
 impl core::fmt::Debug for rsbinder_fmq::shm::Deadline

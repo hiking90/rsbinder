@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::spin::{spin_budget, spin_until, SpinGauge, SPIN_CLOCK_EVERY};
+use rsbinder_fmq::shm::spin::{spin_budget, SpinGauge, SPIN_CLOCK_EVERY};
 use rsbinder_fmq::shm::Deadline;
 use rsbinder_fmq::{AttachPolicy, Descriptor, EventFlag, MessageQueue, NOT_EMPTY, NOT_FULL};
 
@@ -239,27 +239,23 @@ impl Shared {
         is_end: bool,
         deadline: Option<&Deadline>,
     ) -> bool {
-        let budget = self.spin.budget(deadline);
         let mut queue = self.queue();
-        let (look, spun) = spin_until(budget, || {
+        let look = self.spin.look(deadline, || {
             self.dead.load(Ordering::Relaxed)
                 || (!is_end
                     && (self.flag.peek() & CANCEL != 0 || self.abandoned.load(Ordering::Relaxed)))
                 // A broken counter ends the spin too; the loop top reports it.
                 || !matches!(queue.begin_write_cached(n, limit), Ok(None))
         });
-        self.spin.spun(spun, look);
         look.is_found()
     }
 
     /// Look for a record or a death for a spin before parking, leaving the flag word alone.
     fn fills_within(&self, deadline: Option<&Deadline>) -> bool {
-        let budget = self.spin.budget(deadline);
         let queue = self.queue();
-        let (look, spun) = spin_until(budget, || {
+        let look = self.spin.look(deadline, || {
             self.dead.load(Ordering::Relaxed) || !matches!(queue.available_to_read(), Ok(0))
         });
-        self.spin.spun(spun, look);
         look.is_found()
     }
 }
@@ -920,7 +916,7 @@ impl Wait {
     /// The deadline a spin budget is cut to, made once for the whole call.
     fn spin_deadline(&self) -> Option<Deadline> {
         match *self {
-            Wait::Until(at) => Deadline::after(at.saturating_duration_since(Instant::now())),
+            Wait::Until(at) => Deadline::until(at),
             Wait::Never | Wait::Forever => None,
         }
     }

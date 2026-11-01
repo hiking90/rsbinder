@@ -51,6 +51,12 @@ impl Deadline {
         deadline.map(Deadline)
     }
 
+    /// The deadline at `at`, an `Instant` of the caller's own wait: [`after`](Self::after) the
+    /// time left until it, zero once it has passed, and `None` as there.
+    pub fn until(at: std::time::Instant) -> Option<Self> {
+        Self::after(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
     /// Time left until the deadline; zero once it has passed.
     pub(crate) fn remaining(&self) -> Duration {
         let Some(now) = monotonic_now() else {

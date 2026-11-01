@@ -23,7 +23,7 @@ use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use rsbinder::fmq::shm::spin::{spin_until, SpinGauge};
+use rsbinder::fmq::shm::spin::SpinGauge;
 use rsbinder::fmq::Descriptor;
 use rsbinder::{
     BinderResult, Interface, ParcelFileDescriptor, SIBinder, Status, StatusCode, Strong,
@@ -693,11 +693,10 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     /// Look at the ring for a spin's budget; whether a record or a bit in `stop` turned up.
     fn spun(&self, deadline: Option<&Until>) -> bool {
-        let budget = self
+        let futex = deadline.and_then(|until| until.futex.as_ref());
+        let look = self
             .spin
-            .budget(deadline.and_then(|until| until.futex.as_ref()));
-        let (look, spun) = spin_until(budget, || self.reader.pending() || self.local.stopped());
-        self.spin.spun(spun, look);
+            .look(futex, || self.reader.pending() || self.local.stopped());
         look.is_found()
     }
 
