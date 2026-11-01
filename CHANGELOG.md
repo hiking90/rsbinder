@@ -773,6 +773,11 @@ accepts both the 0.12.0 bytes and the new ones.
   with `env_remove("NOTIFY_SOCKET")`, so a service `rsb_hub` starts still
   cannot report `rsb_hub`'s unit ready or stopping. A child that other code
   in the process spawns inherits the variable (see *Migrating*).
+- **A `char` array that would reach a recorded object writes no element.**
+  It was refused with `PermissionDenied` only at the element that reached
+  the object, after the elements before it were written and with the
+  position left inside the array; it is now refused before the first
+  element, as every other array is (AOSP `writeInplace`).
 
 ### Security
 

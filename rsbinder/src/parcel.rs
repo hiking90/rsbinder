@@ -2019,6 +2019,7 @@ impl Parcel {
             .checked_add(padded)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
+        self.check_object_overlap(end)?;
         self.data.reserve(end.saturating_sub(self.data.len()));
         for c in parcelable {
             self.write(&c.as_i32())?;
@@ -3619,6 +3620,39 @@ mod tests {
             still_open(victim),
             "dropping the parcel closed an fd it never owned"
         );
+    }
+
+    /// A char array that would reach an object is refused before any element, as `write_array`.
+    #[test]
+    fn a_char_array_reaching_an_object_writes_no_element() {
+        let pfd = ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+        let mut kernel = Parcel::new();
+        kernel.write(&pfd).unwrap();
+        #[allow(
+            unused_mut,
+            reason = "the rpc case is pushed only with the `rpc` feature"
+        )]
+        let mut cases = vec![("kernel", kernel)];
+        #[cfg(feature = "rpc")]
+        {
+            let mut p = Parcel::new_data_only();
+            p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
+            p.set_rpc_record_fd_positions(true);
+            p.write(&pfd).unwrap();
+            cases.push(("rpc", p));
+        }
+        for (name, mut p) in cases {
+            // `[1][hasComm=0]`, then the fd object at 8: the second element would reach it.
+            let before = p.data.as_slice()[4..8].to_vec();
+            p.set_data_position(0);
+            assert_eq!(
+                p.write_array_char(&[0x41u16, 0x42]),
+                Err(StatusCode::PermissionDenied),
+                "{name}"
+            );
+            assert_eq!(p.data.as_slice()[4..8], before, "{name}");
+            assert_eq!(p.data_position(), 4, "{name}");
+        }
     }
 
     /// AOSP `validateRpcReadData`: no write rewrites a recorded RPC fd index or binder address.
