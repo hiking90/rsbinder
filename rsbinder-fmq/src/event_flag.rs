@@ -97,6 +97,24 @@ impl EventFlag {
         wake_lazy(self.word(), bits)
     }
 
+    /// The wake after a committed write, for a flag a libfmq waiter may share:
+    /// [`wake_lazy`](Self::wake_lazy) on the targets its documentation lists
+    /// as ordering that waiter too (x86, x86-64, AArch64, 32-bit ARM, RISC-V
+    /// 64), [`wake`](Self::wake) on every other.
+    pub fn wake_committed_lazy(&self, bits: u32) -> Result<()> {
+        if cfg!(any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64"
+        )) {
+            self.wake_lazy(bits)
+        } else {
+            self.wake(bits)
+        }
+    }
+
     /// Wait until any bit of `bits` is set, clear those bits and return them.
     /// Returns at once when some already are. `timeout == None` waits
     /// indefinitely; otherwise [`Error::TimedOut`]

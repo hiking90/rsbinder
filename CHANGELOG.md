@@ -26,6 +26,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `FUTURE_WRITE`, Linux before 5.1). It reads the answer right only for a
   memfd the caller created, since a file that takes no seals answers
   `EINVAL` too.
+- **`rsbinder_fmq::EventFlag::wake_committed_lazy`**: `wake_lazy` on the
+  targets whose code for a libfmq waiter orders it too (x86, x86-64,
+  AArch64, 32-bit ARM, RISC-V 64), `wake` elsewhere; the wake the stream
+  ring sends after each committed record.
 
 ### Changed
 

@@ -517,6 +517,7 @@ impl rsbinder_fmq::EventFlag
 pub fn rsbinder_fmq::EventFlag::peek(&self) -> u32
 pub fn rsbinder_fmq::EventFlag::wait(&self, u32, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<u32>
 pub fn rsbinder_fmq::EventFlag::wake(&self, u32) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::EventFlag::wake_committed_lazy(&self, u32) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::EventFlag::wake_lazy(&self, u32) -> rsbinder_fmq::Result<()>
 impl core::clone::Clone for rsbinder_fmq::EventFlag
 pub fn rsbinder_fmq::EventFlag::clone(&self) -> rsbinder_fmq::EventFlag

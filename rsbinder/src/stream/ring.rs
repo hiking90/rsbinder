@@ -48,21 +48,6 @@ const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 /// Bytes a refill lets build while the producer adds: reading right behind it steals its line.
 const MIN_BATCH: usize = 4096;
 
-/// `EventFlag::wake_lazy` where the hardware also orders it against a libfmq waiter, else `wake`.
-fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
-    if cfg!(any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64"
-    )) {
-        flag.wake_lazy(bits)
-    } else {
-        flag.wake(bits)
-    }
-}
-
 // --- The ring, as both ends and the pool see it ---
 
 /// One end's ring handle, shared with its pool task and the death recipient that wakes it.
@@ -210,7 +195,7 @@ impl Shared {
                     drop(queue);
                     self.bump_activity();
                     // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
-                    if let Err(e) = wake_after_commit(&self.flag, NOT_EMPTY) {
+                    if let Err(e) = self.flag.wake_committed_lazy(NOT_EMPTY) {
                         log::error!("stream: the wake after a committed record failed: {e:?}");
                     }
                     return Ok(true);
@@ -1255,7 +1240,7 @@ impl<T: Deserialize> Consumer<T> {
         self.at = 0;
         self.filled = available;
         // The one point room is made; `StreamEndpoint.aidl` lets a multi-record read wake once.
-        let _ = wake_after_commit(&self.shared.flag, NOT_FULL);
+        let _ = self.shared.flag.wake_committed_lazy(NOT_FULL);
         Ok(true)
     }
 
