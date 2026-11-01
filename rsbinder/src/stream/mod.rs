@@ -711,41 +711,28 @@ impl std::fmt::Debug for Token {
 
 // --- Shared by both paths ---
 
-/// Link `recipient` to `binder`'s death, held alive by the returned `Arc`; `Ok(None)` if local.
-fn watch_death<R>(binder: &SIBinder, recipient: R) -> Result<Option<Arc<dyn crate::DeathRecipient>>>
+/// Link `recipient` to `binder`'s death; dropping the link unlinks. `Ok(None)` if local.
+fn watch_death<R>(binder: &SIBinder, recipient: R) -> Result<Option<crate::DeathLink>>
 where
     R: crate::DeathRecipient + 'static,
 {
     if binder.as_remote().is_none() {
         return Ok(None);
     }
-    let recipient: Arc<dyn crate::DeathRecipient> = Arc::new(recipient);
     // Fatal: back-pressure leaves nothing in flight to fail, so only this link reports death.
-    if let Err(e) = binder.link_to_death(Arc::downgrade(&recipient)) {
-        if e == StatusCode::InvalidOperation && binder.as_remote().is_some() {
-            log::error!(
-                "stream: the RPC session to the other end has no incoming connections, so the \
-                 stream could neither be pushed to nor see that end die; open them \
-                 (ClientOptions::incoming_connections / RpcClientConfig::incoming_connections)"
-            );
-        } else {
-            log::error!("stream: cannot watch the peer for death: {e:?}");
-        }
-        return Err(e);
-    }
-    Ok(Some(recipient))
-}
-
-/// Undo `watch_death` (no lock held): a dropped `Arc` alone leaves the kernel subscription.
-fn unlink_death(binder: &SIBinder, recipient: &Option<Arc<dyn crate::DeathRecipient>>) {
-    let Some(recipient) = recipient else { return };
-    // `Drop` calls this; a panic here during an unwind (poisoned recipients lock) would abort.
-    let unlinked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = binder.unlink_to_death(Arc::downgrade(recipient));
-    }));
-    if unlinked.is_err() {
-        log::error!("stream: unlink_to_death panicked; a death link stays registered");
-    }
+    crate::DeathLink::new(binder, Arc::new(recipient))
+        .map(Some)
+        .inspect_err(|&e| {
+            if e == StatusCode::InvalidOperation {
+                log::error!(
+                    "stream: the RPC session to the other end has no incoming connections, so \
+                     the stream could neither be pushed to nor see that end die; open them \
+                     (ClientOptions::incoming_connections / RpcClientConfig::incoming_connections)"
+                );
+            } else {
+                log::error!("stream: cannot watch the peer for death: {e:?}");
+            }
+        })
 }
 
 /// An RPC proxy answers from its session; anything else is local or kernel and always callable.
@@ -1547,10 +1534,10 @@ enum ReceiverInner<T> {
 #[must_use = "dropping the receiver cancels the stream at the producer"]
 pub struct Receiver<T> {
     inner: ReceiverInner<T>,
-    /// The peer, kept for the unlink in `Drop`.
-    peer: SIBinder,
-    /// Holds the death link on the peer; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// Kept: for a local peer it may be the only strong reference to the producer's object.
+    _peer: SIBinder,
+    /// The death link on the peer; `None` for a local peer.
+    death: Option<crate::DeathLink>,
     _item: PhantomData<fn() -> T>,
 }
 
@@ -1608,7 +1595,7 @@ impl<T: Deserialize> Receiver<T> {
         let endpoint = StreamEndpoint::with(ring, sink);
         let receiver = Receiver {
             inner,
-            peer: peer.clone(),
+            _peer: peer.clone(),
             death,
             _item: PhantomData,
         };
@@ -1816,9 +1803,8 @@ impl<T: Deserialize> Iterator for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        // Unlink first: dropping the recipient only makes the link inert, the peer's list stays.
-        let death = self.death.take();
-        unlink_death(&self.peer, &death);
+        // Unlink before `inner` drops; field order would drop the link last.
+        drop(self.death.take());
     }
 }
 

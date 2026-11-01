@@ -25,7 +25,7 @@ use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink}
 use super::pool::on_pool;
 use super::{
     decode_item, dropped_terminator, encode_item, status_from_fields, truncated_terminator,
-    unlink_death, watch_death, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
+    watch_death, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
 };
 
 /// The descriptor type the endpoint carries: a ring of bytes.
@@ -583,10 +583,8 @@ pub(super) struct Producer<T: ?Sized> {
     scratch: Box<Parcel>,
     /// Set once the end record is in, so `Drop` does not write a second.
     ended: bool,
-    /// The consumer's sink, kept for the unlink in `Drop`.
-    sink: SIBinder,
-    /// Holds the death link on the sink; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The death link on the consumer's sink; `None` for a local sink.
+    death: Option<crate::DeathLink>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -619,7 +617,6 @@ impl<T: Serialize + ?Sized> Producer<T> {
             transit: Arc::new(Transit::default()),
             scratch: Box::new(Parcel::new_data_only()),
             ended: false,
-            sink: sink.clone(),
             death,
             _item: PhantomData,
         })
@@ -882,8 +879,7 @@ impl<T: ?Sized> Drop for Producer<T> {
     /// End the stream without waiting for the consumer; see [`Sink`](super::Sink)'s `Drop`.
     fn drop(&mut self) {
         // Unlink always: a dropped recipient leaves a dead `Weak` in the sink's list for good.
-        let death = self.death.take();
-        unlink_death(&self.sink, &death);
+        drop(self.death.take());
         if self.ended {
             return;
         }
@@ -1684,6 +1680,7 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         tx.send(&1, None).expect("send");
         let death = rx.death_recipient();
+        let who = SIBinder::downgrade(&rx.sink_binder());
         let (done, watch) = mpsc::channel();
         thread::spawn(move || {
             let first = rx.recv();
@@ -1695,7 +1692,7 @@ mod tests {
             watch.recv_timeout(Duration::from_millis(300)).is_err(),
             "the consumer waits for a second record"
         );
-        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        crate::DeathRecipient::binder_died(&death, &who);
         let (first, second, third, _rx) = watch
             .recv_timeout(Duration::from_secs(5))
             .expect("death must release the consumer");
@@ -1715,7 +1712,7 @@ mod tests {
     fn an_end_record_outranks_a_death_that_followed_it() {
         let (tx, mut rx) = pair::<i32>(512);
         let death = rx.death_recipient();
-        let sink = tx.sink.clone();
+        let sink = rx.sink_binder();
         end(tx).expect("end");
         crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&sink));
         assert!(rx.recv().is_none());
@@ -1727,7 +1724,7 @@ mod tests {
     fn an_end_record_outranks_a_death_noticed_while_it_is_being_read() {
         let (tx, mut rx) = pair::<i32>(512);
         let death = rx.death_recipient();
-        let sink = tx.sink.clone();
+        let sink = rx.sink_binder();
         let shared = rx.shared.clone();
         let reached = Arc::new(AtomicBool::new(false));
         let seen = reached.clone();
@@ -1763,7 +1760,7 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         tx.send(&1, None).expect("send");
         let death = rx.death_recipient();
-        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&rx.sink_binder()));
         assert!(rx.end_status().is_none(), "an item is still in the ring");
         assert_eq!(rx.recv().expect("the item").expect("ok"), 1);
         let ended = rx.recv().expect("the end").expect_err("an error");
@@ -1835,7 +1832,7 @@ mod tests {
         }
         assert_eq!(rx.try_recv().expect("no error"), Some(1));
         let death = rx.death_recipient();
-        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&rx.sink_binder()));
         assert_eq!(rx.recv().expect("item").expect("ok"), 2);
         assert_eq!(rx.recv().expect("item").expect("ok"), 3);
         let ended = rx.recv().expect("the end").expect_err("an error");

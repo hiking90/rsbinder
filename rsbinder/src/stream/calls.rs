@@ -26,8 +26,8 @@ use super::generated::rsbinder::stream::IStreamSource::{
 #[cfg(feature = "tokio")]
 use super::pool::on_pool;
 use super::{
-    status_from_fields, truncated_terminator, unlink_death, watch_death, Ping, PingPolicy,
-    ReceiverPolicy, SinkPolicy,
+    status_from_fields, truncated_terminator, watch_death, Ping, PingPolicy, ReceiverPolicy,
+    SinkPolicy,
 };
 
 // ---- Pinging a quiet peer (plan 2-24 D9) ----
@@ -548,11 +548,11 @@ pub(super) struct Producer<T: ?Sized> {
     ledger: Arc<Ledger>,
     /// Lives as long as the producer; the consumer got its own reference in `onStart`.
     _source: SIBinder,
-    /// The consumer's sink, kept for the unlink in `Drop` and pinged by a quiet credit wait.
+    /// The consumer's sink, pinged by a quiet credit wait.
     sink: SIBinder,
     ping: PingPolicy,
-    /// Holds the death link on the sink; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The death link on the sink; `None` for a local sink.
+    death: Option<crate::DeathLink>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -579,7 +579,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // First, so the consumer knows where to grant and whom to watch before any batch lands.
         if let Err(e) = peer.on_start(&source, declared) {
             // No producer is built, so nothing else will undo the link.
-            unlink_death(sink, &death);
+            drop(death);
             return Err(e);
         }
         Ok(Producer {
@@ -926,8 +926,7 @@ impl<T: ?Sized> Drop for Producer<T> {
     /// Deliver what is queued and end the stream without waiting for credit.
     fn drop(&mut self) {
         // Unlink regardless: a dropped recipient leaves a dead `Weak` in the sink's list for good.
-        let death = self.death.take();
-        unlink_death(&self.sink, &death);
+        drop(self.death.take());
         if self.ended {
             return;
         }
@@ -983,10 +982,10 @@ struct StreamState {
     end: Option<Status>,
     /// Where to grant and cancel; `None` until `onStart` arrives.
     source: Option<Arc<Peer<dyn IStreamSource>>>,
-    /// The same binder, kept for the unlink in the consumer's `Drop`.
+    /// The same binder, compared by a later `onStart` and pinged by a quiet wait.
     source_binder: Option<SIBinder>,
-    /// Holds the death link on the source; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The death link on the source; `None` until `onStart`, or for a local source.
+    death: Option<crate::DeathLink>,
     /// The consumer wants no more; an `onStart` arriving after this is cancelled on the spot.
     canceled: bool,
     /// The receiver is gone, so nothing will drain a batch again.
@@ -1234,7 +1233,7 @@ impl IStreamSink for SinkObject {
             return Ok(());
         };
         // Linked before taking the lock: no binder call under it.
-        let death = match watch_death(source, SourceDeath(Arc::downgrade(&self.0))) {
+        let mut death = match watch_death(source, SourceDeath(Arc::downgrade(&self.0))) {
             Ok(death) => death,
             Err(code) => {
                 if self.0.refuse_start(source, Status::from(code)) {
@@ -1256,7 +1255,7 @@ impl IStreamSink for SinkObject {
                 if kept {
                     state.source = Some(peer.clone());
                     state.source_binder = Some(source.clone());
-                    state.death = death.clone();
+                    state.death = death.take();
                     state.declared = window;
                 }
                 cancel_now = state.canceled;
@@ -1266,10 +1265,8 @@ impl IStreamSink for SinkObject {
             // A wait begun before now had nobody to ping; woken, it looks the source up.
             self.0.wake();
         }
-        if !kept {
-            // Nothing owns this link now; dropping the recipient would only make it inert.
-            unlink_death(source, &death);
-        }
+        // Not kept: nothing owns this link, so it unlinks here, before the cancel below.
+        drop(death);
         if cancel_now {
             // The consumer gave up before the producer got this far.
             let _ = peer.cancel();
@@ -1683,7 +1680,7 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
-        let (source, binder, death) = {
+        let (source, _source_binder, death) = {
             let mut state = self.stream.lock();
             state.canceled = true;
             state.closed = true;
@@ -1694,10 +1691,8 @@ impl<T> Drop for Consumer<T> {
                 state.death.take(),
             )
         };
-        if let Some(binder) = binder {
-            // Dropping the recipient only makes the link inert; the source's list never shrinks.
-            unlink_death(&binder, &death);
-        }
+        // Unlinked out of the lock, before the cancel.
+        drop(death);
         if let Some(source) = source {
             // Nothing else tells a producer parked on `wait_credit` that nobody reads any more.
             let _ = source.cancel();
