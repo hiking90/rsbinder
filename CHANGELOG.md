@@ -311,6 +311,10 @@ accepts both the 0.12.0 bytes and the new ones.
   is logged instead of unwinding (an abort when the link drops during
   another unwind), and an unlink error such as `DeadObject` after the
   obituary is logged at debug level.
+- **`impl TryFrom<i32> for ExceptionCode`**: the variant for a wire value,
+  every variant included (the reply-header markers, `TransactionFailed`,
+  `JustError`); any other value is the error. `Deserialize` still reads a
+  value with no variant as `JustError`.
 - **`bridge::Delegating` and a generated `IFooDelegate` trait per
   interface**: a gateway overrides only the methods it changes (typically
   the one that re-wraps a binder argument) and publishes
@@ -628,6 +632,15 @@ accepts both the 0.12.0 bytes and the new ones.
 
 ### Changed
 
+- **An RPC handler that panics releases what its reply held before the
+  reply.** The partial reply is discarded inside the handler step, so the
+  `DEC_STRONG` of a proxy it held goes out ahead of the `Unknown` reply, the
+  order the session keeps for every other release; it followed the reply.
+  The kernel and RPC handler steps share one function, and a handler panic
+  logs one line on both: `a transaction handler panicked for code N: …`.
+- **Every caught panic logs its message.** The death-link, obituary,
+  freeze-notification, reply-path, `Rewrap` and `Reconnecting` catches
+  logged a fixed line; they now append the panic's text.
 - **Receiving a kernel binder makes no call to the process behind it.**
   Reading a handle from a parcel sends no `INTERFACE_TRANSACTION`; a kernel
   proxy asks for its descriptor when `descriptor()`, `try_descriptor()` or a
@@ -799,6 +812,25 @@ accepts both the 0.12.0 bytes and the new ones.
   now sent on a free connection, and a call (two-way or oneway) or a reply
   made from such a destructor is refused with `InvalidOperation`, as a
   kernel death or freeze request from one already was.
+- **A panic that escapes an RPC frame's dispatch ends the session.** A
+  panic from user code that a release runs outside the handler, such as the
+  `Drop` of a binder the session lets go when an error reply's parcel
+  drops, unwound the serve thread past the session's end: the session stayed
+  live with no thread reading that connection, so a peer's call on it
+  waited without end. The serve loop now catches it, logs it and ends with
+  `EndReason::Dispatch(StatusCode::Unknown)`, which ends the session as any
+  other loop end does; `serve_blocking` returns instead of unwinding.
+- **A panic in a kernel transaction outside the handler restores the
+  thread's calling identity.** A panic between the dispatch and the reply,
+  such as the `Drop` of a binder the handler had unpublished, left the
+  transaction's calling identity and strict-mode policy on the thread; under
+  a `catch_unwind` of the caller's or tokio's `spawn_blocking`, the thread
+  then answered `get_calling_uid` with that caller and
+  `is_handling_transaction` with `true`. They are now restored on every exit.
+- **A panic in the drop of a panicked handler's reply is caught.** The
+  partial reply of a handler that panicked is discarded under its own
+  `catch_unwind`, kernel and RPC alike, so a `Drop` that panics there no
+  longer unwinds the binder thread or the RPC serve thread.
 
 ### Security
 
