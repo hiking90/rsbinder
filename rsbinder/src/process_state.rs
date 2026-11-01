@@ -1127,13 +1127,10 @@ impl ProcessState {
         }
 
         // Case (a): pin under the lock; see module doc "Proxy cache slow path" for why.
-        thread_state::inc_weak_handle(handle)?;
-        if let Err(err) = thread_state::flush_commands() {
-            log::warn!(
-                "BC_INCREFS for handle {handle} failed at flush: {err:?}; \
-                 handle is no longer valid in the kernel"
-            );
-            return Err(StatusCode::DeadObject);
+        if let Err(err) = thread_state::send_weak_pin(handle) {
+            // Never sent, so no pin is owed; a failed flush the driver consumed counts as sent.
+            log::warn!("BC_INCREFS for handle {handle} was not sent: {err:?}");
+            return Err(err);
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseA {

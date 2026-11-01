@@ -34,8 +34,12 @@
 //!     `DeathRecipient::binder_died`.
 //!   - Other functions in this module that take a borrow at some point:
 //!     `transact`, `wait_for_response`, `flush_commands`, `flush_if_needed`,
-//!     `inc_strong_handle`, `dec_strong_handle`, `inc_weak_handle`,
-//!     `dec_weak_handle`, `free_buffer`, and `process_pending_derefs`.
+//!     `queue_cmd` and the commands it queues (`inc_strong_handle`,
+//!     `dec_strong_handle`, `dec_weak_handle`, `free_buffer`, the two
+//!     `clear_*_notification`), `send_flushed` and the requests it sends
+//!     (`send_weak_pin`, `send_death_request`, `send_freeze_request`), and
+//!     `process_pending_derefs`. `queue_cmd`'s `build` closure only writes into
+//!     the borrowed `out_parcel`; every flush comes after the borrow ends.
 //!
 //! Violation manifests as a `RefCell` panic ("already borrowed" /
 //! "already mutably borrowed"). Binder's nested-IPC protocol means user
@@ -223,7 +227,11 @@
 //!   is rewound. With `retry_flush` (`BC_REPLY` only) one more flush is tried
 //!   first, so a transient failure does not cost the peer its reply. A retried
 //!   `BC_TRANSACTION` would instead leave a two-way call in flight whose
-//!   `BR_REPLY` the next `transact` would take.
+//!   `BR_REPLY` the next `transact` would take. `send_flushed` uses the same
+//!   mark for a command it sends alone (a death or freeze request, the proxy
+//!   cache's `BC_INCREFS`): one the driver never consumed is rewound and
+//!   reported as not sent, so the caller owes no undo; one it consumed counts
+//!   as sent even when the ioctl failed.
 //! - **Handler panics.** `binder::run_handler`, which the RPC server's
 //!   dispatch calls too, catches a panic from `Transactable::transact`,
 //!   discards the partial reply, and returns `StatusCode::Unknown`, so the
@@ -2007,30 +2015,49 @@ pub(crate) fn flush_commands() -> Result<()> {
     })
 }
 
+/// Where [`queue_cmd`] put a command.
+enum Queued {
+    /// In this thread's `out_parcel`; the caller flushes it as it needs.
+    InThreadState,
+    /// `THREAD_STATE` was torn down, so it went to the driver on its own and needs no flush.
+    SentDirectly,
+}
+
+/// Write one command with `build` into this thread's `out_parcel`. With `THREAD_STATE` torn
+/// down, a `fallback` command goes to the driver directly; any other is `InvalidOperation`.
+///
+/// `build` only writes. A command taken back with nothing sent, as an `inc_*` is, does not
+/// fall back: a count it raised alone would let the matching decrement take another holder's.
+fn queue_cmd(fallback: bool, build: impl Fn(&mut CommandStream) -> Result<()>) -> Result<Queued> {
+    match THREAD_STATE.try_with(|thread_state| build(&mut thread_state.borrow_mut().out_parcel)) {
+        Ok(written) => written.map(|()| Queued::InThreadState),
+        Err(_) if fallback => write_without_thread_state_with(build).map(|()| Queued::SentDirectly),
+        Err(_) => Err(StatusCode::InvalidOperation),
+    }
+}
+
+/// One command of two words, as `inc_*` and `dec_*` write them.
+fn write_handle_cmd(out: &mut CommandStream, cmd: u32, handle: u32) -> Result<()> {
+    out.write_cmd::<u32>(&cmd)?;
+    out.write_cmd::<u32>(&handle)
+}
+
+/// Queues `BC_ACQUIRE`. A queued command counts as sent, as in AOSP `incStrongHandle`: a
+/// flush that fails leaves it applied or still queued, and either way the proxy this backs
+/// sends the `BC_RELEASE` after it. `InvalidOperation` once `THREAD_STATE` is torn down.
 pub(crate) fn inc_strong_handle(handle: u32) -> Result<()> {
     log::trace!("inc_strong_handle: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state.out_parcel.write_cmd::<u32>(&(binder::BC_ACQUIRE))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-        }
-
-        flush_if_needed()?;
-
-        Ok(())
-    })
+    let queued = queue_cmd(false, |out| {
+        write_handle_cmd(out, binder::BC_ACQUIRE, handle)
+    })?;
+    if let Queued::InThreadState = queued {
+        // `talk_with_driver` logged a failure; the command stands either way (see above).
+        let _ = flush_if_needed();
+    }
+    Ok(())
 }
 
 // `THREAD_STATE` torn down at thread exit: write one command directly, then exit the thread again.
-fn write_without_thread_state<T: NativeScalar>(cmd: u32, arg: T) -> Result<()> {
-    write_without_thread_state_with(|out| {
-        out.write_cmd::<u32>(&cmd)?;
-        out.write_cmd::<T>(&arg)
-    })
-}
-
 fn write_without_thread_state_with(
     build: impl FnOnce(&mut CommandStream) -> Result<()>,
 ) -> Result<()> {
@@ -2056,60 +2083,28 @@ fn write_without_thread_state_with(
     Ok(())
 }
 
+/// Queues `BC_RELEASE`; after `THREAD_STATE`'s teardown, sends it on its own.
 pub(crate) fn dec_strong_handle(handle: u32) -> Result<()> {
     log::trace!("dec_strong_handle: {handle}");
-    let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state.out_parcel.write_cmd::<u32>(&(binder::BC_RELEASE))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-        }
-
+    let queued = queue_cmd(true, |out| {
+        write_handle_cmd(out, binder::BC_RELEASE, handle)
+    })?;
+    if let Queued::InThreadState = queued {
         flush_if_needed()?;
-
-        Ok(())
-    });
-    match queued {
-        Ok(result) => result,
-        Err(_) => write_without_thread_state::<u32>(binder::BC_RELEASE, handle),
     }
+    Ok(())
 }
 
-pub(crate) fn inc_weak_handle(handle: u32) -> Result<()> {
-    log::trace!("inc_weak_handle: {handle}");
-    THREAD_STATE.with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state.out_parcel.write_cmd::<u32>(&(binder::BC_INCREFS))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-        }
-
-        flush_if_needed()?;
-
-        Ok(())
-    })
-}
-
+/// Queues `BC_DECREFS`; after `THREAD_STATE`'s teardown, sends it on its own.
 pub(crate) fn dec_weak_handle(handle: u32) -> Result<()> {
     log::trace!("dec_weak_handle: {handle}");
-    let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
-        {
-            let mut state = thread_state.borrow_mut();
-
-            state.out_parcel.write_cmd::<u32>(&(binder::BC_DECREFS))?;
-            state.out_parcel.write_cmd::<u32>(&(handle))?;
-        }
-
+    let queued = queue_cmd(true, |out| {
+        write_handle_cmd(out, binder::BC_DECREFS, handle)
+    })?;
+    if let Queued::InThreadState = queued {
         flush_if_needed()?;
-
-        Ok(())
-    });
-    match queued {
-        Ok(result) => result,
-        Err(_) => write_without_thread_state::<u32>(binder::BC_DECREFS, handle),
     }
+    Ok(())
 }
 
 pub(crate) fn flush_if_needed() -> Result<bool> {
@@ -2263,25 +2258,13 @@ fn free_buffer(
     _: binder_uintptr_t,
     _: usize,
 ) -> Result<()> {
-    let queued = THREAD_STATE.try_with(|thread_state| -> Result<()> {
-        let mut thread_state = thread_state.borrow_mut();
-        thread_state
-            .out_parcel
-            .write_cmd::<u32>(&binder::BC_FREE_BUFFER)?;
-        thread_state
-            .out_parcel
-            .write_cmd::<binder_uintptr_t>(&data)?;
-        Ok(())
-    });
-    match queued {
-        Ok(result) => result?,
-        Err(_) => {
-            return write_without_thread_state::<binder_uintptr_t>(binder::BC_FREE_BUFFER, data)
-        }
+    let queued = queue_cmd(true, |out| {
+        out.write_cmd::<u32>(&binder::BC_FREE_BUFFER)?;
+        out.write_cmd::<binder_uintptr_t>(&data)
+    })?;
+    if let Queued::InThreadState = queued {
+        flush_if_needed()?;
     }
-
-    flush_if_needed()?;
-
     Ok(())
 }
 
@@ -2394,14 +2377,11 @@ pub(crate) fn clear_death_notification(handle: u32) -> Result<()> {
     log::trace!("clear_death_notification: {handle}");
     // Counted before the driver can see it, so its done never arrives first.
     ProcessState::note_death_clear(handle);
-    let write = |out: &mut CommandStream| {
+    // A `ProxyHandle` dropped at thread exit calls this after teardown: the fallback.
+    queue_cmd(true, |out| {
         write_handle_cookie(out, binder::BC_CLEAR_DEATH_NOTIFICATION, handle)
-    };
-    // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
-    match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {
-        Ok(result) => result,
-        Err(_) => write_without_thread_state_with(write),
-    }
+    })
+    .map(drop)
 }
 
 /// `binder_handle_cookie` with cookie = handle; AOSP writes the `BpBinder` pointer instead.
@@ -2411,8 +2391,15 @@ fn write_handle_cookie(out: &mut CommandStream, cmd: u32, handle: u32) -> Result
     out.write_cmd::<binder::binder_uintptr_t>(&(handle as _))
 }
 
-/// Writes and flushes a death or freeze request; `Err` only if the kernel never got it (rewound).
-fn send_request_flushed(cmd: u32, handle: u32) -> Result<()> {
+/// Writes one command with `build` and flushes it; `Err` only if the kernel never got it (rewound).
+///
+/// A failed flush that the driver consumed leaves the command applied, so the call succeeds and
+/// the caller's undo (a pin's `BC_DECREFS`, a registry's clear) keeps the count right.
+fn send_flushed(
+    cmd: u32,
+    handle: u32,
+    build: impl Fn(&mut CommandStream) -> Result<()>,
+) -> Result<()> {
     log::trace!("{}: {handle}", command_to_str(cmd));
     // `try_with`: a call from a TLS destructor must fail, not panic under the registry lock.
     THREAD_STATE
@@ -2430,8 +2417,7 @@ fn send_request_flushed(cmd: u32, handle: u32) -> Result<()> {
                 }
                 rewound
             };
-            let written =
-                write_handle_cookie(&mut thread_state.borrow_mut().out_parcel, cmd, handle);
+            let written = build(&mut thread_state.borrow_mut().out_parcel);
             if let Err(err) = written {
                 rewind();
                 return Err(err);
@@ -2452,12 +2438,24 @@ fn send_request_flushed(cmd: u32, handle: u32) -> Result<()> {
 
 /// `BC_REQUEST_DEATH_NOTIFICATION`, flushed; only `death::DeathRegistry` decides when.
 pub(crate) fn send_death_request(handle: u32) -> Result<()> {
-    send_request_flushed(binder::BC_REQUEST_DEATH_NOTIFICATION, handle)
+    let cmd = binder::BC_REQUEST_DEATH_NOTIFICATION;
+    send_flushed(cmd, handle, |out| write_handle_cookie(out, cmd, handle))
 }
 
 /// `BC_REQUEST_FREEZE_NOTIFICATION`, flushed; only `freeze::FreezeRegistry` decides when.
 pub(crate) fn send_freeze_request(handle: u32) -> Result<()> {
-    send_request_flushed(binder::BC_REQUEST_FREEZE_NOTIFICATION, handle)
+    let cmd = binder::BC_REQUEST_FREEZE_NOTIFICATION;
+    send_flushed(cmd, handle, |out| write_handle_cookie(out, cmd, handle))
+}
+
+/// `BC_INCREFS`, flushed, for the proxy cache's pin: see the module doc of `process_state`,
+/// "Proxy cache slow path". `Err` only if the kernel never got it, so no pin is owed.
+pub(crate) fn send_weak_pin(handle: u32) -> Result<()> {
+    let cmd = binder::BC_INCREFS;
+    send_flushed(cmd, handle, |out| {
+        out.write_cmd::<u32>(&cmd)?;
+        out.write_cmd::<u32>(&handle)
+    })
 }
 
 /// [`flush_commands`] unless `THREAD_STATE` is torn down; the fallback writer already sent.
@@ -2472,14 +2470,11 @@ pub(crate) fn flush_commands_if_alive() -> Result<()> {
 pub(crate) fn clear_freeze_notification(handle: u32) -> Result<()> {
     log::trace!("clear_freeze_notification: {handle}");
     ProcessState::note_freeze_clear(handle);
-    let write = |out: &mut CommandStream| {
+    // A `ProxyHandle` dropped at thread exit calls this after teardown: the fallback.
+    queue_cmd(true, |out| {
         write_handle_cookie(out, binder::BC_CLEAR_FREEZE_NOTIFICATION, handle)
-    };
-    // `try_with`: a `ProxyHandle` dropped at thread exit calls this after teardown.
-    match THREAD_STATE.try_with(|thread_state| write(&mut thread_state.borrow_mut().out_parcel)) {
-        Ok(result) => result,
-        Err(_) => write_without_thread_state_with(write),
-    }
+    })
+    .map(drop)
 }
 
 /// The caller of the transaction this thread is handling: pid, uid and,
@@ -4132,6 +4127,55 @@ mod tests {
                     0,
                     "the queued commands went out and the request was rewound"
                 );
+            },
+        );
+    }
+
+    /// From a TLS destructor that runs after `THREAD_STATE`'s, an `inc_*` and a proxy lookup are
+    /// refused, and a proxy dropped there still sends its decrements. A panic in a TLS destructor
+    /// aborts, which is what an `inc_*` through `THREAD_STATE.with` did.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[serial_test::serial(binder)]
+    fn after_the_teardown_an_inc_is_refused_and_a_drop_sends() {
+        in_child_process(
+            "thread_state::tests::after_the_teardown_an_inc_is_refused_and_a_drop_sends",
+            || {
+                // No such refs: the driver ignores counts on them, and only handle 0 is pinged.
+                const NO_REF: u32 = 0x7fff_ffe0;
+                type Last = Box<dyn FnOnce() + Send>;
+                struct Late(RefCell<Option<Last>>);
+                impl Drop for Late {
+                    fn drop(&mut self) {
+                        if let Some(last) = self.0.borrow_mut().take() {
+                            last();
+                        }
+                    }
+                }
+                thread_local! {
+                    static LATE: Late = const { Late(RefCell::new(None)) };
+                }
+                ProcessState::init_default().expect("init_default");
+                std::thread::spawn(|| {
+                    // Registered first, so destroyed after the `THREAD_STATE` the lookup touches.
+                    LATE.with(|_| ());
+                    let held = ProcessState::as_self()
+                        .strong_proxy_for_handle(NO_REF)
+                        .expect("a proxy for an unreferenced handle");
+                    let last: Last = Box::new(move || {
+                        assert!(THREAD_STATE.try_with(|_| ()).is_err(), "torn down first");
+                        assert_eq!(
+                            inc_strong_handle(NO_REF + 1),
+                            Err(StatusCode::InvalidOperation)
+                        );
+                        let refused = ProcessState::as_self().strong_proxy_for_handle(NO_REF + 2);
+                        assert_eq!(refused.err(), Some(StatusCode::InvalidOperation));
+                        drop(held);
+                    });
+                    LATE.with(|late| *late.0.borrow_mut() = Some(last));
+                })
+                .join()
+                .expect("the thread and its destructors ran without a panic");
             },
         );
     }

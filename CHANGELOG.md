@@ -55,6 +55,19 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `create`, `Mapping::map` and `add_seals` in that order; `add_seals`'s
   documentation says why the map comes before a `FUTURE_WRITE` seal.
 
+### Fixed
+
+- **A kernel binder proxy made from a TLS destructor** (one that runs
+  after the binder thread state's own) fails with `InvalidOperation`
+  instead of aborting the process; a proxy dropped there still sends its
+  decrements, as it did.
+- **A failed flush no longer leaks a kernel reference count.** The proxy
+  cache's `BC_INCREFS` is taken back when the driver never consumed it
+  (the lookup fails with the driver's error, no longer `DeadObject`) and
+  counts as sent when it did; a `BC_ACQUIRE` counts as sent once queued,
+  as in AOSP `incStrongHandle`. Before, either failure left a count the
+  matching decrement never undid.
+
 ## [0.13.0] - 2026-10-31
 
 ### Migrating from 0.12.0
