@@ -482,13 +482,17 @@ impl ServiceManager {
     }
 
     fn run_death_receiver(&self, death_receiver: mpsc::Receiver<rsbinder::WIBinder>) {
-        let inner_clone = Arc::clone(&self.inner);
+        // Weak: `Inner` owns the channel's sender, so a strong ref here would keep both alive.
+        let inner_weak = Arc::downgrade(&self.inner);
         let spawn_result = std::thread::Builder::new()
             .name("rsb_hub:death".to_owned())
             .spawn(move || {
                 for who in death_receiver {
+                    let Some(inner_arc) = inner_weak.upgrade() else {
+                        return;
+                    };
                     let (services, callbacks) = {
-                        let mut inner = lock_recover(&inner_clone);
+                        let mut inner = lock_recover(&inner_arc);
                         inner.retire_dead_binder(&who)
                     };
                     // Logged at zero too: retiring nothing is how a broken match shows.
@@ -936,14 +940,14 @@ impl ServiceManager {
             (rows, awaited, inner.death_links.len())
         };
 
-        // Caller's filter first, so `hidden` counts only what the policy withheld.
-        rows.retain(|row| dump_filter_matches(&filter, &row.name));
-        awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
-
+        // Policy first: a `hidden` counted after the caller's filter tells which substrings exist.
         let before = rows.len() + awaited.len();
         rows.retain(|row| self.allows_in(config, caller, Permission::Find, &row.name));
         awaited.retain(|(name, _, _)| self.allows_in(config, caller, Permission::Find, name));
         let hidden = before - rows.len() - awaited.len();
+
+        rows.retain(|row| dump_filter_matches(&filter, &row.name));
+        awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
 
         DumpSnapshot {
             services: rows,
@@ -1821,7 +1825,7 @@ fn abort_on_a_background_panic() {
 }
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // Before any thread: the mask is inherited, and `from_environment` mutates the env.
+    // Before any thread: the mask is inherited.
     if let Err(e) = block_handled_signals() {
         eprintln!("rsb_hub: cannot block signals: {e}");
         std::process::exit(1);
@@ -2475,6 +2479,23 @@ mod tests {
         assert!(!manager.allows_as(None, Permission::Find, SELF_SERVICE_NAME));
     }
 
+    /// The death thread holds `Inner` weakly: `Inner` owns the sender its `recv` waits on.
+    #[test]
+    fn dropping_the_manager_frees_its_state() {
+        let manager = ServiceManager::new(false, Arc::new(Enforcer::allow_all()));
+        let inner = Arc::downgrade(&manager.inner);
+        drop(manager);
+        // The poller holds `Inner` for one pass every 5 s, so allow it one pass.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while inner.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a thread still holds the dropped manager's state"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Without the feature the registry's name is a service name like any other.
     #[cfg(not(feature = "topic"))]
     #[test]
@@ -2737,6 +2758,41 @@ mod tests {
         let out = dump_to_string(&empty_snapshot());
         assert!(!out.contains("hidden by policy"), "{out}");
         assert!(!out.contains("filter:"), "{out}");
+    }
+
+    /// A filter that matches only a name `find` denies must not change what the dump says.
+    #[test]
+    fn the_dump_filter_reveals_nothing_of_withheld_names() {
+        let (manager, config) = a_manager_over(
+            r#"
+            [[rule]]
+            name = "open.*"
+            find = { uid = [1000] }
+            "#,
+        );
+        for name in ["open.a", "secret.a"] {
+            let service = Service {
+                binder: fake_binder(),
+                dump_priority: DUMP_FLAG_PRIORITY_DEFAULT,
+                has_clients: false,
+                guarantee_client: false,
+                context: rsbinder::CallingContext::current(),
+            };
+            lock_recover(&manager.inner)
+                .add_service(name, service)
+                .expect("add");
+        }
+        let caller = kernel_caller(1000);
+        let hidden = |filter: &[&str]| {
+            let filter = filter.iter().map(|f| f.to_string()).collect();
+            let snap = manager.dump_snapshot(&config, Some(&caller), filter);
+            assert!(snap.services.iter().all(|row| row.name != "secret.a"));
+            snap.hidden
+        };
+        assert_eq!(hidden(&[]), 1);
+        assert_eq!(hidden(&["secret"]), 1);
+        assert_eq!(hidden(&["no-match"]), 1);
+        assert_eq!(hidden(&["open"]), 1);
     }
 
     #[test]

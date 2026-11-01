@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder_fmq::{Descriptor, Flavor, Grantor};
 
-/// The `index`th 8-byte word of `map` as an atomic: a queue's counters, as a hostile peer
-/// would reach them. The caller reaches these bytes only through atomics of this size.
+/// Word `index` of `map` as an `AtomicU64`; reach these bytes at no other size.
 #[cfg(target_has_atomic = "64")]
 pub fn counter(map: &rsbinder_fmq::shm::Mapping, index: usize) -> &std::sync::atomic::AtomicU64 {
     assert!(

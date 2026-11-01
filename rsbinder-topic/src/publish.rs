@@ -404,6 +404,10 @@ impl<S: Stores> State<S> {
             ..
         } = self;
         let lending = lending.as_mut().expect("a lend asks a topic with a pool");
+        // Before the window: no wait or eviction changes the loans held, which only this lock does.
+        if lending.slots.at_loan_limit() {
+            return Err(LendError::TooMany);
+        }
         // Under this lock nothing is written, so the floor holds for the whole wait.
         let floor = window.map_or(0, |window| writer.window_floor(window));
         let mut lend = |links: &Links| {

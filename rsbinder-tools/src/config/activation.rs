@@ -135,7 +135,7 @@ impl ActivationRunner for SystemRunner {
                     return;
                 };
                 // `--no-block`: the client waits for a registration notification, not us.
-                let mut c = Command::new(systemctl);
+                let mut c = child_command(systemctl);
                 c.arg("--no-block").arg("start").arg("--").arg(unit);
                 c
             }
@@ -193,9 +193,16 @@ fn exec_command(root: At<'_>, argv: &[String], our_uid: u32) -> Result<Command, 
         }
         Err(e) => return Err(format!("cannot check `exec` program {program:?}: {e}")),
     }
-    let mut c = Command::new(program);
+    let mut c = child_command(program);
     c.args(&argv[1..]);
     Ok(c)
+}
+
+/// `program` without the hub's `$NOTIFY_SOCKET`, which `Notifier::from_environment` leaves set.
+fn child_command(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env_remove(crate::notify::NOTIFY_SOCKET);
+    c
 }
 
 #[cfg(test)]
@@ -366,6 +373,21 @@ mod tests {
         assert!(
             why.contains(&format!("{} is group-writable", bin.display())),
             "{why}"
+        );
+    }
+
+    /// A started service that kept the hub's socket could report the hub's unit ready or stopping.
+    #[test]
+    fn an_exec_start_does_not_pass_on_the_notify_socket() {
+        let tree = Tree::new("notify");
+        chmod(&tree.base.join("bin/svc"), 0o755);
+        let command = tree.command().expect("a trusted program gets a command");
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == crate::notify::NOTIFY_SOCKET && value.is_none()),
+            "{:?}",
+            command.get_envs().collect::<Vec<_>>()
         );
     }
 

@@ -46,8 +46,7 @@ enum Flaw {
     NoFence,
     /// A waker in this process wakes once instead of until the wait is out.
     WakeOnce,
-    /// A raise in this process wakes the bit after its wait's, as one that named another
-    /// subscriber's bit would; the publisher's wake of every bit is as it is.
+    /// A raise here wakes the bit after its wait's, as one naming another subscriber's would.
     OtherBit,
     /// A new wait starts without joining the one a dropped future left on the pool.
     NoJoin,
@@ -276,6 +275,43 @@ enum Received {
     Evicted,
 }
 
+/// `Subscriber::look` at `read`, `before_look` loading `mark`: `Ok` at an end, else its `looked`.
+fn look(
+    model: &Arc<Model>,
+    local: &Local<Arc<Model>>,
+    read: &mut u32,
+    mark: &dyn Fn() -> u32,
+) -> Result<Received, Looked> {
+    // Taken out, it ends before the ring.
+    if local.evicted() {
+        *model.looked.lock().unwrap() = Looked::Exact;
+        return Ok(Received::Evicted);
+    }
+    // `Subscriber::before_look`.
+    let after_one_gave_up = matches!(*model.looked.lock().unwrap(), Looked::GaveUp(_));
+    let mut before = (after_one_gave_up && model.flaw != Flaw::SeqAfterLook).then(mark);
+    let died = local.died();
+    let write = model.write.load(Ordering::Acquire);
+    if write != *read && (!model.lapped || model.half.load(Ordering::Acquire) == write) {
+        *read += 1;
+        *model.looked.lock().unwrap() = Looked::Exact;
+        return Ok(Received::Record);
+    }
+    if after_one_gave_up && model.flaw == Flaw::SeqAfterLook {
+        before = Some(mark());
+    }
+    // `Subscriber::settle`: a record past `read` it could not reach is a look that gave up.
+    let looked = match write != *read {
+        true => Looked::GaveUp(before),
+        false => Looked::Exact,
+    };
+    *model.looked.lock().unwrap() = looked;
+    if died {
+        return Ok(Received::Died);
+    }
+    Err(looked)
+}
+
 /// `Subscriber::wait` past the join, with the ring as `write` and a reader at `read`.
 fn receive(model: &Arc<Model>, local: &Local<Arc<Model>>, read: &mut u32) -> Received {
     // What `decide` compares: `seq`, or with `IdleOnWrite` the `write` that flaw goes by.
@@ -284,33 +320,10 @@ fn receive(model: &Arc<Model>, local: &Local<Arc<Model>>, read: &mut u32) -> Rec
         _ => local.words().seq(),
     };
     loop {
-        // `Subscriber::look`: taken out, it ends before the ring.
-        if local.evicted() {
-            *model.looked.lock().unwrap() = Looked::Exact;
-            return Received::Evicted;
-        }
-        // `Subscriber::before_look`.
-        let after_one_gave_up = matches!(*model.looked.lock().unwrap(), Looked::GaveUp(_));
-        let mut before = (after_one_gave_up && model.flaw != Flaw::SeqAfterLook).then(mark);
-        let died = local.died();
-        let write = model.write.load(Ordering::Acquire);
-        if write != *read && (!model.lapped || model.half.load(Ordering::Acquire) == write) {
-            *read += 1;
-            *model.looked.lock().unwrap() = Looked::Exact;
-            return Received::Record;
-        }
-        if after_one_gave_up && model.flaw == Flaw::SeqAfterLook {
-            before = Some(mark());
-        }
-        // `Subscriber::settle`: a record past `read` it could not reach is a look that gave up.
-        let looked = match write != *read {
-            true => Looked::GaveUp(before),
-            false => Looked::Exact,
+        let looked = match look(model, local, read, &mark) {
+            Ok(received) => return received,
+            Err(looked) => looked,
         };
-        *model.looked.lock().unwrap() = looked;
-        if died {
-            return Received::Died;
-        }
         if local.cancelled() {
             return Received::Cancelled;
         }
@@ -905,16 +918,21 @@ fn polls(model: &Arc<Model>, local: &Local<Arc<Model>>) -> bool {
     sleeps
 }
 
-/// `Subscriber::recv_on_reactor` until a record: `seq` loaded before the look, as `seen` is.
+/// `Subscriber::recv_on_reactor` at `read`: look, `cancelled`, `seen`, then [`decide`] on `looked`.
 #[cfg(feature = "tokio")]
-fn receive_on_reactor(model: &Arc<Model>, local: &Local<Arc<Model>>) {
+fn receive_on_reactor(model: &Arc<Model>, local: &Local<Arc<Model>>, read: &mut u32) -> Received {
     loop {
-        let seen = local.words().seq();
-        if model.write.load(Ordering::Acquire) != 0 {
-            return;
+        let looked = match look(model, local, read, &|| local.words().seq()) {
+            Ok(received) => return received,
+            Err(looked) => looked,
+        };
+        if local.cancelled() {
+            return Received::Cancelled;
         }
-        let stop = local.stop_bits();
-        if decide(Looked::Exact, seen, stop, REACTOR_ENDS, || false) == Next::Look {
+        let seen = local.words().seq();
+        // A commit between the look and `seen` passes the arm's `seq` check; `decide` sees it.
+        let pending = || model.write.load(Ordering::Acquire) != *read;
+        if decide(looked, seen, local.stop_bits(), REACTOR_ENDS, pending) == Next::Look {
             continue;
         }
         if local.arm_reactor(seen, unread()) {
@@ -930,17 +948,67 @@ fn receive_on_reactor(model: &Arc<Model>, local: &Local<Arc<Model>>) {
 
 /// A commit as a reactor's wait arms: the arm sees `seq` moved, or the commit's byte ends it.
 #[cfg(feature = "tokio")]
-#[test]
-fn loom_wait_fd_a_commit_ends_a_reactor_wait() {
+fn a_commit_ends_a_reactor_wait(flaw: Flaw, lapped: bool) {
     check(move || {
-        let (model, local) = fd_model(Flaw::None);
+        let (model, local) = built(flaw, true, lapped);
         let publisher = {
             let model = model.clone();
             thread::spawn(move || publish(&model))
         };
-        receive_on_reactor(&model, &local);
+        assert_eq!(receive_on_reactor(&model, &local, &mut 0), Received::Record);
         publisher.join().unwrap();
     });
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn loom_wait_fd_a_commit_ends_a_reactor_wait() {
+    a_commit_ends_a_reactor_wait(Flaw::None, false);
+}
+
+/// A reader the publisher lapped: looks that find nothing until `half` is stored, then the arm.
+#[cfg(feature = "tokio")]
+#[test]
+fn loom_wait_fd_a_lapped_reactor_wait_sleeps_only_on_a_seq_a_look_came_after() {
+    a_commit_ends_a_reactor_wait(Flaw::None, true);
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+#[should_panic(expected = "deadlock")]
+fn loom_wait_fd_a_lapped_reactor_wait_on_the_seq_loaded_after_its_look_sleeps_through() {
+    a_commit_ends_a_reactor_wait(Flaw::SeqAfterLook, true);
+}
+
+#[cfg(feature = "tokio")]
+fn a_bit_from_this_process_ends_a_reactor_wait(bit: u32, ends: Received) {
+    check(move || {
+        let (model, local) = fd_model(Flaw::None);
+        let waker = {
+            let local = local.clone();
+            thread::spawn(move || local.raise(bit))
+        };
+        assert_eq!(receive_on_reactor(&model, &local, &mut 0), ends);
+        waker.join().unwrap();
+    });
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn loom_wait_fd_an_interrupt_ends_a_reactor_wait() {
+    a_bit_from_this_process_ends_a_reactor_wait(INTERRUPTED, Received::Cancelled);
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn loom_wait_fd_a_death_ends_a_reactor_wait() {
+    a_bit_from_this_process_ends_a_reactor_wait(DIED, Received::Died);
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn loom_wait_fd_a_notice_ends_a_reactor_wait() {
+    a_bit_from_this_process_ends_a_reactor_wait(NOTICE, Received::Cancelled);
 }
 
 /// A bit raised during a poll ends it and the receive after; the first `failing` sends fail.

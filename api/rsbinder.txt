@@ -3460,8 +3460,6 @@ pub fn rsbinder::Stability::clone(&self) -> rsbinder::Stability
 impl core::cmp::Eq for rsbinder::Stability
 impl core::cmp::PartialEq for rsbinder::Stability
 pub fn rsbinder::Stability::eq(&self, &rsbinder::Stability) -> bool
-impl core::convert::From<rsbinder::Stability> for i32
-pub fn i32::from(rsbinder::Stability) -> i32
 impl core::convert::TryFrom<i32> for rsbinder::Stability
 pub type rsbinder::Stability::Error = rsbinder::StatusCode
 pub fn rsbinder::Stability::try_from(i32) -> rsbinder::Result<rsbinder::Stability>

@@ -495,6 +495,21 @@ fn a_loan_is_send() {
     is_send::<crate::LoanMut<'static>>();
 }
 
+/// Plan 17 T-8: a loan is `UnwindSafe` and `RefUnwindSafe` as well, and not `Sync`.
+#[test]
+fn a_loan_is_unwind_safe_and_not_sync() {
+    fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    // Both impls match a `Sync` type, so the `_` below is ambiguous and fails to compile.
+    trait AmbiguousIfSync<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    struct IsSync;
+    impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+    unwind_safe::<crate::LoanMut<'static>>();
+    let _ = <crate::LoanMut<'static> as AmbiguousIfSync<_>>::some_item;
+}
+
 /// A loan taken on one thread is published on another, and its value arrives.
 #[test]
 fn a_loan_published_on_another_thread_reaches_the_subscriber() {

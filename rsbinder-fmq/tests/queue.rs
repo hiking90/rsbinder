@@ -445,7 +445,7 @@ fn write_blocking_times_out_on_a_full_queue() {
     assert_eq!(w.available_to_write().unwrap(), 0);
 }
 
-/// `Some(ZERO)` is one try: no wait, and the EventFlag word is not touched.
+/// `Some(ZERO)` is one try that never waits; a failed try leaves the EventFlag word alone.
 #[test]
 fn a_zero_timeout_tries_once_without_waiting() {
     let mut w = MessageQueue::<u8>::create(2, true).unwrap();
@@ -1145,11 +1145,10 @@ fn send_but_not_sync() {
 
 // ---- Ring memory is reached only through atomics --------------------------
 
-/// A spelling scan of the source; Miri on `racing_copies_are_atomic_accesses` checks semantics.
+/// Frozen: an access it misses is judged by Miri's `regions_copy_atomically` in `queue::tests`.
 #[test]
 fn ring_code_makes_no_plain_copy_of_ring_memory() {
-    // Code only: comment and doc lines may name the very calls this test forbids.
-    // Embedded at build time, so the test also runs where the source tree is absent (a device).
+    // Embedded so it runs on a device; comment lines may name the calls it forbids.
     let source = |file: &str| {
         let text = match file {
             "queue.rs" => include_str!("../src/queue.rs"),
@@ -1158,18 +1157,43 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
             "unsync.rs" => include_str!("../src/unsync.rs"),
             _ => panic!("{file} is not embedded"),
         };
-        text.lines()
+        let mut code = String::new();
+        for line in text
+            .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+        {
+            // A chain rustfmt broke over lines is rejoined, so no `.method()` line stands alone.
+            let rest = line.trim_start();
+            if rest.starts_with('.') && !code.is_empty() {
+                code.push_str(rest);
+            } else {
+                if !code.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(line);
+            }
+        }
+        code
     };
-    const PLAIN_ACCESSES: [&str; 25] = [
+    // Miri runs `Run` (`shm::run`), `Regions` and the unsync cores; not `MessageQueue` (memfd).
+    const PLAIN_ACCESSES: [&str; 35] = [
         "copy_nonoverlapping",
         "ptr::copy",
         "copy_from_slice",
         "clone_from_slice",
         "copy_within",
+        "copy_from",
         ".copy_to",
+        "write_bytes",
+        ".swap(",
+        ".replace(",
+        "ptr::swap",
+        "ptr::replace",
+        // Path calls: `NonNull::as_ptr(p)`, `NonNull::read(p)`, `<*const T>::write(p, v)`.
+        "::as_ptr(",
+        "::read(",
+        "::write(",
+        "transmute",
         "read_volatile",
         "write_volatile",
         "read_unaligned",
@@ -1202,7 +1226,7 @@ fn ring_code_makes_no_plain_copy_of_ring_memory() {
         "at: mapping.as_ptr(),",
         "debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);",
         "let first = self.first.as_ptr().add(start.min(self.first_len) * q);",
-        ".as_ptr()",
+        "let second = self.second.as_ptr().add(start.saturating_sub(self.first_len) * q);",
         "let head_len = ((WORD - at.as_ptr() as usize % WORD) % WORD).min(len);",
         "let at = at.as_ptr();",
         "unsafe { std::slice::from_raw_parts(user.as_ptr().cast(), std::mem::size_of_val(user)) }",

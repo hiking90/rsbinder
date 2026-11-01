@@ -28,8 +28,8 @@
 //! lines; see [`uri`] for the grammar.
 //!
 //! The low-level types ([`crate::ProcessState`], [`crate::hub`],
-//! `crate::rpc::{RpcServer, RpcSession}`) are unchanged and remain the
-//! direct path; this is a thin layer over them with no wire change.
+//! `crate::rpc::{RpcServer, RpcSession}`) remain the direct path; this is
+//! a thin layer over them with no wire change.
 //!
 //! # What the `Uri` does *not* hide
 //!
@@ -99,24 +99,31 @@ pub fn connect_binder(uri: impl Into<Uri>) -> Result<SIBinder> {
 /// ends the wait instead of leaving a blocking-pool thread parked until
 /// the service appears. RPC: the connect runs on `spawn_blocking`; it does
 /// not wait for a name to appear, only for the connection and the lookup.
+///
+/// Called while handling a transaction
+/// ([`is_handling_transaction`](crate::is_handling_transaction)), on either
+/// endpoint, the whole connect runs **inline** on the handler's thread, as
+/// every async API of this crate does there (see
+/// [`BinderAsyncPool`](crate::BinderAsyncPool)'s *Which thread a transact
+/// runs on*), and needs no Tokio runtime. The first poll then blocks that
+/// thread until the name is registered (kernel, the inline
+/// `wait_for_interface_async` described in its *From inside a transaction*)
+/// or the lookup ends (RPC). Dropping the future cannot end that wait, and
+/// a `timeout` around it never fires. Look services up before serving, not
+/// while serving.
 #[cfg(feature = "tokio")]
 pub fn connect_async<T: FromIBinder + ?Sized + 'static>(
     uri: impl Into<Uri>,
 ) -> impl std::future::Future<Output = Result<Strong<T>>> + 'static {
     let uri = uri.into();
     async move {
-        if crate::is_handling_transaction() {
-            return connect::<T>(uri);
-        }
         if uri.endpoint.is_kernel() {
             let (uri, name) = split_service(uri, "rsbinder::connect_async")?;
             // Initializes `ProcessState` as `connect` does; opens the driver, never waits.
             client::new_client(uri, ClientOptions::default())?;
             return crate::wait_for_interface_async::<T>(&name).await;
         }
-        tokio::task::spawn_blocking(move || connect::<T>(uri))
-            .await
-            .unwrap_or_else(|e| Err(crate::rt::join_error_status(e)))
+        crate::rt::blocking_op(move || connect::<T>(uri)).await
     }
 }
 
@@ -130,4 +137,69 @@ fn split_service(mut uri: Uri, who: &str) -> Result<(Uri, String)> {
         return Err(crate::StatusCode::BadValue);
     };
     Ok((uri, name))
+}
+
+#[cfg(all(test, feature = "tokio", feature = "rpc"))]
+mod tests {
+    use super::*;
+    use crate::{Interface, StatusCode};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    struct Absent;
+
+    impl Interface for Absent {}
+
+    impl FromIBinder for Absent {
+        fn interface_descriptor() -> &'static str {
+            "rsbinder.test.Absent"
+        }
+        fn try_from(_: SIBinder) -> Result<Strong<Self>> {
+            Err(StatusCode::BadType)
+        }
+    }
+
+    /// In a handler, a kernel `connect_async` runs `connect` on the polling thread, no runtime.
+    #[test]
+    #[serial_test::serial(binder)]
+    fn a_kernel_connect_async_in_a_handler_runs_inline_without_a_runtime() {
+        crate::tests::in_own_process(
+            "entry::tests::a_kernel_connect_async_in_a_handler_runs_inline_without_a_runtime",
+            connect_async_in_a_handler,
+        );
+    }
+
+    /// The test above, in its own process: `hub::default` keeps a handle-0 proxy for good.
+    fn connect_async_in_a_handler() {
+        // Without a driver both orders fail at `new_client` before any runtime use: no verdict.
+        if client::new_client(Uri::kernel(), ClientOptions::default()).is_err() {
+            eprintln!("skipped: no kernel binder driver");
+            return;
+        }
+        let (done, watch) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _calling = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 0, pid: 7 }),
+                crate::TransportCaps::SAME_HOST,
+            );
+            assert!(crate::is_handling_transaction());
+            // The service manager's own name: a live one answers at once, an absent one fails.
+            let uri = Uri::kernel().with_service("manager");
+            let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let connect = connect_async::<Absent>(uri);
+                let mut connect = std::pin::pin!(connect);
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                std::future::Future::poll(connect.as_mut(), &mut cx).is_ready()
+            }));
+            let _ = done.send(matches!(polled, Ok(true)));
+        });
+        match watch.recv_timeout(Duration::from_secs(10)) {
+            Ok(inline) => assert!(
+                inline,
+                "the first poll needed a Tokio runtime or left the lookup to another thread"
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("the inline connect did not end"),
+            Err(e) => panic!("the polling thread died: {e}"),
+        }
+    }
 }

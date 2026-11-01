@@ -629,7 +629,6 @@ impl TypeGenerator {
     }
 
     /// `allow_box` is false for array elements: `Box<T>` has no `SerializeArray` impl.
-    /// `field`: a parcelable or union field, the only place `heap=true` boxes here.
     fn make_user_defined_type_name(&self, type_name: &str, allow_box: bool, field: bool) -> String {
         let lookup_decl = lookup_decl_from_name(type_name, crate::Namespace::AIDL)
             .expect("type must be resolved during code generation");
@@ -644,8 +643,7 @@ impl TypeGenerator {
                 .expect("a resolved declaration has a name"),
         );
         let is_interface = matches!(lookup_decl.decl, Declaration::Interface(_));
-        // Only `@nullable` boxes: `Option` ends `Default` recursion; `ensure_sized` rejects others.
-        // `heap=true` boxes wherever it is (AOSP `aidl_to_rust.cpp:305-306`), a bare one on a cycle.
+        // Box a `@nullable` `heap=true` field, or one on a cycle; `ensure_sized` rejects the rest.
         let needs_box = allow_box
             && self.is_nullable
             && !is_interface
@@ -1170,7 +1168,7 @@ impl TypeGenerator {
         self.type_decl_in(value_type, allow_box, false)
     }
 
-    /// [`type_decl`](Self::type_decl); `field` lets `heap=true` box (`make_user_defined_type_name`).
+    /// [`type_decl`](Self::type_decl); `field` (a parcelable or union field) lets `heap=true` box.
     fn type_decl_in(&self, value_type: &ValueType, allow_box: bool, field: bool) -> String {
         match value_type {
             ValueType::Void => "()".into(),

@@ -493,4 +493,36 @@ mod tests {
     fn process_state() {
         ProcessState::init("/dev/binderfs/binder", DEFAULT_MAX_BINDER_THREADS).expect("init");
     }
+
+    /// Runs `body`, the test named `test`, in a child test process; skips without a driver.
+    ///
+    /// For a test that reaches `hub::default()`: its process-lifetime static holds a proxy for
+    /// handle 0, and the `process_state` handle-0 tests need theirs to be the only one. A child
+    /// starts with no proxy cached, whatever the other tests of this binary left behind.
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
+    pub(crate) fn in_own_process(test: &str, body: fn()) {
+        const CHILD: &str = "RSBINDER_OWN_PROCESS_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            body();
+            return;
+        }
+        // Checked here: a child that skipped would also report "1 passed".
+        if !crate::ProcessState::is_initialized() && crate::ProcessState::init_default().is_err() {
+            eprintln!("skipped: no kernel binder driver");
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", test, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn the child test");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Zero tests run exits 0 too: the filter must have found `test`.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child {test}: {:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
 }

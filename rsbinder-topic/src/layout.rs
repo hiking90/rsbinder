@@ -1,10 +1,13 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two memory objects of a subscription, byte for byte, and every `unsafe` block of the
-//! crate.
+//! The three memory objects of a subscription, byte for byte, and every `unsafe` block that makes
+//! a pointer into them. The callers that read the slots' slices, on a `SAFETY` argument of their
+//! own, are in `sample.rs` and `pool.rs`; the other `unsafe` blocks of the library (outside
+//! `cfg(test)`) pass that argument on for a `Trusted` subscriber (`receive.rs`, `subscriber.rs`,
+//! `named.rs`) or register a file descriptor with the reactor (`subscriber.rs`).
 //!
-//! Both are sealed memfds. Each side maps the object it made read-write and the peer's
+//! All three are sealed memfds. Each side maps the object it made read-write and the peer's
 //! read-only, and `F_SEAL_FUTURE_WRITE` makes the kernel refuse the peer any other mapping. The
 //! offsets and sizes are fixed in bytes and do not depend on the page size or on the width of a
 //! pointer, since a 32-bit and a 64-bit process may share one object.
@@ -748,13 +751,15 @@ impl StoredPool {
 /// wherever it moves. What is done with the value on another thread
 /// (`TypedWriter::publish_loan`, `TypedWriter::give_back`) takes the writer's mutex, as a call
 /// from the thread that lent it does, so publishing or giving the slot back is ordered after
-/// every write through the value. `_not_sync` keeps the value `!Sync` (plan 17 T-8).
+/// every write through the value. `_not_sync` keeps the value `!Sync` (plan 17 T-8) and nothing
+/// else: the `Cell` is never made, so `AssertUnwindSafe` leaves the value `UnwindSafe` and
+/// `RefUnwindSafe`, which the public `LoanMut` holding it is.
 pub(crate) struct LentSlot {
     mapping: Arc<Mapping>,
     slot: u32,
     at: usize,
     len: usize,
-    _not_sync: PhantomData<Cell<()>>,
+    _not_sync: PhantomData<std::panic::AssertUnwindSafe<Cell<()>>>,
 }
 
 impl LentSlot {

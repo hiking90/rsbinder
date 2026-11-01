@@ -20,7 +20,6 @@ mod common;
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -86,10 +85,8 @@ fn parent_creates_child_reads() {
         return;
     }
 
-    let path = common::sock_path("pc");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).expect("bind");
-    let mut child = spawn_child("parent_creates_child_reads", &path);
+    let (path, listener) = common::SockFile::bind("pc");
+    let mut child = spawn_child("parent_creates_child_reads", &path.0);
     let sock = common::accept_from(&listener, &mut child);
 
     let mut queue = MessageQueue::<u32>::create(CAPACITY, true).expect("create");
@@ -112,7 +109,6 @@ fn parent_creates_child_reads() {
         out.contains(&format!("sum={}", expected_sum())),
         "child output: {out}"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Child allocates and writes; parent attaches, so the seal check sees a foreign memfd.
@@ -135,10 +131,8 @@ fn child_creates_parent_reads() {
         return;
     }
 
-    let path = common::sock_path("cp");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).expect("bind");
-    let mut child = spawn_child("child_creates_parent_reads", &path);
+    let (path, listener) = common::SockFile::bind("cp");
+    let mut child = spawn_child("child_creates_parent_reads", &path.0);
     let mut sock = common::accept_from(&listener, &mut child);
 
     let desc = common::recv_descriptor(&sock);
@@ -165,7 +159,6 @@ fn child_creates_parent_reads() {
     sock.write_all(&[1]).expect("done ack");
     let out = common::finish(child);
     assert!(out.contains("child done"), "child output: {out}");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The child parks on `NOT_EMPTY`; the parent wakes it through the `EventFlag` alone, no write.
@@ -186,10 +179,8 @@ fn wake_crosses_the_process_boundary() {
         return;
     }
 
-    let path = common::sock_path("wk");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).expect("bind");
-    let mut child = spawn_child("wake_crosses_the_process_boundary", &path);
+    let (path, listener) = common::SockFile::bind("wk");
+    let mut child = spawn_child("wake_crosses_the_process_boundary", &path.0);
     let mut sock = common::accept_from(&listener, &mut child);
 
     let queue = MessageQueue::<u8>::create(16, true).expect("create");
@@ -213,7 +204,6 @@ fn wake_crosses_the_process_boundary() {
         after_ms >= 150,
         "child woke before the wake was sent: {out}"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The child maps the parent's memfd read-only, sleeps on one `RoWord32` and wakes another.
@@ -229,9 +219,11 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
     let limit = Duration::from_secs(10);
     let page = rustix::param::page_size() as u64;
     let word_at = |mapping: &Mapping, index: usize| {
-        mapping
+        let at = mapping
             .as_ptr()
-            .map_addr(|addr| addr.saturating_add(4 * index))
+            .map_addr(|addr| addr.saturating_add(4 * index));
+        assert_eq!(at.addr().get() % 4, 0, "word {index} is not 4-aligned");
+        at
     };
 
     if is_child() {
@@ -241,7 +233,7 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
         assert_eq!(shm::verify_received(fd).expect("verify_received"), page);
         Mapping::map(fd, 0, page, Access::ReadWrite).expect_err("the memfd is write-sealed");
         let mapping = Mapping::map(fd, 0, page, Access::ReadOnly).expect("map read-only");
-        // SAFETY: words of a live mapping that this process only loads, each at one size.
+        // SAFETY: 4-aligned words (`word_at` asserts it) of a live mapping, loads only, one size.
         let [gate, sleeper, done] =
             [0, 1, 2].map(|index| unsafe { RoWord32::from_ptr(word_at(&mapping, index)) });
 
@@ -265,16 +257,14 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
         return;
     }
 
-    let path = common::sock_path("ro");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).expect("bind");
-    let mut child = spawn_child("a_read_only_word_waits_and_wakes_across_processes", &path);
+    let (path, listener) = common::SockFile::bind("ro");
+    let mut child = spawn_child("a_read_only_word_waits_and_wakes_across_processes", &path.0);
     let mut sock = common::accept_from(&listener, &mut child);
 
     let fd = shm::create(page, &CreateOptions::new("ro-word").populate(true)).expect("create");
     let mapping = Mapping::map(fd.as_fd(), 0, page, Access::ReadWrite).expect("map");
     shm::add_seals(fd.as_fd(), Seals::SHRINK | Seals::FUTURE_WRITE).expect("seal");
-    // SAFETY: words of a live mapping, reached through atomics only, each at one size.
+    // SAFETY: 4-aligned words (`word_at` asserts it) of a live mapping, atomics only, one size.
     let [gate, sleeper, done] =
         [0, 1, 2].map(|index| unsafe { word_at(&mapping, index).cast::<AtomicU32>().as_ref() });
     common::send_descriptor(
@@ -315,5 +305,4 @@ fn a_read_only_word_waits_and_wakes_across_processes() {
         waits <= 3,
         "the child's wait returned without sleeping: {out}"
     );
-    let _ = std::fs::remove_file(&path);
 }

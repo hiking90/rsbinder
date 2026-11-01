@@ -86,8 +86,13 @@
 //!   `Dying`, under this lock, so a lock-free check could push onto a dying session after that
 //!   clear; that slot is never shut down, its serve loop blocks in `recv` forever pinning the
 //!   session graph, and the caller would confirm the attach to the peer. Refusals: `DeadObject`
-//!   when torn down, `BadType` when the transport's traits differ from the founding connection's
-//!   (a live session must not read as dead), `FailedTransaction` at a cap. Only a server
+//!   when torn down, `BadType` when the transport's fd passing or its peer's principal differs
+//!   from the founding connection's (a live session must not read as dead), `FailedTransaction`
+//!   at a cap. `ConnState::admits` is the one place that decides admission, for an r34 join, an
+//!   android-13+ attach and a client's own fan-out alike. The principal is the uid of a
+//!   `PeerIdentity::Local` peer, a certificate's fingerprint, a vsock cid (one VM), or none for
+//!   `PeerIdentity::Anonymous`; an anonymous connection joins an anonymous founder, since there
+//!   is nothing to compare (AOSP 13+ admits on the 32-byte id alone everywhere). Only a server
 //!   attach bumps `live_conns` (`try_bump_live_conns`, in the same critical section): a
 //!   client's outgoing slots and a server's callback slots are not serve-driven, and a client's
 //!   incoming slots are served by threads the session owns.
@@ -274,6 +279,15 @@
 //! to a server session it did not found, splitting one server session across two client
 //! states with separate oneway numbering, binder addresses and lifetimes.
 //!
+//! The crate-internal `session_id()` is this session's own 32 bytes (AOSP `RpcSession::mId`,
+//! `kSessionIdBytes == 32`). On a server session it is the id minted at session build, replied
+//! by `GET_SESSION_ID` and used as the `RpcServer` registry key. On a client session it is NOT
+//! the peer's id: the client mints it locally and never puts it on the wire (it exists so a
+//! client session that serves callbacks can answer `GET_SESSION_ID`), and the server's id is a
+//! different 32 bytes that only `get_session_id` (one round trip, AOSP `setupClient` →
+//! `readId()`) returns. An attach given it is refused with `BadValue` before connecting, as
+//! every id other than the server-minted one is.
+//!
 //! # One inner per session
 //!
 //! One `RpcSessionInner` owns a session's whole slot pool (AOSP `mOutgoing` and `mIncoming` in
@@ -345,7 +359,7 @@
 //!    `drainCommands` (android-17.0.0_r1 `RpcSession.cpp:933-942`). The hold is rsbinder's: it
 //!    keeps this handler out of a write that only the peer's next send could unblock. A peer
 //!    reads nothing there while it sends nothing, and some never drain: libbinder from
-//!    android-16.0.0_r4 with incoming threads, android-12, rsbinder before "Draining sends". A
+//!    android-16.0.0_r4 with incoming threads, android-12. A
 //!    peer that sends only oneways, with no callback connection, gets the held `DEC_STRONG`s
 //!    with its next twoway. A hold dies with its slot, which leaves the pool only with the
 //!    session, and a session end resets the peer's counts anyway. The peer picks the addresses,
@@ -480,21 +494,37 @@
 //! * A stability `int32` follows every binder, null included
 //!   (`finishFlattenBinder` → `Stability::getRepr`; android-12.0.0_r34
 //!   `Parcel.cpp:198-214`). libbinder's `finishUnflattenBinder` requires it:
-//!   without it the short read yields a null root. rsbinder sends the
+//!   without it the short read yields a null root. rsbinder sends a local
 //!   binder's declared stability, not a hardcoded 0; its default
-//!   `Stability::System` is a level libbinder accepts for an RPC binder. A
-//!   null binder's is always `UNDECLARED` (level 0). android-13+ writes the
-//!   bare level (`0b001100` for System, plus `0x0c000000` on Android SDK
-//!   31/32); r34 writes the android-12 `Category`, `version (1) | level << 24`
-//!   (`0x0c000001`, a null binder `0x00000001`), whatever the host.
+//!   `Stability::System` is a level libbinder accepts for an RPC binder, and a
+//!   binder built with `Stability::Local` holds `System` too. The level
+//!   written is the binder's `IBinder::stability()`, for every kind of binder.
+//!   An RPC proxy's is the first declared level it arrived with, as AOSP
+//!   `getRepr` reads a `BpBinder`'s (libbinder refuses its own binder coming
+//!   home with another level), or this process's level (`System`) until one
+//!   arrives; so the getter and the word sent back agree. A null binder's is
+//!   always `UNDECLARED` (level 0). The word follows the profile, whatever
+//!   the host, Android SDK 31/32 included: android-13+ writes the bare level
+//!   (`0b001100` for System; libbinder 13+ reads it as
+//!   an `int16_t`, so a `Category` there is `BAD_TYPE`); r34 writes the
+//!   android-12 `Category`, `version (1) | level << 24` (`0x0c000001`, a
+//!   null binder `0x00000001`). The kernel parcel's choice by host SDK is a
+//!   private function of `parcelable.rs`, out of this codec's reach.
 //! * Reading it follows AOSP `Stability::setRepr`: a null binder with any
-//!   level but `UNDECLARED` is `BAD_TYPE`, and on r34 so is a `Category` whose
-//!   version is below android-12's `kBinderWireFormatOldest` (1). A non-null
-//!   binder's level is not checked (AOSP also requires VENDOR, SYSTEM or VINTF),
-//!   so a `Stability::Local` binder rsbinder sends is refused by libbinder and
-//!   accepted by rsbinder. The word is read after the binder has entered, as
-//!   `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder is
-//!   dropped, which pays its receipt back.
+//!   level but `UNDECLARED` is `BAD_TYPE` (android-13+ takes the level from
+//!   the word's low 16 bits, as libbinder reads an `int16_t`), and on r34 so
+//!   is a `Category` whose version is below android-12's
+//!   `kBinderWireFormatOldest` (1). A non-null
+//!   binder's level is not checked (AOSP also requires VENDOR, SYSTEM or VINTF):
+//!   an RPC proxy fills its level once, from the first word naming one of the
+//!   three, as `setRepr` fills a `BpBinder`'s once. `UNDECLARED` and a level
+//!   naming no `Stability` fill nothing, where the kernel path refuses the
+//!   latter with `BadValue` (`Stability` rustdoc, "What rsbinder checks"). Only
+//!   a word at a position the parcel received fills it: an unsent parcel read
+//!   back holds the proxy's own `stability()`, not a level a peer sent. The
+//!   word is read after the binder has entered, as
+//!   `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder
+//!   stays in the parcel, which pays its receipt back when it drops.
 //! * A local binder written into a parcel takes one `timesSent` bump
 //!   (`RpcState::on_binder_leaving`), and the parcel owns it while unsent
 //!   (AOSP `mSendState`): `Parcel::drop` hands it back through
@@ -1180,9 +1210,7 @@ impl std::fmt::Debug for RpcClientConfig {
     }
 }
 
-/// The wire a session speaks: r34 (default, no handshake) or android-13+ (handshake-negotiated).
-///
-/// Both use AOSP framing: a bare `RpcWireHeader` and `bodySize` bytes, no length prefix.
+/// The wire a session speaks: r34 (no handshake) or android-13+; both use bare AOSP framing.
 enum WireProfile {
     /// android-12 r34: the client's `int32` session-id preamble, then `R34Codec` messages.
     R34(R34Codec),
@@ -1216,21 +1244,18 @@ impl WireProfile {
         }
     }
 
-    /// The `int32` stability written after every binder (`None` = null, `UNDECLARED`).
-    ///
-    /// android-12 writes a `Category` (`version | level << 24`) whatever the host SDK, so r34
-    /// does too; android-13+ writes the bare level.
+    /// The `int32` after every binder: r34's android-12 `Category`, android-13+'s bare level.
     fn binder_stability_repr(&self, stability: Option<Stability>) -> i32 {
         match self {
             WireProfile::R34(_) => {
                 crate::binder::android12_category_repr(stability.map_or(0, Stability::level))
             }
-            WireProfile::Android13Plus(_) => stability.map_or(0, i32::from),
+            WireProfile::Android13Plus(_) => stability.map_or(0, Stability::level),
         }
     }
 
-    /// AOSP `Stability::setRepr` on a received stability word; module doc (binders).
-    fn check_binder_stability(&self, repr: i32, null: bool) -> Result<()> {
+    /// AOSP `Stability::setRepr` on a received stability word, returning its level; module doc.
+    fn check_binder_stability(&self, repr: i32, null: bool) -> Result<i32> {
         let level = match self {
             WireProfile::R34(_) => {
                 // android-12 `kBinderWireFormatOldest` is 1: a `Category` without one is older.
@@ -1241,14 +1266,15 @@ impl WireProfile {
                 }
                 (repr >> 24) & 0xff
             }
-            WireProfile::Android13Plus(_) => repr,
+            // AOSP 13+ reads the word as an `int16_t`; the high 16 bits are dropped.
+            WireProfile::Android13Plus(_) => i32::from(repr as i16),
         };
         // A null binder's stability must be `UNDECLARED`.
         if null && level != 0 {
             log::error!("RPC: null binder with stability {repr:#x}");
             return Err(StatusCode::BadType);
         }
-        Ok(())
+        Ok(level)
     }
 
     /// The negotiated protocol version; `None` for R34, which has no object table.
@@ -1836,34 +1862,59 @@ mod slot_pool {
 
 use slot_pool::{ConnSlot, ConnState};
 
-/// `caps` inputs, fixed by the founding slot for all (AOSP: one ctx factory per `RpcServer`).
+/// The peer a slot's transport reports, reduced to what a later slot must share (module doc).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Principal {
+    /// A kernel-vouched uid.
+    Local(u32),
+    /// A TLS client or server certificate's SHA-256; its label is not compared.
+    Cert([u8; 32]),
+    /// A vsock context id: one VM, every process in it.
+    Vsock(u32),
+    /// No identity: tcp-debug, or a TLS server that asks no client certificate.
+    Anonymous,
+}
+
+impl Principal {
+    fn of(peer: &PeerIdentity) -> Self {
+        match peer {
+            PeerIdentity::Local { uid, .. } => Principal::Local(*uid),
+            PeerIdentity::Certificate(cert) => Principal::Cert(*cert.fingerprint()),
+            PeerIdentity::Vsock { cid } => Principal::Vsock(*cid),
+            PeerIdentity::Anonymous => Principal::Anonymous,
+        }
+    }
+}
+
+/// `caps` and admission inputs, fixed by the founding slot for all (module doc "Slot pool").
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ConnTraits {
     passes_fds: bool,
-    local_peer: bool,
+    principal: Principal,
 }
 
 impl ConnTraits {
     fn of(transport: &dyn RpcTransport) -> Self {
         ConnTraits {
             passes_fds: transport.supports_fd_passing(),
-            local_peer: transport.peer_identity().is_local(),
+            principal: Principal::of(&transport.peer_identity()),
         }
     }
 }
 
 impl ConnState {
-    /// Whether `transport` may join this session's pool.
+    /// Whether `transport` may join this session's pool: the one admission check of every slot.
     fn admits(&self, transport: &dyn RpcTransport) -> bool {
         let traits = ConnTraits::of(transport);
-        if traits != self.traits {
+        let admitted = traits == self.traits;
+        if !admitted {
             log::error!(
-                "RPC: connection refused — its transport ({traits:?}) differs from the \
-                 session's founding connection ({:?})",
+                "RPC: connection refused — its transport or peer ({traits:?}) differs from \
+                 the session's founding connection ({:?})",
                 self.traits
             );
         }
-        traits == self.traits
+        admitted
     }
 }
 
@@ -2914,7 +2965,7 @@ impl RpcSessionInner {
         if self.fd_mode() == FileDescriptorTransportMode::Unix && traits.passes_fds {
             caps |= C::FD_PASSING;
         }
-        if traits.local_peer {
+        if matches!(traits.principal, Principal::Local(_)) {
             // A kernel-vouched uid, and the same kernel on both ends.
             caps |= C::TRUSTED_UID | C::SAME_HOST;
         }
@@ -3149,20 +3200,32 @@ impl RpcSessionInner {
             return Err(StatusCode::BadValue);
         }
         let addr = self.wire_read_binder_addr(parcel)?;
-        let binder = self.binder_at(parcel, obj_pos, addr)?;
-        // AOSP `finishUnflattenBinder` runs after `onBinderEntering`: a refused binder drops here,
-        // so its receipt is paid as AOSP's `sp` release pays it.
+        // AOSP android-16.0.0_r4 `unflattenBinder`: only a received position enters.
+        let received = parcel.rpc_received_at(obj_pos);
+        let binder = if received {
+            self.entered_binder_at(parcel, obj_pos, addr)?
+        } else {
+            self.lookup_binder(addr)?
+        };
+        // After `onBinderEntering`, as AOSP: the parcel's drop pays a refused binder's receipt.
         let stability: i32 = parcel.read()?;
-        self.profile.check_binder_stability(stability, false)?;
+        let level = self.profile.check_binder_stability(stability, false)?;
+        // A word this process wrote is the proxy's own `get()`, not a received level.
+        if received {
+            if let Some(rp) = (*binder).as_any().downcast_ref::<RpcProxy>() {
+                rp.record_received_stability(level);
+            }
+        }
         Ok(Some(binder))
     }
 
-    /// The binder a non-null RPC binder at `obj_pos` names: entered once if it arrived here.
-    fn binder_at(&self, parcel: &mut Parcel, obj_pos: usize, addr: RpcAddress) -> Result<SIBinder> {
-        // AOSP android-16.0.0_r4 `unflattenBinder`: only a received position enters.
-        if !parcel.rpc_received_at(obj_pos) {
-            return self.lookup_binder(addr);
-        }
+    /// The binder a received non-null RPC binder at `obj_pos` names, entered once.
+    fn entered_binder_at(
+        &self,
+        parcel: &mut Parcel,
+        obj_pos: usize,
+        addr: RpcAddress,
+    ) -> Result<SIBinder> {
         if let Some((entered, binder)) = parcel.rpc_entered_at(obj_pos) {
             if entered != addr {
                 log::error!("RPC: position {obj_pos} entered {entered:?}, now reads {addr:?}");
@@ -4643,22 +4706,7 @@ impl RpcSession {
         }
     }
 
-    /// This session's opaque 32-byte id (AOSP `RpcSession::mId`,
-    /// `kSessionIdBytes == 32`). On the server side this is the id
-    /// minted at session build and replied by the `GET_SESSION_ID`
-    /// special transact; the multi-connection path uses it as the
-    /// [`super::RpcServer`] registry key. Per-session, never global.
-    ///
-    /// **On a client session this is NOT the peer's session id.** A
-    /// client mints this value locally and never puts it on the wire —
-    /// it exists so a client session that serves callbacks can answer
-    /// `GET_SESSION_ID` — and the server's id is a different 32 bytes
-    /// that only [`RpcSession::get_session_id`] (one round trip, AOSP
-    /// `RpcSession::setupClient` → `readId()`) can tell you. Passing
-    /// this accessor's value to an attach is therefore always wrong; the
-    /// attach entries refuse it with [`StatusCode::BadValue`] before
-    /// connecting, as they refuse every id other than this session's
-    /// server-minted one.
+    /// This session's 32-byte id (AOSP `mId`); a client's is local, not the server's (module doc).
     pub(crate) fn session_id(&self) -> [u8; 32] {
         *self.inner.shared.rpc_session_id.as_bytes()
     }
@@ -4980,20 +5028,12 @@ impl RpcSession {
             })
     }
 
-    /// Serve one slot of the pool until its read reaches end of stream or
-    /// the loop fails: each accepted connection's server worker drives the
-    /// slot it was added as. [`serve_blocking`](RpcSession::serve_blocking)
-    /// is this on the founding slot. A `slot_id` that names no connection
-    /// of this session ends the call at once with
-    /// [`EndReason::SessionEnded`], and leaves the session as it was.
+    /// `serve_blocking` on slot `slot_id`; a slot this session lacks ends at once, `SessionEnded`.
     pub(crate) fn serve_blocking_on(&self, slot_id: u64) -> SessionEnd {
         self.serve_blocking_on_inner(slot_id, false, false, PhaseDeadline::none(), false)
     }
 
     /// `serve_blocking` with an armed admission deadline lifted after the first frame (r34 server).
-    ///
-    /// A `TimedOut` over that first frame reads as this end evicting an idle peer; the kernel's
-    /// `ETIMEDOUT` stays a lost connection (`EndReason::Frame(DeadObject)`, `Lost`).
     #[cfg(test)]
     pub(crate) fn serve_blocking_clearing_deadline_after_first(&self) -> SessionEnd {
         let none = PhaseDeadline::none();
@@ -5612,8 +5652,8 @@ impl RpcSession {
     /// theirs. So a failure ends the whole session, and returns its
     /// error, unless the attach never got its whole header out: a check
     /// before the header refused it (a `max_version` below the session's,
-    /// a transport unlike the founding connection's, or an id other than
-    /// this session's [`get_session_id()`](Self::get_session_id), such as
+    /// a transport or server peer unlike the founding connection's, or an
+    /// id other than this session's [`get_session_id()`](Self::get_session_id), such as
     /// the client-local id this session minted for itself or another
     /// session's id, which is [`StatusCode::BadValue`]), the
     /// connect or the handshake deadline's setup failed, or the header
@@ -5786,7 +5826,7 @@ impl RpcSession {
     ///
     /// - the attach never got its whole header out: a check before the
     ///   header refused it (a `max_version` below the session's, a
-    ///   transport unlike the founding connection's, an id other than this
+    ///   transport or server peer unlike the founding connection's, an id other than this
     ///   session's [`get_session_id()`](Self::get_session_id), which is
     ///   [`StatusCode::BadValue`]), the connect or the handshake deadline's
     ///   setup failed, or the header write failed (a server admits
@@ -7582,8 +7622,7 @@ mod tests {
         client.close_session();
     }
 
-    /// An r34 client's first bytes, as android-12 `RpcServer::establishConnection` and
-    /// `RpcState::rpcRec` read them: the `-1` session id, then `GET_ROOT` with no length prefix.
+    /// An r34 client opens with the `-1` preamble, then `GET_ROOT` with no length prefix.
     #[test]
     fn r34_client_opens_with_the_preamble_and_an_unprefixed_get_root() {
         let (session, mut peer) = r34_client_with_raw_peer();
@@ -7605,8 +7644,7 @@ mod tests {
         assert!(call.join().expect("caller").is_err(), "the peer closed");
     }
 
-    /// An r34 acceptor reads the preamble, then AOSP-framed messages; `GET_ROOT` with no root
-    /// is a null binder (`flattenBinder` writes `0`).
+    /// An r34 acceptor takes the preamble, then AOSP frames; `GET_ROOT` with no root is null.
     #[test]
     fn r34_acceptor_takes_the_preamble_then_unprefixed_messages() {
         use super::super::transport::UnixTransport;
@@ -7638,10 +7676,7 @@ mod tests {
         );
     }
 
-    /// An android-12 `GET_ROOT` reply, built by hand: the root binder becomes a proxy and its
-    /// stability is consumed. A `Category` of version 0 is refused after the binder entered, so
-    /// its receipt goes back as a `DEC_STRONG` (AOSP `finishUnflattenBinder` runs after
-    /// `onBinderEntering`).
+    /// An android-12 root reply becomes a proxy; a version-0 `Category` is refused, receipt paid.
     #[test]
     fn r34_client_reads_an_aosp12_root_reply() {
         let addr = [0x5a_u8; RPC_ADDR_LEN];
@@ -7696,8 +7731,7 @@ mod tests {
         }
     }
 
-    /// Only an `RpcServer` mints an r34 id, so a bare acceptor answers `GET_SESSION_ID` as an
-    /// unknown transaction rather than with an id no connection could join.
+    /// A bare r34 acceptor answers `GET_SESSION_ID` as unknown: only an `RpcServer` mints an id.
     #[test]
     fn a_bare_r34_acceptor_has_no_session_id() {
         use super::super::transport::MemTransport;
@@ -7716,8 +7750,7 @@ mod tests {
         );
     }
 
-    /// A preamble other than `-1` asks to join a session a bare acceptor does not have; a
-    /// length-prefixed (pre-AOSP-framing rsbinder) client's first word reads as one.
+    /// A bare r34 acceptor refuses every preamble but `-1`, a length prefix's first word included.
     #[test]
     fn r34_acceptor_refuses_any_preamble_but_new() {
         use super::super::transport::UnixTransport;
@@ -8780,8 +8813,7 @@ mod tests {
         let mut data = Parcel::new();
         data.write(&vec![0u8; payload]).expect("payload");
 
-        // 8 KiB every 50 ms, the most XNU's 8 KiB AF_UNIX buffer hands over, so both kernels
-        // see ~128 waits of ~50 ms each: the send outlasts the deadline, no wait comes near it.
+        // 8 KiB per 50 ms (XNU's AF_UNIX buffer): ~128 short waits outlast the deadline.
         let reader = std::thread::spawn(move || {
             let mut buf = vec![0u8; 8 << 10];
             let mut total = 0usize;
@@ -9579,8 +9611,7 @@ mod tests {
         WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"))
     }
 
-    /// Every wire follows a null binder with an `UNDECLARED` stability, as AOSP `flattenBinder`
-    /// does: android-13+ as the bare level, r34 as the android-12 `Category` (`version` 1).
+    /// A null binder carries `UNDECLARED` on every wire: the bare level, or r34's `Category` 1.
     #[test]
     fn a_null_binder_carries_its_stability_on_every_wire() {
         for (profile, words) in [
@@ -9606,11 +9637,14 @@ mod tests {
         }
     }
 
-    /// AOSP `Stability::setRepr` on a null binder's stability; android-12 also wants `version >= 1`.
+    /// AOSP `Stability::setRepr` on a null binder's stability; android-12 wants `version >= 1`.
     #[test]
     fn a_null_binder_stability_is_checked_as_aosp_does() {
         for (profile, stability, want) in [
             (a13_v2(), 0x0c, Err(StatusCode::BadType)),
+            // android-13+ reads the word as an `int16_t`: the high 16 bits are not a level.
+            (a13_v2(), 0x0001_0000, Ok(())),
+            (a13_v2(), 0x0001_000c, Err(StatusCode::BadType)),
             (
                 WireProfile::R34(R34Codec),
                 0x0c00_0001,
@@ -9634,8 +9668,7 @@ mod tests {
         }
     }
 
-    /// r34 writes a non-null binder as android-12 does: `1`, the 32-byte address, then the
-    /// `Category` of its stability (System: `0x0c000001`).
+    /// r34 writes a binder as android-12 does: `1`, the 32-byte address, then its `Category`.
     #[test]
     fn an_r34_binder_is_followed_by_its_android12_category() {
         let session = parcel_session(WireProfile::R34(R34Codec));
@@ -9648,6 +9681,190 @@ mod tests {
         assert_eq!(p.read::<i32>().expect("present"), 1);
         p.set_data_position(4 + RPC_ADDR_LEN);
         assert_eq!(p.read::<i32>().expect("stability"), 0x0c00_0001);
+    }
+
+    /// The RPC word is the profile's form alone: android-13+ never writes a `Category`.
+    #[test]
+    fn an_rpc_binder_stability_word_follows_the_profile_alone() {
+        let levels = [
+            (None, 0),
+            (Some(Stability::Local), 0),
+            (Some(Stability::Vendor), 0b00_0011),
+            (Some(Stability::System), 0b00_1100),
+            (Some(Stability::Vintf), 0b11_1111),
+        ];
+        for (wire, profile) in [
+            (
+                "v0",
+                WireProfile::Android13Plus(Android13PlusCodec::android13()),
+            ),
+            (
+                "v1",
+                WireProfile::Android13Plus(Android13PlusCodec::android14_15()),
+            ),
+            ("v2", a13_v2()),
+        ] {
+            for (stability, level) in levels {
+                let word = profile.binder_stability_repr(stability);
+                assert_eq!(word, level, "{wire} {stability:?}");
+                assert_eq!(
+                    profile.check_binder_stability(word, stability.is_none()),
+                    Ok(level),
+                    "{wire} {stability:?} round trip"
+                );
+            }
+        }
+        let r34 = WireProfile::R34(R34Codec);
+        for (stability, level) in levels {
+            let word = r34.binder_stability_repr(stability);
+            assert_eq!(word, (level << 24) | 1, "r34 {stability:?}");
+            assert_eq!(
+                r34.check_binder_stability(word, stability.is_none()),
+                Ok(level),
+                "r34 {stability:?} round trip"
+            );
+        }
+    }
+
+    /// A received proxy reports and goes back with the stability it arrived with (AOSP `getRepr`).
+    #[test]
+    fn a_received_proxy_is_sent_back_with_its_stability() {
+        for (stability, level) in [
+            (Stability::Vendor, 0b00_0011),
+            (Stability::Vintf, 0b11_1111),
+        ] {
+            for (wire, profile, word) in [
+                (
+                    "android-13+",
+                    WireProfile::Android13Plus(Android13PlusCodec::android14_15()),
+                    level,
+                ),
+                ("r34", WireProfile::R34(R34Codec), (level << 24) | 1),
+            ] {
+                let session = parcel_session(profile);
+                let mut counter = 0u64;
+                let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+                let mut sent = Parcel::new();
+                sent.write(&1i32).expect("present");
+                session
+                    .inner
+                    .wire_write_binder_addr(&mut sent, &addr)
+                    .expect("address");
+                sent.write(&word).expect("stability");
+                let (mut received, entered) = session.inner.receive_parcel(
+                    sent.rpc_data_bytes().to_vec(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                entered.expect("entered");
+                let proxy: SIBinder = received.read().expect("proxy");
+                assert_eq!(proxy.stability(), stability, "{wire} getter");
+
+                let mut back = Parcel::new();
+                back.attach_rpc_ops(session.inner.parcel_ops());
+                back.write(&proxy).expect("write back");
+                back.set_data_position(back.data_size() - 4);
+                let sent_back = back.read::<i32>().expect("stability");
+                assert_eq!(sent_back, word, "{wire} {stability:?} word");
+            }
+        }
+    }
+
+    /// `UNDECLARED` and a re-read own word fill nothing: unset until a declared word arrives.
+    #[test]
+    fn an_undeclared_word_leaves_an_rpc_proxy_at_the_local_level() {
+        for (wire, profile, undeclared, system, vintf) in [
+            (
+                "android-13+",
+                WireProfile::Android13Plus(Android13PlusCodec::android14_15()),
+                0,
+                0b00_1100,
+                0b11_1111,
+            ),
+            (
+                "r34",
+                WireProfile::R34(R34Codec),
+                0x0000_0001,
+                0x0c00_0001,
+                0x3f00_0001,
+            ),
+        ] {
+            let session = parcel_session(profile);
+            let mut counter = 0u64;
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+            let receive = |word: i32| {
+                let mut sent = Parcel::new();
+                sent.write(&1i32).expect("present");
+                session
+                    .inner
+                    .wire_write_binder_addr(&mut sent, &addr)
+                    .expect("address");
+                sent.write(&word).expect("stability");
+                let (mut received, entered) = session.inner.receive_parcel(
+                    sent.rpc_data_bytes().to_vec(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                entered.expect("entered");
+                received.read::<SIBinder>().expect("proxy")
+            };
+            let sent_back = |proxy: &SIBinder| {
+                let mut back = Parcel::new();
+                back.attach_rpc_ops(session.inner.parcel_ops());
+                back.write(proxy).expect("write back");
+                back.set_data_position(back.data_size() - 4);
+                back.read::<i32>().expect("stability")
+            };
+
+            let proxy = receive(undeclared);
+            assert_eq!(proxy.stability(), Stability::System, "{wire} getter");
+            assert_eq!(sent_back(&proxy), system, "{wire} word sent back");
+
+            // An unsent parcel read back holds this proxy's own fallback word: it fills nothing.
+            let mut unsent = Parcel::new();
+            unsent.attach_rpc_ops(session.inner.parcel_ops());
+            unsent.write(&proxy).expect("write");
+            unsent.set_data_position(0);
+            let reread: SIBinder = unsent.read().expect("re-read");
+            assert!(
+                Arc::ptr_eq(proxy.as_arc(), reread.as_arc()),
+                "{wire} re-read proxy"
+            );
+
+            // The cell stayed unset, so a later declared word still fills it.
+            let again = receive(vintf);
+            assert!(
+                Arc::ptr_eq(proxy.as_arc(), again.as_arc()),
+                "{wire} same proxy"
+            );
+            assert_eq!(proxy.stability(), Stability::Vintf, "{wire} filled later");
+            assert_eq!(sent_back(&proxy), vintf, "{wire} filled word");
+        }
+    }
+
+    /// A binder built with `Stability::Local` is sent with this process's level on both wires.
+    #[test]
+    fn a_local_binder_is_sent_with_the_local_level() {
+        for (wire, profile, word) in [
+            (
+                "android-13+",
+                WireProfile::Android13Plus(Android13PlusCodec::android14_15()),
+                0b00_1100,
+            ),
+            ("r34", WireProfile::R34(R34Codec), 0x0c00_0001),
+        ] {
+            let session = parcel_session(profile);
+            let local = crate::Interface::as_binder(&crate::Binder::new_with_stability(
+                LocalSvc,
+                Stability::Local,
+            ));
+            assert_eq!(local.stability(), Stability::System, "{wire} getter");
+            let mut p = Parcel::new();
+            p.attach_rpc_ops(session.inner.parcel_ops());
+            p.write(&local).expect("write");
+            p.set_data_position(p.data_size() - 4);
+            assert_eq!(p.read::<i32>().expect("stability"), word, "{wire} word");
+        }
     }
 
     /// One claim at a time: a failed attempt frees the parcel for a retry, a sent one stays sent.

@@ -121,7 +121,7 @@ const FIRST_NAP: Duration = Duration::from_micros(50);
 /// The longest: a wake lost at most this long ago is sent again.
 const LAST_NAP: Duration = Duration::from_millis(1);
 
-/// Yield once, then sleep `FIRST_NAP` doubling to `LAST_NAP`: a sleep frees the core, a yield may not.
+/// Yield once, then sleep `FIRST_NAP` doubling to `LAST_NAP`: a yield may not free the core.
 fn pause(nap: &mut Duration) {
     if nap.is_zero() {
         yield_now();

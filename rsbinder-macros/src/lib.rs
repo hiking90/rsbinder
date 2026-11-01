@@ -506,7 +506,7 @@ fn expand(args: &Args, item: &ItemTrait) -> syn::Result<proc_macro2::TokenStream
         #module
         #vis use #mod_ident::*;
         #[doc(hidden)]
-        #[allow(dead_code, non_upper_case_globals)]
+        #[allow(non_upper_case_globals, reason = "rsbinder::interface stem marker")]
         const #marker: () = ();
     })
 }
@@ -3052,5 +3052,39 @@ interface IGolden11 {
             }
         ));
         assert_eq!(kept, "__rsbinder_one_interface_per_stem_Ifoo");
+    }
+
+    /// The marker's lint attribute lands in the user's crate, so it carries a `reason`.
+    #[test]
+    fn marker_lint_attributes_carry_a_reason() {
+        let item: ItemTrait = syn::parse2(quote!(
+            pub trait IFoo {
+                fn go(&self) -> BinderResult<()>;
+            }
+        ))
+        .unwrap();
+        let expanded = expand(&Args { descriptor: None }, &item).expect("expand");
+        let file: syn::File = syn::parse2(expanded).expect("expansion parses");
+        let marker = file
+            .items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Const(c) => Some(c),
+                _ => None,
+            })
+            .expect("marker const");
+        let lints: Vec<String> = marker
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("allow") || a.path().is_ident("expect"))
+            .map(|a| quote::ToTokens::to_token_stream(a).to_string())
+            .collect();
+        assert!(
+            !lints.is_empty(),
+            "the marker needs `non_upper_case_globals`"
+        );
+        for lint in lints {
+            assert!(lint.contains("reason"), "{lint}");
+        }
     }
 }

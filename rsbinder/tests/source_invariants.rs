@@ -6,12 +6,12 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Seven remain: refuted prose, the one slot un-push, the files a
+//! Eight remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in, the method surface of
 //! `CommandStream`, the places a raw fd number becomes an fd, the
-//! public types whose drop ends something, and the library threads made by
-//! a call that panics — each a closed set, not an enumeration of ways to
-//! get it wrong. The call sites of the layer split
+//! public types whose drop ends something, the library threads made by
+//! a call that panics, and the places an async API chooses its thread —
+//! each a closed set, not an enumeration of ways to get it wrong. The call sites of the layer split
 //! are not scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
 //! stream's callers.
@@ -85,9 +85,11 @@
 //! `raw_fd_numbers_become_fds_only_at_the_pinned_sites` lists every call of
 //! the first two in `src/`, by file and enclosing `fn`, test code included,
 //! and allows none of the closes (any `io::close` or `libc::close` path,
-//! `use rustix::io::close` included). The two in `parcel.rs` are the driver-buffer
-//! adoption and the `from_ipc_parts` read; the third is a test taking back the
-//! number its own `into_raw_fd` released, which does not come from a parcel.
+//! `use rustix::io::close` included, and a free `close(` call, which a grouped
+//! `use rustix::io::{close, ..}` leaves on no line naming its path). The two
+//! in `parcel.rs` are the driver-buffer adoption and the `from_ipc_parts`
+//! read; the third is a test taking back the number its own `into_raw_fd`
+//! released, which does not come from a parcel.
 //! A new site — a second adoption, or a close of an fd named by the
 //! bytes — must be argued for here.
 //!
@@ -112,12 +114,41 @@
 //! library makes its threads with `thread::Builder` and returns the error to
 //! a direct caller, or logs it where no caller waits (a kernel-requested
 //! looper). `library_threads_are_made_by_builder` finds either call in the
-//! code of `rsbinder`, `rsbinder-fmq` and `rsbinder-topic`, outside a file
+//! code of `rsbinder`, `rsbinder-fmq` and `rsbinder-topic` — the path with or
+//! without `(`, so a `use std::thread::spawn;` line counts, and a free
+//! `spawn(` / `scope(` call, which a grouped `use std::thread::{self, spawn}`
+//! leaves on no line naming its path — outside a file
 //! named `*tests.rs` and outside a `mod .. {` under a `cfg` naming `test`,
 //! and allows only the sites in its list. The list is empty: every library
 //! thread is made by `thread::Builder`. A site that has to stay — a call
 //! whose failure no caller could receive — goes into the list with the
 //! reason, as the `Drop` exemptions above carry theirs.
+//!
+//! # Async thread choice
+//!
+//! An async API called on a thread that is handling a transaction runs its
+//! whole binder operation inline on that thread, so the kernel can route
+//! every call it makes to a peer thread that waits for the handler's reply,
+//! and an RPC session can drive a nested call on the thread that holds the
+//! outer one (`BinderAsyncPool` trait doc, *Which thread a transact runs
+//! on*). Off a transaction it goes to the blocking pool. One function makes
+//! that choice, `__spawn_transact` (`binder_async.rs`); the crate's lookups
+//! and `connect_async` reach it through `rt::blocking_op`. A new async API
+//! that calls `spawn_blocking` or the pool's `spawn` itself, or branches on
+//! `is_handling_transaction()` itself, would make the choice a second time
+//! and can lose the rule (a call from a pool thread leaves the handler's
+//! transaction chain). `async_apis_choose_their_thread_in_one_place` finds
+//! the words `spawn_blocking` and `is_handling_transaction` (a `use`, an
+//! alias or a call) outside their `fn` definitions, and every
+//! `<pool>::spawn(` call whose owner is `Tokio`, `P`, `BinderAsyncPool>` or
+//! `__RsbPool`, in `rsbinder`, `rsbinder-fmq` and `rsbinder-topic`, with the
+//! test-code mask of the thread-creation test, and allows only its list:
+//! `Tokio::spawn`, the decision itself and its `P::spawn` arm, the public
+//! `is_handling_transaction` wrapper and its re-export, `LocalCallGuard::enter`
+//! (whether a local call opens an in-process frame, not a thread choice), and
+//! the two `Reconnecting` refusals. It checks text, not the thread a transaction
+//! leaves from: a thread made with `thread::Builder` that sends a lookup is
+//! not seen.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -400,7 +431,7 @@ fn byte_order_primitives_stay_pinned() {
         },
         Pin {
             // None anywhere: the L3 structs have field-by-field codecs, not a raw-bytes view.
-            needle: "transmute::<[u8",
+            needle: "transmute",
             tree_wide: true,
             files: &[("parcelable.rs", 0)],
         },
@@ -491,6 +522,16 @@ fn raw_fd_numbers_become_fds_only_at_the_pinned_sites() {
                 .iter()
                 .map(|needle| line.matches(needle).count())
                 .sum::<usize>();
+            // A free `close(` after a grouped `use`; `.close(`, `X::close(`, `fn close(` are not.
+            let bare_close = line
+                .match_indices("close(")
+                .filter(|&(at, _)| {
+                    let before = &line[..at];
+                    !before.ends_with(|c: char| c.is_alphanumeric() || "_.:".contains(c))
+                        && !before.ends_with("fn ")
+                })
+                .count();
+            let calls = calls + bare_close;
             let enclosing = enclosing_fn(&lines, i + 1).unwrap_or("<no fn>");
             for _ in 0..calls {
                 found.push((rel.clone(), enclosing.to_string()));
@@ -686,8 +727,19 @@ fn library_threads_are_made_by_builder() {
             let lines: Vec<&str> = content.lines().map(code_only).collect();
             let test = test_module_lines(&lines);
             for (i, line) in lines.iter().enumerate() {
-                let calls =
-                    line.matches("thread::spawn(").count() + line.matches("thread::scope(").count();
+                // No `(`: a `use std::thread::spawn;` line counts, as does the free call after it.
+                let paths =
+                    line.matches("thread::spawn").count() + line.matches("thread::scope").count();
+                let free = ["spawn(", "scope("]
+                    .iter()
+                    .flat_map(|word| line.match_indices(word))
+                    .filter(|&(at, _)| {
+                        let before = &line[..at];
+                        !before.ends_with(|c: char| c.is_alphanumeric() || "_.:".contains(c))
+                            && !before.ends_with("fn ")
+                    })
+                    .count();
+                let calls = paths + free;
                 if test[i] || calls == 0 {
                     continue;
                 }
@@ -712,6 +764,121 @@ fn library_threads_are_made_by_builder() {
         found.is_empty() && missing.is_empty(),
         "a library thread is made by a call that panics on failure, or a pinned site moved — \
          use `thread::Builder` and return the error; see this test's doc.\n\
+         unpinned: {found:#?}\nmissing: {missing:#?}"
+    );
+}
+
+/// Pins where an async API may choose its thread; see module doc "Async thread choice".
+#[test]
+fn async_apis_choose_their_thread_in_one_place() {
+    // (crate, file under `src/`, needle, enclosing `fn` line prefix), one entry per site.
+    const PINNED: &[(&str, &str, &str, &str)] = &[
+        // The pool itself: reached only through `__spawn_transact`'s off-transaction arm.
+        ("rsbinder", "rt/tokio_rt.rs", "spawn_blocking", "fn spawn<"),
+        // The decision, and its off-transaction arm.
+        (
+            "rsbinder",
+            "binder_async.rs",
+            "is_handling_transaction",
+            "pub fn __spawn_transact",
+        ),
+        (
+            "rsbinder",
+            "binder_async.rs",
+            "::spawn(",
+            "pub fn __spawn_transact",
+        ),
+        // The public wrapper over `thread_state`'s predicate, and its re-export.
+        (
+            "rsbinder",
+            "native.rs",
+            "is_handling_transaction",
+            "pub fn is_handling_transaction",
+        ),
+        ("rsbinder", "lib.rs", "is_handling_transaction", "<no fn>"),
+        // Not an async API: whether a local call opens an in-process frame.
+        (
+            "rsbinder",
+            "thread_state.rs",
+            "is_handling_transaction",
+            "pub(crate) fn enter",
+        ),
+        // `Reconnecting` refuses to wait in a handler (`WouldBlock`); it picks no thread.
+        (
+            "rsbinder",
+            "reconnect.rs",
+            "is_handling_transaction",
+            "pub async fn connected",
+        ),
+        (
+            "rsbinder",
+            "reconnect.rs",
+            "is_handling_transaction",
+            "fn acquire",
+        ),
+    ];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found: Vec<(String, String, &str, String)> = Vec::new();
+    for krate in ["rsbinder", "rsbinder-fmq", "rsbinder-topic"] {
+        let src_root = workspace.join(krate).join("src");
+        if !src_root.is_dir() {
+            eprintln!(
+                "skipping {krate}: sources not reachable at {}",
+                src_root.display()
+            );
+            continue;
+        }
+        visit(&src_root, &mut |path, content| {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                return;
+            }
+            let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+            let rel = rel.replace('\\', "/");
+            let lines: Vec<&str> = content.lines().map(code_only).collect();
+            let test = test_module_lines(&lines);
+            // Whole words: a `use`, an `as` alias and a method call on a runtime all count.
+            let mut sites: Vec<(usize, &str)> = Vec::new();
+            for needle in ["spawn_blocking", "is_handling_transaction"] {
+                sites.extend(word_sites(&lines, needle).into_iter().map(|l| (l, needle)));
+            }
+            // A direct pool call skips the decision as surely as `spawn_blocking` does.
+            for (i, line) in lines.iter().enumerate() {
+                for (at, _) in line.match_indices("::spawn(") {
+                    let owner = &line[..at];
+                    let ident = |c: char| c.is_alphanumeric() || c == '_';
+                    let pool = ["BinderAsyncPool>", "__RsbPool"]
+                        .iter()
+                        .any(|o| owner.ends_with(o))
+                        || ["Tokio", "P"].iter().any(|o| {
+                            owner.ends_with(o) && !owner[..owner.len() - o.len()].ends_with(ident)
+                        });
+                    if pool {
+                        sites.push((i + 1, "::spawn("));
+                    }
+                }
+            }
+            for (line, needle) in sites {
+                if test[line - 1] {
+                    continue;
+                }
+                let enclosing = enclosing_fn(&lines, line).unwrap_or("<no fn>").to_string();
+                found.push((krate.to_string(), rel.clone(), needle, enclosing));
+            }
+        });
+    }
+    let mut missing = Vec::new();
+    for (krate, file, needle, prefix) in PINNED {
+        match found.iter().position(|(k, p, n, f)| {
+            k == krate && p == file && n == needle && f.starts_with(prefix)
+        }) {
+            Some(at) => drop(found.swap_remove(at)),
+            None => missing.push(format!("{krate}/src/{file}: {needle} in {prefix}")),
+        }
+    }
+    assert!(
+        found.is_empty() && missing.is_empty(),
+        "an async API picks its own thread, or a pinned site moved — route the blocking work \
+         through `rt::blocking_op` / `__spawn_transact`; see this test's doc.\n\
          unpinned: {found:#?}\nmissing: {missing:#?}"
     );
 }

@@ -4099,19 +4099,9 @@ mod wire_golden {
 
     #[test]
     fn stability_word_is_little_endian() {
-        // The category repr varies by platform (android-12), so only the byte order is pinned.
-        let level = i32::from(crate::Stability::Vintf);
-        assert_eq!(
-            enc(&level),
-            [
-                (level & 0xFF) as u8,
-                ((level >> 8) & 0xFF) as u8,
-                ((level >> 16) & 0xFF) as u8,
-                ((level >> 24) & 0xFF) as u8,
-            ]
-        );
-        #[cfg(not(target_os = "android"))]
-        assert_eq!(enc(&level), [0x3F, 0x00, 0x00, 0x00]);
+        // VINTF as the raw level and as android-12's `Category`, the two forms a binder carries.
+        assert_eq!(enc(&0b11_1111i32), [0x3F, 0x00, 0x00, 0x00]);
+        assert_eq!(enc(&0x3F00_0001i32), [0x01, 0x00, 0x00, 0x3F]);
     }
 
     #[test]

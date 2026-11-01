@@ -130,8 +130,7 @@ pub fn as_written_in(ty: &Type, ctx: Ctx) -> syn::Result<String> {
     })
 }
 
-/// A segment as printed: a bare `Option`/`Vec`/`Box`/`String` gets `rsbinder-aidl`'s path,
-/// since the checks here already read those names as std's.
+/// A segment as printed; bare `Option`/`Vec`/`Box`/`String` take `rsbinder-aidl`'s path.
 fn segment_name(path: &syn::Path, seg: &syn::PathSegment) -> String {
     let bare = path.leading_colon.is_none() && path.segments.len() == 1;
     let std = match seg.ident.to_string().as_str() {

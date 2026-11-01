@@ -47,7 +47,8 @@ pub enum Error {
     NoEventFlag,
     /// The wait's deadline passed.
     TimedOut,
-    /// A system call failed.
+    /// A system call failed. The errno's message is this error's `Display`,
+    /// so `source()` is `None`: a reporter walking the chain prints it once.
     Os(Errno),
 }
 
@@ -131,14 +132,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Error::Os(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for Error {}
 
 /// `e`'s errno when it is in 1..4096, the range the kernel returns, else `EIO`.
 pub(crate) fn errno_of(e: &std::io::Error) -> Errno {
@@ -188,5 +182,13 @@ mod tests {
         assert_eq!(format!("{errno:?}"), format!("{io:?}"));
         let via_error = std::io::Error::from(Error::Os(errno));
         assert_eq!(via_error.raw_os_error(), Some(perm));
+    }
+
+    #[test]
+    fn an_os_error_prints_its_errno_once_along_the_source_chain() {
+        let errno = Errno::from_raw(rustix::io::Errno::PERM.raw_os_error());
+        let e = Error::Os(errno);
+        assert_eq!(e.to_string(), errno.to_string());
+        assert!(std::error::Error::source(&e).is_none());
     }
 }

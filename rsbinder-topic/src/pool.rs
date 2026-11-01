@@ -347,6 +347,11 @@ impl Slots {
         self.lent -= 1;
     }
 
+    /// Whether `max_loans` loans are held, so a lend is refused whatever the slots.
+    pub(crate) fn at_loan_limit(&self) -> bool {
+        self.lent >= self.max_loans
+    }
+
     /// The loans held and not published.
     #[cfg(test)]
     pub(crate) fn lent(&self) -> usize {

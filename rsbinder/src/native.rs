@@ -73,11 +73,22 @@
 //!
 //! `parceled` is AOSP `BBinder::mParceled`. It becomes `true` the first time
 //! the binder is written to a parcel; after that the setters refuse with
-//! `InvalidOperation`. AOSP aborts at the same point via
-//! `LOG_ALWAYS_FATAL_IF(mParceled, ...)`
-//! ([`Binder.cpp:579,606,659,678,713`](https://cs.android.com/android/platform/superproject/+/android-16.0.0_r4:frameworks/native/libs/binder/Binder.cpp;l=579));
-//! rsbinder returns an error so the refusal composes with the `Result`-based
-//! AIDL surface.
+//! `InvalidOperation`. AOSP has no parceled check on stability: its
+//! `LOG_ALWAYS_FATAL_IF(wasParceled(), ...)` guards `setRequestingSid`,
+//! `setMinSchedulerPolicy`, `setInheritRt`, `setMinRpcThreads` and
+//! `setExtension` only (android17-release `Binder.cpp`). After the first
+//! flatten the level is set, and `Stability::setRepr` aborts any change but a
+//! `forceDowngradeTo*` to a level the current one includes
+//! (`LOG_ALWAYS_FATAL_IF(result != OK)` in `markVintf` and
+//! `forceDowngradeToStability`, android17-release `Stability.cpp`). rsbinder
+//! refuses all three setters once parceled, so it is stricter where AOSP lets
+//! a sent binder be set to its own level or a sent VINTF binder be
+//! downgraded. It returns an error so the refusal composes with the
+//! `Result`-based AIDL surface.
+//!
+//! A binder constructed with `Stability::Local` stores this process's level
+//! (`binder::local_level`, `System`), not a `Local` tag: see the `Stability`
+//! rustdoc.
 //!
 //! # Attached objects
 //!
@@ -273,7 +284,7 @@ struct Inner<T: Remotable + Send + Sync> {
 }
 
 impl<T: Remotable> Inner<T> {
-    /// `InvalidOperation` once `parceled` is set; AOSP aborts on `mParceled` (Binder.cpp:579).
+    /// `InvalidOperation` once `parceled` is set; AOSP has no such check (module doc).
     fn set_stability_guarded(&self, level: Stability) -> Result<()> {
         if self.parceled.load(Ordering::Acquire) {
             return Err(StatusCode::InvalidOperation);
@@ -521,6 +532,11 @@ impl<T: 'static + Remotable> Binder<T> {
     /// Stability is normally set by the AIDL generator via `@VintfStability`,
     /// not by user-side construction. Reach for this only when constructing
     /// `Binder<T>` directly without going through the generator.
+    ///
+    /// [`Stability::Local`] is resolved here to this process's level
+    /// (`System`), as AOSP Rust's constructor does; the binder then reports
+    /// and sends that level. See [`Stability`] "Vendor partition" for
+    /// `Stability::Vendor`.
     pub fn new_with_stability(remotable: T, stability: Stability) -> Self {
         Self::new_with_stability_and_features(remotable, stability, Default::default())
     }
@@ -543,6 +559,11 @@ impl<T: 'static + Remotable> Binder<T> {
         features: BinderFeatures,
     ) -> Self {
         features.check_scheduler();
+        // AOSP Rust `mark_local_stability`: `Local` names this process's level; `Stability` doc.
+        let stability = match stability {
+            Stability::Local => crate::binder::local_level(),
+            declared => declared,
+        };
         Binder::<T> {
             inner: Arc::new(Inner {
                 remotable,
@@ -926,6 +947,14 @@ mod stability_mutation_tests {
         }
     }
 
+    /// AOSP Rust `mark_local_stability`: a `Local` binder holds this process's level.
+    #[test]
+    fn a_local_binder_takes_this_process_level() {
+        let b = Binder::new_with_stability(DummyRemotable, Stability::Local);
+        assert_eq!(b.inner.stability(), crate::binder::local_level());
+        assert_eq!(b.inner.stability(), Stability::System);
+    }
+
     #[test]
     fn default_binder_is_system_and_not_parceled() {
         let b = Binder::new(DummyRemotable);
@@ -933,15 +962,13 @@ mod stability_mutation_tests {
         assert!(!b.inner.was_parceled());
     }
 
-    /// After the upgrade the wire `i32` decodes back to `Vintf`.
+    /// After the upgrade the binder's level is VINTF's.
     #[test]
     fn mark_vintf_upgrades_to_vintf() {
         let b = Binder::new(DummyRemotable);
         b.inner.mark_vintf().expect("not parceled yet");
         assert_eq!(b.inner.stability(), Stability::Vintf);
-        let wire: i32 = b.inner.stability().into();
-        // Level byte is low (raw) or high (android-12 Category repr): decode, don't mask.
-        assert_eq!(Stability::try_from(wire).unwrap(), Stability::Vintf);
+        assert_eq!(b.inner.stability().level(), 0b111111);
     }
 
     #[test]
@@ -962,7 +989,7 @@ mod stability_mutation_tests {
         assert_eq!(b.inner.stability(), Stability::System);
     }
 
-    /// After `set_parceled()` all three setters return `InvalidOperation` (AOSP aborts there).
+    /// After `set_parceled()` all three setters return `InvalidOperation`; see module doc.
     #[test]
     fn parceled_guard_blocks_all_setters() {
         let b = Binder::new(DummyRemotable);

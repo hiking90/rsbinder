@@ -220,7 +220,7 @@ pub(crate) struct BuiltinDecl {
     pub source: &'static str,
 }
 
-/// AOSP FMQ types vendored from `android17-release` (frozen V2, `common/fmq/aidl`), plus rsbinder's.
+/// AOSP FMQ types from `android17-release` (frozen V2, `common/fmq/aidl`), plus rsbinder's.
 pub(crate) const BUILTIN_DECLS: &[BuiltinDecl] = &[
     BuiltinDecl {
         fqcn: "android.hardware.common.NativeHandle",

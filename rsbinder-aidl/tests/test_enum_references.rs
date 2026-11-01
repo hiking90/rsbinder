@@ -656,7 +656,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
     // Ensure FoldState is NOT used for non-FoldState fields
     let reason_line = output
         .lines()
-        .find(|l| l.contains("r#reason:") || l.contains("r#reason ="))
+        .find(|l| l.trim_start().starts_with("r#reason:") && l.contains("::UNKNOWN"))
         .expect("the reason field must be generated");
     assert!(
         !reason_line.contains("FoldState"),
@@ -666,7 +666,7 @@ fn test_multiple_enums_with_same_member_name() -> Result<(), Box<dyn Error>> {
 
     let wake_line = output
         .lines()
-        .find(|l| l.contains("r#wakeReason:") || l.contains("r#wakeReason ="))
+        .find(|l| l.trim_start().starts_with("r#wakeReason:") && l.contains("::UNKNOWN"))
         .expect("the wakeReason field must be generated");
     assert!(
         !wake_line.contains("FoldState"),

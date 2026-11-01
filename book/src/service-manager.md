@@ -118,7 +118,11 @@ answered (no service manager, or its policy denied it), so
 an ordinary binder client, so the HUB's policy applies to it like anything
 else — `list` and `info` need `list`, and every name they report is
 filtered by `find`; `dump <name>` needs `find` on `<name>`, and for
-`manager` also `list`.
+`manager` also `list`. In `dump manager`, `find` filters the names and
+each name's fields; the totals — the rule and declaration counts,
+`death subscriptions`, `hidden by policy`, and the
+[topic registry](#topic-names)'s line with its counters — go to every
+caller that holds `list`.
 
 ## Registering a Service
 
@@ -259,6 +263,11 @@ and unregisters the callback it placed with the service manager. Do **not** hand
 `spawn_blocking(hub::wait_for_interface)`: dropping that future only detaches the
 `JoinHandle`, leaving a blocking-pool thread waiting for a service nobody is waiting for
 any more.
+
+Inside a transaction handler none of that applies: there the wait runs inline on the handler's
+binder thread, the `timeout` never fires, and the handler holds its thread until the service
+appears. Use a `try_get_interface_async` loop under the `timeout` there (see
+[Migrating from 0.12 to 0.13](migrating-0.13.md)).
 
 Each outstanding wait holds one thread of the same `spawn_blocking` pool your outbound
 calls go through, so this is for the handful of waits a process does at start-up — not for

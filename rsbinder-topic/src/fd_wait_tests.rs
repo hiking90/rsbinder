@@ -676,11 +676,19 @@ fn a_subscriber_that_waits_anew_at_every_commit_and_never_reads_holds_no_publish
     const COMMITS: u64 = 100_000;
     let publisher = topic(64 << 10);
     let subscriber = fd_subscriber(&publisher);
-    let words = subscriber.local().words();
-    for n in 0..COMMITS {
-        words.begin_wait(words.seq());
-        publisher.publish(&num(n as u32)).unwrap();
-    }
+    // One open file with the publisher's end: made blocking, only the send's own flags stop a wait.
+    let sender = subscriber.local().words().fd.as_ref().unwrap().sender();
+    rustix::io::ioctl_fionbio(sender, false).unwrap();
+    let publishing = thread::spawn(move || {
+        let words = subscriber.local().words();
+        for n in 0..COMMITS {
+            words.begin_wait(words.seq());
+            publisher.publish(&num(n as u32)).unwrap();
+        }
+        (publisher, subscriber)
+    });
+    eventually("the publishes return", || publishing.is_finished());
+    let (publisher, subscriber) = publishing.join().unwrap();
     assert_eq!(publisher.sends(), COMMITS);
     let socket = subscriber.wait_fd().unwrap();
     let queued = rustix::io::ioctl_fionread(socket).unwrap();
@@ -1054,8 +1062,7 @@ mod reactor {
         }
     }
 
-    /// A reactor that refuses the fd (registered by the caller already) is a runtime error, each
-    /// time, apart from an interrupt; once it takes the fd, the wait goes on.
+    /// The caller registered the fd already; each refusal errs until the reactor takes the fd.
     #[test]
     fn a_reactor_that_refuses_the_fd_is_a_runtime_error_and_not_a_cancel() {
         use tokio::io::{unix::AsyncFd, Interest};
@@ -1068,8 +1075,11 @@ mod reactor {
             // SAFETY: the subscriber, which owns the fd, outlives this registration.
             let theirs = unsafe { AsyncFd::register_with_interest(fd, Interest::READABLE) };
             let theirs = theirs.unwrap();
-            assert_eq!(subscriber.recv_async().await.map(drop), refused);
-            assert_eq!(subscriber.recv_async().await.map(drop), refused);
+            for _ in 0..2 {
+                let refused_now = tokio::time::timeout(WAIT, subscriber.recv_async()).await;
+                let refused_now = refused_now.expect("a refusal that did not return");
+                assert_eq!(refused_now.map(drop), refused);
+            }
             theirs
         });
         drop(theirs);

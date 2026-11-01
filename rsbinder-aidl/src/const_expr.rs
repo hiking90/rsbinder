@@ -223,8 +223,7 @@ pub enum ValueType {
     Holder,
     UserDefined(String),
     Reference {
-        // Full AIDL enum type. Short enum names can collide across packages.
-        // A union's `Tag` carries the union's name here (its module); `enum_name` is `Tag`.
+        // Full AIDL enum type (short names collide); a union `Tag` carries the union's name.
         enum_type: String,
         enum_name: String,
         member_name: String,
@@ -721,12 +720,15 @@ impl ValueType {
         );
 
         match operator {
-            "||" => Ok(ConstExpr::new(ValueType::Bool(
-                lhs.to_bool()? || rhs.to_bool()?,
-            ))),
-            "&&" => Ok(ConstExpr::new(ValueType::Bool(
-                lhs.to_bool()? && rhs.to_bool()?,
-            ))),
+            // AOSP evaluates both operands first, so `true || TYPO` still fails on `TYPO`.
+            "||" | "&&" => {
+                let (l, r) = (lhs.to_bool()?, rhs.to_bool()?);
+                Ok(ConstExpr::new(ValueType::Bool(if operator == "||" {
+                    l || r
+                } else {
+                    l && r
+                })))
+            }
             "|" => {
                 arithmetic_bit_op!(lhs, |, rhs, "|", promoted)
             }

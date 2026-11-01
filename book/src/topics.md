@@ -300,8 +300,11 @@ second memfd, and the ring carries only a record that names the slot:
 
 A loan (`LoanMut`) is `Send`, so a spawned task can hold one across an
 `.await` and publish it from whichever worker thread it resumes on. With
-backpressure, `loan_slice` and `publish` wait under the topic's lock as a
-publish does, up to the timeout, and block that worker thread meanwhile.
+backpressure, `loan_slice` waits for a free slot and `publish` for room in
+the ring, under the topic's lock as a publish does, up to the timeout; both
+block that worker thread meanwhile. A `loan_slice` while
+`PoolPolicy::max_loans` loans are held is refused with
+`PublishError::TooManyLoans` at once, without that wait.
 
 A `Bytes` subscriber receives a lent value as any other, or where it lies with
 `recv_sample`, `try_recv_sample`, `try_latest_sample` and `recv_sample_async`;

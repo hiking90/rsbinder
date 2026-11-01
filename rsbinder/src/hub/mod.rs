@@ -557,7 +557,7 @@ enum Android15Numbering {
     Shifted,
 }
 
-/// Side-effect-free: past the end pre-r6, `getServiceDebugInfo()` on r6+ (`numbering_pins`).
+/// State-free: past the end pre-r6; r6+ runs `getServiceDebugInfo()`, an SELinux `list` check.
 #[cfg(any(
     test,
     all(
@@ -1733,9 +1733,12 @@ impl ServiceManager {
     ///
     /// # Cancellation
     ///
-    /// `crate::wait_for_interface_async` (plan 11-1 §3.1) runs this wait on
-    /// the blocking pool with a caller-owned waiter state and cancels it from
-    /// its guard's `Drop` when the future is dropped. `onRegistration` and
+    /// `crate::wait_for_interface_async` (plan 11-1 §3.1), called off a
+    /// transaction, runs this wait on the blocking pool with a caller-owned
+    /// waiter state and cancels it from its guard's `Drop` when the future is
+    /// dropped. Called while handling a transaction it runs the wait inline on
+    /// the handler's thread, where nothing drops the future until the wait
+    /// ends, so that wait is never cancelled. `onRegistration` and
     /// the cancel signal wake the same condition variable, so the wait has
     /// one blocking point and the cancel latency is the notify, not the 1 s
     /// tick: the thread leaves and unregisters its callback at once.
@@ -1858,12 +1861,12 @@ pub(crate) enum WaitEnd {
 }
 
 impl WaitEnd {
-    /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry (plan 10-10b §3.10).
-    /// A failed lookup ends the wait as AOSP `realGetService`'s error does.
+    /// Every failed lookup is `Transient`: it ends the wait, as AOSP `realGetService`'s error does.
     pub(crate) fn lookup(status: Status) -> Self {
         WaitEnd::Transient(status.into())
     }
 
+    /// Only `EX_SECURITY` and `EX_ILLEGAL_ARGUMENT` repeat on retry (plan 10-10b §3.10).
     pub(crate) fn from_registration(status: Status) -> Self {
         match status.exception_code() {
             ExceptionCode::Security | ExceptionCode::IllegalArgument => WaitEnd::Refused(status),

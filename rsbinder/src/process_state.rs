@@ -36,7 +36,7 @@
 //!
 //! # Proxy cache slow path
 //!
-//! `strong_proxy_for_handle_stability` misses its read-lock fast path, then
+//! `proxy_for_handle` misses its read-lock fast path, then
 //! runs three phases so no IPC happens with `handle_to_proxy` locked:
 //!
 //! - **P1** — short write-lock window. Decides the sub-case and, for case
@@ -65,7 +65,7 @@
 //! - **(a)** entry absent, or its pin already in `Drop` (AOSP `attemptIncWeak` fails). P1 pins.
 //! - **(b)** entry present with no live proxy but a live pin. P1 upgrades the pin and holds it
 //!   to P3 for its `BC_ACQUIRE`, and P3 resurrects under the pin's generation (AOSP `force_set`),
-//!   keeping whatever descriptor the pin has cached.
+//!   keeping whatever descriptor and received stability level the pin holds.
 //! - **(c)** another thread inserted or upgraded the entry between the
 //!   fast-path miss and P1; the live entry is returned.
 //!
@@ -98,7 +98,7 @@
 //! keeps the pin's generation — same kernel slot, and a fresh wire-delivered
 //! strong ref makes it transactable again; only case (a) allocates one.
 //!
-//! A case-(b) re-lookup through `strong_proxy_for_handle_stability` is driven
+//! A case-(b) re-lookup through `proxy_for_handle` is driven
 //! by a fresh wire delivery of the handle (servicemanager `checkService`, or an
 //! incoming transaction carrying it), which gives the new `BC_ACQUIRE` a
 //! kernel strong count it can transact on. `WIBinder::upgrade()` differs: it
@@ -148,6 +148,10 @@
 //! the pin and so the answer, and a recycled handle id gets a new pin through case (a), so it
 //! never sees the answer of the node the id named before. An RPC proxy follows the same rule
 //! without the `CallRestriction` (`rpc::proxy` module doc "Descriptor").
+//!
+//! The stability level a parcel read of the handle carries (`binder::ReceivedStability`, AOSP
+//! `BpBinder::mStability`) lives on the pin for the same reason: a proxy revived through case
+//! (b) reports the level the node was received with, and a new pin starts unset.
 //!
 //! # Death links
 //!
@@ -261,7 +265,7 @@
 //! the `BC_DEAD_BINDER_DONE` that `execute_command`'s `BR_DEAD_BINDER` arm queued after phase 1.
 //!
 //! Phase 1 can run on the thread that issued the originating transaction,
-//! including one inside `strong_proxy_for_handle_stability`; its
+//! including one inside `proxy_for_handle`; its
 //! `handle_to_proxy.write()` would deadlock if the slow path held the lock
 //! across IPC, which is why P2 runs unlocked. It must be called with no
 //! `THREAD_STATE` or `BINDER_DEREFS` borrow held: `send_obituary` runs user
@@ -343,6 +347,8 @@ pub(crate) struct HandlePin {
     counted: OnceLock<CountedPin>,
     /// The first successful `INTERFACE_TRANSACTION` answer; module doc "Interface descriptor".
     descriptor: OnceLock<String>,
+    /// AOSP `BpBinder::mStability`; here so a case-(b) revival keeps it, as it keeps `descriptor`.
+    stability: ReceivedStability,
 }
 
 /// What `on_proxy_create` charged, for the matching `on_proxy_drop` (AOSP `mTrackedUid`).
@@ -359,6 +365,7 @@ impl HandlePin {
             generation,
             counted: OnceLock::new(),
             descriptor: OnceLock::new(),
+            stability: ReceivedStability::unset(),
         })
     }
 
@@ -395,6 +402,11 @@ impl HandlePin {
     /// Keeps the first answer stored, as `BpBinder::getInterfaceDescriptor` does; returns it.
     pub(crate) fn cache_descriptor(&self, descriptor: String) -> &str {
         self.descriptor.get_or_init(|| descriptor)
+    }
+
+    /// The level every proxy and `WIBinder` of this pin reports; filled by the kernel read alone.
+    pub(crate) fn received_stability(&self) -> &ReceivedStability {
+        &self.stability
     }
 }
 
@@ -434,7 +446,7 @@ enum SlowPathPlan {
 /// Outcome of P1: a live entry (slow path done) or a [`SlowPathPlan`] for P2/P3.
 enum SlowPathDecision {
     /// Case (c): another thread inserted or upgraded the entry before P1 took the write lock.
-    Cached(SIBinder),
+    Cached(Arc<ProxyHandle>),
     /// Sub-cases (a)/(b) — proceed to P2 (IPC) and P3 (commit).
     NeedIpc(SlowPathPlan),
 }
@@ -485,9 +497,8 @@ fn slow_path_p2_test_hook(handle: u32) {
 fn commit_new_acquired(
     handle_to_proxy: &mut HashMap<u32, CacheEntry>,
     pin: &Arc<HandlePin>,
-    stability: Stability,
-) -> Result<SIBinder> {
-    let arc = ProxyHandle::new_acquired(pin, stability)?;
+) -> Result<Arc<ProxyHandle>> {
+    let arc = ProxyHandle::new_acquired(pin)?;
     pin.count_once();
     handle_to_proxy.insert(
         pin.handle(),
@@ -496,7 +507,7 @@ fn commit_new_acquired(
             pin: Arc::downgrade(pin),
         },
     );
-    Ok(SIBinder::from_arc(arc as Arc<dyn IBinder>))
+    Ok(arc)
 }
 
 /// Per-handle proxy cache entry; see module doc "Proxy cache entry".
@@ -1060,15 +1071,17 @@ impl ProcessState {
 
     /// Get binder from handle.
     /// If the binder is not cached, it will create a new binder.
+    ///
+    /// A proxy made here has no stability level of its own: it reports this
+    /// process's (`System`) until a parcel read of the same handle carries a
+    /// declared one (see [`Stability`]).
     pub fn strong_proxy_for_handle(&self, handle: u32) -> Result<SIBinder> {
-        self.strong_proxy_for_handle_stability(handle, Default::default())
+        self.proxy_for_handle(handle)
+            .map(|p| SIBinder::from_arc(p as Arc<dyn IBinder>))
     }
 
-    pub(crate) fn strong_proxy_for_handle_stability(
-        &self,
-        handle: u32,
-        stability: Stability,
-    ) -> Result<SIBinder> {
+    /// The cached or new proxy for `handle`; its stability is the caller's to fill.
+    pub(crate) fn proxy_for_handle(&self, handle: u32) -> Result<Arc<ProxyHandle>> {
         // Read-lock fast path: pure Arc::clone, no kernel command.
         if let Some(arc) = self
             .handle_to_proxy
@@ -1077,7 +1090,7 @@ impl ProcessState {
             .get(&handle)
             .and_then(|e| e.weak.upgrade())
         {
-            return Ok(SIBinder::from_arc(arc));
+            return Ok(arc);
         }
 
         // Slow path in three lock-decoupled phases: see module doc "Proxy cache slow path".
@@ -1087,7 +1100,7 @@ impl ProcessState {
                 SlowPathDecision::NeedIpc(plan) => plan,
             };
             let ready = self.slow_path_p2(handle, plan)?;
-            if let Some(binder) = self.slow_path_p3(handle, stability, ready)? {
+            if let Some(binder) = self.slow_path_p3(handle, ready)? {
                 return Ok(binder);
             }
         }
@@ -1104,7 +1117,7 @@ impl ProcessState {
         if let Some(entry) = handle_to_proxy.get(&handle) {
             // Case (c): another thread inserted/upgraded since the read-fast-path miss.
             if let Some(arc) = entry.weak.upgrade() {
-                return Ok(SlowPathDecision::Cached(SIBinder::from_arc(arc)));
+                return Ok(SlowPathDecision::Cached(arc));
             }
             // Case (b): a `WIBinder` keeps the pin; it backs P3's BC_ACQUIRE (`attemptIncWeak`).
             if let Some(pin) = entry.pin.upgrade() {
@@ -1148,12 +1161,7 @@ impl ProcessState {
     }
 
     /// P3: re-check races from P2 and commit; `None` re-runs P1.
-    fn slow_path_p3(
-        &self,
-        handle: u32,
-        stability: Stability,
-        ready: SlowPathReady,
-    ) -> Result<Option<SIBinder>> {
+    fn slow_path_p3(&self, handle: u32, ready: SlowPathReady) -> Result<Option<Arc<ProxyHandle>>> {
         // Declared first so it drops after the lock: watermark callbacks may re-enter the cache.
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
         // Declared before the guard (and `ready` is a parameter) so every pin drops after the lock.
@@ -1166,7 +1174,7 @@ impl ProcessState {
         let entry = handle_to_proxy.get(&handle);
         // Re-check (c): a concurrent slow path completed during our P2; ours is redundant.
         if let Some(arc) = entry.and_then(|e| e.weak.upgrade()) {
-            return Ok(Some(SIBinder::from_arc(arc)));
+            return Ok(Some(arc));
         }
         entry_pin = entry.and_then(|e| e.pin.upgrade());
 
@@ -1178,7 +1186,7 @@ impl ProcessState {
             // An obituary removed the entry, or replaced it with a dying pin: redo P1.
             (SlowPathReady::CaseB { .. }, _) => return Ok(None),
         };
-        commit_new_acquired(&mut handle_to_proxy, pin, stability).map(Some)
+        commit_new_acquired(&mut handle_to_proxy, pin).map(Some)
     }
 
     /// The live proxy of the entry that still names `pin`; module doc "Proxy cache entry".

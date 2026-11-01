@@ -61,8 +61,9 @@ pub trait RegistryAccess: Send + Sync {
     ///
     /// It must not call the registry. When it judges the watchers of a change it runs while the
     /// registry holds the lock that orders its notices, so its cost holds up the registry's other
-    /// changes; every other judgement, those of notices sent again among them, runs with no lock
-    /// of the registry held.
+    /// advertises and the sends of owed notices; a withdraw, a watch and a death go on. Every
+    /// other judgement, those of notices sent again among them, runs with no lock of the
+    /// registry held.
     ///
     /// A panic in it ends the call that asked, and the registry goes on: a change keeps its new
     /// state, and those of its notices not sent by then are not sent; a notice the retry thread
@@ -456,8 +457,7 @@ impl Shared {
         self.inner.lock().expect("lock poisoned")
     }
 
-    /// `fire_order` guards no data: a panic while it was held, as a judgement may, leaves nothing
-    /// to repair, and the next change goes on.
+    /// `fire_order` guards no data: a panic under it, as a judgement may, leaves nothing to repair.
     fn order(&self) -> MutexGuard<'_, ()> {
         self.fire_order
             .lock()
@@ -648,7 +648,7 @@ impl Shared {
             }
             return;
         }
-        // Owed with no thread only after a failed spawn: any send tries it again.
+        // Owed with no thread after a failed spawn or a retry thread's panic: a send starts one.
         if !added && inner.table.owed() == 0 {
             return;
         }
@@ -700,8 +700,7 @@ impl Shared {
     }
 }
 
-/// Clears `retrying` when the retry thread ends by a panic, as a judgement may: a later send then
-/// starts another, where the flag left set would keep every owed notice unsent for good.
+/// Clears `retrying` when the retry thread panics: left set, no later send would start another.
 struct Ending(Weak<Shared>);
 
 impl Drop for Ending {

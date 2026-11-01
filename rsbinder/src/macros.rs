@@ -291,7 +291,7 @@ macro_rules! __declare_binder_interface_adapter {
                         ::core::option::Option::None => $crate::__if_local_transport! {
                             $local_transport
                             {
-                                // Code generated without the in-process transport: a sync-only native is BadType.
+                                // Without `local_transport`: a sync-only native is BadType.
                                 match $crate::Binder::<$native>::try_from(ibinder) {
                                     ::core::result::Result::Ok(native) => {
                                         if native.0.try_as_async().is_some() {
@@ -304,7 +304,7 @@ macro_rules! __declare_binder_interface_adapter {
                                 }
                             }
                             {
-                                // AOSP: a local binder without an async service is proxied in-process.
+                                // AOSP: a sync-only local binder is proxied in-process.
                                 match $crate::__local_binder::<$native>(&ibinder)? {
                                     ::core::option::Option::Some(native) if native.0.try_as_async().is_some() => {
                                         ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native)))
@@ -803,7 +803,7 @@ macro_rules! declare_binder_interface {
                             }
                         }
                         {
-                            // Another `Remotable` of this descriptor is proxied in-process (plan 17 D-13).
+                            // Another `Remotable` of this descriptor: in-process (plan 17 D-13).
                             match $crate::__local_binder::<$native>(&binder)? {
                                 ::core::option::Option::Some(native) => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new(native))),
                                 ::core::option::Option::None => ::core::result::Result::Ok($crate::Strong::new(::std::boxed::Box::new($proxy::__rsb_local(binder)))),

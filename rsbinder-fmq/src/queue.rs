@@ -408,11 +408,12 @@ impl<T: Element> MessageQueue<T> {
         Ok(self.capacity - self.available_to_read()?)
     }
 
-    /// The ring's `n` elements at counter value `position`, for as long as `'a` borrows `self`.
-    fn regions_at<'a>(&self, position: u64, n: usize) -> Regions<'a, T> {
-        debug_assert!(n <= self.capacity);
-        // SAFETY: mapped read-write while the transaction holds `&'a mut self`; callers check `n`.
-        unsafe { Regions::over(self.ring.base, self.ring.bytes, position, n, false) }
+    /// The ring's `n` elements at counter value `position`, borrowed with the queue beside them.
+    fn regions_at(&mut self, position: u64, n: usize) -> (&mut Self, Regions<'_, T>) {
+        assert!(n <= self.capacity, "more elements than the capacity");
+        // SAFETY: `ring` holds `capacity` elements, mapped read-write while `self` is borrowed.
+        let regions = unsafe { Regions::over(self.ring.base, self.ring.bytes, position, n, false) };
+        (self, regions)
     }
 
     /// Reserve `n` elements to write. `None` when fewer are free now;
@@ -446,9 +447,9 @@ impl<T: Element> MessageQueue<T> {
         if free < n {
             return Ok(None);
         }
-        let regions = self.regions_at(write, n);
+        let (queue, regions) = self.regions_at(write, n);
         Ok(Some(WriteTxn {
-            queue: self,
+            queue,
             regions,
             position: write,
             path: WritePath::Loaded,
@@ -546,9 +547,9 @@ impl<T: Element> MessageQueue<T> {
             }
             read = fresh;
         }
-        let regions = self.regions_at(write, n);
+        let (queue, regions) = self.regions_at(write, n);
         Ok(Some(WriteTxn {
-            queue: self,
+            queue,
             regions,
             position: write,
             path: WritePath::Cached { read },
@@ -582,9 +583,9 @@ impl<T: Element> MessageQueue<T> {
         if available < n {
             return Ok(None);
         }
-        let regions = self.regions_at(read, n);
+        let (queue, regions) = self.regions_at(read, n);
         Ok(Some(ReadTxn {
-            queue: self,
+            queue,
             regions,
             position: read,
         }))
@@ -642,9 +643,10 @@ impl<T: Element> MessageQueue<T> {
     /// [`Notify::WRITE`].
     ///
     /// `timeout` `None` waits without end, as libfmq's `timeOutNanos == 0`
-    /// does; `Some(Duration::ZERO)` tries once, without waiting and without
-    /// touching the EventFlag word, and is [`TimedOut`](Error::TimedOut)
-    /// when the items do not fit.
+    /// does; `Some(Duration::ZERO)` tries once and never waits on the
+    /// EventFlag word, and is [`TimedOut`](Error::TimedOut) when the items do
+    /// not fit. A transfer that succeeds sets the wake bits, whatever the
+    /// timeout.
     ///
     /// Fails with [`NoEventFlag`](Error::NoEventFlag) on a queue without the
     /// word, `BadValue` when `items` exceed the capacity (the wait could
@@ -1254,3 +1256,6 @@ impl<T: Element> std::fmt::Debug for Regions<'_, T> {
             .finish()
     }
 }
+
+#[cfg(all(test, not(loom)))]
+mod tests;

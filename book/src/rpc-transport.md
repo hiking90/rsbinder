@@ -229,8 +229,10 @@ not change across those releases. It has no handshake:
   reads `GET_MAX_THREADS` and `GET_SESSION_ID`, then opens
   `max_threads - 1` more connections that write that id; the server
   serves each as its own connection of the session, so calls on
-  different connections run at once. A local connection joins only from
-  the founding connection's uid, a check Android 12 does not make.
+  different connections run at once. A further connection joins only from
+  the founding connection's peer (the same uid over a Unix socket, the
+  same cid over vsock; plaintext TCP on the id alone), a check Android 12
+  does not make. A TLS server takes no join, since Android 12 has no TLS.
   `RpcSession::get_session_id` returns the id's 4 bytes.
 - An rsbinder r34 client opens one connection and does not join more.
 
@@ -532,8 +534,9 @@ Each transport defines its own trust boundary, surfaced as a
 
 - **`Local { uid, pid }`** — Unix socket peer with kernel-vouched
   credentials.
-- **`Vsock { cid }`** — VM context id (a routing address, **not** an
-  ACL basis on its own — the trust comes from hypervisor isolation).
+- **`Vsock { cid }`** — the peer VM's context id, assigned by the
+  hypervisor: it tells one VM from another (a session admits later
+  connections only from its founder's cid), not one process from another.
 - **`Certificate(CertId)`** — TLS peer authenticated by its leaf cert.
 - **`Anonymous`** — no identity at all. ACL is impossible against an
   anonymous peer. The debug TCP backend always returns this, and **any**

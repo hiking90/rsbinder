@@ -60,8 +60,8 @@ pub(crate) fn join_error_status(e: tokio::task::JoinError) -> StatusCode {
     }
 }
 
-/// Retrieve an existing service for a particular interface — one
-/// `getService` wire call, which does not block — the awaitable counterpart
+/// Retrieve an existing service for a particular interface — a `getService`
+/// call and the interface check after it, neither of which waits — the awaitable counterpart
 /// of [`crate::hub::try_get_interface`], with its result: `Ok(None)` when the
 /// name is not registered, the service manager's [`Status`](crate::Status) on a failure.
 /// For an event-driven wait use [`wait_for_interface_async`]; for a lookup
@@ -73,20 +73,34 @@ pub(crate) fn join_error_status(e: tokio::task::JoinError) -> StatusCode {
 /// from the synchronous ones in [`crate::hub`]. It matches
 /// [`crate::connect_async`], the facade entry point.
 ///
-/// Being a single round trip, this runs **inline** when it is called while
-/// handling a transaction; see [`check_interface_async`] for why.
+/// Called while handling a transaction
+/// ([`is_handling_transaction`](crate::is_handling_transaction)), the lookup
+/// and the interface check run **inline** on the handler's thread, as every
+/// async API of this crate does there (see [`BinderAsyncPool`]'s *Which
+/// thread a transact runs on*), and need no Tokio runtime; elsewhere they run
+/// on the blocking pool. Inside a handler this is also the bounded way to wait
+/// for a name: loop over it with a `tokio::time::sleep` between tries, under a
+/// `timeout` (see [`wait_for_interface_async`]'s *From inside a transaction*).
 pub async fn try_get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> BinderResult<Option<Strong<T>>> {
-    if crate::is_handling_transaction() {
-        // The rule of `__spawn_transact`: a nested call stays on the handler's thread.
-        return hub::try_get_interface::<T>(name);
-    }
-
     let name = name.to_string();
-    tokio::task::spawn_blocking(move || hub::try_get_interface::<T>(&name))
-        .await
-        .unwrap_or_else(|e| Err(join_error_status(e).into()))
+    blocking_op(move || hub::try_get_interface::<T>(&name)).await
+}
+
+/// Run the blocking binder work of an async API of this crate through
+/// [`crate::__spawn_transact`]: inline on a thread that is handling a
+/// transaction, on the Tokio blocking pool otherwise. Every async lookup and
+/// [`crate::connect_async`] go through here, so the choice is made in one
+/// place; `rsbinder/tests/source_invariants.rs` pins the `spawn_blocking`,
+/// `is_handling_transaction` and pool `::spawn(` sites that would bypass it.
+pub(crate) fn blocking_op<B, E, F>(op: F) -> BoxFuture<'static, Result<B, E>>
+where
+    F: FnOnce() -> Result<B, E> + Send + 'static,
+    B: Send + 'static,
+    E: From<StatusCode> + Send + 'static,
+{
+    crate::__spawn_transact::<Tokio, _, _, _, _, _, _>(op, |res| async move { res })
 }
 
 /// [`try_get_interface_async`] with "not registered" folded into
@@ -116,6 +130,11 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// name registered under a different interface is
 /// [`StatusCode::BadType`], exactly as in the sync path — the wait is not
 /// retried on a descriptor mismatch.
+///
+/// Called while handling a transaction, the whole wait runs inline on the
+/// handler's thread instead, and the first poll returns only when it ends (see
+/// *From inside a transaction*). What *Dropping the future*, *Cost* and *What
+/// drives it* say about the blocking pool is about a call made anywhere else.
 ///
 /// # Dropping the future
 ///
@@ -150,7 +169,8 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// | How this future is driven | Completion | A `timeout` around it |
 /// |---|---|---|
 /// | awaited on a runtime that is being driven | observed | fires |
-/// | awaited inside a handler this crate drives with [`TokioRuntime`] | observed — the wake comes from the blocking pool, not from the scheduler | only while that runtime's timer is advancing, which is the condition in [`TokioRuntime`]'s *Stalls* |
+/// | polled on a thread handling a transaction (a kernel binder or RPC transaction's handler, with or without a Tokio runtime) | the first poll runs the whole wait inline and returns its result | never — see *From inside a transaction* |
+/// | polled in a local async service called in-process through its sync handle (`Bn*::new_async_binder`) from a thread that handles no transaction | on the blocking pool, as in the first row | fires while the runtime the [`TokioRuntime`] handle points at runs its timer |
 /// | `tokio::spawn`ed onto a current-thread runtime nobody is parked in | never — the task is not polled, so the wait never starts and no pool thread is taken | – |
 ///
 /// The first poll is what submits the blocking task, so a runtime that stops
@@ -159,15 +179,31 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 ///
 /// # From inside a transaction
 ///
-/// Calling it while handling a transaction keeps that binder thread occupied
-/// until the service appears, and the in-flight transaction goes unanswered for
-/// that long — a `timeout` bounds the wait only under the condition in the
-/// table above. Look services up before serving, not while serving.
+/// Called while handling a transaction
+/// ([`is_handling_transaction`](crate::is_handling_transaction)), the whole
+/// operation — the wait, the lookups it re-polls with, and the interface check
+/// after it — runs **inline** on the handler's thread, as every async API of
+/// this crate does there (see [`BinderAsyncPool`]'s *Which thread a transact
+/// runs on*) and as AOSP `binder_tokio::wait_for_interface` does. It needs no
+/// Tokio runtime. Every call it makes stays in the handler's transaction
+/// chain, so the kernel can hand it to a peer thread that waits for this
+/// handler's reply. That covers the interface check's `INTERFACE_TRANSACTION`
+/// to the service found and, on the Android 16 protocol with the `rpc` feature,
+/// the calls to a service's accessor; made from a pool thread, they would
+/// never be answered by a peer whose binder threads all wait for this handler
+/// and whose thread pool cannot grow.
 ///
-/// Unlike the single-round-trip lookups, this does not run inline on the
-/// calling thread: the wait goes to the blocking pool wherever it is called
-/// from, so it is the reply that is delayed, not the kernel's deadlock
-/// prevention that is lost.
+/// The cost is that only the wait's own end ends it. The first poll returns
+/// once the service appears or the wait gives up, so a `timeout`, a `select!`
+/// or a drop around the future never takes effect, and the handler's binder
+/// thread and its caller's reply stay held until then — for good, if the name
+/// is never registered. Look services up before serving, not while serving.
+/// For a bounded wait inside a handler, loop over [`try_get_interface_async`]
+/// with a `tokio::time::sleep` between tries, under the `timeout`: each try is
+/// bounded and runs inline, and the sleep needs a runtime whose timer advances
+/// (see [`TokioRuntime`]'s *Stalls*). A loop over [`check_interface_async`]
+/// does not do this: `checkService` never starts a lazy service, which
+/// registers only once something calls `getService` for it.
 ///
 /// # Thread pool
 ///
@@ -183,7 +219,7 @@ pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
 
     let name = name.to_string();
     let wait_state = state.clone();
-    let res = tokio::task::spawn_blocking(move || {
+    blocking_op(move || {
         // `hub::default()` may probe the wire; casting here matches the sync path's `BadType`.
         let binder = hub::default()?
             .wait_for_service_cancellable(&name, wait_state)
@@ -193,8 +229,7 @@ pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
             })?;
         binder.into_interface_checked()
     })
-    .await;
-    res.unwrap_or_else(|e| Err(join_error_status(e)))
+    .await
 }
 
 /// Cancels the wait on drop: a `spawn_blocking` task ignores `abort()`, so its state tells it.
@@ -214,27 +249,17 @@ impl Drop for CancelWaitOnDrop {
 /// except on Android 15 r6+, where `check_*` is carried by `getService` —
 /// see the `hub` module doc.
 ///
-/// Being a single round trip, this follows [`try_get_interface_async`] and runs
-/// **inline** when it is called while handling a transaction, so the kernel can
-/// apply its deadlock prevention to the nested call.
-/// [`wait_for_interface_async`] deliberately does not — an unbounded wait has
-/// nothing to gain from staying on that thread and everything to lose.
+/// Called while handling a transaction
+/// ([`is_handling_transaction`](crate::is_handling_transaction)), the lookup
+/// and the interface check run **inline** on the handler's thread, as every
+/// async API of this crate does there (see [`BinderAsyncPool`]'s *Which
+/// thread a transact runs on*), and need no Tokio runtime; elsewhere they run
+/// on the blocking pool.
 pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
 ) -> Result<Strong<T>, StatusCode> {
-    fn lookup<T: FromIBinder + ?Sized + 'static>(name: &str) -> Result<Strong<T>, StatusCode> {
-        hub::check_interface::<T>(name)
-    }
-
-    if crate::is_handling_transaction() {
-        // The rule of `__spawn_transact`: a nested call stays on the handler's thread.
-        return lookup::<T>(name);
-    }
-
     let name = name.to_string();
-    tokio::task::spawn_blocking(move || lookup::<T>(&name))
-        .await
-        .unwrap_or_else(|e| Err(join_error_status(e)))
+    blocking_op(move || hub::check_interface::<T>(&name)).await
 }
 
 /// A future that completes when a binder dies — one `select!` arm instead of a
@@ -259,11 +284,10 @@ pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// Dropping it before the death unregisters the notification.
 ///
 /// Dropping it never panics. The kernel `unlink_to_death` panics on a
-/// poisoned recipients lock, and that poisoning is reachable without a bug:
-/// `ProxyHandle::link_to_death` holds the write guard across
-/// `talk_with_driver`, which panics if the driver under-consumes. The unlink
-/// therefore runs under `catch_unwind` (as `bridge::unlink_all` does); a
-/// caught panic is logged and leaves the death link registered.
+/// poisoned recipients lock, which any earlier panic under that lock leaves
+/// behind. The unlink therefore runs under `catch_unwind` (as
+/// `bridge::unlink_all` does); a caught panic is logged and leaves the death
+/// link registered.
 #[must_use = "dropping the signal at once unregisters the death notification at once"]
 pub struct DeathSignal {
     rx: tokio::sync::oneshot::Receiver<()>,
@@ -408,9 +432,9 @@ pub fn death_signal(binder: &SIBinder) -> Result<DeathSignal, StatusCode> {
 /// Use the Tokio `spawn_blocking` pool with AIDL.
 ///
 /// [`spawn`](BinderAsyncPool::spawn) always hands the work to
-/// `tokio::task::spawn_blocking`; a generated proxy keeps a transact made
-/// inside a transaction on the handler's thread itself (see
-/// [`BinderAsyncPool`]).
+/// `tokio::task::spawn_blocking`; a generated proxy and every async API of
+/// this crate keep the work of a call made inside a transaction on the
+/// handler's thread themselves (see [`BinderAsyncPool`]).
 pub enum Tokio {}
 
 impl BinderAsyncPool for Tokio {
@@ -508,10 +532,11 @@ impl BinderAsyncPool for Tokio {
 ///
 /// [`spawn_blocking`](tokio::task::spawn_blocking) is deliberately not in that
 /// set: the blocking pool runs independently of the scheduler, so awaiting one
-/// completes here too. That is why an *outbound* call through
-/// [`BinderAsyncPool`] — which is `spawn_blocking` —
-/// works from a handler this adapter is driving on a current-thread handle,
-/// even though a `tokio::spawn`ed task in the same place would not.
+/// completes here too. An *outbound* call or lookup the handler makes itself
+/// needs neither: on the handler's thread it runs inline (see
+/// [`BinderAsyncPool`]), so it works from a handler this adapter is driving
+/// on a current-thread handle, even though a `tokio::spawn`ed task in the same
+/// place would not.
 ///
 /// # Cost
 ///
@@ -718,5 +743,87 @@ mod tests {
     fn death_signal_is_send_and_static() {
         fn assert_send_static<T: Send + 'static>() {}
         assert_send_static::<DeathSignal>();
+    }
+
+    #[cfg(feature = "rpc")]
+    struct Absent;
+
+    #[cfg(feature = "rpc")]
+    impl crate::Interface for Absent {}
+
+    #[cfg(feature = "rpc")]
+    impl FromIBinder for Absent {
+        fn interface_descriptor() -> &'static str {
+            "rsbinder.test.Absent"
+        }
+        fn try_from(_: SIBinder) -> crate::Result<Strong<Self>> {
+            Err(StatusCode::BadType)
+        }
+    }
+
+    /// In a handler, each async lookup's first poll runs it on the polling thread, no runtime.
+    #[cfg(feature = "rpc")]
+    #[test]
+    #[serial_test::serial(binder)]
+    fn async_lookups_in_a_handler_run_inline_without_a_runtime() {
+        crate::tests::in_own_process(
+            "rt::tokio_rt::tests::async_lookups_in_a_handler_run_inline_without_a_runtime",
+            async_lookups_in_a_handler,
+        );
+    }
+
+    /// The test above, in its own process: `hub::default` keeps a handle-0 proxy for good.
+    #[cfg(feature = "rpc")]
+    fn async_lookups_in_a_handler() {
+        // An inline `hub::default` needs an initialized `ProcessState`, which needs a driver.
+        if !crate::ProcessState::is_initialized() && crate::ProcessState::init_default().is_err() {
+            eprintln!("skipped: no kernel binder driver");
+            return;
+        }
+        fn ready<F: Future>(fut: F) -> bool {
+            let mut fut = std::pin::pin!(fut);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            fut.as_mut().poll(&mut cx).is_ready()
+        }
+        let (done, watch) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _calling = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 0, pid: 7 }),
+                crate::TransportCaps::SAME_HOST,
+            );
+            assert!(crate::is_handling_transaction());
+            // The service manager's own name: a live one answers at once, an absent one fails.
+            let polled = std::panic::catch_unwind(|| {
+                [
+                    (
+                        "try_get_interface_async",
+                        ready(try_get_interface_async::<Absent>("manager")),
+                    ),
+                    (
+                        "check_interface_async",
+                        ready(check_interface_async::<Absent>("manager")),
+                    ),
+                    (
+                        "wait_for_interface_async",
+                        ready(wait_for_interface_async::<Absent>("manager")),
+                    ),
+                ]
+            });
+            let _ = done.send(polled.map_err(|_| ()));
+        });
+        match watch.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(polls)) => {
+                for (api, inline) in polls {
+                    assert!(
+                        inline,
+                        "{api}: the first poll left the lookup to another thread"
+                    );
+                }
+            }
+            Ok(Err(())) => {
+                panic!("a first poll needed a Tokio runtime (`spawn_blocking` panicked)")
+            }
+            Err(_) => panic!("an inline lookup did not end, or the polling thread died"),
+        }
     }
 }

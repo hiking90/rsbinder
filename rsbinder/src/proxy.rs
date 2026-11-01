@@ -216,9 +216,8 @@ enum CachedExtension {
 /// the `process_state` module doc "Proxy cache entry".
 pub struct ProxyHandle {
     handle: u32,
-    /// Shared `BC_INCREFS`; its generation is this proxy's. See module doc "Proxy identity".
+    /// Shared `BC_INCREFS`, descriptor and stability; its generation is this proxy's (module doc).
     pin: Arc<HandlePin>,
-    stability: Stability,
     /// Lock-free readers `Acquire`, locked readers `Relaxed`; see the module doc table.
     obituary_sent: AtomicBool,
     recipients: Mutex<Vec<sync::Weak<dyn DeathRecipient>>>,
@@ -231,19 +230,23 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     /// Sends `BC_ACQUIRE`; caller holds the proxy-cache lock and `pin`. See module doc.
-    pub(crate) fn new_acquired(pin: &Arc<HandlePin>, stability: Stability) -> Result<Arc<Self>> {
+    pub(crate) fn new_acquired(pin: &Arc<HandlePin>) -> Result<Arc<Self>> {
         let handle = pin.handle();
         thread_state::inc_strong_handle(handle)?;
         Ok(Arc::new_cyclic(|me| Self {
             handle,
             pin: Arc::clone(pin),
-            stability,
             obituary_sent: AtomicBool::new(false),
             recipients: Mutex::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
             freeze_used: AtomicBool::new(false),
             me: me.clone(),
         }))
+    }
+
+    /// A kernel stability word for this proxy's pin, as a raw level; `ReceivedStability::fill`.
+    pub(crate) fn record_received_stability(&self, level: i32) {
+        self.pin.received_stability().fill(level);
     }
 
     /// This proxy's key in the death and freeze registries; stable while it lives.
@@ -487,7 +490,7 @@ impl Debug for ProxyHandle {
                 "descriptor",
                 &self.pin.cached_descriptor().unwrap_or("(not cached)"),
             )
-            .field("stability", &self.stability)
+            .field("stability", &IBinder::stability(self))
             .field("obituary_sent", &self.obituary_sent)
             .finish()
     }
@@ -673,8 +676,9 @@ impl IBinder for ProxyHandle {
         thread_state::ping_binder(self.handle())
     }
 
+    /// AOSP `getRepr` on a `BpBinder`: the first declared level received, this process's before.
     fn stability(&self) -> Stability {
-        self.stability
+        self.pin.received_stability().get()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -765,10 +769,14 @@ mod tests {
         if let Some(descriptor) = descriptor {
             pin.cache_descriptor(descriptor.to_string());
         }
+        synthetic_proxy_on(pin, obituary_sent)
+    }
+
+    /// [`synthetic_proxy`] on an existing `pin`, as a case-(b) revival makes one.
+    fn synthetic_proxy_on(pin: Arc<HandlePin>, obituary_sent: bool) -> Arc<ProxyHandle> {
         Arc::new_cyclic(|me| ProxyHandle {
             handle: 1,
             pin,
-            stability: Stability::Local,
             obituary_sent: AtomicBool::new(obituary_sent),
             recipients: Mutex::new(Vec::new()),
             extension: RwLock::new(ExtensionCache::NotQueried),
@@ -866,10 +874,27 @@ mod tests {
         let debug_str = format!("{handle:?}");
         assert_eq!(
             debug_str,
-            "ProxyHandle { handle: 1, descriptor: \"test\", stability: Local, obituary_sent: false }"
+            "ProxyHandle { handle: 1, descriptor: \"test\", stability: System, obituary_sent: false }"
         );
 
         std::mem::forget(handle);
+    }
+
+    /// A received level is the pin's: a revived proxy and an earlier `WIBinder` both report it.
+    #[test]
+    fn a_received_level_is_kept_by_the_pin() {
+        let first = synthetic_proxy(false);
+        let sib = SIBinder::from_arc(first.clone() as Arc<dyn IBinder>);
+        let weak = SIBinder::downgrade(&sib);
+        first.record_received_stability(Stability::Vintf.level());
+        let revived = synthetic_proxy_on(Arc::clone(first.pin()), false);
+        assert_eq!(revived.stability(), Stability::Vintf, "revived proxy");
+        assert!(format!("{weak:?}").contains("stability: Vintf"), "{weak:?}");
+
+        std::mem::forget(weak);
+        std::mem::forget(sib);
+        std::mem::forget(revived);
+        std::mem::forget(first);
     }
 
     /// Plan 16: printing a proxy never asks the remote, and a dead one is not asked either.
@@ -879,7 +904,7 @@ mod tests {
         assert_eq!(IBinder::cached_descriptor(&*handle), None);
         assert_eq!(
             format!("{handle:?}"),
-            "ProxyHandle { handle: 1, descriptor: \"(not cached)\", stability: Local, \
+            "ProxyHandle { handle: 1, descriptor: \"(not cached)\", stability: System, \
              obituary_sent: true }"
         );
         let sib = SIBinder::from_arc(handle.clone() as Arc<dyn IBinder>);

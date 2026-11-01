@@ -501,8 +501,7 @@ fn enforce_permission_given_twice_is_rejected() {
     rsbinder_aidl::parse_document(&ctx).expect("repeatable");
 }
 
-/// AOSP `method_decl`: `annotation_list ONEWAY type` annotates the return type with the list
-/// before `oneway` and the one inside `type` alike, so either position guards the method.
+/// AOSP `method_decl` gives the return type the annotations before and after `oneway` alike.
 #[test]
 fn oneway_enforce_permission_is_checked_on_either_side_of_oneway() {
     for method in [

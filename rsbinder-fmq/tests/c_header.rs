@@ -19,7 +19,6 @@ mod common;
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -41,13 +40,15 @@ fn crate_dir() -> &'static Path {
 fn compile(compiler_env: &str, default: &str, args: &[&str], src: &str, out: &str) -> PathBuf {
     let compiler = std::env::var(compiler_env).unwrap_or_else(|_| default.to_string());
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join(out);
+    // Another test process sharing `target/` may be running `out`: write aside, then `rename`.
+    let partial = out.with_extension(format!("{}.partial", std::process::id()));
     let result = Command::new(&compiler)
         .args(args)
         .args(["-Wall", "-Wextra", "-Werror", "-O1", "-I"])
         .arg(crate_dir().join("c"))
         .arg(crate_dir().join("tests/c").join(src))
         .arg("-o")
-        .arg(&out)
+        .arg(&partial)
         .output()
         .unwrap_or_else(|e| panic!("{compiler}: {e} (set ${compiler_env})"));
     assert!(
@@ -55,6 +56,8 @@ fn compile(compiler_env: &str, default: &str, args: &[&str], src: &str, out: &st
         "{compiler} {src}:\n{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    std::fs::rename(&partial, &out)
+        .unwrap_or_else(|e| panic!("rename {} to {}: {e}", partial.display(), out.display()));
     out
 }
 
@@ -114,14 +117,16 @@ fn start(
     tag: &str,
     origin: &str,
     role: &str,
-) -> (std::process::Child, std::os::unix::net::UnixStream, PathBuf) {
-    let path = common::sock_path(tag);
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).unwrap();
+) -> (
+    std::process::Child,
+    std::os::unix::net::UnixStream,
+    common::SockFile,
+) {
+    let (path, listener) = common::SockFile::bind(tag);
     let mut child = common::spawn(
         peer()
             .args([origin, role])
-            .arg(&path)
+            .arg(&path.0)
             .args([COUNT.to_string(), CAPACITY.to_string()]),
     );
     let sock = common::accept_from(&listener, &mut child);
@@ -131,7 +136,7 @@ fn start(
 /// Rust creates; the C header attaches and reads.
 #[test]
 fn rust_creates_c_reads() {
-    let (child, mut sock, path) = start("c1r", "attach", "read");
+    let (child, mut sock, _path) = start("c1r", "attach", "read");
     let mut q = MessageQueue::<u32>::create(CAPACITY, true).unwrap();
     common::send_descriptor(&sock, &q.descriptor().unwrap());
     let mut ack = [0u8];
@@ -141,13 +146,12 @@ fn rust_creates_c_reads() {
     let out = common::finish(child);
     assert!(out.contains(&format!("sum={}", expected_sum())), "{out}");
     assert!(out.contains("capacity=64 grantors=4"), "{out}");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// Rust creates and reads; the C header attaches and writes, waiting on `NOT_FULL` when full.
 #[test]
 fn rust_creates_c_writes() {
-    let (child, mut sock, path) = start("c1w", "attach", "write");
+    let (child, mut sock, _path) = start("c1w", "attach", "write");
     let mut q = MessageQueue::<u32>::create(CAPACITY, true).unwrap();
     common::send_descriptor(&sock, &q.descriptor().unwrap());
     let mut ack = [0u8];
@@ -158,13 +162,12 @@ fn rust_creates_c_writes() {
 
     let out = common::finish(child);
     assert!(out.contains("done"), "{out}");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The C header creates and writes; Rust attaches under the strict policy and reads.
 #[test]
 fn c_creates_rust_reads() {
-    let (child, mut sock, path) = start("c2r", "create", "write");
+    let (child, mut sock, _path) = start("c2r", "create", "write");
     let desc = common::recv_descriptor(&sock);
     let mine = MessageQueue::<u32>::create(CAPACITY, true)
         .unwrap()
@@ -187,13 +190,12 @@ fn c_creates_rust_reads() {
 
     let out = common::finish(child);
     assert!(out.contains("done"), "{out}");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// The C header creates and reads; Rust attaches and writes.
 #[test]
 fn c_creates_rust_writes() {
-    let (child, mut sock, path) = start("c2w", "create", "read");
+    let (child, mut sock, _path) = start("c2w", "create", "read");
     let desc = common::recv_descriptor(&sock);
     let mut ack = [0u8];
     sock.read_exact(&mut ack).unwrap();
@@ -202,24 +204,24 @@ fn c_creates_rust_writes() {
 
     let out = common::finish(child);
     assert!(out.contains(&format!("sum={}", expected_sum())), "{out}");
-    let _ = std::fs::remove_file(&path);
 }
 
 /// `probe` mode: the header's answer to `desc`, then to the counters after `damage` ran.
 fn probe(tag: &str, desc: &Descriptor, max_capacity: usize, damage: impl FnOnce()) -> String {
-    let path = common::sock_path(tag);
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).unwrap();
-    let mut child = common::spawn(peer().arg("probe").arg(&path).arg(max_capacity.to_string()));
+    let (path, listener) = common::SockFile::bind(tag);
+    let mut child = common::spawn(
+        peer()
+            .arg("probe")
+            .arg(&path.0)
+            .arg(max_capacity.to_string()),
+    );
     let mut sock = common::accept_from(&listener, &mut child);
     common::send_descriptor(&sock, desc);
     let mut ack = [0u8];
     sock.read_exact(&mut ack).unwrap();
     damage();
     let _ = sock.write_all(&[1]);
-    let out = common::finish(child);
-    let _ = std::fs::remove_file(&path);
-    out
+    common::finish(child)
 }
 
 fn errno(e: rustix::io::Errno) -> i32 {

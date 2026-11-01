@@ -502,6 +502,15 @@ fn enum_autoincrement_overflow_is_rejected() {
     assert!(out.contains("r#N2 = 1,"), "got: {out}");
 }
 
+/// AOSP `AidlEnumDeclaration::Autofill` reads `@Backing`'s `type` as a folded string.
+#[test]
+fn backing_type_is_a_folded_string() {
+    let folded = generate_str("@Backing(type=\"in\" + \"t\") enum E { A = 1 }")
+        .expect("a concatenated backing type must generate");
+    let plain = generate_str("@Backing(type=\"int\") enum E { A = 1 }").expect("plain");
+    assert_eq!(folded, plain);
+}
+
 /// A `@FixedSize` union's `Tag` is `byte`-backed, so a 129th field is a diagnostic, not `Tag(128)`.
 #[test]
 fn fixed_size_union_tag_overflow_is_rejected() {
@@ -1621,7 +1630,7 @@ fn an_out_of_range_enum_reference_is_not_truncated() {
 
 /// AOSP's seven-trait `@RustDerive` schema; always-emitted impls (`Debug`, `Default`) are dropped.
 #[test]
-fn rust_derive_accepts_only_the_aosp_schema() {
+fn rust_derive_drops_always_emitted_traits() {
     let out =
         generate_str("package a; @RustDerive(Default=true, Clone=true) parcelable P { int x; }")
             .expect("must generate");
@@ -1699,8 +1708,7 @@ fn empty_interface_hash_is_rejected() {
     let _ = rsbinder_aidl::Builder::new().source("I.aidl").hash("");
 }
 
-/// `Builder::hash` takes any non-empty text; `"` and `\` must not end the emitted literal early,
-/// and a bidi control (rustc's deny-by-default `text_direction_codepoint_in_literal`) is escaped.
+/// `"`, `\` and bidi controls (rustc denies them raw) in `Builder::hash` text are escaped.
 #[test]
 fn interface_hash_is_emitted_as_an_escaped_literal() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hash_escape");
@@ -2115,15 +2123,18 @@ fn non_enum_defined_type_takes_no_constant() {
 /// AOSP `ValueString`: String takes only a string, integral targets never take a float.
 #[test]
 fn const_conversions_reject_mismatched_kinds() {
-    for src in [
-        "interface I { const String S = 5; }",
-        "interface I { const String S = true; }",
-        "interface I { const String[] N = { UNDEFINED }; }",
-        "interface I { const int X = 1.5; }",
-        "interface I { const long L = 1e19; }",
-        "parcelable P { boolean b = 0.5; }",
+    let not_string = "is not a string and cannot initialize a String";
+    let float = "cannot initialize an integral, boolean or char type";
+    for (src, needle) in [
+        ("interface I { const String S = 5; }", not_string),
+        ("interface I { const String S = true; }", not_string),
+        ("interface I { const String[] N = { 5 }; }", not_string),
+        ("interface I { const int X = 1.5; }", float),
+        ("interface I { const long L = 1e19; }", float),
+        ("parcelable P { boolean b = 0.5; }", float),
     ] {
-        generate_err(src);
+        let err = generate_err(src);
+        assert!(err.contains(needle), "{src}: {err}");
     }
 }
 
@@ -2555,8 +2566,7 @@ fn bare_enum_default_is_not_looked_up_in_the_field_enum() {
     ));
 }
 
-/// AOSP merges into a declaration the comments of every annotation, the keyword, and for a
-/// member its type and (methods only) its name; `FindDeprecated` searches them all.
+/// AOSP `FindDeprecated` searches every comment AOSP merges into the declaration.
 #[test]
 fn deprecated_counts_every_token_aosp_merges_into_the_declaration() {
     for (src, note) in [
@@ -2609,8 +2619,7 @@ fn deprecated_counts_every_token_aosp_merges_into_the_declaration() {
     }
 }
 
-/// Comments AOSP drops: a field's or constant's name, between `oneway` and `interface`, and
-/// inside an annotation's arguments.
+/// Comments AOSP drops: on a field or constant name, after `oneway`, inside annotation arguments.
 #[test]
 fn deprecated_ignores_comments_aosp_does_not_merge() {
     for src in [

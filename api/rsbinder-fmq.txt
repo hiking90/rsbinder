@@ -207,7 +207,6 @@ pub fn rsbinder_fmq::Error::eq(&self, &rsbinder_fmq::Error) -> bool
 impl core::convert::From<rsbinder_fmq::Error> for std::io::error::Error
 pub fn std::io::error::Error::from(rsbinder_fmq::Error) -> Self
 impl core::error::Error for rsbinder_fmq::Error
-pub fn rsbinder_fmq::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Debug for rsbinder_fmq::Error
 pub fn rsbinder_fmq::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for rsbinder_fmq::Error

@@ -375,9 +375,7 @@ fn an_interrupt_before_the_wait_ends_the_next_one() {
     interrupter.interrupt();
 }
 
-/// Plan 17 T-11: two subscribers asleep on the topic's one `seq` word with different futex bits.
-/// A raise for one ends its sleep alone; a wake of every bit, as the publisher's, ends both, with
-/// `seq` as it was, so the masks alone decide.
+/// Plan 17 T-11: two sleepers on one `seq` word with different futex bits; the masks alone decide.
 #[test]
 fn a_raise_wakes_its_own_subscribers_bit_and_a_wake_of_every_bit_ends_every_sleep() {
     use std::num::NonZeroU32;
@@ -401,16 +399,13 @@ fn a_raise_wakes_its_own_subscribers_bit_and_a_wake_of_every_bit_ends_every_slee
     };
 
     let woken = park(&a, Duration::from_secs(10));
+    eventually("the first sleeps", || a.is_parked());
     let unwoken = park(&b, Duration::from_millis(500));
-    eventually("both sleep", || a.is_parked() && b.is_parked());
+    eventually("the second sleeps", || b.is_parked());
     // Time to reach the kernel: a wait not yet in it would sleep through a stray wake too.
     thread::sleep(Duration::from_millis(20));
     a.raise(INTERRUPTED);
     assert_eq!(joined(woken), Slept::Woke);
-    assert!(
-        b.is_parked(),
-        "a raise for one subscriber ended another's sleep"
-    );
     assert_eq!(joined(unwoken), Slept::TimedOut);
 
     assert!(a.take(INTERRUPTED));

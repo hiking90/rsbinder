@@ -408,7 +408,10 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     ///
     /// Cancel-safe: dropping the future loses no record. A wait the pool has not started is taken
     /// back at the drop, and one it has started is woken, so the next receive waits only for that
-    /// thread to leave it. A future leaked rather than dropped leaves its wait to the pool: the
+    /// thread to leave it. That drop blocks, as [`Interrupter::interrupt`] does, until the pool
+    /// thread is out of its sleep: dropped on an executor thread, as by an expired
+    /// `tokio::time::timeout`, it holds that thread until the pool thread is scheduled. A future
+    /// leaked rather than dropped leaves its wait to the pool: the
     /// next receive that may wait returns a record already unread, and else joins that wait
     /// before it waits itself. The join lasts until a pool thread has run that wait, which ends
     /// as any wait does, at a commit, an interrupt or a death; while it is still queued nothing

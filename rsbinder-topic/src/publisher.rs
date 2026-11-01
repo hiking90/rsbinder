@@ -64,6 +64,8 @@ pub struct Publisher<T: Payload> {
     binder: SIBinder,
     /// The name the publisher holds, dropped before the end record.
     advertised: Mutex<Option<Held>>,
+    /// One advertise at a time: two that skip no resolver call would drop the one entry they share.
+    advertising: Mutex<()>,
 }
 
 /// A name a resolver gave: what to, where, and the advertisement that takes it back.
@@ -115,6 +117,7 @@ impl<T: Payload + 'static> Publisher<T> {
             shared,
             binder,
             advertised: Mutex::new(None),
+            advertising: Mutex::new(()),
         })
     }
 
@@ -155,10 +158,14 @@ impl<T: Payload + 'static> Publisher<T> {
     /// (plan 15 D8), keeping the subscribers already connected.
     ///
     /// The publisher holds one name. The advertisement it held before is dropped once the
-    /// resolver has given this one, so the name moves without a gap; when `resolver`'s
-    /// [`host`](Resolver::host) is the one the publisher's name is held on and `name` is that
-    /// name, the resolver is not asked again (a registry keeps one entry for the same name and
-    /// binder, which the drop of the earlier advertisement would take back).
+    /// resolver has given this one, so the name moves without a gap. When `resolver` has a
+    /// [`host`](Resolver::host), it is the one the publisher's name is held on, and `name` and
+    /// the binder advertised are the ones the publisher holds, the resolver is not asked again
+    /// (a registry keeps one entry for the same name and binder, which the drop of the earlier
+    /// advertisement would take back); a resolver whose `host` is `None` is asked every time.
+    /// Calls on one publisher run one at a time, each after the resolver call of the one before
+    /// it, so two calls from different threads for the same name, binder and host ask the
+    /// resolver once.
     ///
     /// [`ITopic::ERROR_CLOSED`] once the publisher is closed: the call never gives the name of a
     /// topic whose end record is written, and a close during the call takes the new name back.
@@ -178,6 +185,11 @@ impl<T: Payload + 'static> Publisher<T> {
         binder: SIBinder,
         resolver: &dyn Resolver,
     ) -> BinderResult<()> {
+        // `close` does not take it, so a resolver call here holds up no close.
+        let _serial = self
+            .advertising
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let host = resolver.host();
         let closed = || refuse(ERROR_CLOSED, "the publisher has been closed");
         {
@@ -510,10 +522,10 @@ impl Acceptor {
     ///
     /// Refusals: `EX_SECURITY` when [`PublisherPolicy::authorize`] does not admit the caller,
     /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
-    /// request names another payload type; `BadValue` for a token of this process that came
-    /// through binder (its death would say nothing about the caller), a pin count other than 0
-    /// or 1, a
-    /// `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
+    /// request names another payload type; `UnexpectedNull` for a null `token` or `control`;
+    /// `BadValue` for a token of this process that came through binder (its death would say
+    /// nothing about the caller) or that is not an `ISubscription`, a pin count other than 0 or 1,
+    /// a `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
     /// not a unix stream socket for `WAKE_FD` or not null for `WAKE_FUTEX`, or a control page
     /// that is not a sealed memfd of the size, magic, version and pin count the request states;
     /// [`ITopic::ERROR_FULL`] when the publisher holds as many subscriptions as its policy allows,
