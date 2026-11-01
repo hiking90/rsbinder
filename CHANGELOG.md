@@ -223,6 +223,10 @@ accepts both the 0.12.0 bytes and the new ones.
 - `link_to_death` on an RPC proxy refuses a recipient with no strong
   reference left with `BadValue`, as a kernel proxy does; 0.12.0 returned
   `Ok` and never notified it.
+- `send_frame` on `UnixTransport`, `TcpDebugTransport` and
+  `VsockTransport` reports a send deadline that expired before the first
+  byte as `RpcError::Timeout`, not `Io(WouldBlock)`; their `recv_frame`
+  extends its read deadline while the peer takes this end's bytes.
 
 **Streams and topics**
 
@@ -641,6 +645,21 @@ accepts both the 0.12.0 bytes and the new ones.
 - **Every caught panic logs its message.** The death-link, obituary,
   freeze-notification, reply-path, `Rewrap` and `Reconnecting` catches
   logged a fixed line; they now append the panic's text.
+- **The frame API of the socket transports follows their raw sends and
+  reads** (see *Migrating*). `UnixTransport`, `TcpDebugTransport`,
+  `VsockTransport` and `TlsTransport` keep the trait's `send_frame` /
+  `recv_frame`, which frame over `send_raw` / `recv_raw`, and every socket
+  send but TLS's goes through one loop. A send deadline that expires
+  before the frame's first byte is `RpcError::Timeout` and after it
+  `Io(WouldBlock)`, counted from the peer's last progress; `send_frame`
+  on unix, tcp_debug and vsock reported `Io(WouldBlock)` at any position.
+  `recv_frame` keeps its read deadline open while the peer is still taking
+  this end's bytes, as a session's reads already did.
+  `UnixTransport::send_frame_with_fds` waits for room in `poll` on Linux
+  and Android, where it blocked. Every frame reader classifies a short
+  read by one rule: fds that arrive with no byte are a cut frame
+  (`Truncated`) in the android-13+ reader too, where they read as a clean
+  end. A `sendmsg` that takes nothing is `WriteZero` on every send.
 - **Receiving a kernel binder makes no call to the process behind it.**
   Reading a handle from a parcel sends no `INTERFACE_TRANSACTION`; a kernel
   proxy asks for its descriptor when `descriptor()`, `try_descriptor()` or a

@@ -549,6 +549,19 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   word such as `0x00010000`; 0.12.0 compared all 32 bits with `UNDECLARED`
   and refused it with `BAD_TYPE` (CHANGELOG *Fixed*). A null binder whose
   low 16 bits are not zero is still `BAD_TYPE`.
+- **The frame API of the bundled socket transports follows their raw
+  sends and reads.** `send_frame` on `UnixTransport`, `TcpDebugTransport`
+  and `VsockTransport` is one `send_raw` of the length and the body, so a
+  send deadline that expires before the first byte is `RpcError::Timeout`
+  (the stream is still frame-synchronized) and one after it
+  `Io(WouldBlock)`, each counted from the peer's last progress. 0.12.0
+  reported `Io(WouldBlock)` at any position. Code that matched
+  `Io(WouldBlock)` to detect a stalled `send_frame` also matches `Timeout`.
+  `recv_frame` reads through `recv_raw`, so a peer that is still taking
+  this end's bytes keeps its read deadline from expiring, as it already did
+  for a session. `UnixTransport::send_frame_with_fds` waits for room in
+  `poll` on Linux and Android instead of blocking in `sendmsg`; its deadline
+  follows the same rule. Frames on the wire are unchanged.
 
 ## Streams and topics
 
