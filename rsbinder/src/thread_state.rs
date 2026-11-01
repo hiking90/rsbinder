@@ -190,8 +190,10 @@
 //!   table keeps `Inner<T>` alive while the entry exists, and the `SIBinder`
 //!   built from the returned `Arc` keeps it alive for the dispatch.
 //! - **Reply path containment.** The saved transaction state is restored on
-//!   every exit (an `Err` or panic must not leak it into the next command),
-//!   and a panic from the reply flush/await — `talk_with_driver` or a nested
+//!   every exit (an `Err` or panic must not leak it into the next command):
+//!   `TransactionFrame` holds it and restores it on drop, so a panic outside
+//!   every catch (the arm's last drop of a native, which runs its `Drop`)
+//!   restores it too. A panic from the reply flush/await — `talk_with_driver` or a nested
 //!   dispatch; OOM aborts and is not catchable — is caught rather than
 //!   unwinding the worker loop (as `binder::run_handler` does; a dropped
 //!   reply reaches a sync caller as `BR_DEAD_REPLY`). The `unflushed_mark` is
@@ -570,6 +572,44 @@ impl Drop for LocalCallGuard {
         set_strict_mode_policy(self.strict_mode_policy);
         replace_work_source(self.work_source);
         IN_PROCESS_CALL.with(|c| c.set(self.in_process_call));
+    }
+}
+
+/// A `BR_TRANSACTION`'s frame on this thread: installs its calling identity, and on drop gives
+/// back the outer frame and strict-mode policy, an unwind included (R1, pattern P3).
+///
+/// Only the arm in `execute_command` makes one, already inside `THREAD_STATE.with`, so the
+/// cell outlives it. The restore takes a fresh borrow; if one is still out it logs instead of
+/// panicking, which during an unwind would abort.
+struct TransactionFrame<'a> {
+    thread_state: &'a RefCell<ThreadState>,
+    transaction: Option<TransactionState>,
+    strict_mode_policy: i32,
+}
+
+impl<'a> TransactionFrame<'a> {
+    fn enter(thread_state: &'a RefCell<ThreadState>, current: TransactionState) -> Self {
+        let mut state = thread_state.borrow_mut();
+        let transaction = state.transaction.replace(current);
+        let strict_mode_policy = state.strict_mode_policy;
+        TransactionFrame {
+            thread_state,
+            transaction,
+            strict_mode_policy,
+        }
+    }
+}
+
+impl Drop for TransactionFrame<'_> {
+    fn drop(&mut self) {
+        match self.thread_state.try_borrow_mut() {
+            // Undo `check_interface`'s policy overwrite, as AOSP `executeCommand` does.
+            Ok(mut state) => {
+                state.transaction = self.transaction.take();
+                state.strict_mode_policy = self.strict_mode_policy;
+            }
+            Err(_) => log::error!("BR_TRANSACTION: thread state borrowed; frame not restored"),
+        }
     }
 }
 
@@ -1439,18 +1479,13 @@ fn execute_command(cmd: i32) -> Result<()> {
 
                 // TODO: AOSP `mServingStackPointer` is not tracked.
 
-                let (transaction_old, strict_mode_policy_old) = {
-                    let mut thread_state = thread_state.borrow_mut();
-                    let transaction_old = thread_state.transaction.take();
-                    let strict_mode_policy_old = thread_state.strict_mode_policy;
-
-                    thread_state.transaction = Some(TransactionState::from_transaction_data(
-                        &tr_secctx.transaction_data,
-                        calling_sid_at(tr_secctx.secctx),
-                    ));
-
-                    (transaction_old, strict_mode_policy_old)
-                };
+                // Built first: a panic in `calling_sid_at` then leaves the outer frame in place.
+                let current = TransactionState::from_transaction_data(
+                    &tr_secctx.transaction_data,
+                    calling_sid_at(tr_secctx.secctx),
+                );
+                // After `reader`: an unwind restores the frame before it frees the buffer.
+                let frame = TransactionFrame::enter(thread_state, current);
                 // Unset until an AIDL stub's `check_interface` installs the caller's value.
                 let _work_source = WorkSourceDispatchGuard::enter();
 
@@ -1559,12 +1594,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                         Ok(())
                     }));
 
-                {
-                    // Undo `check_interface`'s policy overwrite, as AOSP `executeCommand` does.
-                    let mut thread_state = thread_state.borrow_mut();
-                    thread_state.transaction = transaction_old;
-                    thread_state.strict_mode_policy = strict_mode_policy_old;
-                }
+                // Restored after the reply went out, as AOSP restores after `sendReply`.
+                drop(frame);
 
                 // Logged, not returned, as AOSP `sendReply`; module doc "Driver errors".
                 match reply_result {
@@ -3866,6 +3897,118 @@ mod tests {
         // The RPC handler resumes where it left off.
         assert_eq!(calling_caps(), Some(unix_caps));
         assert_eq!(get_calling_uid(), 1234);
+    }
+
+    /// A native whose handler sets a policy and drops its own table entry, and whose drop panics.
+    #[cfg(target_os = "linux")]
+    struct UnpublishingNative {
+        id: std::sync::OnceLock<u64>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Transactable for UnpublishingNative {
+        fn transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+            set_strict_mode_policy(0x55);
+            let id = *self.id.get().expect("published");
+            let ps = ProcessState::as_self();
+            assert!(ps.ref_native_kernel(id).is_some());
+            assert!(ps.deref_native_kernel(id).is_some());
+            assert!(ps.lookup_native(id).is_none(), "the entry is gone");
+            Ok(())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl IBinder for UnpublishingNative {
+        fn link_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn unlink_to_death(&self, _: std::sync::Weak<dyn DeathRecipient>) -> Result<()> {
+            Err(StatusCode::InvalidOperation)
+        }
+        fn ping_binder(&self) -> Result<()> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_transactable(&self) -> Option<&dyn Transactable> {
+            Some(self)
+        }
+        fn descriptor(&self) -> &str {
+            "rsbinder.test.UnpublishingNative"
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for UnpublishingNative {
+        fn drop(&mut self) {
+            panic!("UnpublishingNative dropped");
+        }
+    }
+
+    /// D6 (plan 18): a panic outside the handler's guard, here the arm's last drop of a native
+    /// the handler unpublished, still restores the frame: no transaction, the caller's policy.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[serial_test::serial(binder)]
+    fn a_panic_after_the_dispatch_restores_the_transaction_frame() {
+        ProcessState::init_default().expect("init_default");
+        let _ = THREAD_STATE.with(|ts| ts.borrow_mut().transaction.take());
+        set_strict_mode_policy(0x11);
+
+        let native = Arc::new(UnpublishingNative {
+            id: std::sync::OnceLock::new(),
+        });
+        let id = ProcessState::as_self().publish_native(native.clone());
+        native.id.set(id).expect("once");
+        // The table entry, then the arm's `strong`, are the last references.
+        drop(native);
+
+        let mut buffer = [0u8; 8];
+        let mut offsets = [0 as binder_size_t; 1];
+        let mut tr = TransactionData::default();
+        tr.set_target_ptr(id);
+        tr.code = 1;
+        tr.flags = binder::TF_ONE_WAY;
+        tr.sender_pid = 9999;
+        tr.sender_euid = 1000;
+        tr.buffer = buffer.as_mut_ptr() as _;
+        tr.offsets = offsets.as_mut_ptr() as _;
+
+        let (was_looper, mark) = THREAD_STATE.with(|ts| {
+            let mut ts = ts.borrow_mut();
+            let was_looper = ts.is_looper;
+            ts.is_looper = true;
+            let mark = ts.unflushed_mark();
+            ts.in_parcel.set_data_size(0).expect("reset in_parcel");
+            ts.in_parcel.set_data_position(0);
+            ts.in_parcel
+                .write_transaction(&tr)
+                .expect("forge BR_TRANSACTION payload");
+            ts.in_parcel.set_data_position(0);
+            (was_looper, mark)
+        });
+
+        let unwound = std::panic::catch_unwind(|| execute_command(binder::BR_TRANSACTION as i32));
+
+        let (transaction, policy) = THREAD_STATE.with(|ts| {
+            discard_unflushed_commands(ts, mark, false);
+            let mut ts = ts.borrow_mut();
+            ts.is_looper = was_looper;
+            let _ = ts.in_parcel.set_data_size(0);
+            (ts.transaction.take().is_some(), ts.strict_mode_policy)
+        });
+        set_strict_mode_policy(0);
+        assert!(
+            unwound.is_err(),
+            "the native's drop panicked through the arm"
+        );
+        assert!(!transaction, "the transaction frame was restored");
+        assert_eq!(policy, 0x11, "the caller's policy was restored");
     }
 
     /// Plain `BR_TRANSACTION` (not `_SEC_CTX`): no SID even while handling a transaction.
