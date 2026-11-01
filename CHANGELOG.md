@@ -22,6 +22,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   pairing `wait_for_service` and `rsbinder-topic`'s service-manager
   resolver now use.
 
+### Changed
+
+- **`wait_for_service` on Android 10** waits in the same loop as on later
+  versions, minus the registration notice: after the first lookup misses,
+  the next comes a second later rather than at once, and a missing service
+  logs the same "still waiting" warning every ten seconds.
+
 ## [0.13.0] - 2026-10-31
 
 ### Migrating from 0.12.0

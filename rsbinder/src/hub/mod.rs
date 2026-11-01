@@ -1723,14 +1723,13 @@ impl ServiceManager {
     /// # Android 10
     ///
     /// The legacy C service manager has no registration notifications, so the
-    /// event path is unavailable and the wait transparently falls back to ~1s
-    /// polling. The contract is the same (unbounded until the service appears),
-    /// except that the legacy protocol cannot distinguish "not registered" from
-    /// a transport error, so the wait does not give up early there — it keeps
-    /// polling. The per-second pause is a condvar wait on the waiter's
-    /// cancellation state rather than `thread::sleep`, so a dropped
-    /// `wait_for_interface_async` future releases its blocking-pool thread
-    /// at once there too.
+    /// event path is unavailable and the wait is the per-second re-poll alone,
+    /// with the same "still waiting" warnings. The contract is the same
+    /// (unbounded until the service appears), except that the legacy protocol
+    /// cannot distinguish "not registered" from a transport error, so the wait
+    /// does not give up early there — it keeps polling. The per-second pause
+    /// is the same condvar wait, so a dropped `wait_for_interface_async`
+    /// future releases its blocking-pool thread at once there too.
     ///
     /// # Cancellation
     ///
@@ -1781,11 +1780,10 @@ impl ServiceManager {
         let woken = Arc::clone(&state);
         // Held to the end: every exit unregisters, a panic's too.
         let _watch = match self.watch_borrowed(name, move |binder| woken.deliver(binder)) {
-            Ok(watch) => watch,
+            Ok(watch) => Some(watch),
+            // No registration notices on the legacy C protocol: the loop's re-polls find it.
             #[cfg(all(target_os = "android", feature = "android_10"))]
-            Err(_) if matches!(self, ServiceManager::Android10(_)) => {
-                return self.poll_for_service(name, &state);
-            }
+            Err(_) if matches!(self, ServiceManager::Android10(_)) => None,
             // AOSP `waitForService`: a refused registration (bad name, SELinux) ends the wait.
             Err(status) => return Err(WaitEnd::from_registration(status)),
         };
@@ -1829,28 +1827,6 @@ impl ServiceManager {
         match self.wait_for_service(name) {
             Some(binder) => binder.into_interface_checked(),
             None => Err(StatusCode::NameNotFound),
-        }
-    }
-
-    /// Android 10 only: 1s polls until the service appears or the wait is cancelled.
-    #[cfg(all(target_os = "android", feature = "android_10"))]
-    fn poll_for_service(
-        &self,
-        name: &str,
-        state: &WaiterState,
-    ) -> std::result::Result<SIBinder, WaitEnd> {
-        loop {
-            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
-                return Ok(binder);
-            }
-            let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let (guard, _) = state
-                .cv
-                .wait_timeout_while(guard, std::time::Duration::from_secs(1), |st| !st.cancelled)
-                .unwrap_or_else(|e| e.into_inner());
-            if guard.cancelled {
-                return Err(WaitEnd::Cancelled);
-            }
         }
     }
 }
