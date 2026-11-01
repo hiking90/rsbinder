@@ -5,16 +5,14 @@
 //!
 //! Every copy `MessageQueue` and the unsynchronized writer make goes through
 //! [`Regions::write_at`] or [`Regions::read_at`]. Under Miri a plain read or
-//! write of ring memory anywhere on that path, whatever its spelling, races
-//! the peer thread's atomic stores and is reported as a data race; that is
-//! what judges the path, and `tests/queue.rs`'s spelling scan is a tripwire
-//! in front of it.
+//! write of ring memory anywhere on that path races the peer thread's atomic
+//! stores and is reported as a data race; outside `shm` no such access can be
+//! written without `unsafe`, which the crate denies.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 use super::*;
 
-const WORD: usize = size_of::<usize>();
 /// Ring bytes: four words on a 64-bit target, eight on a 32-bit one.
 const RING: usize = 32;
 /// The ring's bytes before either thread writes; no read after this thread's own write returns it.
@@ -35,19 +33,14 @@ fn regions_copy_atomically() {
     ];
     for (position, n, start, len) in shapes {
         let shape = (position, n, start, len);
-        let ring: Box<[AtomicUsize]> = (0..RING / WORD)
-            .map(|_| AtomicUsize::new(usize::from_ne_bytes([FILL; WORD])))
-            .collect();
+        let ring = Mapping::heap(RING).unwrap().carve().bytes(0, RING).unwrap();
+        ring.store(0, &[FILL; RING]);
         // Relaxed only: an `Acquire` load of `stored` would order the copy after the peer's store.
         let (stored, done) = (AtomicUsize::new(0), AtomicBool::new(false));
         std::thread::scope(|s| {
-            let (ring, stored, done) = (&*ring, &stored, &done);
-            // `Regions` is neither `Send` nor `Sync`, so each thread makes its own over one split.
-            let regions = move |release: bool| {
-                let base = NonNull::from(ring).cast::<u8>();
-                // SAFETY: initialized atomics borrowed past the scope; both threads use this split.
-                unsafe { Regions::<u8>::over(base, RING, position, n, release) }
-            };
+            let (ring, stored, done) = (&ring, &stored, &done);
+            // Each thread makes its own `Regions` over the one ring, at the same split.
+            let regions = move |release: bool| Regions::<u8>::over(ring, position, n, release);
             // The peer breaks the protocol: it keeps storing into the elements this thread copies.
             let peer = s.spawn(move || {
                 let mut i = 0;
@@ -83,11 +76,8 @@ fn regions_copy_atomically() {
                 }
             });
         });
-        let bytes: Vec<u8> = ring
-            .into_vec()
-            .into_iter()
-            .flat_map(|word| word.into_inner().to_ne_bytes())
-            .collect();
+        let mut bytes = [0u8; RING];
+        ring.load(0, &mut bytes);
         let offset = (position % RING as u64) as usize;
         let split: Vec<usize> = (start..start + len).map(|e| (offset + e) % RING).collect();
         for (at, b) in bytes.iter().enumerate() {
@@ -98,4 +88,15 @@ fn regions_copy_atomically() {
             }
         }
     }
+}
+
+/// A span past the ring is a panic in the copy, not an access outside the mapping.
+#[test]
+#[should_panic(expected = "past an area of 32")]
+fn regions_past_the_ring_panic_at_the_copy() {
+    let ring = Mapping::heap(RING).unwrap().carve().bytes(0, RING).unwrap();
+    // 45 one-byte elements from byte 24: 8 before the wrap, 37 after it, more than the ring.
+    let regions = Regions::<u8>::over(&ring, 24, 45, false);
+    let mut out = [0u8; 45];
+    let _ = regions.read_at(0, &mut out);
 }

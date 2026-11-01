@@ -78,7 +78,10 @@ fn copies_round_trip_at_every_start_and_length() {
                 reader.load(0, &mut whole);
                 assert_eq!(whole[off..off + n], src, "area {area_at} copy {off}+{n}");
                 let outside = whole[..off].iter().chain(&whole[off + n..]);
-                assert!(outside.into_iter().all(|b| *b == 0xee), "area {area_at} copy {off}+{n}");
+                assert!(
+                    outside.into_iter().all(|b| *b == 0xee),
+                    "area {area_at} copy {off}+{n}"
+                );
                 let mut held = vec![0x11u8; 3];
                 bytes.load_extend(off, n, &mut held);
                 assert_eq!((&held[..3], &held[3..]), (&[0x11u8; 3][..], &src[..]));
@@ -110,7 +113,10 @@ fn a_copy_past_the_area_panics() {
 #[test]
 #[should_panic(expected = "past an area of 16")]
 fn a_copy_whose_end_overflows_panics() {
-    carve(16).bytes(0, 16).unwrap().load(usize::MAX, &mut [0u8; 2]);
+    carve(16)
+        .bytes(0, 16)
+        .unwrap()
+        .load(usize::MAX, &mut [0u8; 2]);
 }
 
 #[test]
@@ -131,7 +137,10 @@ fn words_read_back_through_their_read_only_views() {
     let words = c.words32(4, 3).unwrap();
     word.store(5, Relaxed);
     words.get(2).store(6, Relaxed);
-    assert_eq!((word.as_ro().load(), words.as_ro().get(2).load_acquire()), (5, 6));
+    assert_eq!(
+        (word.as_ro().load(), words.as_ro().get(2).load_acquire()),
+        (5, 6)
+    );
     #[cfg(target_has_atomic = "64")]
     if RoWord64::PRESENT {
         let wide = c.word64(16).unwrap();
@@ -181,7 +190,9 @@ fn pieces_go_to_other_threads_and_keep_the_memory() {
         let mut c = carve(16);
         c.bytes(0, 16).unwrap()
     };
-    std::thread::spawn(move || bytes.store(0, &[1u8; 16])).join().unwrap();
+    std::thread::spawn(move || bytes.store(0, &[1u8; 16]))
+        .join()
+        .unwrap();
 }
 
 /// Exists for Miri: two threads copy overlapping bytes split at different places. With `Run`,
@@ -281,7 +292,10 @@ fn a_read_only_view_races_its_writer_as_atomics() {
         while !done.load(Relaxed) {
             out.clear();
             reader.load_extend(0, 2 * WORD + 1, &mut out);
-            assert!(out[2..2 + WORD].iter().all(|b| [0, 0x33, 0x44].contains(b)), "{out:x?}");
+            assert!(
+                out[2..2 + WORD].iter().all(|b| [0, 0x33, 0x44].contains(b)),
+                "{out:x?}"
+            );
         }
     });
 }

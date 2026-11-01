@@ -92,6 +92,16 @@ impl<T: WordType> Deref for Word<T> {
     }
 }
 
+/// Another handle on the same word, at the same size.
+impl<T: WordType> Clone for Word<T> {
+    fn clone(&self) -> Self {
+        Self {
+            at: self.at,
+            _memory: Arc::clone(&self._memory),
+        }
+    }
+}
+
 impl<T: WordType> std::fmt::Debug for Word<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Word").field("size", &T::SIZE).finish()
@@ -162,6 +172,17 @@ impl<T: WordType> Words<T> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// Another handle on the same words, at the same size.
+impl<T: WordType> Clone for Words<T> {
+    fn clone(&self) -> Self {
+        Self {
+            at: self.at,
+            len: self.len,
+            _memory: Arc::clone(&self._memory),
+        }
     }
 }
 
@@ -260,7 +281,9 @@ impl Area {
 
     #[inline]
     fn words_at(&self, first: usize, n: usize) -> &[AtomicUsize] {
-        let at = self.at.map_addr(|a| a.saturating_add(self.head + first * WORD));
+        let at = self
+            .at
+            .map_addr(|a| a.saturating_add(self.head + first * WORD));
         // SAFETY: whole aligned words of the area (`cut`), each only ever accessed as a word.
         unsafe { std::slice::from_raw_parts(at.cast::<AtomicUsize>().as_ptr(), n) }
     }
@@ -344,7 +367,10 @@ impl Area {
         let (whole, rest) = src.split_at(cut.whole.1 * WORD);
         let words = self.words_at(cut.whole.0, cut.whole.1);
         for (d, s) in words.iter().zip(whole.chunks_exact(WORD)) {
-            d.store(usize::from_ne_bytes(s.try_into().expect("a whole word")), order);
+            d.store(
+                usize::from_ne_bytes(s.try_into().expect("a whole word")),
+                order,
+            );
         }
         src = rest;
         if let Some((index, n)) = cut.trail {
@@ -352,7 +378,11 @@ impl Area {
             self.merge(index, 0, part, order);
             src = rest;
         }
-        for (d, s) in self.bytes_at(cut.tail.start, cut.tail.len()).iter().zip(src) {
+        for (d, s) in self
+            .bytes_at(cut.tail.start, cut.tail.len())
+            .iter()
+            .zip(src)
+        {
             d.store(*s, order);
         }
     }
@@ -377,7 +407,10 @@ impl Area {
         let words = self.words_at(cut.whole.0, cut.whole.1);
         for (s, d) in words.iter().zip(whole.chunks_exact_mut(WORD)) {
             let d: &mut [MaybeUninit<u8>; WORD] = d.try_into().expect("a whole word");
-            *d = s.load(Ordering::Relaxed).to_ne_bytes().map(MaybeUninit::new);
+            *d = s
+                .load(Ordering::Relaxed)
+                .to_ne_bytes()
+                .map(MaybeUninit::new);
         }
         dst = rest;
         if let Some((index, n)) = cut.trail {
@@ -388,7 +421,11 @@ impl Area {
             }
             dst = rest;
         }
-        for (s, d) in self.bytes_at(cut.tail.start, cut.tail.len()).iter().zip(dst) {
+        for (s, d) in self
+            .bytes_at(cut.tail.start, cut.tail.len())
+            .iter()
+            .zip(dst)
+        {
             *d = MaybeUninit::new(s.load(Ordering::Relaxed));
         }
     }
@@ -549,6 +586,13 @@ impl Bytes {
     }
 }
 
+/// Another handle on the same area, split the same way.
+impl Clone for Bytes {
+    fn clone(&self) -> Self {
+        Self(self.0.share())
+    }
+}
+
 impl std::fmt::Debug for Bytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bytes").field("len", &self.0.len).finish()
@@ -615,6 +659,13 @@ impl RoBytes {
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.0.at.as_ptr()
+    }
+}
+
+/// Another handle on the same area, split the same way.
+impl Clone for RoBytes {
+    fn clone(&self) -> Self {
+        Self(self.0.share())
     }
 }
 
@@ -693,7 +744,9 @@ impl Lendable {
 
 impl std::fmt::Debug for Lendable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Lendable").field("len", &self.len()).finish()
+        f.debug_struct("Lendable")
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -730,7 +783,9 @@ impl RoLendable {
 
 impl std::fmt::Debug for RoLendable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoLendable").field("len", &self.len()).finish()
+        f.debug_struct("RoLendable")
+            .field("len", &self.len())
+            .finish()
     }
 }
 

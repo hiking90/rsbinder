@@ -33,6 +33,8 @@ pub fn rsbinder_fmq::shm::Bytes::load_acquire<T: rsbinder_fmq::Element>(&self, u
 pub fn rsbinder_fmq::shm::Bytes::load_extend(&self, usize, usize, &mut alloc::vec::Vec<u8>)
 pub fn rsbinder_fmq::shm::Bytes::store<T: rsbinder_fmq::Element>(&self, usize, &[T])
 pub fn rsbinder_fmq::shm::Bytes::store_release<T: rsbinder_fmq::Element>(&self, usize, &[T])
+impl core::clone::Clone for rsbinder_fmq::shm::Bytes
+pub fn rsbinder_fmq::shm::Bytes::clone(&self) -> Self
 impl core::fmt::Debug for rsbinder_fmq::shm::Bytes
 pub fn rsbinder_fmq::shm::Bytes::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder_fmq::shm::Bytes
@@ -136,6 +138,8 @@ pub fn rsbinder_fmq::shm::RoBytes::len(&self) -> usize
 pub fn rsbinder_fmq::shm::RoBytes::load<T: rsbinder_fmq::Element>(&self, usize, &mut [T])
 pub fn rsbinder_fmq::shm::RoBytes::load_acquire<T: rsbinder_fmq::Element>(&self, usize, &mut [T])
 pub fn rsbinder_fmq::shm::RoBytes::load_extend(&self, usize, usize, &mut alloc::vec::Vec<u8>)
+impl core::clone::Clone for rsbinder_fmq::shm::RoBytes
+pub fn rsbinder_fmq::shm::RoBytes::clone(&self) -> Self
 impl core::fmt::Debug for rsbinder_fmq::shm::RoBytes
 pub fn rsbinder_fmq::shm::RoBytes::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder_fmq::shm::RoBytes
@@ -308,6 +312,8 @@ impl rsbinder_fmq::shm::Word<core::sync::atomic::AtomicU64>
 pub fn rsbinder_fmq::shm::Word<core::sync::atomic::AtomicU64>::as_ro(&self) -> rsbinder_fmq::Result<rsbinder_fmq::shm::Word<rsbinder_fmq::shm::RoWord64>>
 impl<T: rsbinder_fmq::shm::WordType + core::marker::Sync> core::marker::Send for rsbinder_fmq::shm::Word<T>
 impl<T: rsbinder_fmq::shm::WordType + core::marker::Sync> core::marker::Sync for rsbinder_fmq::shm::Word<T>
+impl<T: rsbinder_fmq::shm::WordType> core::clone::Clone for rsbinder_fmq::shm::Word<T>
+pub fn rsbinder_fmq::shm::Word<T>::clone(&self) -> Self
 impl<T: rsbinder_fmq::shm::WordType> core::fmt::Debug for rsbinder_fmq::shm::Word<T>
 pub fn rsbinder_fmq::shm::Word<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: rsbinder_fmq::shm::WordType> core::ops::deref::Deref for rsbinder_fmq::shm::Word<T>
@@ -329,6 +335,8 @@ pub fn rsbinder_fmq::shm::Words<T>::is_empty(&self) -> bool
 pub fn rsbinder_fmq::shm::Words<T>::len(&self) -> usize
 impl<T: rsbinder_fmq::shm::WordType + core::marker::Sync> core::marker::Send for rsbinder_fmq::shm::Words<T>
 impl<T: rsbinder_fmq::shm::WordType + core::marker::Sync> core::marker::Sync for rsbinder_fmq::shm::Words<T>
+impl<T: rsbinder_fmq::shm::WordType> core::clone::Clone for rsbinder_fmq::shm::Words<T>
+pub fn rsbinder_fmq::shm::Words<T>::clone(&self) -> Self
 impl<T: rsbinder_fmq::shm::WordType> core::fmt::Debug for rsbinder_fmq::shm::Words<T>
 pub fn rsbinder_fmq::shm::Words<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for rsbinder_fmq::shm::Words<T>
@@ -619,13 +627,13 @@ pub fn rsbinder_fmq::MessageQueue<T>::write_blocking(&mut self, &[T], core::opti
 pub fn rsbinder_fmq::MessageQueue<T>::write_blocking_with(&mut self, &[T], rsbinder_fmq::Notify, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<()>
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::MessageQueue<T>
 pub fn rsbinder_fmq::MessageQueue<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::MessageQueue<T>
 impl<T> core::marker::Freeze for rsbinder_fmq::MessageQueue<T>
+impl<T> core::marker::Send for rsbinder_fmq::MessageQueue<T>
 impl<T> !core::marker::Sync for rsbinder_fmq::MessageQueue<T>
-impl<T> core::marker::Unpin for rsbinder_fmq::MessageQueue<T> where T: core::marker::Unpin
+impl<T> core::marker::Unpin for rsbinder_fmq::MessageQueue<T>
 impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::MessageQueue<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::MessageQueue<T>
-impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::MessageQueue<T> where T: core::panic::unwind_safe::UnwindSafe
+impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::MessageQueue<T>
 pub struct rsbinder_fmq::Notify
 pub rsbinder_fmq::Notify::wait: core::num::nonzero::NonZeroU32
 pub rsbinder_fmq::Notify::wake: u32
@@ -661,7 +669,7 @@ pub fn rsbinder_fmq::ReadTxn<'a, T>::deref(&self) -> &rsbinder_fmq::Regions<'a, 
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::ReadTxn<'_, T>
 pub fn rsbinder_fmq::ReadTxn<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a, T> core::marker::Freeze for rsbinder_fmq::ReadTxn<'a, T>
-impl<'a, T> !core::marker::Send for rsbinder_fmq::ReadTxn<'a, T>
+impl<'a, T> core::marker::Send for rsbinder_fmq::ReadTxn<'a, T>
 impl<'a, T> !core::marker::Sync for rsbinder_fmq::ReadTxn<'a, T>
 impl<'a, T> core::marker::Unpin for rsbinder_fmq::ReadTxn<'a, T>
 impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::ReadTxn<'a, T>
@@ -677,12 +685,12 @@ pub fn rsbinder_fmq::Regions<'_, T>::second_len(&self) -> usize
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::Regions<'_, T>
 pub fn rsbinder_fmq::Regions<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a, T> core::marker::Freeze for rsbinder_fmq::Regions<'a, T>
-impl<'a, T> !core::marker::Send for rsbinder_fmq::Regions<'a, T>
-impl<'a, T> !core::marker::Sync for rsbinder_fmq::Regions<'a, T>
+impl<'a, T> core::marker::Send for rsbinder_fmq::Regions<'a, T>
+impl<'a, T> core::marker::Sync for rsbinder_fmq::Regions<'a, T>
 impl<'a, T> core::marker::Unpin for rsbinder_fmq::Regions<'a, T>
 impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::Regions<'a, T>
-impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Regions<'a, T> where T: core::panic::unwind_safe::RefUnwindSafe
-impl<'a, T> !core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Regions<'a, T>
+impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::Regions<'a, T>
+impl<'a, T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::Regions<'a, T>
 #[non_exhaustive] pub struct rsbinder_fmq::UnsyncCreate
 pub rsbinder_fmq::UnsyncCreate::read_only_readers: bool
 impl rsbinder_fmq::UnsyncCreate
@@ -736,13 +744,13 @@ pub fn rsbinder_fmq::UnsyncReader<T>::read(&mut self, &mut [T]) -> rsbinder_fmq:
 pub fn rsbinder_fmq::UnsyncReader<T>::read_latest(&mut self, &mut [T]) -> rsbinder_fmq::Result<rsbinder_fmq::UnsyncLatest>
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncReader<T>
 pub fn rsbinder_fmq::UnsyncReader<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::UnsyncReader<T>
 impl<T> !core::marker::Freeze for rsbinder_fmq::UnsyncReader<T>
+impl<T> core::marker::Send for rsbinder_fmq::UnsyncReader<T>
 impl<T> !core::marker::Sync for rsbinder_fmq::UnsyncReader<T>
-impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncReader<T> where T: core::marker::Unpin
+impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncReader<T>
 impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncReader<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncReader<T>
-impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncReader<T> where T: core::panic::unwind_safe::UnwindSafe
+impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncReader<T>
 pub struct rsbinder_fmq::UnsyncWriteTxn<'a, T: rsbinder_fmq::Element>
 impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncWriteTxn<'_, T>
 pub fn rsbinder_fmq::UnsyncWriteTxn<'_, T>::commit(self) -> rsbinder_fmq::Result<()>
@@ -754,11 +762,11 @@ pub fn rsbinder_fmq::UnsyncWriteTxn<'a, T>::deref(&self) -> &rsbinder_fmq::Regio
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncWriteTxn<'_, T>
 pub fn rsbinder_fmq::UnsyncWriteTxn<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a, T> core::marker::Freeze for rsbinder_fmq::UnsyncWriteTxn<'a, T>
-impl<'a, T> !core::marker::Send for rsbinder_fmq::UnsyncWriteTxn<'a, T>
-impl<'a, T> !core::marker::Sync for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> core::marker::Send for rsbinder_fmq::UnsyncWriteTxn<'a, T>
+impl<'a, T> core::marker::Sync for rsbinder_fmq::UnsyncWriteTxn<'a, T>
 impl<'a, T> core::marker::Unpin for rsbinder_fmq::UnsyncWriteTxn<'a, T>
 impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncWriteTxn<'a, T>
-impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncWriteTxn<'a, T> where T: core::panic::unwind_safe::RefUnwindSafe
+impl<'a, T> core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncWriteTxn<'a, T>
 impl<'a, T> !core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncWriteTxn<'a, T>
 pub struct rsbinder_fmq::UnsyncWriter<T: rsbinder_fmq::Element>
 impl<T: rsbinder_fmq::Element> rsbinder_fmq::UnsyncWriter<T>
@@ -771,13 +779,13 @@ pub fn rsbinder_fmq::UnsyncWriter<T>::write(&mut self, &[T]) -> rsbinder_fmq::Re
 pub fn rsbinder_fmq::UnsyncWriter<T>::written(&self) -> u64
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::UnsyncWriter<T>
 pub fn rsbinder_fmq::UnsyncWriter<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<T: rsbinder_fmq::Element> core::marker::Send for rsbinder_fmq::UnsyncWriter<T>
 impl<T> core::marker::Freeze for rsbinder_fmq::UnsyncWriter<T>
+impl<T> core::marker::Send for rsbinder_fmq::UnsyncWriter<T>
 impl<T> !core::marker::Sync for rsbinder_fmq::UnsyncWriter<T>
-impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncWriter<T> where T: core::marker::Unpin
+impl<T> core::marker::Unpin for rsbinder_fmq::UnsyncWriter<T>
 impl<T> core::marker::UnsafeUnpin for rsbinder_fmq::UnsyncWriter<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for rsbinder_fmq::UnsyncWriter<T>
-impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncWriter<T> where T: core::panic::unwind_safe::UnwindSafe
+impl<T> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::UnsyncWriter<T>
 pub struct rsbinder_fmq::WriteTxn<'a, T: rsbinder_fmq::Element>
 impl<T: rsbinder_fmq::Element> rsbinder_fmq::WriteTxn<'_, T>
 pub fn rsbinder_fmq::WriteTxn<'_, T>::commit(self) -> rsbinder_fmq::Result<()>
@@ -789,7 +797,7 @@ pub fn rsbinder_fmq::WriteTxn<'a, T>::deref(&self) -> &rsbinder_fmq::Regions<'a,
 impl<T: rsbinder_fmq::Element> core::fmt::Debug for rsbinder_fmq::WriteTxn<'_, T>
 pub fn rsbinder_fmq::WriteTxn<'_, T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<'a, T> core::marker::Freeze for rsbinder_fmq::WriteTxn<'a, T>
-impl<'a, T> !core::marker::Send for rsbinder_fmq::WriteTxn<'a, T>
+impl<'a, T> core::marker::Send for rsbinder_fmq::WriteTxn<'a, T>
 impl<'a, T> !core::marker::Sync for rsbinder_fmq::WriteTxn<'a, T>
 impl<'a, T> core::marker::Unpin for rsbinder_fmq::WriteTxn<'a, T>
 impl<'a, T> core::marker::UnsafeUnpin for rsbinder_fmq::WriteTxn<'a, T>

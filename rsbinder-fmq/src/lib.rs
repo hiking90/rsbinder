@@ -102,12 +102,14 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 // Every allow outside tests says why (plan 13-1).
 #![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
+// Shared memory becomes atomics in `shm` alone (plan 12-2); `tests/source_invariants.rs` checks it.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod descriptor;
 mod error;
 mod event_flag;
 mod queue;
-mod ring;
 pub mod shm;
 mod unsync;
 

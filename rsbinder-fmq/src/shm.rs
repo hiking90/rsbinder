@@ -69,6 +69,11 @@
 //! target the name is a type with no value and [`RoWord64::PRESENT`] is
 //! `false`, so a caller compiles everywhere and refuses at run time.
 
+#![expect(
+    unsafe_code,
+    reason = "shm is where addresses of shared memory become atomics"
+)]
+
 use std::os::fd::BorrowedFd;
 
 use crate::error::Result;
@@ -84,13 +89,14 @@ mod run;
 pub mod spin;
 mod word;
 
+pub(crate) use element::bytes_of_mut;
 pub use element::Element;
 pub use futex::{futex_wait, futex_wake, Deadline};
 pub use mapping::{Access, Mapping, RoMapping};
+pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
 pub use piece::{
     AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType, Words,
 };
-pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
 pub use run::{RoRun, Run};
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.
 pub use word::*;

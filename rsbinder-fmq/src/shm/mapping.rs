@@ -261,7 +261,10 @@ impl Mapping {
     /// When the mapping was made [`Access::ReadOnly`]: carve it through
     /// [`RoMapping`] instead, whose pieces have no stores.
     pub fn carve(self) -> super::Carve {
-        assert!(self.writable, "a read-only mapping is carved as a `RoMapping`");
+        assert!(
+            self.writable,
+            "a read-only mapping is carved as a `RoMapping`"
+        );
         super::Carve::new(self.memory, self.delta)
     }
 

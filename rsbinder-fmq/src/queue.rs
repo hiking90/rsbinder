@@ -6,7 +6,6 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
-use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -15,10 +14,9 @@ use crate::descriptor::{
 };
 use crate::error::{received, Error, Result};
 use crate::event_flag::{EventFlag, NOT_EMPTY, NOT_FULL};
-use crate::ring;
 pub(crate) use crate::shm::AtomicU64;
-use crate::shm::{self, Access, CreateOptions, Deadline, Mapping, Run, Seals};
 pub use crate::shm::Element;
+use crate::shm::{self, Access, Bytes, CreateOptions, Deadline, Mapping, RoMapping, Seals, Word};
 
 /// `Unsupported` where no queue can exist: off Linux and Android, or without 64-bit atomics.
 pub(crate) fn check_target() -> Result<()> {
@@ -33,64 +31,32 @@ pub(crate) fn check_target() -> Result<()> {
     }
 }
 
-pub(crate) struct Counter {
-    _mapping: Mapping,
-    ptr: NonNull<AtomicU64>,
+/// The 8-byte counter at grantor `g`, mapped read-write.
+pub(crate) fn map_counter(desc: &Descriptor, g: Grantor) -> Result<Word<AtomicU64>> {
+    // Before any system call; `word64` would say `Unsupported` too, after the `mmap`.
+    check_target()?;
+    // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
+    let mut carve = map_grantor(desc, g, 8)?.carve();
+    carve.word64(0).map_err(received)
 }
 
-impl Counter {
-    pub(crate) fn map(desc: &Descriptor, g: Grantor) -> Result<Self> {
-        // No `Counter` exists where `AtomicU64` is the uninhabited stand-in; `get` relies on it.
-        check_target()?;
-        // Only the 8-byte word: a peer-sized extent would be the peer's choice of address space.
-        let mapping = map_grantor(desc, g, 8, Access::ReadWrite)?;
-        let ptr = mapping.as_ptr().cast::<AtomicU64>();
-        debug_assert_eq!(ptr.as_ptr() as usize % std::mem::align_of::<AtomicU64>(), 0);
-        Ok(Self {
-            _mapping: mapping,
-            ptr,
-        })
-    }
-
-    fn get(&self) -> &AtomicU64 {
-        // SAFETY: in `_mapping`, 8-aligned (grantor offsets are 8-aligned), atomic-only.
-        unsafe { self.ptr.as_ref() }
-    }
-
-    /// The word's address, valid while this `Counter` lives.
-    pub(crate) fn address(&self) -> NonNull<AtomicU64> {
-        self.ptr
-    }
-}
-
-pub(crate) struct Ring {
-    _mapping: Mapping,
-    pub(crate) base: NonNull<u8>,
-    pub(crate) bytes: usize,
-}
-
-impl Ring {
-    /// Map the data grantor `g` of a descriptor that `validate` passed or this crate laid out.
-    pub(crate) fn map(desc: &Descriptor, g: Grantor, access: Access) -> Result<Self> {
-        let mapping = map_grantor(desc, g, g.extent, access)?;
-        Ok(Self {
-            base: mapping.as_ptr(),
-            // ≤ i32::MAX: checked by `validate`, and by `ring_bytes` for a new queue.
-            bytes: g.extent as usize,
-            _mapping: mapping,
-        })
-    }
+/// The data grantor `g` of a descriptor that `validate` passed or this crate laid out, read-write.
+pub(crate) fn map_ring(desc: &Descriptor, g: Grantor) -> Result<Bytes> {
+    let mut carve = map_grantor(desc, g, g.extent)?.carve();
+    // ≤ i32::MAX: checked by `validate`, and by `ring_bytes` for a new queue.
+    carve.bytes(0, g.extent as usize).map_err(received)
 }
 
 /// `len` bytes at grantor `g`; what `Mapping::map` refuses of it is the descriptor's failure.
-pub(crate) fn map_grantor(
-    desc: &Descriptor,
-    g: Grantor,
-    len: u64,
-    access: Access,
-) -> Result<Mapping> {
+pub(crate) fn map_grantor(desc: &Descriptor, g: Grantor, len: u64) -> Result<Mapping> {
     let fd = desc.fds[g.fd_index as usize].as_fd();
-    Mapping::map(fd, u64::from(g.offset), len, access).map_err(received)
+    Mapping::map(fd, u64::from(g.offset), len, Access::ReadWrite).map_err(received)
+}
+
+/// [`map_grantor`], read-only.
+pub(crate) fn map_grantor_ro(desc: &Descriptor, g: Grantor, len: u64) -> Result<RoMapping> {
+    let fd = desc.fds[g.fd_index as usize].as_fd();
+    RoMapping::map(fd, u64::from(g.offset), len).map_err(received)
 }
 
 /// `capacity * size_of::<T>()`, within what libfmq maps and a 32-bit `usize` holds.
@@ -168,20 +134,24 @@ pub(crate) fn ring_bytes<T: Element>(capacity: usize) -> Result<u64> {
 /// any write sees no difference; one that attaches after would discard
 /// what was written. [`attach`](Self::attach) never writes the counters.
 pub struct MessageQueue<T: Element> {
-    read: Counter,
-    write: Counter,
-    ring: Ring,
+    ring: Bytes,
+    state: State<T>,
+}
+
+/// Everything of a queue but its ring, so that a transaction borrows the two apart.
+struct State<T: Element> {
+    read: Word<AtomicU64>,
+    write: Word<AtomicU64>,
+    ring_bytes: u64,
     flag: Option<EventFlag>,
     desc: Descriptor,
     capacity: usize,
     /// (read, write) as the cached writer last saw them; `None` until a cached write loads them.
     writer_view: Option<(u64, u64)>,
     _not_sync: PhantomData<Cell<()>>,
-    _element: PhantomData<T>,
+    // No `T` is held, so `T` decides no auto trait.
+    _element: PhantomData<fn() -> T>,
 }
-
-// SAFETY: pointers into owned `Mapping`s (`Send`), reached only via atomics (`Counter`, `Run`).
-unsafe impl<T: Element> Send for MessageQueue<T> {}
 
 impl<T: Element> MessageQueue<T> {
     /// Allocate a queue of `capacity` elements in a new memfd, with an
@@ -224,9 +194,9 @@ impl<T: Element> MessageQueue<T> {
         };
         let policy = AttachPolicy::new(capacity).require_event_flag(event_flag);
         let queue = Self::open(desc, &policy)?;
-        queue.read.get().store(0, Ordering::Release);
-        queue.write.get().store(0, Ordering::Release);
-        if let Some(flag) = &queue.flag {
+        queue.state.read.store(0, Ordering::Release);
+        queue.state.write.store(0, Ordering::Release);
+        if let Some(flag) = &queue.state.flag {
             flag.reset();
         }
         Ok(queue)
@@ -286,41 +256,42 @@ impl<T: Element> MessageQueue<T> {
         // The target's verdict comes before the descriptor's.
         check_target()?;
         let geo = validate(&desc, size_of::<T>(), policy, Flavor::SynchronizedReadWrite)?;
-        let read = Counter::map(&desc, geo.read)?;
-        let write = Counter::map(&desc, geo.write)?;
-        let ring = Ring::map(&desc, geo.data, Access::ReadWrite)?;
+        let read = map_counter(&desc, geo.read)?;
+        let write = map_counter(&desc, geo.write)?;
+        let ring = map_ring(&desc, geo.data)?;
         let flag = match geo.event_flag {
             // The 4-byte word only, as for the counters.
-            Some(g) => Some(EventFlag::from_mapping(map_grantor(
-                &desc,
-                g,
-                4,
-                Access::ReadWrite,
-            )?)),
+            Some(g) => {
+                let mut carve = map_grantor(&desc, g, 4)?.carve();
+                Some(EventFlag::from_word(carve.word32(0).map_err(received)?))
+            }
             None => None,
         };
         recheck_ashmem_sizes(&desc, &geo)?;
         Ok(Self {
-            read,
-            write,
+            state: State {
+                read,
+                write,
+                ring_bytes: ring.len() as u64,
+                flag,
+                desc,
+                capacity: geo.capacity,
+                writer_view: None,
+                _not_sync: PhantomData,
+                _element: PhantomData,
+            },
             ring,
-            flag,
-            desc,
-            capacity: geo.capacity,
-            writer_view: None,
-            _not_sync: PhantomData,
-            _element: PhantomData,
         })
     }
 
     /// The descriptor a peer attaches with; its fds are duplicates.
     pub fn descriptor(&self) -> Result<Descriptor> {
-        self.desc.try_clone()
+        self.state.desc.try_clone()
     }
 
     /// Elements the ring holds.
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.state.capacity
     }
 
     /// Bytes per element, `size_of::<T>()`.
@@ -331,51 +302,27 @@ impl<T: Element> MessageQueue<T> {
     /// A handle on the EventFlag word, when the queue has one. It outlives
     /// the queue.
     pub fn event_flag(&self) -> Option<EventFlag> {
-        self.flag.clone()
-    }
-
-    /// Both counters, checked against a hostile peer: order, in-flight ≤ ring, no wrap, alignment.
-    fn positions(&self) -> Result<(u64, u64)> {
-        let write = self.write.get().load(Ordering::Acquire);
-        let read = self.read.get().load(Ordering::Acquire);
-        if read > write {
-            return Err(Error::Corrupted("read counter ahead of the write counter"));
-        }
-        if write - read > self.ring.bytes as u64 {
-            return Err(Error::Corrupted("more bytes in flight than the ring holds"));
-        }
-        // A commit adds at most `bytes`; a counter this high would wrap.
-        if write > u64::MAX - self.ring.bytes as u64 {
-            return Err(Error::Corrupted("counter too close to wrapping"));
-        }
-        let q = size_of::<T>() as u64;
-        if read % q != 0 || write % q != 0 {
-            return Err(Error::Corrupted(
-                "counter not a multiple of the element size",
-            ));
-        }
-        Ok((read, write))
+        self.state.flag.clone()
     }
 
     /// Elements that can be read now. `Err` when the counters fail their
     /// invariant.
     pub fn available_to_read(&self) -> Result<usize> {
-        let (read, write) = self.positions()?;
+        let (read, write) = self.state.positions()?;
         Ok(((write - read) / size_of::<T>() as u64) as usize)
     }
 
     /// Elements that can be written now. `Err` when the counters fail their
     /// invariant.
     pub fn available_to_write(&self) -> Result<usize> {
-        Ok(self.capacity - self.available_to_read()?)
+        Ok(self.state.capacity - self.available_to_read()?)
     }
 
-    /// The ring's `n` elements at counter value `position`, borrowed with the queue beside them.
-    fn regions_at(&mut self, position: u64, n: usize) -> (&mut Self, Regions<'_, T>) {
-        assert!(n <= self.capacity, "more elements than the capacity");
-        // SAFETY: `ring` holds `capacity` elements, mapped read-write while `self` is borrowed.
-        let regions = unsafe { Regions::over(self.ring.base, self.ring.bytes, position, n, false) };
-        (self, regions)
+    /// The ring's `n` elements at counter value `position`, borrowed apart from the state.
+    fn regions_at(&mut self, position: u64, n: usize) -> (&mut State<T>, Regions<'_, T>) {
+        assert!(n <= self.state.capacity, "more elements than the capacity");
+        let regions = Regions::over(&self.ring, position, n, false);
+        (&mut self.state, regions)
     }
 
     /// Reserve `n` elements to write. `None` when fewer are free now;
@@ -401,42 +348,21 @@ impl<T: Element> MessageQueue<T> {
     /// # fn main() {}
     /// ```
     pub fn begin_write(&mut self, n: usize) -> Result<Option<WriteTxn<'_, T>>> {
-        if n > self.capacity {
+        if n > self.state.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
-        let (read, write) = self.positions()?;
-        let free = self.capacity - ((write - read) / size_of::<T>() as u64) as usize;
+        let (read, write) = self.state.positions()?;
+        let free = self.state.capacity - ((write - read) / size_of::<T>() as u64) as usize;
         if free < n {
             return Ok(None);
         }
-        let (queue, regions) = self.regions_at(write, n);
+        let (state, regions) = self.regions_at(write, n);
         Ok(Some(WriteTxn {
-            queue,
+            state,
             regions,
             position: write,
             path: WritePath::Loaded,
         }))
-    }
-
-    /// Publish `n` elements at `position`, the write counter `begin_write` loaded; drops the view.
-    fn commit_write(&mut self, position: u64, n: usize) -> Result<()> {
-        self.writer_view = None;
-        let (read, write) = self.positions()?;
-        if write != position {
-            return Err(Error::Corrupted(
-                "write counter moved during the transaction",
-            ));
-        }
-        let q = size_of::<T>() as u64;
-        if (write - read) / q + n as u64 > self.capacity as u64 {
-            return Err(Error::Corrupted(
-                "read counter moved back during the transaction",
-            ));
-        }
-        self.write
-            .get()
-            .store(write + n as u64 * q, Ordering::Release);
-        Ok(())
     }
 
     /// [`begin_write`](Self::begin_write) for a writer that relies on being
@@ -473,29 +399,30 @@ impl<T: Element> MessageQueue<T> {
         n: usize,
         limit: usize,
     ) -> Result<Option<WriteTxn<'_, T>>> {
-        let limit = limit.min(self.capacity);
+        let limit = limit.min(self.state.capacity);
         if n > limit {
             return Err(Error::BadValue("more items than the limit in flight"));
         }
-        let (mut read, write) = match self.writer_view {
+        let state = &mut self.state;
+        let (mut read, write) = match state.writer_view {
             Some(view) => view,
             None => {
-                let view = self.positions()?;
-                self.writer_view = Some(view);
+                let view = state.positions()?;
+                state.writer_view = Some(view);
                 view
             }
         };
         let q = size_of::<T>() as u64;
         let fits = |read: u64| ((write - read) / q) as usize + n <= limit;
         if !fits(read) {
-            let fresh = self.read.get().load(Ordering::Acquire);
+            let fresh = state.read.load(Ordering::Acquire);
             if fresh < read {
                 return Err(Error::Corrupted("read counter moved backwards"));
             }
             if fresh > write {
                 return Err(Error::Corrupted("read counter ahead of the write counter"));
             }
-            if write - fresh > self.ring.bytes as u64 {
+            if write - fresh > state.ring_bytes {
                 return Err(Error::Corrupted("more bytes in flight than the ring holds"));
             }
             if fresh % q != 0 {
@@ -503,31 +430,19 @@ impl<T: Element> MessageQueue<T> {
                     "counter not a multiple of the element size",
                 ));
             }
-            self.writer_view = Some((fresh, write));
+            state.writer_view = Some((fresh, write));
             if !fits(fresh) {
                 return Ok(None);
             }
             read = fresh;
         }
-        let (queue, regions) = self.regions_at(write, n);
+        let (state, regions) = self.regions_at(write, n);
         Ok(Some(WriteTxn {
-            queue,
+            state,
             regions,
             position: write,
             path: WritePath::Cached { read },
         }))
-    }
-
-    /// Publish `n` elements at `position`, the view's write counter, and keep the new one as view.
-    fn commit_write_cached(&mut self, read: u64, position: u64, n: usize) -> Result<()> {
-        let next = position + n as u64 * size_of::<T>() as u64;
-        // `positions` refused a start this close; reaching it takes 2^64 bytes.
-        if next > u64::MAX - self.ring.bytes as u64 {
-            return Err(Error::Corrupted("counter too close to wrapping"));
-        }
-        self.write.get().store(next, Ordering::Release);
-        self.writer_view = Some((read, next));
-        Ok(())
     }
 
     /// The next `n` unread elements, or `None` when fewer are available now;
@@ -537,40 +452,20 @@ impl<T: Element> MessageQueue<T> {
     /// transaction dropped without a commit frees nothing, and the next read
     /// sees the same elements.
     pub fn begin_read(&mut self, n: usize) -> Result<Option<ReadTxn<'_, T>>> {
-        if n > self.capacity {
+        if n > self.state.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
-        let (read, write) = self.positions()?;
+        let (read, write) = self.state.positions()?;
         let available = ((write - read) / size_of::<T>() as u64) as usize;
         if available < n {
             return Ok(None);
         }
-        let (queue, regions) = self.regions_at(read, n);
+        let (state, regions) = self.regions_at(read, n);
         Ok(Some(ReadTxn {
-            queue,
+            state,
             regions,
             position: read,
         }))
-    }
-
-    /// Free `n` elements at `position`, the read counter `begin_read` loaded.
-    fn commit_read(&mut self, position: u64, n: usize) -> Result<()> {
-        let (read, write) = self.positions()?;
-        if read != position {
-            return Err(Error::Corrupted(
-                "read counter moved during the transaction",
-            ));
-        }
-        let q = size_of::<T>() as u64;
-        if n as u64 > (write - read) / q {
-            return Err(Error::Corrupted(
-                "write counter moved back during the transaction",
-            ));
-        }
-        self.read
-            .get()
-            .store(read + n as u64 * q, Ordering::Release);
-        Ok(())
     }
 
     /// Write all of `items`, or none: [`Transfer::WouldBlock`] when they do
@@ -646,7 +541,7 @@ impl<T: Element> MessageQueue<T> {
         timeout: Option<Duration>,
     ) -> Result<()> {
         self.flag_ref()?;
-        if items.len() > self.capacity {
+        if items.len() > self.state.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
         self.blocking(notify, timeout, |queue| queue.write(items))
@@ -680,7 +575,7 @@ impl<T: Element> MessageQueue<T> {
         timeout: Option<Duration>,
     ) -> Result<()> {
         self.flag_ref()?;
-        if out.len() > self.capacity {
+        if out.len() > self.state.capacity {
             return Err(Error::BadValue("more items than the queue holds"));
         }
         self.blocking(notify, timeout, |queue| queue.read(out))
@@ -730,6 +625,80 @@ impl<T: Element> MessageQueue<T> {
     }
 }
 
+impl<T: Element> State<T> {
+    /// Both counters, checked against a hostile peer: order, in-flight ≤ ring, no wrap, alignment.
+    fn positions(&self) -> Result<(u64, u64)> {
+        let write = self.write.load(Ordering::Acquire);
+        let read = self.read.load(Ordering::Acquire);
+        if read > write {
+            return Err(Error::Corrupted("read counter ahead of the write counter"));
+        }
+        if write - read > self.ring_bytes {
+            return Err(Error::Corrupted("more bytes in flight than the ring holds"));
+        }
+        // A commit adds at most `ring_bytes`; a counter this high would wrap.
+        if write > u64::MAX - self.ring_bytes {
+            return Err(Error::Corrupted("counter too close to wrapping"));
+        }
+        let q = size_of::<T>() as u64;
+        if read % q != 0 || write % q != 0 {
+            return Err(Error::Corrupted(
+                "counter not a multiple of the element size",
+            ));
+        }
+        Ok((read, write))
+    }
+
+    /// Publish `n` elements at `position`, the write counter `begin_write` loaded; drops the view.
+    fn commit_write(&mut self, position: u64, n: usize) -> Result<()> {
+        self.writer_view = None;
+        let (read, write) = self.positions()?;
+        if write != position {
+            return Err(Error::Corrupted(
+                "write counter moved during the transaction",
+            ));
+        }
+        let q = size_of::<T>() as u64;
+        if (write - read) / q + n as u64 > self.capacity as u64 {
+            return Err(Error::Corrupted(
+                "read counter moved back during the transaction",
+            ));
+        }
+        self.write.store(write + n as u64 * q, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish `n` elements at `position`, the view's write counter, and keep the new one as view.
+    fn commit_write_cached(&mut self, read: u64, position: u64, n: usize) -> Result<()> {
+        let next = position + n as u64 * size_of::<T>() as u64;
+        // `positions` refused a start this close; reaching it takes 2^64 bytes.
+        if next > u64::MAX - self.ring_bytes {
+            return Err(Error::Corrupted("counter too close to wrapping"));
+        }
+        self.write.store(next, Ordering::Release);
+        self.writer_view = Some((read, next));
+        Ok(())
+    }
+
+    /// Free `n` elements at `position`, the read counter `begin_read` loaded.
+    fn commit_read(&mut self, position: u64, n: usize) -> Result<()> {
+        let (read, write) = self.positions()?;
+        if read != position {
+            return Err(Error::Corrupted(
+                "read counter moved during the transaction",
+            ));
+        }
+        let q = size_of::<T>() as u64;
+        if n as u64 > (write - read) / q {
+            return Err(Error::Corrupted(
+                "write counter moved back during the transaction",
+            ));
+        }
+        self.read.store(read + n as u64 * q, Ordering::Release);
+        Ok(())
+    }
+}
+
 /// Which counter a [`WriteTxn`]'s commit reads: both again, or the cached writer's view.
 #[derive(Clone, Copy, Debug)]
 enum WritePath {
@@ -771,7 +740,7 @@ enum WritePath {
 /// would read whatever the ring held.
 #[must_use = "dropping a write transaction publishes nothing; `commit` makes the elements visible"]
 pub struct WriteTxn<'a, T: Element> {
-    queue: &'a mut MessageQueue<T>,
+    state: &'a mut State<T>,
     regions: Regions<'a, T>,
     position: u64,
     path: WritePath,
@@ -812,8 +781,8 @@ impl<T: Element> WriteTxn<'_, T> {
             return Err(Error::BadValue("commit exceeds the elements reserved"));
         }
         match self.path {
-            WritePath::Loaded => self.queue.commit_write(self.position, n),
-            WritePath::Cached { read } => self.queue.commit_write_cached(read, self.position, n),
+            WritePath::Loaded => self.state.commit_write(self.position, n),
+            WritePath::Cached { read } => self.state.commit_write_cached(read, self.position, n),
         }
     }
 }
@@ -846,7 +815,7 @@ impl<T: Element> std::fmt::Debug for WriteTxn<'_, T> {
 /// elements. The transaction gives no way to write the ring.
 #[must_use = "dropping a read transaction frees nothing; `commit` consumes the elements"]
 pub struct ReadTxn<'a, T: Element> {
-    queue: &'a mut MessageQueue<T>,
+    state: &'a mut State<T>,
     regions: Regions<'a, T>,
     position: u64,
 }
@@ -876,7 +845,7 @@ impl<T: Element> ReadTxn<'_, T> {
         if n > self.regions.len() {
             return Err(Error::BadValue("commit exceeds the elements reserved"));
         }
-        self.queue.commit_read(self.position, n)
+        self.state.commit_read(self.position, n)
     }
 }
 
@@ -982,7 +951,7 @@ pub(crate) fn allocate_shared(total: u64) -> Result<OwnedFd> {
 
 impl<T: Element> MessageQueue<T> {
     fn flag_ref(&self) -> Result<&EventFlag> {
-        match &self.flag {
+        match &self.state.flag {
             Some(flag) => Ok(flag),
             None => Err(Error::NoEventFlag),
         }
@@ -990,7 +959,7 @@ impl<T: Element> MessageQueue<T> {
 
     /// The transfer is committed, so a failed wake is logged, not returned (libfmq does too).
     fn wake_after_commit(&self, bits: u32) {
-        let Some(flag) = &self.flag else { return };
+        let Some(flag) = &self.state.flag else { return };
         if let Err(e) = flag.wake(bits) {
             log::error!("fmq: the wake after a committed transfer failed: {e:?}");
         }
@@ -1000,9 +969,9 @@ impl<T: Element> MessageQueue<T> {
 impl<T: Element> std::fmt::Debug for MessageQueue<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MessageQueue")
-            .field("capacity", &self.capacity)
+            .field("capacity", &self.state.capacity)
             .field("quantum", &size_of::<T>())
-            .field("event_flag", &self.flag.is_some())
+            .field("event_flag", &self.state.flag.is_some())
             .finish()
     }
 }
@@ -1023,70 +992,26 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 ///
 /// # Soundness
 ///
-/// Both runs of a copy lie inside the ring: the index range is checked
-/// against [`len`](Self::len). The ring stays mapped while a `Regions`
-/// lives: it is reached only through the transaction that holds it, whose
-/// lifetime `'a` is that of its mutable borrow of the queue or writer, and
-/// no transaction hands out a `&mut Regions`, so one cannot be moved out or
-/// swapped into another transaction. It is
-/// one read-write [`Mapping`]: a single `mmap`
-/// result of at most `isize::MAX` bytes, every byte initialized as the pages
-/// of a mapped file are. Every access to ring bytes is a relaxed
-/// atomic load or store — `AtomicU8` up to the first `usize` boundary,
-/// `AtomicUsize` words after it, `AtomicU8` for the bytes left over — and
-/// the caller's slice is ordinary memory on the other side of the copy.
-/// The regions of an [`UnsyncWriter`](crate::UnsyncWriter) differ in one
-/// respect: their stores are `Release`, the order that flavor's readers
-/// depend on.
-/// Nothing hands out a reference into the ring. The split depends only on
-/// which `usize`-aligned words a run covers whole — its start and its
-/// length, the start being any byte for `u8` elements — so nothing relies
-/// on the ring base's alignment.
+/// Every copy goes through the ring's [`Bytes`](shm::Bytes), which checks
+/// the range against the ring's length and gives each ring byte one access
+/// size for every copy, whatever its start and length (see that type); the
+/// caller's slice is ordinary memory on the other side of the copy. `'a` is
+/// a shared borrow of the ring, which the transaction takes apart from the
+/// mutable borrow of the queue's or writer's other state, so the ring stays
+/// mapped while a `Regions` lives. The regions of an
+/// [`UnsyncWriter`](crate::UnsyncWriter) differ in one respect: their
+/// stores are `Release`, the order that flavor's readers depend on.
 ///
 /// A change made to the ring from outside — the peer process, another
 /// handle in this process (each handle `mmap`s the memory itself: a second
 /// writer, or a descriptor whose grantors overlap), C code, or `rsbinder`'s
-/// `SharedMemory` on the same fd — is another thread's relaxed store in
+/// `SharedMemory` on the same fd — is another thread's atomic store in
 /// Rust's memory model. A copy that runs
 /// at the same time is a race between atomics, not a data race: the bytes
 /// copied out are some mix of old and new, every such pattern is a `T`
 /// (the [`Element`] contract), and the outcome is a wrong element or, when
 /// the counters were changed too, [`Corrupted`](Error::Corrupted). It is
-/// never undefined behavior. `rsbinder::shared_memory` treats a shared
-/// mapping the same way.
-///
-/// Rust's model makes unordered atomic accesses of different sizes to the
-/// same bytes undefined behavior unless both are loads, and two copies that
-/// differ in start or length split the same bytes into different sizes.
-/// Copies through one mapping
-/// never run at the same time: a `Regions`, and every transaction that
-/// holds one, is neither `Send` nor `Sync`; the transaction borrows its
-/// queue or writer mutably, and neither of those is `Sync`.
-///
-/// ```compile_fail,E0277
-/// fn is_send<T: Send>() {}
-/// is_send::<rsbinder_fmq::Regions<'static, u8>>();
-/// ```
-///
-/// ```compile_fail,E0277
-/// fn is_sync<T: Sync>() {}
-/// is_sync::<rsbinder_fmq::Regions<'static, u8>>();
-/// ```
-///
-/// ```compile_fail,E0277
-/// fn is_send<T: Send>() {}
-/// is_send::<rsbinder_fmq::WriteTxn<'static, u8>>();
-/// ```
-///
-/// ```compile_fail,E0277
-/// fn is_send<T: Send>() {}
-/// is_send::<rsbinder_fmq::ReadTxn<'static, u8>>();
-/// ```
-///
-/// ```compile_fail,E0277
-/// fn is_send<T: Send>() {}
-/// is_send::<rsbinder_fmq::UnsyncWriteTxn<'static, u8>>();
-/// ```
+/// never undefined behavior.
 ///
 /// When the protocol is kept, the reader copies elements only after the
 /// `Acquire` load of the write counter, which [`WriteTxn::commit`] stored
@@ -1094,41 +1019,36 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// writer copied (libfmq's `write` is a `memcpy` followed by the same
 /// store).
 pub struct Regions<'a, T: Element> {
-    first: NonNull<u8>,
+    ring: &'a Bytes,
+    /// The ring byte the first part starts at.
+    first_at: usize,
     first_len: usize,
-    second: NonNull<u8>,
     second_len: usize,
-    /// `write_at` stores with `Release`: the unsynchronized writer's order (`Run::store_release`).
+    /// `write_at` stores with `Release`: the order the unsynchronized writer's readers need.
     release: bool,
-    _borrow: PhantomData<&'a mut [T]>,
+    _element: PhantomData<fn() -> T>,
 }
 
 impl<'a, T: Element> Regions<'a, T> {
-    /// # Safety: the ring is writable and meets `Run::new` for `'a`; `n` elements fit in `bytes`.
-    pub(crate) unsafe fn over(
-        base: NonNull<u8>,
-        bytes: usize,
-        position: u64,
-        n: usize,
-        release: bool,
-    ) -> Self {
+    /// `n` elements of `ring` at counter value `position`; a span past the ring panics at the copy.
+    pub(crate) fn over(ring: &'a Bytes, position: u64, n: usize, release: bool) -> Self {
         let q = size_of::<T>();
-        let offset = (position % bytes as u64) as usize;
-        let contiguous = (bytes - offset) / q;
-        debug_assert_eq!(offset % q, 0);
-        let first = base.map_addr(|addr| addr.saturating_add(offset));
+        let bytes = ring.len();
+        let first_at = (position % bytes as u64) as usize;
+        let contiguous = (bytes - first_at) / q;
+        debug_assert_eq!(first_at % q, 0);
         let (first_len, second_len) = if n > contiguous {
             (contiguous, n - contiguous)
         } else {
             (n, 0)
         };
         Regions {
-            first,
+            ring,
+            first_at,
             first_len,
-            second: base,
             second_len,
             release,
-            _borrow: PhantomData,
+            _element: PhantomData,
         }
     }
 }
@@ -1154,22 +1074,14 @@ impl<T: Element> Regions<'_, T> {
         self.second_len
     }
 
-    /// The ring runs elements `start..start + n` cover, before and after the wrap, as atomics.
-    fn runs(&self, start: usize, n: usize) -> [Run<'_>; 2] {
+    /// Where elements `start..start + n` lie: ring bytes before and after the wrap, and how many
+    /// of them come before it.
+    fn split(&self, start: usize, n: usize) -> (usize, usize, usize) {
         let q = size_of::<T>();
         let head = self.first_len.saturating_sub(start).min(n);
-        // SAFETY: `start + n <= len()` (callers) keeps both runs in the ring; see "Soundness".
-        unsafe {
-            let first = self.first.as_ptr().add(start.min(self.first_len) * q);
-            let second = self
-                .second
-                .as_ptr()
-                .add(start.saturating_sub(self.first_len) * q);
-            [
-                Run::new(NonNull::new_unchecked(first), head * q),
-                Run::new(NonNull::new_unchecked(second), (n - head) * q),
-            ]
-        }
+        let first = self.first_at + start.min(self.first_len) * q;
+        let second = start.saturating_sub(self.first_len) * q;
+        (first, second, head)
     }
 
     /// Copy `src` into the elements starting at `start`. `BadValue` when
@@ -1181,14 +1093,14 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("write past the reserved elements"));
         }
-        let [head, tail] = self.runs(start, src.len());
-        let (to_head, to_tail) = ring::bytes_of(src).split_at(head.len());
+        let (first, second, head) = self.split(start, src.len());
+        let (to_first, to_second) = src.split_at(head);
         if self.release {
-            head.store_release(to_head);
-            tail.store_release(to_tail);
+            self.ring.store_release(first, to_first);
+            self.ring.store_release(second, to_second);
         } else {
-            head.store(to_head);
-            tail.store(to_tail);
+            self.ring.store(first, to_first);
+            self.ring.store(second, to_second);
         }
         Ok(())
     }
@@ -1202,10 +1114,10 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("read past the available elements"));
         }
-        let [head, tail] = self.runs(start, dst.len());
-        let (to_head, to_tail) = ring::bytes_of_mut(dst).split_at_mut(head.len());
-        head.load(to_head);
-        tail.load(to_tail);
+        let (first, second, head) = self.split(start, dst.len());
+        let (to_first, to_second) = dst.split_at_mut(head);
+        self.ring.load(first, to_first);
+        self.ring.load(second, to_second);
         Ok(())
     }
 }
