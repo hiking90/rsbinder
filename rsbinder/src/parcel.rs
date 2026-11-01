@@ -88,7 +88,9 @@
 //!   `NotSent`: its `Drop` (and `set_for_rpc(false)`) hands them back through
 //!   `RpcParcelOps::cancel_leaving`, so a parcel written and never sent, or
 //!   refused before the send (`WouldBlock`, `DeadObject`, an encode failure),
-//!   leaks no node and can be sent again as is. The give-back sends nothing to the peer.
+//!   leaks no node and can be sent again as is. The give-back itself sends
+//!   nothing; a proxy release it lets go (one held for this parcel's
+//!   unpaid send) goes out as that proxy's `DEC_STRONG`.
 //! - `send_state` is AOSP `RpcFields::mSendState`. `client_transact` and
 //!   `send_reply_parcel` claim the parcel (`NotSent` → `InFlight`) for one
 //!   send and, on success, mark it `Sent`, which hands `leaving_addrs` to the

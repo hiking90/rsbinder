@@ -82,7 +82,7 @@
 //!   weak derefs drain before the next strong one is dispatched, so a weak
 //!   deref queued by a strong-deref destructor runs ahead of the next pending
 //!   strong; each queue is FIFO (`VecDeque::pop_front` / `mem::take`).
-//! - **`dispatch_transact_caught`** is called with no `THREAD_STATE` or
+//! - **`dispatch_kernel_observed`** is called with no `THREAD_STATE` or
 //!   `BINDER_DEREFS` borrow held: `Transactable::transact` is user code that
 //!   may make nested binder calls into this module.
 //! - **`binder::local_transact`** (the in-process transport of a generated
@@ -193,7 +193,7 @@
 //!   every exit (an `Err` or panic must not leak it into the next command),
 //!   and a panic from the reply flush/await — `talk_with_driver` or a nested
 //!   dispatch; OOM aborts and is not catchable — is caught rather than
-//!   unwinding the worker loop (as `dispatch_transact_caught` does; a dropped
+//!   unwinding the worker loop (as `binder::run_handler` does; a dropped
 //!   reply reaches a sync caller as `BR_DEAD_REPLY`). The `unflushed_mark` is
 //!   taken outside `catch_unwind` so the panic arm can rewind to it too. That
 //!   arm rewinds only this transaction's bytes: truncating the whole
@@ -206,7 +206,7 @@
 //!   `CallRestriction` *before* queuing `BC_TRANSACTION`.
 //!   `write_transaction_data` records raw pointers into the caller's `data`;
 //!   if the `FatalIfNotOneway` `panic!` unwinds instead of aborting (it is
-//!   reachable under `dispatch_transact_caught`'s `catch_unwind` for a nested
+//!   reachable under `run_handler`'s `catch_unwind` for a nested
 //!   sync call, and under tokio's `spawn_blocking` panic capture), a completed
 //!   `BC_TRANSACTION` with dangling pointers would stay in `out_parcel` and be
 //!   flushed later — a cross-process use-after-free. AOSP checks *after*
@@ -222,13 +222,13 @@
 //!   first, so a transient failure does not cost the peer its reply. A retried
 //!   `BC_TRANSACTION` would instead leave a two-way call in flight whose
 //!   `BR_REPLY` the next `transact` would take.
-//! - **Handler panics.** `dispatch_transact_caught` catches a panic from
-//!   `Transactable::transact`, discards the partial reply, and returns
-//!   `StatusCode::Unknown`, so the `BR_TRANSACTION` reply path sends the
-//!   client a deterministic error reply instead of leaving it waiting for
-//!   `BR_REPLY`. This mirrors the guard around `DeathRecipient` callbacks in
-//!   `death::DeathRecipients::dispatch`; the `Transactable` trait doc
-//!   states the full guarantee.
+//! - **Handler panics.** `binder::run_handler`, which the RPC server's
+//!   dispatch calls too, catches a panic from `Transactable::transact`,
+//!   discards the partial reply, and returns `StatusCode::Unknown`, so the
+//!   `BR_TRANSACTION` reply path sends the client a deterministic error reply
+//!   instead of leaving it waiting for `BR_REPLY`. This mirrors the guard
+//!   around `DeathRecipient` callbacks in `death::DeathRecipients::dispatch`;
+//!   the `Transactable` trait doc states the full guarantee.
 //! - **Dead-binder handshake.** For `BR_DEAD_BINDER`,
 //!   `drive_dead_binder_handshake` runs three phases: `obituary` (the user
 //!   callbacks), `queue_done` (write `BC_DEAD_BINDER_DONE`), and `flush`
@@ -1367,29 +1367,7 @@ where
     queue_done()
 }
 
-/// `transact` with panics caught; call with no borrow held (R1). See module doc "Handler panics".
-fn dispatch_transact_caught(
-    transactable: &dyn Transactable,
-    code: TransactionCode,
-    reader: &mut Parcel,
-    reply: &mut Parcel,
-) -> Result<()> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        transactable.transact(code, reader, reply)
-    }));
-    match result {
-        Ok(transact_result) => transact_result,
-        Err(payload) => {
-            let msg = crate::error::panic_message(&payload);
-            error!("Transactable::transact panicked for code {code}: {msg}");
-            // Discard the partial reply so the client never parses half-formed data.
-            *reply = Parcel::with_capacity(0);
-            Err(StatusCode::Unknown)
-        }
-    }
-}
-
-/// [`dispatch_transact_caught`] between the observer's calls, no borrow held; `DeadObject` mapped.
+/// `run_handler` over `transact` between observer calls, no borrow held (R1); `DeadObject` mapped.
 fn dispatch_kernel_observed(
     binder: &SIBinder,
     transactable: &dyn Transactable,
@@ -1409,7 +1387,11 @@ fn dispatch_kernel_observed(
             calling_pid: tr.sender_pid,
             transport: crate::TransportCaps::KERNEL,
         },
-        || dispatch_transact_caught(transactable, code, reader, reply),
+        || {
+            run_handler(code, reply, |reply| {
+                transactable.transact(code, reader, reply)
+            })
+        },
     )
     .map_err(handler_reply_status)
 }
@@ -3233,9 +3215,30 @@ mod tests {
         );
     }
 
-    /// A panic becomes `Err(Unknown)` with the partial reply reset (module doc "Handler panics").
+    struct KernelTarget;
+    impl Remotable for KernelTarget {
+        fn descriptor() -> &'static str {
+            "x.y.INamed"
+        }
+        fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+            Ok(())
+        }
+        fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The kernel dispatch of `t` for code 1; the binder supplies only the observer's descriptor.
+    fn dispatch_kernel(t: &dyn Transactable, reply: &mut Parcel) -> Result<()> {
+        let binder = Interface::as_binder(&crate::native::Binder::new(KernelTarget));
+        let mut tr = TransactionData::default();
+        tr.code = 1;
+        dispatch_kernel_observed(&binder, t, &tr, &mut Parcel::new(), reply)
+    }
+
+    /// A panic becomes `Err(Unknown)` with the partial reply reset (`binder::run_handler`).
     #[test]
-    fn test_dispatch_transact_caught_isolates_panic() {
+    fn a_kernel_handler_panic_is_unknown_and_discards_the_reply() {
         struct PanickingTransactable;
         impl Transactable for PanickingTransactable {
             fn transact(
@@ -3250,9 +3253,8 @@ mod tests {
             }
         }
 
-        let mut reader = Parcel::new();
         let mut reply = Parcel::new();
-        let result = dispatch_transact_caught(&PanickingTransactable, 1, &mut reader, &mut reply);
+        let result = dispatch_kernel(&PanickingTransactable, &mut reply);
 
         assert!(
             matches!(result, Err(StatusCode::Unknown)),
@@ -3268,7 +3270,7 @@ mod tests {
 
     /// A non-panicking `transact`'s `Result` passes through the panic guard unchanged.
     #[test]
-    fn test_dispatch_transact_caught_propagates_normal_result() {
+    fn a_kernel_handler_result_passes_the_panic_guard() {
         struct OkTransactable;
         impl Transactable for OkTransactable {
             fn transact(
@@ -3294,13 +3296,12 @@ mod tests {
             }
         }
 
-        let mut reader = Parcel::new();
         let mut reply = Parcel::new();
-        assert!(dispatch_transact_caught(&OkTransactable, 1, &mut reader, &mut reply).is_ok());
+        assert!(dispatch_kernel(&OkTransactable, &mut reply).is_ok());
         assert_eq!(reply.data_size(), std::mem::size_of::<i32>());
 
         let mut reply = Parcel::new();
-        let err = dispatch_transact_caught(&ErrTransactable, 1, &mut reader, &mut reply);
+        let err = dispatch_kernel(&ErrTransactable, &mut reply);
         assert!(matches!(err, Err(StatusCode::PermissionDenied)));
     }
 
@@ -3313,29 +3314,7 @@ mod tests {
                 Err(self.0)
             }
         }
-        struct Named;
-        impl Remotable for Named {
-            fn descriptor() -> &'static str {
-                "x.y.INamed"
-            }
-            fn on_transact(
-                &self,
-                _: TransactionCode,
-                _: &mut Parcel,
-                _: &mut Parcel,
-            ) -> Result<()> {
-                Ok(())
-            }
-            fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
-                Ok(())
-            }
-        }
-        let binder = Interface::as_binder(&crate::native::Binder::new(Named));
-        let tr = TransactionData::default();
-        let replied = |status| {
-            let (mut reader, mut reply) = (Parcel::new(), Parcel::new());
-            dispatch_kernel_observed(&binder, &Fails(status), &tr, &mut reader, &mut reply)
-        };
+        let replied = |status| dispatch_kernel(&Fails(status), &mut Parcel::new());
         assert_eq!(
             replied(StatusCode::DeadObject),
             Err(StatusCode::FailedTransaction)

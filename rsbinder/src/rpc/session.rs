@@ -4068,16 +4068,11 @@ impl RpcSessionInner {
                 } else {
                     Ok(())
                 };
+                // Caught: unwinding would skip the serve loop's slot cleanup.
                 token.and_then(|()| {
-                    // Unwinding would skip the serve loop's slot cleanup; mirrors the kernel path.
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::binder::run_handler(code, &mut reply, |reply| {
                         let token = crate::binder::sealed::Token::new();
-                        target.rpc_transact(token, code, &mut reader, &mut reply)
-                    }))
-                    .unwrap_or_else(|payload| {
-                        let msg = crate::error::panic_message(&payload);
-                        log::error!("RPC on_transact panicked for code {code}: {msg}");
-                        Err(crate::StatusCode::Unknown)
+                        target.rpc_transact(token, code, &mut reader, reply)
                     })
                 })
             })
@@ -4089,12 +4084,12 @@ impl RpcSessionInner {
             if let Err(e) = result {
                 log::error!("oneway RPC transaction failed (dropped): {e:?}");
             }
-            // A oneway reply is never sent: `reply` drops unsent and gives its bumps back.
+            // Never sent: `reply` drops unsent and gives its bumps back (on a panic, already did).
             return Ok(());
         }
         match result {
             Ok(()) => self.send_reply_parcel(&reply),
-            // The error reply discards `reply`, which drops unsent and gives its bumps back.
+            // `reply` then drops unsent and gives its bumps back; a panic's was already dropped.
             Err(e) => self.send_reply(crate::binder::handler_reply_status(e).into(), &[], &[], &[]),
         }
     }

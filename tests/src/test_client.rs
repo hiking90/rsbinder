@@ -2982,7 +2982,7 @@ fn test_wibinder_upgrade_after_obituary() {
 //     deliberately panicking `Transactable` registered as a service. Out of
 //     scope without modifying `test_service` or `ITestService.aidl`.
 //     Practical bar: the unit test in `thread_state.rs` exercising the
-//     same `dispatch_transact_caught` code path that the BR_TRANSACTION arm
+//     same `dispatch_kernel_observed` code path that the BR_TRANSACTION arm
 //     calls in production.
 //   - Item 11 (extension cache staleness)               — would need an
 //     extension that can die independently of its parent service, which the

@@ -47,6 +47,10 @@
 //! - `t13_a_twoway_handler_panic_is_unknown_and_the_session_serves_on`,
 //!   `t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on`: a handler panic is
 //!   contained on every wire; the twoway caller reads `Unknown`, the oneway is dropped.
+//! - `t15_a_panicking_handlers_reply_is_released_before_the_reply`: the reply a panicking
+//!   handler wrote is dropped before the `REPLY`, and with it the release of a proxy in it.
+//! - `t16_a_panicking_drop_of_the_discarded_reply_is_contained`: that drop's own panic (a
+//!   released node's `Drop`) is caught too, and the session keeps serving.
 //!
 //! # Mutation gates
 //!
@@ -104,6 +108,10 @@ const TX_KEEP: TransactionCode = FIRST_CALL_TRANSACTION + 4;
 const TX_TAKE: TransactionCode = FIRST_CALL_TRANSACTION + 5;
 /// Panics, twoway or oneway.
 const TX_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 6;
+/// `Option<SIBinder>` in, written into the reply, then a panic.
+const TX_ECHO_THEN_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 7;
+/// A fresh binder whose drop panics, written into the reply, then a panic.
+const TX_BOMB_THEN_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 8;
 
 #[derive(Default)]
 struct Acct {
@@ -160,11 +168,40 @@ impl Remotable for Acct {
                 Ok(())
             }
             TX_PANIC => panic!("TX_PANIC"),
+            TX_ECHO_THEN_PANIC => {
+                let b: Option<SIBinder> = reader.read()?;
+                reply.write(&b)?;
+                panic!("TX_ECHO_THEN_PANIC")
+            }
+            TX_BOMB_THEN_PANIC => {
+                reply.write(&Interface::as_binder(&Binder::new(Bomb)))?;
+                panic!("TX_BOMB_THEN_PANIC")
+            }
             _ => Err(StatusCode::UnknownTransaction),
         }
     }
     fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A binder whose last drop panics.
+struct Bomb;
+impl Interface for Bomb {}
+impl Remotable for Bomb {
+    fn descriptor() -> &'static str {
+        CARRIER
+    }
+    fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+        Err(StatusCode::UnknownTransaction)
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("Bomb dropped");
     }
 }
 
@@ -952,6 +989,88 @@ fn t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on() {
             .expect("oneway")
             .is_none());
         p.call(TX_ECHO, None).expect("the call after it");
+    }
+}
+
+/// T15: a panicking handler's reply is discarded before the `REPLY`, so the release of a proxy
+/// it wrote there precedes the `REPLY` (module doc "Deferred `DEC_STRONG`" of `session.rs`).
+#[test]
+fn t15_a_panicking_handlers_reply_is_released_before_the_reply() {
+    for version in [1, PROTOCOL_V2] {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let server = session(a, AddressSpace::Acceptor, Wire::V(version));
+        server.set_root(local()).expect("set_root");
+        let s = server.clone();
+        let serve = std::thread::spawn(move || s.serve_blocking());
+        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut raw = RawClient {
+            stream: b,
+            codec: Android13PlusCodec::with_version(version).unwrap(),
+        };
+        let (root_reply, _) = raw.call(WireTransaction {
+            code: SpecialTransaction::GetRoot.code(),
+            ..Default::default()
+        });
+        let root = Android13PlusCodec::decode_addr(&root_reply.data, 4).expect("root address");
+        let mut ctr = 0u64;
+        let mine = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
+
+        let mut token = Parcel::new();
+        write_rpc_interface_token(&mut token, DESC).unwrap();
+        let mut data = token.rpc_data_bytes().to_vec();
+        let at = data.len() as u32;
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&Android13PlusCodec::encode_addr(&mine));
+        data.extend_from_slice(&0i32.to_le_bytes());
+        let object_positions = if version >= PROTOCOL_V2 {
+            vec![at]
+        } else {
+            vec![]
+        };
+        let (reply, decs) = raw.call(WireTransaction {
+            address: root,
+            code: TX_ECHO_THEN_PANIC,
+            data,
+            object_positions,
+            ..Default::default()
+        });
+        assert_eq!(reply.status, i32::from(StatusCode::Unknown), "v{version}");
+        assert!(
+            decs.contains(&(mine, 1)),
+            "v{version}: the proxy in the discarded reply is released before the REPLY: {decs:?}"
+        );
+        let (_, decs) = raw.call(WireTransaction {
+            address: root,
+            code: PING_TRANSACTION,
+            ..Default::default()
+        });
+        assert!(
+            decs.iter().all(|(a, _)| *a != mine),
+            "v{version}: released once: {decs:?}"
+        );
+
+        drop(raw);
+        let _ = serve.join();
+    }
+}
+
+/// T16: a panic in the drop of a panicked handler's discarded reply is caught too; the caller
+/// reads `Unknown` and the session keeps serving.
+#[test]
+fn t16_a_panicking_drop_of_the_discarded_reply_is_contained() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let p = Pair::new(wire);
+        assert_eq!(
+            p.call(TX_BOMB_THEN_PANIC, None).map(drop),
+            Err(StatusCode::Unknown),
+            "{wire:?}"
+        );
+        p.call(TX_ECHO, None).expect("the next call");
+        assert_eq!(
+            p.server.local_node_count(),
+            1,
+            "{wire:?}: the bomb's node went"
+        );
     }
 }
 
