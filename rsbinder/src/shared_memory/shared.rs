@@ -193,48 +193,24 @@ impl DeserializeOption for SharedMemory {
 /// Size of a shared-memory region from its fd alone (libcutils
 /// `ashmem_get_size_region`).
 pub fn region_size<F: AsFd>(fd: F) -> Result<usize> {
-    let st = rustix::fs::fstat(fd.as_fd()).map_err(crate::error::errno_status)?;
-    if st.st_size > 0 {
-        return usize::try_from(st.st_size).map_err(|_| StatusCode::BadValue);
-    }
-    ashmem_size(fd.as_fd())
+    let size = rsbinder_fmq::shm::region_size(fd.as_fd())?;
+    usize::try_from(size).map_err(|_| StatusCode::BadValue)
 }
 
 /// libcutils `__ashmem_is_ashmem`; a peer's fd must pass it before any ashmem ioctl.
-#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     rsbinder_fmq::shm::is_ashmem_fd(fd)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub(crate) fn is_ashmem_fd(_fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    false
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn ashmem_size(fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
-    let size = rsbinder_fmq::shm::ashmem_size(fd).map_err(|e| match e {
-        rsbinder_fmq::Error::Os(errno) => StatusCode::from(std::io::Error::from(errno)),
-        _ => StatusCode::BadValue,
-    })?;
-    usize::try_from(size).map_err(|_| StatusCode::BadValue)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn ashmem_size(_fd: std::os::fd::BorrowedFd<'_>) -> Result<usize> {
-    Err(StatusCode::BadValue)
-}
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn write_sealed<F: AsFd>(fd: F) -> bool {
-    use rsbinder_fmq::shm::Seals;
     // ashmem answers `F_GET_SEALS` with `EINVAL`; its read-only state is the prot mask.
     if is_ashmem_fd(fd.as_fd()) {
         // `false` when the ioctl fails: the region is then offered as writable.
         return rsbinder_fmq::shm::ashmem_write_protected(fd.as_fd()).unwrap_or(false);
     }
     rsbinder_fmq::shm::seals(fd.as_fd())
-        .map(|s| s.intersects(Seals::WRITE | Seals::FUTURE_WRITE))
+        .map(|s| super::heap::seals_forbid_writing(s.bits()))
         .unwrap_or(false)
 }
 
