@@ -136,7 +136,7 @@ impl<'a, M: Trust> Sample<'a, M> {
             Source::Ring(bytes) => Some(bytes),
             Source::Slot { pool, slot, len } if M::TRUSTED => {
                 // SAFETY: the pin this sample holds, and the word `trust_publisher` took.
-                Some(unsafe { pool.pool().slot_slice(slot, len) })
+                Some(unsafe { pool.slot_slice(slot, len) })
             }
             Source::Slot { .. } => None,
         }
@@ -169,7 +169,7 @@ impl Sample<'_, Untrusted> {
         match self.source {
             Source::Ring(bytes) => bytes,
             // SAFETY: the pin this sample holds, and the caller's word for the publisher.
-            Source::Slot { pool, slot, len } => unsafe { pool.pool().slot_slice(slot, len) },
+            Source::Slot { pool, slot, len } => unsafe { pool.slot_slice(slot, len) },
         }
     }
 }

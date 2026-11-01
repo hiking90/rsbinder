@@ -1,11 +1,13 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! The three memory objects of a subscription, byte for byte, and every `unsafe` block that makes
-//! a pointer into them. The callers that read the slots' slices, on a `SAFETY` argument of their
-//! own, are in `sample.rs` and `pool.rs`; the other `unsafe` blocks of the library (outside
-//! `cfg(test)`) pass that argument on for a `Trusted` subscriber (`receive.rs`, `subscriber.rs`,
-//! `named.rs`) or register a file descriptor with the reactor (`subscriber.rs`).
+//! The three memory objects of a subscription, byte for byte, carved into the pieces of
+//! `rsbinder_fmq::shm`; nothing here makes a pointer into them. The slots' bytes are the one part
+//! that may be read in place: they are carved `Lendable`, and the callers that take the slices, on
+//! a `SAFETY` argument of their own, are in `sample.rs` and `pool.rs`. The other `unsafe` blocks
+//! of the library (outside `cfg(test)`) pass that argument on for a `Trusted` subscriber
+//! (`receive.rs`, `subscriber.rs`, `named.rs`) or register a file descriptor with the reactor
+//! (`subscriber.rs`).
 //!
 //! All three are sealed memfds. Each side maps the object it made read-write and the peer's
 //! read-only, and `F_SEAL_FUTURE_WRITE` makes the kernel refuse the peer any other mapping. The
@@ -89,28 +91,25 @@
 //!
 //! # The views
 //!
-//! [`Stored`] and [`Loaded`] are topic memory as its writer and as a reader reach it. Both are an
-//! address and a capacity; the constructor's contract is that `0x40 + capacity` bytes at an
-//! 8-aligned address stay alive with the owner the view holds, are initialized, and are accessed
-//! through atomics only. The code here adds what makes the accesses consistent in size: the
-//! 8-byte and 4-byte words lie at the offsets above and nowhere else, and a ring copy starts on a
-//! multiple of 8 and is a multiple of 8 long, so every byte of the ring is always part of the
-//! same `usize`. That holds when two views share one allocation, as they do in the tests that
-//! run on heap memory.
+//! [`Stored`] and [`Loaded`] are topic memory as its writer and as a reader reach it: the words
+//! at the offsets above and the ring, each a piece carved from one mapping, which `shm` refuses
+//! to carve with two pieces over one byte. Each piece accesses its bytes at one size, so the
+//! views need no rule of their own about access sizes. A ring copy starts on a multiple of 8 and
+//! is a multiple of 8 long because records are laid out so (`ring.rs`), not for the copy's sake.
 
-use std::cell::Cell;
-use std::marker::PhantomData;
+// Shared memory is reached through `rsbinder_fmq::shm` pieces alone (plan 12-2).
+#![forbid(unsafe_code)]
+
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rsbinder::fmq::shm::{
-    self, Access, CreateOptions, Mapping, RoRun, RoWord32, RoWord64, Run, Seals,
+    self, Access, Bytes, Carve, CreateOptions, Lendable, Mapping, RoBytes, RoCarve, RoLendable,
+    RoMapping, RoWord32, RoWord64, Seals, Word, Words,
 };
 use rsbinder::fmq::{Descriptor, Errno, Error, Flavor, Grantor, Result};
 
-use crate::pool::{GenerationLoads, Generations, LendError, Pin, Pins, Slots};
+use crate::pool::{GenerationLoads, Generations, LendError, LentSlot, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
 
 /// The layout version this crate reads and writes: 0.3. A subscriber stores its `read` with
@@ -240,224 +239,194 @@ fn split(capacity: usize, position: u64, len: usize) -> (usize, usize) {
     (offset, len.min(capacity - offset))
 }
 
-/// Topic memory as its one writer reaches it; `O` keeps the bytes alive.
-pub(crate) struct Stored<O> {
-    base: NonNull<u8>,
-    capacity: usize,
-    _owner: O,
+/// Topic memory as its one writer reaches it: the words of the header and the ring, as pieces.
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
+pub(crate) struct Stored {
+    region_end: Word<AtomicU64>,
+    write: Word<AtomicU64>,
+    magic: Word<AtomicU32>,
+    version: Word<AtomicU32>,
+    seq: Word<AtomicU32>,
+    tail: Word<AtomicU64>,
+    last: Word<AtomicU64>,
+    half: Word<AtomicU64>,
+    frontier: Word<AtomicU64>,
+    ring: Bytes,
 }
 
-// SAFETY: an address into memory `O` keeps alive, reached through atomics only.
-unsafe impl<O: Send> Send for Stored<O> {}
-
-impl<O> Stored<O> {
-    /// # Safety: the module's "The views" contract, with the bytes valid for writes.
-    unsafe fn new(base: NonNull<u8>, capacity: usize, owner: O) -> Self {
+impl Stored {
+    /// Topic memory with a ring of `capacity` bytes, carved from a writable mapping of it.
+    fn carve(mut carve: Carve, capacity: usize) -> Result<Self> {
         assert!(capacity != 0 && capacity % 8 == 0, "a ring off the grid");
-        Self {
-            base,
-            capacity,
-            _owner: owner,
-        }
-    }
-
-    fn word64(&self, at: usize) -> &AtomicU64 {
-        debug_assert!(at % 8 == 0 && at + 8 <= topic::RING);
-        // SAFETY: `new`'s contract: an aligned 8-byte word of the header, atomics only, one size.
-        unsafe { self.base.add(at).cast::<AtomicU64>().as_ref() }
-    }
-
-    fn word32(&self, at: usize) -> &AtomicU32 {
-        debug_assert!(at % 4 == 0 && at + 4 <= topic::RING);
-        // SAFETY: `new`'s contract: an aligned 4-byte word of the header, atomics only, one size.
-        unsafe { self.base.add(at).cast::<AtomicU32>().as_ref() }
-    }
-
-    fn ring(&self, offset: usize, len: usize) -> Run<'_> {
-        assert!(offset <= self.capacity && len <= self.capacity - offset);
-        // SAFETY: `new`'s contract and the assert: inside the ring, which `split` tiles in words.
-        unsafe { Run::new(self.base.add(topic::RING + offset), len) }
+        Ok(Self {
+            region_end: carve.word64(topic::REGION_END)?,
+            write: carve.word64(topic::WRITE)?,
+            magic: carve.word32(topic::MAGIC)?,
+            version: carve.word32(topic::VERSION)?,
+            seq: carve.word32(topic::SEQ)?,
+            tail: carve.word64(topic::TAIL)?,
+            last: carve.word64(topic::LAST)?,
+            half: carve.word64(topic::HALF)?,
+            frontier: carve.word64(topic::FRONTIER)?,
+            ring: carve.bytes(topic::RING, capacity)?,
+        })
     }
 
     /// Write the two words that say what this memory is. Before any peer has the fd.
     fn mark(&self) {
-        self.word32(topic::MAGIC)
-            .store(TOPIC_MAGIC, Ordering::Relaxed);
-        self.word32(topic::VERSION)
-            .store(VERSION, Ordering::Relaxed);
+        self.magic.store(TOPIC_MAGIC, Ordering::Relaxed);
+        self.version.store(VERSION, Ordering::Relaxed);
     }
 }
 
-impl<O> Stores for Stored<O> {
+impl Stores for Stored {
     fn capacity(&self) -> u64 {
-        self.capacity as u64
+        self.ring.len() as u64
     }
 
     fn store_tail(&self, position: u64) {
-        self.word64(topic::TAIL).store(position, Ordering::Release);
+        self.tail.store(position, Ordering::Release);
     }
 
     fn store_region_end(&self, position: u64) {
-        self.word64(topic::REGION_END)
-            .store(position, Ordering::Release);
+        self.region_end.store(position, Ordering::Release);
     }
 
     fn store_frontier(&self, position: u64) {
-        self.word64(topic::FRONTIER)
-            .store(position, Ordering::Release);
+        self.frontier.store(position, Ordering::Release);
     }
 
     fn store_write(&self, position: u64) {
-        self.word64(topic::WRITE).store(position, Ordering::Release);
+        self.write.store(position, Ordering::Release);
     }
 
     fn store_last(&self, position: u64) {
-        self.word64(topic::LAST).store(position, Ordering::Release);
+        self.last.store(position, Ordering::Release);
     }
 
     fn store_half(&self, position: u64) {
-        self.word64(topic::HALF).store(position, Ordering::Release);
+        self.half.store(position, Ordering::Release);
     }
 
     fn bump_seq(&self) -> u32 {
-        let seq = self.word32(topic::SEQ).fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         seq.wrapping_add(1)
     }
 
     fn wake_seq(&self) {
         // Fails only where the system call does not exist; there no subscriber can sleep either.
-        let _ = shm::futex_wake(self.word32(topic::SEQ), std::num::NonZeroU32::MAX);
+        let _ = shm::futex_wake(&self.seq, std::num::NonZeroU32::MAX);
     }
 
     fn store_ring(&self, position: u64, src: &[u8]) {
-        let (offset, first) = split(self.capacity, position, src.len());
+        let (offset, first) = split(self.ring.len(), position, src.len());
         let (head, wrapped) = src.split_at(first);
-        self.ring(offset, head.len()).store_release(head);
-        self.ring(0, wrapped.len()).store_release(wrapped);
+        self.ring.store_release(offset, head);
+        self.ring.store_release(0, wrapped);
     }
 }
 
-/// Topic memory as a reader reaches it: loads, and nothing that stores. `O` keeps it alive.
-pub(crate) struct Loaded<O> {
-    base: NonNull<u8>,
-    capacity: usize,
-    _owner: O,
+/// Topic memory as a reader reaches it: loads, and nothing that stores.
+pub(crate) struct Loaded {
+    write: Word<RoWord64>,
+    magic: Word<RoWord32>,
+    version: Word<RoWord32>,
+    seq: Word<RoWord32>,
+    tail: Word<RoWord64>,
+    last: Word<RoWord64>,
+    half: Word<RoWord64>,
+    frontier: Word<RoWord64>,
+    ring: RoBytes,
 }
 
-// SAFETY: an address into memory `O` keeps alive, reached through atomic loads only.
-unsafe impl<O: Send> Send for Loaded<O> {}
-
-impl<O> Loaded<O> {
-    /// # Safety: the module's "The views" contract; the bytes need not be valid for writes.
-    unsafe fn new(base: NonNull<u8>, capacity: usize, owner: O) -> Self {
+impl Loaded {
+    /// Topic memory with a ring of `capacity` bytes, carved from a read-only mapping of it.
+    fn carve(mut carve: RoCarve, capacity: usize) -> Result<Self> {
         assert!(capacity != 0 && capacity % 8 == 0, "a ring off the grid");
-        Self {
-            base,
-            capacity,
-            _owner: owner,
-        }
-    }
-
-    fn word64(&self, at: usize) -> &RoWord64 {
-        debug_assert!(at % 8 == 0 && at + 8 <= topic::RING);
-        // SAFETY: `new`'s contract: an aligned 8-byte word of the header, atomics only, one size.
-        unsafe { RoWord64::from_ptr(self.base.add(at)) }
-    }
-
-    fn word32(&self, at: usize) -> &RoWord32 {
-        debug_assert!(at % 4 == 0 && at + 4 <= topic::RING);
-        // SAFETY: `new`'s contract: an aligned 4-byte word of the header, atomics only, one size.
-        unsafe { RoWord32::from_ptr(self.base.add(at)) }
-    }
-
-    fn ring(&self, offset: usize, len: usize) -> RoRun<'_> {
-        assert!(offset <= self.capacity && len <= self.capacity - offset);
-        // SAFETY: `new`'s contract and the assert: inside the ring, which `split` tiles in words.
-        unsafe { RoRun::new(self.base.add(topic::RING + offset), len) }
+        Ok(Self {
+            write: carve.word64(topic::WRITE)?,
+            magic: carve.word32(topic::MAGIC)?,
+            version: carve.word32(topic::VERSION)?,
+            seq: carve.word32(topic::SEQ)?,
+            tail: carve.word64(topic::TAIL)?,
+            last: carve.word64(topic::LAST)?,
+            half: carve.word64(topic::HALF)?,
+            frontier: carve.word64(topic::FRONTIER)?,
+            ring: carve.bytes(topic::RING, capacity)?,
+        })
     }
 
     /// The word a subscriber sleeps on, as a handle that keeps the memory alive on its own.
-    pub(crate) fn seq(&self) -> Seq<O>
-    where
-        O: Clone,
-    {
+    pub(crate) fn seq(&self) -> Seq {
         Seq {
-            base: self.base,
-            _owner: self._owner.clone(),
+            word: self.seq.clone(),
         }
     }
 
     /// Whether the two words that say what this memory is hold what this crate writes there.
     fn marked(&self) -> Result<()> {
-        if self.word32(topic::MAGIC).load() != TOPIC_MAGIC {
+        if self.magic.load() != TOPIC_MAGIC {
             return Err(Error::BadValue("received memfd is not topic memory"));
         }
-        if self.word32(topic::VERSION).load() != VERSION {
+        if self.version.load() != VERSION {
             return Err(Error::BadValue("topic memory of another layout version"));
         }
         Ok(())
     }
 }
 
-impl<O> Loads for Loaded<O> {
+impl Loads for Loaded {
     fn capacity(&self) -> u64 {
-        self.capacity as u64
+        self.ring.len() as u64
     }
 
     fn tail(&self) -> u64 {
-        self.word64(topic::TAIL).load_acquire()
+        self.tail.load_acquire()
     }
 
     fn frontier(&self) -> u64 {
-        self.word64(topic::FRONTIER).load_acquire()
+        self.frontier.load_acquire()
     }
 
     fn write(&self) -> u64 {
-        self.word64(topic::WRITE).load_acquire()
+        self.write.load_acquire()
     }
 
     fn last(&self) -> u64 {
-        self.word64(topic::LAST).load_acquire()
+        self.last.load_acquire()
     }
 
     fn half(&self) -> u64 {
-        self.word64(topic::HALF).load_acquire()
+        self.half.load_acquire()
     }
 
     fn load_ring(&self, position: u64, dst: &mut [u8]) {
-        let (offset, first) = split(self.capacity, position, dst.len());
+        let (offset, first) = split(self.ring.len(), position, dst.len());
         let (head, wrapped) = dst.split_at_mut(first);
-        self.ring(offset, head.len()).load(head);
-        self.ring(0, wrapped.len()).load(wrapped);
+        self.ring.load(offset, head);
+        self.ring.load(0, wrapped);
     }
 
     fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
-        let (offset, first) = split(self.capacity, position, len);
-        self.ring(offset, first).load_extend(dst);
-        self.ring(0, len - first).load_extend(dst);
+        let (offset, first) = split(self.ring.len(), position, len);
+        self.ring.load_extend(offset, first, dst);
+        self.ring.load_extend(0, len - first, dst);
     }
 
     fn fence(&self) {
-        // What `RoRun::load_acquire` adds to `load`.
+        // What `RoBytes::load_acquire` adds to `load`.
         std::sync::atomic::fence(Ordering::Acquire);
     }
 }
 
 /// Topic memory's `seq`, apart from the reader: what a wait on another thread sleeps on and wakes.
-pub(crate) struct Seq<O> {
-    base: NonNull<u8>,
-    _owner: O,
+pub(crate) struct Seq {
+    word: Word<RoWord32>,
 }
 
-// SAFETY: an address into memory `O` keeps alive, reached through `RoWord32` only.
-unsafe impl<O: Send> Send for Seq<O> {}
-// SAFETY: as above; `RoWord32` is an atomic, so `&Seq` on two threads is two atomic accesses.
-unsafe impl<O: Sync> Sync for Seq<O> {}
-
-impl<O> Seq<O> {
+impl Seq {
     pub(crate) fn word(&self) -> &RoWord32 {
-        // SAFETY: the `Loaded` this came from: an aligned 4-byte word of the header, one size.
-        unsafe { RoWord32::from_ptr(self.base.add(topic::SEQ)) }
+        &self.word
     }
 }
 
@@ -470,15 +439,14 @@ fn ring_capacity(ring_bytes: usize) -> Result<usize> {
 }
 
 /// Make topic memory with a ring of `ring_bytes`: the fd to hand to subscribers, and the mapping.
-pub(crate) fn create_topic(ring_bytes: usize) -> Result<(OwnedFd, Stored<Mapping>)> {
+pub(crate) fn create_topic(ring_bytes: usize) -> Result<(OwnedFd, Stored)> {
     check_target()?;
     let capacity = ring_capacity(ring_bytes)?;
     let size = (topic::RING + capacity) as u64;
     let options = CreateOptions::new("rsbinder-topic").populate(true);
     let fd = shm::create(size, &options)?;
     let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
-    // SAFETY: a page-aligned mapping of `size` zeroed bytes, owned by the view, atomics only.
-    let stored = unsafe { Stored::new(mapping.as_ptr(), capacity, mapping) };
+    let stored = Stored::carve(mapping.carve(), capacity)?;
     stored.mark();
     // After the mapping: `FUTURE_WRITE` refuses every writable mapping made from here on.
     seal(fd.as_fd())?;
@@ -486,7 +454,7 @@ pub(crate) fn create_topic(ring_bytes: usize) -> Result<(OwnedFd, Stored<Mapping
 }
 
 /// Map topic memory a publisher sent, read-only, once the fd, its size and its marks pass.
-pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded<Arc<Mapping>>> {
+pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded> {
     check_target()?;
     let size = shm::verify_received(fd)?;
     let capacity = usize::try_from(size)
@@ -494,10 +462,8 @@ pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded<Ar
         .and_then(|size| size.checked_sub(topic::RING))
         .filter(|ring| ring % 8 == 0 && (MIN_RING..=MAX_RING.min(max_ring)).contains(ring))
         .ok_or(Error::BadValue("topic memory of a size outside the bounds"))?;
-    // Shared, so that a `Seq` taken from the view outlives a dropped reader.
-    let mapping = Arc::new(Mapping::map(fd, 0, size, Access::ReadOnly)?);
-    // SAFETY: a page-aligned mapping of `size` bytes `verify_received` found present and sealed.
-    let loaded = unsafe { Loaded::new(mapping.as_ptr(), capacity, mapping) };
+    // The pieces share the mapping, so a `Seq` taken from the view outlives a dropped reader.
+    let loaded = Loaded::carve(RoMapping::map(fd, 0, size)?.carve(), capacity)?;
     loaded.marked()?;
     Ok(loaded)
 }
@@ -538,8 +504,10 @@ fn control_size(pins: u32) -> u64 {
 
 /// A subscriber's control page, mapped read-write.
 pub(crate) struct ControlPage {
-    mapping: Mapping,
-    pins: u32,
+    state: Word<AtomicU32>,
+    read: Word<AtomicU64>,
+    lost: Word<AtomicU64>,
+    pins: Words<AtomicU32>,
 }
 
 impl ControlPage {
@@ -550,51 +518,47 @@ impl ControlPage {
         let size = control_size(pins);
         let options = CreateOptions::new("rsbinder-topic-control").populate(true);
         let fd = shm::create(size, &options)?;
-        let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
-        let page = Self { mapping, pins };
-        page.word32(control::MAGIC)
+        let mut carve = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?.carve();
+        carve
+            .word32(control::MAGIC)?
             .store(CONTROL_MAGIC, Ordering::Relaxed);
-        page.word32(control::VERSION)
+        carve
+            .word32(control::VERSION)?
             .store(VERSION, Ordering::Relaxed);
-        page.word32(control::PINS).store(pins, Ordering::Relaxed);
+        carve.word32(control::PINS)?.store(pins, Ordering::Relaxed);
+        let page = Self {
+            state: carve.word32(control::STATE)?,
+            read: carve.word64(control::READ)?,
+            lost: carve.word64(control::LOST)?,
+            pins: carve.words32(control::PIN as usize, pins as usize)?,
+        };
         seal(fd.as_fd())?;
         Ok((fd, page))
     }
 
-    fn word32(&self, at: usize) -> &AtomicU32 {
-        debug_assert!(at % 4 == 0 && at + 4 <= control::READ);
-        // SAFETY: an aligned 4-byte word of the page's first line, in a mapping `self` owns.
-        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU32>().as_ref() }
-    }
-
-    fn word64(&self, at: usize) -> &AtomicU64 {
-        debug_assert!(at == control::READ || at == control::LOST);
-        // SAFETY: an aligned 8-byte word of the page's second line, in a mapping `self` owns.
-        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU64>().as_ref() }
-    }
-
     /// The [`WAITING`] and [`CLOSED`] bits and the `seq` a wait sleeps on. Changed by RMWs alone.
     pub(crate) fn state(&self) -> &AtomicU32 {
-        self.word32(control::STATE)
+        &self.state
     }
 
     /// The subscriber's read position, which the publisher reads for statistics, the pool's lends
     /// and, with backpressure, its waits.
     pub(crate) fn read(&self) -> &AtomicU64 {
-        self.word64(control::READ)
+        &self.read
     }
 
     /// Records the subscriber reported as lost, for statistics only.
     pub(crate) fn lost(&self) -> &AtomicU64 {
-        self.word64(control::LOST)
+        &self.lost
     }
 
     /// Pin word `nth`: 0, or the number of the slot this subscriber reads plus one.
     fn pin(&self, nth: u32) -> &AtomicU32 {
-        assert!(nth < self.pins, "a pin word the page does not have");
-        let at = control::PIN as usize + 4 * nth as usize;
-        // SAFETY: an aligned 4-byte word below `control_size(pins)`, in a mapping `self` owns.
-        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU32>().as_ref() }
+        assert!(
+            (nth as usize) < self.pins.len(),
+            "a pin word the page does not have"
+        );
+        self.pins.get(nth as usize)
     }
 }
 
@@ -606,8 +570,10 @@ impl Pin for ControlPage {
 
 /// A subscriber's control page as the publisher maps it: read-only.
 pub(crate) struct ControlView {
-    mapping: Mapping,
-    pins: u32,
+    state: Word<RoWord32>,
+    read: Word<RoWord64>,
+    lost: Word<RoWord64>,
+    pins: Words<RoWord32>,
 }
 
 impl ControlView {
@@ -618,60 +584,51 @@ impl ControlView {
         if size != control_size(pins) {
             return Err(Error::BadValue("control page of another size"));
         }
-        let view = Self {
-            mapping: Mapping::map(fd, 0, size, Access::ReadOnly)?,
-            pins,
-        };
-        if view.word32(control::MAGIC).load() != CONTROL_MAGIC {
+        let mut carve = RoMapping::map(fd, 0, size)?.carve();
+        if carve.word32(control::MAGIC)?.load() != CONTROL_MAGIC {
             return Err(Error::BadValue("received memfd is not a control page"));
         }
-        if view.word32(control::VERSION).load() != VERSION {
+        if carve.word32(control::VERSION)?.load() != VERSION {
             return Err(Error::BadValue("control page of another layout version"));
         }
-        if view.word32(control::PINS).load() != pins {
+        if carve.word32(control::PINS)?.load() != pins {
             return Err(Error::BadValue("control page with another pin count"));
         }
-        Ok(view)
-    }
-
-    fn word32(&self, at: usize) -> &RoWord32 {
-        debug_assert!(at % 4 == 0 && at + 4 <= control::READ);
-        // SAFETY: an aligned 4-byte word of the page's first line, in a mapping `self` owns.
-        unsafe { RoWord32::from_ptr(self.mapping.as_ptr().add(at)) }
-    }
-
-    fn word64(&self, at: usize) -> &RoWord64 {
-        debug_assert!(at == control::READ || at == control::LOST);
-        // SAFETY: an aligned 8-byte word of the page's second line, in a mapping `self` owns.
-        unsafe { RoWord64::from_ptr(self.mapping.as_ptr().add(at)) }
+        Ok(Self {
+            state: carve.word32(control::STATE)?,
+            read: carve.word64(control::READ)?,
+            lost: carve.word64(control::LOST)?,
+            pins: carve.words32(control::PIN as usize, pins as usize)?,
+        })
     }
 
     /// The subscriber's [`WAITING`] and [`CLOSED`] bits and the `seq` its wait sleeps on.
     pub(crate) fn state(&self) -> &RoWord32 {
-        self.word32(control::STATE)
+        &self.state
     }
 
     /// What the subscriber says its read position is.
     pub(crate) fn read(&self) -> u64 {
-        self.word64(control::READ).load_acquire()
+        self.read.load_acquire()
     }
 
     /// How many records the subscriber says it lost.
     pub(crate) fn lost(&self) -> u64 {
-        self.word64(control::LOST).load_acquire()
+        self.lost.load_acquire()
     }
 
     /// The pin words the page has.
     pub(crate) fn pins(&self) -> u32 {
-        self.pins
+        self.pins.len() as u32
     }
 
     /// Pin word `nth`, a `Relaxed` load: the caller fences (`pool.rs`).
     pub(crate) fn pin(&self, nth: u32) -> u32 {
-        assert!(nth < self.pins, "a pin word the page does not have");
-        let at = control::PIN as usize + 4 * nth as usize;
-        // SAFETY: an aligned 4-byte word below `control_size(pins)`, in a mapping `self` owns.
-        unsafe { RoWord32::from_ptr(self.mapping.as_ptr().add(at)) }.load()
+        assert!(
+            (nth as usize) < self.pins.len(),
+            "a pin word the page does not have"
+        );
+        self.pins.get(nth as usize).load()
     }
 }
 
@@ -691,28 +648,27 @@ pub(crate) fn pool_size(slots: u32, slot_bytes: u32) -> Option<u64> {
 
 /// Pool memory as the publisher reaches it. Its slots are reached only through [`LentSlot`]s.
 pub(crate) struct StoredPool {
-    /// Shared with each [`LentSlot`], so that a loan outlives no mapping.
-    mapping: Arc<Mapping>,
+    generations: Words<AtomicU64>,
+    /// Every slot; each [`LentSlot`] holds a handle on it, so that a loan outlives no mapping.
+    area: Lendable,
     slots: u32,
     slot_bytes: u32,
 }
 
 impl StoredPool {
-    fn word32(&self, at: usize) -> &AtomicU32 {
-        debug_assert!(at % 4 == 0 && at + 4 <= pool::GENERATIONS);
-        // SAFETY: an aligned 4-byte word of the header, in a mapping `self` owns.
-        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU32>().as_ref() }
-    }
-
     fn generation(&self, slot: u32) -> &AtomicU64 {
         assert!(slot < self.slots, "a slot outside the pool");
-        let at = pool::GENERATIONS + 8 * slot as usize;
-        // SAFETY: an aligned 8-byte word below `slot_area(slots)`, in a mapping `self` owns.
-        unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU64>().as_ref() }
+        self.generations.get(slot as usize)
     }
 
     pub(crate) fn slot_bytes(&self) -> u32 {
         self.slot_bytes
+    }
+
+    /// The address the mapping starts at, for tests that look it up in `/proc/self/smaps`.
+    #[cfg(test)]
+    fn mapping_start(&self) -> usize {
+        self.area.as_ptr() as usize - slot_area(self.slots) as usize
     }
 
     /// Lend a slot for a value of `len` bytes, at most [`slot_bytes`](Self::slot_bytes):
@@ -726,57 +682,8 @@ impl StoredPool {
     ) -> std::result::Result<LentSlot, LendError> {
         assert!(len <= self.slot_bytes as usize, "a loan longer than a slot");
         let slot = slots.lend(self, pins, read)?;
-        let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
-        Ok(LentSlot {
-            mapping: self.mapping.clone(),
-            slot,
-            at,
-            len,
-            _not_sync: PhantomData,
-        })
-    }
-}
-
-/// The bytes of a slot the publisher lent: `Slots` lends it to this value alone until the slot
-/// is published or given back, which takes the value.
-///
-/// `Send`, not `Sync` (plan 17 T-8): the value may move to another thread, and `bytes_mut` hands
-/// out the slot's bytes only through `&mut self`.
-///
-/// # Safety
-///
-/// `bytes` and `bytes_mut` rely on three things. The slot is lent to this value alone, so no
-/// other reference to its bytes exists in this process, on this thread or another. The bytes
-/// `at..at + len` lie inside the mapping `mapping` holds, which lives as long as the value
-/// wherever it moves. What is done with the value on another thread
-/// (`TypedWriter::publish_loan`, `TypedWriter::give_back`) takes the writer's mutex, as a call
-/// from the thread that lent it does, so publishing or giving the slot back is ordered after
-/// every write through the value. `_not_sync` keeps the value `!Sync` (plan 17 T-8) and nothing
-/// else: the `Cell` is never made, so `AssertUnwindSafe` leaves the value `UnwindSafe` and
-/// `RefUnwindSafe`, which the public `LoanMut` holding it is.
-pub(crate) struct LentSlot {
-    mapping: Arc<Mapping>,
-    slot: u32,
-    at: usize,
-    len: usize,
-    _not_sync: PhantomData<std::panic::AssertUnwindSafe<Cell<()>>>,
-}
-
-impl LentSlot {
-    pub(crate) fn slot(&self) -> u32 {
-        self.slot
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8] {
-        // SAFETY: a lent slot inside `mapping`, which nothing else here reaches; initialized pages.
-        unsafe { std::slice::from_raw_parts(self.mapping.as_ptr().add(self.at).as_ptr(), self.len) }
-    }
-
-    pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as `bytes`, and `&mut self` makes this the only reference.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.mapping.as_ptr().add(self.at).as_ptr(), self.len)
-        }
+        let at = slot as usize * self.slot_bytes as usize;
+        Ok(LentSlot::new(self.area.clone(), slot, at..at + len))
     }
 }
 
@@ -788,58 +695,47 @@ impl Generations for StoredPool {
 
 /// Pool memory as a subscriber reaches it: loads only.
 pub(crate) struct LoadedPool {
-    mapping: Mapping,
+    generations: Words<RoWord64>,
+    /// Every slot, loaded through atomics or, under a pin, read in place (`pool.rs`).
+    area: RoLendable,
     slots: u32,
     slot_bytes: u32,
 }
 
 impl LoadedPool {
-    fn word32(&self, at: usize) -> &RoWord32 {
-        debug_assert!(at % 4 == 0 && at + 4 <= pool::GENERATIONS);
-        // SAFETY: an aligned 4-byte word of the header, in a mapping `self` owns.
-        unsafe { RoWord32::from_ptr(self.mapping.as_ptr().add(at)) }
-    }
-
     pub(crate) fn slot_bytes(&self) -> u32 {
         self.slot_bytes
     }
 
     /// Fill `dst` from the start of `slot`, with `Relaxed` loads: the caller pinned it.
     pub(crate) fn load_slot(&self, slot: u32, dst: &mut [u8]) {
-        self.slot_run(slot, dst.len()).load(dst);
+        let range = self.slot_range(slot, dst.len());
+        self.area.load(range.start, dst);
     }
 
     /// [`load_slot`](Self::load_slot) of `len` bytes appended to `dst`, not zeroed first.
     pub(crate) fn load_slot_extend(&self, slot: u32, len: usize, dst: &mut Vec<u8>) {
-        self.slot_run(slot, len).load_extend(dst);
+        let range = self.slot_range(slot, len);
+        self.area.load_extend(range.start, len, dst);
     }
 
-    fn slot_run(&self, slot: u32, len: usize) -> RoRun<'_> {
+    /// The bytes of [`area`](Self::area) the first `len` bytes of `slot` are.
+    pub(crate) fn slot_range(&self, slot: u32, len: usize) -> std::ops::Range<usize> {
         assert!(slot < self.slots && len <= self.slot_bytes as usize);
-        let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
-        // SAFETY: a slot of a mapping `self` owns; no `slot_slice` slice is live (its contract).
-        unsafe { RoRun::new(self.mapping.as_ptr().add(at), len) }
+        let at = slot as usize * self.slot_bytes as usize;
+        at..at + len
     }
 
-    /// The first `len` bytes of `slot`, in place.
-    ///
-    /// # Safety
-    ///
-    /// While the slice lives, no process writes those bytes — the publisher keeps the pin
-    /// protocol (`pool.rs`) and the caller holds the pin — and this process reads them through
-    /// no run ([`load_slot`](Self::load_slot)).
-    pub(crate) unsafe fn slot_slice(&self, slot: u32, len: usize) -> &[u8] {
-        assert!(slot < self.slots && len <= self.slot_bytes as usize);
-        let at = slot_area(self.slots) as usize + slot as usize * self.slot_bytes as usize;
-        // SAFETY: inside a slot of a mapping `self` owns; the caller's contract keeps it unchanged.
-        unsafe { std::slice::from_raw_parts(self.mapping.as_ptr().add(at).as_ptr(), len) }
+    /// Every slot of the pool, in slot order.
+    pub(crate) fn area(&self) -> &RoLendable {
+        &self.area
     }
 
-    /// The addresses the mapping covers, for tests that a sample lies in it.
+    /// The addresses the slots cover, for tests that a sample lies in them.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn addresses(&self) -> std::ops::Range<usize> {
-        let start = self.mapping.as_ptr().as_ptr() as usize;
-        start..start + self.mapping.len()
+        let start = self.area.as_ptr() as usize;
+        start..start + self.area.len()
     }
 }
 
@@ -850,9 +746,7 @@ impl GenerationLoads for LoadedPool {
 
     fn load_generation(&self, slot: u32) -> u64 {
         assert!(slot < self.slots, "a slot outside the pool");
-        let at = pool::GENERATIONS + 8 * slot as usize;
-        // SAFETY: an aligned 8-byte word below `slot_area(slots)`, in a mapping `self` owns.
-        unsafe { RoWord64::from_ptr(self.mapping.as_ptr().add(at)) }.load()
+        self.generations.get(slot as usize).load()
     }
 }
 
@@ -870,47 +764,32 @@ pub(crate) fn create_pool(
     // Huge pages come with the first write through a mapping advised so, not with `pwrite`.
     let options = CreateOptions::new("rsbinder-topic-pool").populate(!huge);
     let fd = shm::create(size, &options)?;
-    let mapping = Arc::new(Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?);
+    let mapping = Mapping::map(fd.as_fd(), 0, size, Access::ReadWrite)?;
+    if huge {
+        mapping.populate_huge_pages();
+    }
+    let mut carve = mapping.carve();
+    carve
+        .word32(pool::MAGIC)?
+        .store(POOL_MAGIC, Ordering::Relaxed);
+    carve
+        .word32(pool::VERSION)?
+        .store(VERSION, Ordering::Relaxed);
+    carve.word32(pool::SLOTS)?.store(slots, Ordering::Relaxed);
+    carve
+        .word32(pool::SLOT_BYTES)?
+        .store(slot_bytes, Ordering::Relaxed);
     let stored = StoredPool {
-        mapping,
+        generations: carve.words64(pool::GENERATIONS, slots as usize)?,
+        area: carve.lendable(
+            slot_area(slots) as usize,
+            slots as usize * slot_bytes as usize,
+        )?,
         slots,
         slot_bytes,
     };
-    if huge {
-        stored.touch_huge();
-    }
-    stored
-        .word32(pool::MAGIC)
-        .store(POOL_MAGIC, Ordering::Relaxed);
-    stored
-        .word32(pool::VERSION)
-        .store(VERSION, Ordering::Relaxed);
-    stored.word32(pool::SLOTS).store(slots, Ordering::Relaxed);
-    stored
-        .word32(pool::SLOT_BYTES)
-        .store(slot_bytes, Ordering::Relaxed);
     seal(fd.as_fd())?;
     Ok((fd, stored))
-}
-
-impl StoredPool {
-    /// Advise huge pages, then write a byte of every 4 KiB so that each page holds data.
-    fn touch_huge(&self) {
-        let len = self.mapping.len();
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            // Refused without transparent huge pages, which leaves small ones: nothing to undo.
-            let advice = rustix::mm::Advice::LinuxHugepage;
-            let at = self.mapping.as_ptr().as_ptr().cast();
-            // SAFETY: this whole mapping, and an advice that changes no byte of it.
-            let _ = unsafe { rustix::mm::madvise(at, len, advice) };
-        }
-        for at in (0..len).step_by(4 << 10) {
-            // SAFETY: a byte this mapping owns, before any peer has the fd: no access races it.
-            unsafe { self.mapping.as_ptr().add(at).cast::<AtomicU8>().as_ref() }
-                .store(0, Ordering::Relaxed);
-        }
-    }
 }
 
 /// Map pool memory a publisher sent, read-only, once the fd, its size and its marks pass: the
@@ -931,25 +810,29 @@ pub(crate) fn map_pool(
             "pool memory of another size than its slots",
         ));
     }
-    let pool = LoadedPool {
-        mapping: Mapping::map(fd, 0, size, Access::ReadOnly)?,
-        slots,
-        slot_bytes,
-    };
-    if pool.word32(pool::MAGIC).load() != POOL_MAGIC {
+    let mut carve = RoMapping::map(fd, 0, size)?.carve();
+    if carve.word32(pool::MAGIC)?.load() != POOL_MAGIC {
         return Err(Error::BadValue("received memfd is not pool memory"));
     }
-    if pool.word32(pool::VERSION).load() != VERSION {
+    if carve.word32(pool::VERSION)?.load() != VERSION {
         return Err(Error::BadValue("pool memory of another layout version"));
     }
-    if pool.word32(pool::SLOTS).load() != slots
-        || pool.word32(pool::SLOT_BYTES).load() != slot_bytes
+    if carve.word32(pool::SLOTS)?.load() != slots
+        || carve.word32(pool::SLOT_BYTES)?.load() != slot_bytes
     {
         return Err(Error::BadValue(
             "pool memory with other slots than its endpoint",
         ));
     }
-    Ok(pool)
+    Ok(LoadedPool {
+        generations: carve.words64(pool::GENERATIONS, slots as usize)?,
+        area: carve.lendable(
+            slot_area(slots) as usize,
+            slots as usize * slot_bytes as usize,
+        )?,
+        slots,
+        slot_bytes,
+    })
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -957,69 +840,83 @@ pub(crate) use heap::Heap;
 
 #[cfg(any(test, feature = "fuzzing"))]
 mod heap {
-    use std::sync::Arc;
-
     use super::*;
 
     /// Topic memory on the heap, for what cannot map a memfd: Miri, and a fuzzer's input.
     pub(crate) struct Heap {
-        words: Arc<[AtomicU64]>,
-        capacity: usize,
+        stored: Stored,
     }
 
     impl Heap {
         /// Zeroed topic memory with a ring of `capacity` bytes, marked as `create_topic` marks it.
         #[cfg(test)]
         pub(crate) fn new(capacity: usize) -> Self {
-            let heap = Self::zeroed(capacity);
-            heap.stored().mark();
+            let heap = Self::zeroed(capacity).expect("heap memory of a valid ring");
+            heap.stored.mark();
             heap
         }
 
         /// Topic memory holding `image`: 64 bytes of header, then the ring, cut to a multiple of 8.
         pub(crate) fn from_image(image: &[u8]) -> Option<Self> {
             let capacity = image.len().checked_sub(topic::RING)? / 8 * 8;
+            let heap = Self::zeroed(capacity).ok()?;
+            let word32 = |at: usize| u32::from_ne_bytes(image[at..at + 4].try_into().expect("4"));
+            let word64 = |at: usize| u64::from_ne_bytes(image[at..at + 8].try_into().expect("8"));
+            // Each byte through its own piece: Miri's weak-memory emulation takes one size per byte.
+            let s = &heap.stored;
+            for (word, at) in [
+                (&s.region_end, topic::REGION_END),
+                (&s.write, topic::WRITE),
+                (&s.tail, topic::TAIL),
+                (&s.last, topic::LAST),
+                (&s.half, topic::HALF),
+                (&s.frontier, topic::FRONTIER),
+            ] {
+                word.store(word64(at), Ordering::Relaxed);
+            }
+            for (word, at) in [
+                (&s.magic, topic::MAGIC),
+                (&s.version, topic::VERSION),
+                (&s.seq, topic::SEQ),
+            ] {
+                word.store(word32(at), Ordering::Relaxed);
+            }
+            s.ring.store(0, &image[topic::RING..topic::RING + capacity]);
+            Some(heap)
+        }
+
+        /// `BadValue` for a ring of zero bytes, which `Stored::carve` refuses by panicking.
+        fn zeroed(capacity: usize) -> Result<Self> {
             if capacity == 0 {
-                return None;
+                return Err(Error::BadValue("a ring of zero bytes"));
             }
-            // Built with `new`, not stored: Miri's weak-memory emulation takes one size per byte.
-            let words = image[..topic::RING + capacity]
-                .chunks_exact(8)
-                .map(|bytes| {
-                    let mut value = [0; 8];
-                    value.copy_from_slice(bytes);
-                    AtomicU64::new(u64::from_ne_bytes(value))
-                });
-            Some(Self {
-                words: words.collect(),
-                capacity,
+            let carve = Mapping::heap(topic::RING + capacity)?.carve();
+            Ok(Self {
+                stored: Stored::carve(carve, capacity)?,
             })
-        }
-
-        #[cfg(test)]
-        fn zeroed(capacity: usize) -> Self {
-            let words = (topic::RING + capacity) / 8;
-            Self {
-                words: (0..words).map(|_| AtomicU64::new(0)).collect(),
-                capacity,
-            }
-        }
-
-        fn base(&self) -> NonNull<u8> {
-            NonNull::from(&*self.words).cast()
         }
 
         /// A writer's view. Use one at a time, as there is one publisher.
         #[cfg(test)]
-        pub(crate) fn stored(&self) -> Stored<Arc<[AtomicU64]>> {
-            // SAFETY: 8-aligned initialized atomics the view's `Arc` keeps alive; atomics only.
-            unsafe { Stored::new(self.base(), self.capacity, self.words.clone()) }
+        pub(crate) fn stored(&self) -> Stored {
+            self.stored.clone()
         }
 
-        /// A reader's view.
-        pub(crate) fn loaded(&self) -> Loaded<Arc<[AtomicU64]>> {
-            // SAFETY: as in `stored`; the reader only loads.
-            unsafe { Loaded::new(self.base(), self.capacity, self.words.clone()) }
+        /// A reader's view: the writer's pieces, read-only.
+        pub(crate) fn loaded(&self) -> Loaded {
+            let s = &self.stored;
+            let ro = |word: &Word<AtomicU64>| word.as_ro().expect("a target with `RoWord64`");
+            Loaded {
+                write: ro(&s.write),
+                magic: s.magic.as_ro(),
+                version: s.version.as_ro(),
+                seq: s.seq.as_ro(),
+                tail: ro(&s.tail),
+                last: ro(&s.last),
+                half: ro(&s.half),
+                frontier: ro(&s.frontier),
+                ring: s.ring.as_ro(),
+            }
         }
     }
 }

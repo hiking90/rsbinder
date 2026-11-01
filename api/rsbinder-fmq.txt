@@ -102,6 +102,8 @@ impl rsbinder_fmq::shm::Lendable
 pub fn rsbinder_fmq::shm::Lendable::as_ro(&self) -> rsbinder_fmq::shm::RoLendable
 pub unsafe fn rsbinder_fmq::shm::Lendable::slice(&self, core::ops::range::Range<usize>) -> &[u8]
 pub unsafe fn rsbinder_fmq::shm::Lendable::slice_mut(&self, core::ops::range::Range<usize>) -> &mut [u8]
+impl core::clone::Clone for rsbinder_fmq::shm::Lendable
+pub fn rsbinder_fmq::shm::Lendable::clone(&self) -> Self
 impl core::fmt::Debug for rsbinder_fmq::shm::Lendable
 pub fn rsbinder_fmq::shm::Lendable::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::deref::Deref for rsbinder_fmq::shm::Lendable
@@ -121,6 +123,7 @@ pub fn rsbinder_fmq::shm::Mapping::carve(self) -> rsbinder_fmq::shm::Carve
 pub fn rsbinder_fmq::shm::Mapping::heap(usize) -> rsbinder_fmq::Result<Self>
 pub fn rsbinder_fmq::shm::Mapping::len(&self) -> usize
 pub fn rsbinder_fmq::shm::Mapping::map(std::os::fd::owned::BorrowedFd<'_>, u64, u64, rsbinder_fmq::shm::Access) -> rsbinder_fmq::Result<Self>
+pub fn rsbinder_fmq::shm::Mapping::populate_huge_pages(&self)
 impl core::fmt::Debug for rsbinder_fmq::shm::Mapping
 pub fn rsbinder_fmq::shm::Mapping::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder_fmq::shm::Mapping
@@ -170,6 +173,8 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::RoCarve
 pub struct rsbinder_fmq::shm::RoLendable(_)
 impl rsbinder_fmq::shm::RoLendable
 pub unsafe fn rsbinder_fmq::shm::RoLendable::slice(&self, core::ops::range::Range<usize>) -> &[u8]
+impl core::clone::Clone for rsbinder_fmq::shm::RoLendable
+pub fn rsbinder_fmq::shm::RoLendable::clone(&self) -> Self
 impl core::fmt::Debug for rsbinder_fmq::shm::RoLendable
 pub fn rsbinder_fmq::shm::RoLendable::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::ops::deref::Deref for rsbinder_fmq::shm::RoLendable

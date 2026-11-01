@@ -601,7 +601,6 @@ mod real {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use rsbinder::fmq::shm::Mapping;
     use rsbinder::fmq::Error;
     use rsbinder::{DeathRecipient, WIBinder};
 
@@ -612,7 +611,7 @@ mod real {
 
     /// The words of one subscription: `seq` in the topic memory, `state` in the control page.
     pub(crate) struct Parts {
-        pub(crate) seq: Seq<Arc<Mapping>>,
+        pub(crate) seq: Seq,
         pub(crate) control: Arc<ControlPage>,
         /// The fds of a subscription the publisher wakes through its socket.
         pub(crate) fd: Option<FdWake>,

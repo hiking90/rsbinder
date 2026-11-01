@@ -3,6 +3,7 @@
 
 use std::os::fd::BorrowedFd;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicU8;
 
 use crate::error::{Error, Result};
 
@@ -266,6 +267,31 @@ impl Mapping {
             "a read-only mapping is carved as a `RoMapping`"
         );
         super::Carve::new(self.memory, self.delta)
+    }
+
+    /// Ask for transparent huge pages and give every page of the mapping
+    /// data: `madvise(MADV_HUGEPAGE)` over it (Linux and Android; a kernel
+    /// without transparent huge pages refuses, which leaves small pages),
+    /// then a zero byte stored every 4 KiB from [`as_ptr`](Self::as_ptr).
+    ///
+    /// A memfd's pages come as huge pages only with the first write through
+    /// a mapping advised so, not with the `pwrite`s of
+    /// [`CreateOptions::populate`](super::CreateOptions::populate). The
+    /// stores write zeros, so this is for memory that holds nothing yet:
+    /// made, mapped and not yet handed to a peer or carved.
+    pub fn populate_huge_pages(&self) {
+        let (at, len) = (self.as_ptr(), self.len());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let advice = rustix::mm::Advice::LinuxHugepage;
+            // SAFETY: inside this mapping; an advice that changes no byte of it.
+            let _ = unsafe { rustix::mm::madvise(at.as_ptr().cast(), len, advice) };
+        }
+        for offset in (0..len).step_by(4 << 10) {
+            let byte = at.map_addr(|a| a.saturating_add(offset)).cast::<AtomicU8>();
+            // SAFETY: a byte of this live mapping, which no piece covers yet; an atomic store.
+            unsafe { byte.as_ref() }.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// The address of the byte at the `offset` given to [`map`](Self::map).
@@ -538,6 +564,18 @@ mod tests {
         let mut out = vec![0u8; 50];
         seen.load_acquire(0, &mut out);
         assert_eq!((seen_word.load_acquire(), out), (0x1234_5678, src));
+    }
+
+    /// Advised and touched before it is carved: the pieces then read the zeros it stored.
+    #[test]
+    fn huge_pages_are_asked_for_before_the_mapping_is_carved() {
+        let (file, page) = two_pages(&read_write());
+        let mapping = Mapping::map(file.as_fd(), 0, 2 * page as u64, Access::ReadWrite).unwrap();
+        mapping.populate_huge_pages();
+        let bytes = mapping.carve().bytes(0, 2 * page).unwrap();
+        let mut out = vec![0xffu8; 2 * page];
+        bytes.load(0, &mut out);
+        assert!(out.iter().all(|b| *b == 0));
     }
 
     #[test]

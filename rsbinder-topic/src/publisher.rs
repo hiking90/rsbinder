@@ -15,7 +15,6 @@ use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
-use rsbinder::fmq::shm::Mapping;
 use rsbinder::{
     BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
     StatusCode, Strong,
@@ -29,8 +28,9 @@ use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{asked_here, policy_status, refuse, status_of};
-use crate::layout::{self, ControlView, LentSlot, Stored, HEADER_OFFSET, VERSION};
+use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
+use crate::pool::LentSlot;
 use crate::pool::MAX_PINS;
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Advertisement, Resolver, ServiceManager};
@@ -78,7 +78,7 @@ struct Held {
 
 /// What the publisher, the acceptors and the death notifications share.
 struct Shared<T> {
-    writer: TypedWriter<T, Stored<Mapping>>,
+    writer: TypedWriter<T, Stored>,
     /// The topic memory, duplicated into every reply.
     fd: OwnedFd,
     /// The pool memory, duplicated into every reply, for a topic that lends slots.
@@ -399,7 +399,7 @@ impl Publisher<Bytes> {
 /// or `tokio::task::block_in_place` gives.
 #[must_use = "dropping the loan gives the slot back unpublished; call `publish`"]
 pub struct LoanMut<'a> {
-    writer: &'a TypedWriter<Bytes, Stored<Mapping>>,
+    writer: &'a TypedWriter<Bytes, Stored>,
     /// `None` once published.
     slot: Option<LentSlot>,
 }

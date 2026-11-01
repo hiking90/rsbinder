@@ -24,7 +24,6 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use rsbinder::fmq::shm::spin::{spin_until, SpinGauge};
-use rsbinder::fmq::shm::Mapping;
 use rsbinder::fmq::Descriptor;
 use rsbinder::{
     BinderResult, Interface, ParcelFileDescriptor, SIBinder, Status, StatusCode, Strong,
@@ -153,7 +152,7 @@ impl Default for SubscriberPolicy {
 pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     /// Raises `ABANDON` on drop, first of the fields: a pool wait lets go of the memory now.
     _abandon: Abandon,
-    reader: TypedReader<T, Loaded<Arc<Mapping>>>,
+    reader: TypedReader<T, Loaded>,
     control: Closing,
     /// [`Wake::Fd`]'s fds on the reactor; dropped before `local` closes them.
     #[cfg(feature = "tokio")]
@@ -1175,7 +1174,7 @@ impl fmt::Debug for Interrupter {
 }
 
 /// SUB6 and SUB7: the reply's version and descriptor, then the topic memory it names, mapped.
-fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loaded<Arc<Mapping>>> {
+fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loaded> {
     if endpoint.version != VERSION as i32 {
         return Err(refuse(ERROR_VERSION, "publisher of another layout version"));
     }

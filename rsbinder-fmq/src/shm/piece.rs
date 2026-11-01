@@ -742,6 +742,14 @@ impl Lendable {
     }
 }
 
+/// Another handle on the same area: one per holder a protocol lends parts of it to. The slices'
+/// contract is on the bytes, not on the handle, so it covers every handle.
+impl Clone for Lendable {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl std::fmt::Debug for Lendable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Lendable")
@@ -778,6 +786,13 @@ impl RoLendable {
     pub unsafe fn slice(&self, range: Range<usize>) -> &[u8] {
         // SAFETY: inside the area, which lives with `self`; the caller's contract leaves it unchanged.
         unsafe { self.0 .0.slice(range).as_ref() }
+    }
+}
+
+/// Another handle on the same area, as for [`Lendable`].
+impl Clone for RoLendable {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 

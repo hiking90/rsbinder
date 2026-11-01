@@ -23,7 +23,6 @@ use crate::named::{
     BEFORE_DRAIN_ENDS, BEFORE_INTERRUPT, BEFORE_LOOKING, BEFORE_REPLACE, BETWEEN_LOOKS,
 };
 use crate::ring::{Kind, Stores, Writer, BEFORE_JUDGING};
-use rsbinder::fmq::shm::Mapping;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{
@@ -628,7 +627,7 @@ fn empty_item(index: u32) -> [u8; 8] {
 }
 
 /// `ByHand` memory as its publisher's [`Writer`] stores it, while a test stores beside it.
-struct Shared(Rc<Stored<Mapping>>);
+struct Shared(Rc<Stored>);
 
 impl Stores for Shared {
     fn capacity(&self) -> u64 {
@@ -692,7 +691,7 @@ fn lap(old: &Old, position: u64) {
 /// A name subscriber of `ByHand` memory, its old publisher, and the new one that took the name.
 struct Draining {
     subscriber: NamedSubscriber<Bytes>,
-    stored: Rc<Stored<Mapping>>,
+    stored: Rc<Stored>,
     writer: Old,
     old: SIBinder,
     _new: Publisher<Bytes>,
