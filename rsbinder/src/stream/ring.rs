@@ -25,8 +25,8 @@ use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink}
 #[cfg(feature = "tokio")]
 use super::pool::on_pool;
 use super::{
-    decode_item, dropped_terminator, encode_item, status_from_fields, truncated_terminator,
-    watch_death, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
+    decode_item, dropped_terminator, encode_item, end_decision, status_from_fields, watch_death,
+    Book, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
 };
 
 /// The descriptor type the endpoint carries: a ring of bytes.
@@ -134,12 +134,7 @@ impl Shared {
             .ping
             .get()
             .and_then(|(peer, policy)| Ping::to(peer, *policy));
-        let quiet_until = ping
-            .as_ref()
-            .and_then(|ping| Instant::now().checked_add(ping.every));
-        // A caller's deadline that comes first ends the wait without a ping.
-        let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
-        let wake_at = if pings { quiet_until } else { deadline };
+        let (wake_at, pings) = Ping::wake_at(ping.as_ref(), deadline);
         let standing = self.flag.peek() & mask != 0;
         let parked_at = Instant::now();
         let timeout = wake_at.map(|at| at.saturating_duration_since(parked_at));
@@ -318,25 +313,15 @@ impl WriteFailure {
 
 /// What a pool task left behind: one at most, which the owner waits for before writing or waiting.
 #[derive(Default)]
-struct TransitState {
-    /// Items accepted and never written. Only the terminator reports them.
-    lost: i32,
-    /// A failure with nobody told yet; the next call returns it.
-    unreported: Option<StatusCode>,
-    /// The ring is unusable; every later call returns this.
-    broken: Option<StatusCode>,
-}
-
-#[derive(Default)]
 struct Transit {
     /// Up while a token is on the pool; lowered as it settles into the book.
-    gate: PoolGate<TransitState>,
+    gate: PoolGate<Book>,
     /// `unreported` or `broken` was ever set; never cleared, so while it is down neither is.
     flagged: std::sync::atomic::AtomicBool,
 }
 
 impl Transit {
-    fn lock(&self) -> std::sync::MutexGuard<'_, TransitState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
         self.gate.lock()
     }
 
@@ -375,15 +360,10 @@ impl Transit {
     /// The token is done: leave `failure` for the next call; `lost` = its item did not go in.
     #[cfg(feature = "tokio")]
     fn settle(&self, failure: Option<StatusCode>, lost: bool, broken: bool) {
-        self.gate.settle(|state| {
-            if lost {
-                state.lost = state.lost.saturating_add(1);
-            }
+        self.gate.settle(|book| {
+            book.add_lost(i32::from(lost));
             if let Some(e) = failure {
-                state.unreported = Some(e);
-                if broken {
-                    state.broken.get_or_insert(e);
-                }
+                book.record_failure(e, broken);
                 self.flagged.store(true, Ordering::SeqCst);
             }
         });
@@ -717,13 +697,12 @@ impl<T: ?Sized> Producer<T> {
         if !self.transit.flagged.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.transit.broken().map_or(Ok(()), Err)
+        self.transit.lock().usable()
     }
 
     /// A transit failure, returned once; a broken ring's error, returned on every call.
     fn reported(&self) -> Result<()> {
-        let unreported = self.transit.take_unreported();
-        unreported.or(self.transit.broken()).map_or(Ok(()), Err)
+        self.transit.lock().reported()
     }
 
     /// Write the end record; `failed` is what an earlier record left unreported.
@@ -734,32 +713,20 @@ impl<T: ?Sized> Producer<T> {
         service_specific: i32,
         message: Option<&str>,
     ) -> Result<()> {
-        if self.shared.dead.load(Ordering::SeqCst) || failed == Some(StatusCode::DeadObject) {
-            // Nobody is left to tell.
-            return Err(StatusCode::DeadObject);
-        }
-        let canceled = self.is_canceled();
-        // After a cancel no loss is reported: the consumer asked for nothing more.
-        let truncated = match truncated_terminator(exception, self.transit.lost()) {
-            Some(truncated) if !canceled => Some(truncated),
-            _ => None,
-        };
-        let wrote = match &truncated {
+        let dead = self.shared.dead.load(Ordering::SeqCst);
+        let decision = end_decision(
+            failed,
+            dead,
+            self.is_canceled(),
+            self.transit.lost(),
+            exception,
+        );
+        decision.send(|truncated| match truncated {
             Some(truncated) => {
                 self.write_end(ExceptionCode::IllegalState as i32, 0, Some(truncated))
             }
             None => self.write_end(exception, service_specific, message),
-        };
-        match failed {
-            // The consumer still waits in `recv`, so the end went in; return the earlier failure.
-            Some(e) if !canceled => {
-                if let Err(end) = wrote {
-                    log::warn!("stream: the end record could not be written: {end:?}");
-                }
-                Err(e)
-            }
-            _ => wrote,
-        }
+        })
     }
 
     /// Never waits: the reserve keeps room, so no room means the consumer moved the read counter.

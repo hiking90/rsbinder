@@ -776,6 +776,14 @@ impl Ping {
         None
     }
 
+    /// When a quiet wait wakes, and whether it then pings: at the ping if that comes no later
+    /// than `deadline`, else at `deadline` without one.
+    fn wake_at(ping: Option<&Ping>, deadline: Option<Instant>) -> (Option<Instant>, bool) {
+        let quiet_until = ping.and_then(|ping| Instant::now().checked_add(ping.every));
+        let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
+        (if pings { quiet_until } else { deadline }, pings)
+    }
+
     /// Unanswered within the reply deadline, it ends the session, and the death link the stream.
     fn send(&self) {
         match self.peer.ping_binder() {
@@ -862,6 +870,101 @@ fn dropped_terminator(lost: i32) -> String {
         "the stream's producer dropped its sink without ending the stream; \
          {lost} queued item(s) were not sent"
     )
+}
+
+/// What a producer's pool tokens left: the book its [`PoolGate`](crate::signal::PoolGate) holds.
+#[derive(Default)]
+struct Book {
+    /// Items accepted and never delivered; only the terminator reports them.
+    lost: i32,
+    /// A failure with nobody told yet; the next call returns it.
+    unreported: Option<StatusCode>,
+    /// Nothing more can be sent; every later call returns this. The first failure stands.
+    broken: Option<StatusCode>,
+}
+
+impl Book {
+    fn add_lost(&mut self, count: i32) {
+        self.lost = self.lost.saturating_add(count);
+    }
+
+    /// A send failed: the next call returns `e`, and every call does if it `breaks` the stream.
+    fn record_failure(&mut self, e: StatusCode, breaks: bool) {
+        self.unreported = Some(e);
+        if breaks {
+            self.broken.get_or_insert(e);
+        }
+    }
+
+    /// The error that broke the stream, if one has.
+    fn usable(&self) -> Result<()> {
+        self.broken.map_or(Ok(()), Err)
+    }
+
+    /// A failure, returned once; a broken stream's error, returned on every call.
+    fn reported(&mut self) -> Result<()> {
+        self.unreported.take().or(self.broken).map_or(Ok(()), Err)
+    }
+}
+
+/// What ending a stream does; the ring and the RPC path decide it alike (`end_decision`).
+#[derive(Debug, PartialEq)]
+enum EndDecision {
+    /// Nobody is left to tell: nothing is sent, and the end returns `DeadObject`.
+    Dead,
+    /// Send the caller's end, or `truncated` in its place when items went missing; the end
+    /// returns `failed` if set, else what the send returned.
+    Send {
+        truncated: Option<String>,
+        failed: Option<StatusCode>,
+    },
+}
+
+/// How `end` (and `end_async`) ends a stream after an earlier failure `failed`, with `lost`
+/// items never delivered and the caller's end carrying `exception`.
+///
+/// `dead` is the ring's `dead` flag. The RPC path passes `false`: it does not consult the
+/// sink's death here and sends the end anyway, which a dead sink then refuses.
+fn end_decision(
+    failed: Option<StatusCode>,
+    dead: bool,
+    canceled: bool,
+    lost: i32,
+    exception: i32,
+) -> EndDecision {
+    if dead || failed == Some(StatusCode::DeadObject) {
+        return EndDecision::Dead;
+    }
+    // After a cancel no loss or earlier failure is reported: the consumer asked for no more.
+    if canceled {
+        return EndDecision::Send {
+            truncated: None,
+            failed: None,
+        };
+    }
+    EndDecision::Send {
+        truncated: truncated_terminator(exception, lost),
+        failed,
+    }
+}
+
+impl EndDecision {
+    /// Send the end with `send` (given the truncated message, `None` for the caller's end) and
+    /// return the end's result; an earlier failure wins, and a failed send is then only logged.
+    fn send(self, send: impl FnOnce(Option<&str>) -> Result<()>) -> Result<()> {
+        let EndDecision::Send { truncated, failed } = self else {
+            return Err(StatusCode::DeadObject);
+        };
+        let sent = send(truncated.as_deref());
+        let Some(e) = failed else {
+            return sent;
+        };
+        // The consumer still waits for the end, so it went out regardless.
+        if let Err(end) = sent {
+            log::warn!("stream: the end could not be delivered: {end:?}");
+        }
+        Err(e)
+    }
 }
 
 /// Split a [`Status`] into the three `onEnd` arguments.
@@ -1827,6 +1930,87 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread;
+
+    /// Every combination: death sends nothing; a cancel sends the caller's end and reports
+    /// nothing earlier; otherwise losses cut the end and an earlier failure is passed on. The
+    /// RPC path's `dead` is always `false` (`end_decision`'s doc), so its rows are the
+    /// `dead = false` half.
+    #[test]
+    fn an_end_is_decided_alike_on_both_paths() {
+        let ok = ExceptionCode::None as i32;
+        let own = ExceptionCode::IllegalArgument as i32;
+        for failed in [
+            None,
+            Some(StatusCode::DeadObject),
+            Some(StatusCode::TimedOut),
+        ] {
+            for dead in [false, true] {
+                for canceled in [false, true] {
+                    for lost in [0, 2] {
+                        for exception in [ok, own] {
+                            let got = end_decision(failed, dead, canceled, lost, exception);
+                            let row = (failed, dead, canceled, lost, exception);
+                            if dead || failed == Some(StatusCode::DeadObject) {
+                                assert_eq!(got, EndDecision::Dead, "{row:?}");
+                                continue;
+                            }
+                            let EndDecision::Send {
+                                truncated,
+                                failed: passed,
+                            } = got
+                            else {
+                                panic!("{row:?}: nobody is dead, so the end goes out");
+                            };
+                            if canceled {
+                                assert_eq!((truncated, passed), (None, None), "{row:?}");
+                                continue;
+                            }
+                            assert_eq!(passed, failed, "{row:?}");
+                            // A producer's own failure is more specific than a count of losses.
+                            let cut = lost > 0 && exception == ok;
+                            assert_eq!(truncated.is_some(), cut, "{row:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The end goes out whatever came before, unless nobody is left; an earlier failure wins.
+    #[test]
+    fn an_end_decision_sends_once_and_returns_the_earlier_failure() {
+        let mut calls = 0;
+        assert_eq!(
+            EndDecision::Dead.send(|_| {
+                calls += 1;
+                Ok(())
+            }),
+            Err(StatusCode::DeadObject)
+        );
+        assert_eq!(calls, 0, "nothing is sent to the dead");
+
+        let earlier = EndDecision::Send {
+            truncated: Some("cut".into()),
+            failed: Some(StatusCode::TimedOut),
+        };
+        let mut seen = None;
+        let answer = earlier.send(|truncated| {
+            seen = truncated.map(str::to_owned);
+            Err(StatusCode::FailedTransaction)
+        });
+        assert_eq!(answer, Err(StatusCode::TimedOut));
+        assert_eq!(seen.as_deref(), Some("cut"));
+
+        let clean = EndDecision::Send {
+            truncated: None,
+            failed: None,
+        };
+        assert_eq!(
+            clean.send(|_| Err(StatusCode::FailedTransaction)),
+            Err(StatusCode::FailedTransaction),
+            "with nothing earlier, the send's own result is the answer"
+        );
+    }
 
     /// A local peer is kernel-class, so this is the ring on Linux; RPC is `tests/stream_rpc.rs`.
     fn pair<T: Serialize + Deserialize>() -> (Sink<T>, Receiver<T>) {

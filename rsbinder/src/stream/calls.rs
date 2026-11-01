@@ -26,8 +26,10 @@ use super::generated::rsbinder::stream::IStreamSource::{
 };
 #[cfg(feature = "tokio")]
 use super::pool::on_pool;
+#[cfg(feature = "tokio")]
+use super::EndDecision;
 use super::{
-    status_from_fields, truncated_terminator, watch_death, Ping, PingPolicy, ReceiverPolicy,
+    end_decision, status_from_fields, watch_death, Book, Ping, PingPolicy, ReceiverPolicy,
     SinkPolicy,
 };
 
@@ -41,10 +43,7 @@ fn park<S>(
     deadline: Option<Instant>,
     ping: Option<&Ping>,
 ) {
-    let quiet_until = ping.and_then(|ping| Instant::now().checked_add(ping.every));
-    // A caller's deadline that comes first ends the wait without a ping.
-    let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
-    let wake_at = if pings { quiet_until } else { deadline };
+    let (wake_at, pings) = Ping::wake_at(ping, deadline);
     let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
     while blocked(&state) {
         state = match signal
@@ -329,25 +328,16 @@ where
 
 // ---- Producer ----
 
-#[derive(Default)]
-struct LedgerState {
-    /// Items that left the pending batch and never arrived; only the terminator can report them.
-    lost: i32,
-    /// A send that failed with nobody told yet; the next call returns it.
-    unreported: Option<StatusCode>,
-    /// A failed send's delivery is unknown, so remaining credit is too; nothing more is sent.
-    broken: Option<StatusCode>,
-}
-
 /// Batch outcomes, written by the pool task: dropping a `*_async` future detaches, not cancels it.
+/// A failed send whose delivery is unknown breaks the stream: its credit is unknown too.
 #[derive(Default)]
 struct Ledger {
     /// Up while a batch is on its way; nothing may be sent past it, lest it arrive out of order.
-    gate: PoolGate<LedgerState>,
+    gate: PoolGate<Book>,
 }
 
 impl Ledger {
-    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
         self.gate.lock()
     }
 
@@ -356,8 +346,7 @@ impl Ledger {
     }
 
     fn add_lost(&self, count: i32) {
-        let mut state = self.lock();
-        state.lost = state.lost.saturating_add(count);
+        self.lock().add_lost(count);
     }
 
     fn take_unreported(&self) -> Option<StatusCode> {
@@ -448,14 +437,11 @@ impl Drop for BatchInTransit {
             self.credit.grant(1);
         }
         // One critical section with the gate's lowering: a waiter that sees it down sees this.
-        self.ledger.gate.settle(|state| {
+        self.ledger.gate.settle(|book| {
             if let Some(e) = failure {
-                state.lost = state.lost.saturating_add(self.count);
-                state.unreported = Some(e);
+                book.add_lost(self.count);
                 // Delivery unknown: the credit can neither be given back nor kept safely.
-                if !not_delivered {
-                    state.broken = Some(e);
-                }
+                book.record_failure(e, !not_delivered);
             }
         });
     }
@@ -585,9 +571,9 @@ impl<T: Serialize + ?Sized> Producer<T> {
         self.send_with_credit()
     }
 
-    /// The error that broke the stream, if one has: see `LedgerState::broken`.
+    /// The error that broke the stream, if one has: see [`Ledger`].
     fn usable(&self) -> Result<()> {
-        self.ledger.broken().map_or(Ok(()), Err)
+        self.ledger.lock().usable()
     }
 
     /// Queue one item; `true` when the batch has reached its threshold and should go out.
@@ -645,8 +631,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
 
     /// The last batch's failure, reported once; a broken stream reports it on every call.
     fn reported(&self) -> Result<()> {
-        let unreported = self.ledger.take_unreported();
-        unreported.or(self.ledger.broken()).map_or(Ok(()), Err)
+        self.ledger.lock().reported()
     }
 
     pub(super) fn terminate(
@@ -669,39 +654,15 @@ impl<T: Serialize + ?Sized> Producer<T> {
             }
             (Ok(()), stale) => stale,
         };
-        match failed {
-            // Nobody is left to tell.
-            Some(StatusCode::DeadObject) => Err(StatusCode::DeadObject),
-            // After a cancel no loss or flush failure is reported: the consumer asked for no more.
-            _ if self.credit.is_canceled() => {
-                self.peer.on_end(exception, service_specific, message)
-            }
-            // The consumer still blocks in `recv`: end it anyway, report the earlier flush error.
-            Some(e) => {
-                if let Err(end) = self.send_terminator(exception, service_specific, message) {
-                    log::warn!("stream: the terminator could not be delivered: {end:?}");
-                }
-                Err(e)
-            }
-            // Caller's terminator, unless an earlier send lost items, which nothing else reports.
-            None => self.send_terminator(exception, service_specific, message),
-        }
-    }
-
-    /// The caller's terminator, or the one saying items went missing when any did.
-    fn send_terminator(
-        &self,
-        exception: i32,
-        service_specific: i32,
-        message: Option<&str>,
-    ) -> Result<()> {
-        match truncated_terminator(exception, self.ledger.lost()) {
+        let canceled = self.credit.is_canceled();
+        let decision = end_decision(failed, false, canceled, self.ledger.lost(), exception);
+        decision.send(|truncated| match truncated {
             Some(truncated) => {
                 self.peer
-                    .on_end(ExceptionCode::IllegalState as i32, 0, Some(&truncated))
+                    .on_end(ExceptionCode::IllegalState as i32, 0, Some(truncated))
             }
             None => self.peer.on_end(exception, service_specific, message),
-        }
+        })
     }
 
     /// The item is encoded now; the returned future sends the batch if it is full.
@@ -799,20 +760,17 @@ impl<T: Serialize + ?Sized> Producer<T> {
             }
             (Ok(()), stale) => stale,
         };
-        // As in `terminate`: only a dead consumer leaves nobody to send the terminator to.
-        if let Some(StatusCode::DeadObject) = failed {
+        // As in `terminate`; the end goes out from the pool, so the decision is taken apart here.
+        let canceled = self.credit.is_canceled();
+        let decision = end_decision(failed, false, canceled, self.ledger.lost(), exception);
+        let EndDecision::Send { truncated, failed } = decision else {
             self.ended = true;
             return Err(StatusCode::DeadObject);
-        }
-        let canceled = self.credit.is_canceled();
-        // As in `terminate`: cancel keeps the caller's end; losses are reported here or nowhere.
-        let (exception, service_specific, message) =
-            match truncated_terminator(exception, self.ledger.lost()) {
-                Some(truncated) if !canceled => {
-                    (ExceptionCode::IllegalState as i32, 0, Some(truncated))
-                }
-                _ => (exception, service_specific, message),
-            };
+        };
+        let (exception, service_specific, message) = match truncated {
+            Some(truncated) => (ExceptionCode::IllegalState as i32, 0, Some(truncated)),
+            None => (exception, service_specific, message),
+        };
         let outcome = Arc::new(std::sync::OnceLock::new());
         let terminator = TerminatorInTransit {
             peer: self.peer.clone(),
@@ -832,10 +790,8 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // The token's answer first: if the pool never ran it, its `Drop` still sent the end.
         let sent = outcome.get().copied();
         let ended = sent.unwrap_or(pooled);
-        match failed {
-            Some(e) if !canceled => Err(e),
-            _ => ended,
-        }
+        // `deliver` logged a failed send; an earlier failure is the answer, as in `send`.
+        failed.map_or(ended, Err)
     }
 
     /// Batches this producer may still send without waiting.
