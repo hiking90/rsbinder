@@ -2062,6 +2062,38 @@ fn an_ended_publisher_with_no_binder_after_it_asks_the_lookup() {
     assert_eq!(names.lookups(), 1);
 }
 
+/// A lookup that panics ends its connection thread, and the next notice starts another.
+#[test]
+fn a_lookup_that_panics_leaves_the_next_notice_free_to_connect() {
+    let names = Names::looking();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let (panicked, seen) = mpsc::channel();
+    let calls = AtomicUsize::new(0);
+    names.before_lookup(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panicked.send(()).unwrap();
+            panic!("the test's lookup panics");
+        }
+    });
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    seen.recv_timeout(WAIT).expect("the lookup was asked");
+    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    next.publish(&bytes(5)).unwrap();
+    // A notice while the thread still unwinds finds `connecting` set: give it again.
+    let deadline = Instant::now() + WAIT;
+    while !subscriber.wait_connected(Duration::from_millis(20)) {
+        assert!(Instant::now() < deadline, "connected within {WAIT:?}");
+        names.give(NAME, next.as_binder());
+    }
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+}
+
 /// The death of the connection's publisher is an end too.
 #[test]
 fn a_dead_publisher_with_no_binder_after_it_asks_the_lookup() {

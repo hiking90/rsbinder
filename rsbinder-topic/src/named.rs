@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::fd::BorrowedFd;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder::{
@@ -1416,7 +1416,8 @@ impl<T: Payload + 'static> Named<T> {
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-connect".into())
             .spawn(move || named.run(begin, after));
-        if spawned.is_err() {
+        if let Err(error) = spawned {
+            log::warn!("topic: no thread to connect to the name's publisher: {error}");
             // The next registration of the name tries again.
             self.lock().connecting = false;
         }
@@ -1424,6 +1425,7 @@ impl<T: Payload + 'static> Named<T> {
 
     /// The connection thread: subscribe from `begin` after `after`, retry, move to a newer binder.
     fn run(self: Arc<Self>, begin: Begin, after: Duration) {
+        let _unwinding = Connecting(&self);
         // Whether `binder` is the lookup's answer: its refusal asks no more.
         let (mut binder, mut looked) = match begin {
             Begin::At(binder) => (binder, false),
@@ -1596,6 +1598,21 @@ impl<T: Payload + 'static> Named<T> {
         };
         state.connecting = next.is_some();
         next
+    }
+}
+
+/// Clears `connecting` when the connection thread unwinds (a resolver's lookup may panic).
+struct Connecting<'n, T: Payload>(&'n Named<T>);
+
+impl<T: Payload> Drop for Connecting<'_, T> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.connecting = false;
+        drop(state);
+        self.0.signal();
     }
 }
 
