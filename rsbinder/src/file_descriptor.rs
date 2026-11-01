@@ -68,8 +68,7 @@ impl ParcelFileDescriptor {
     /// `ParcelFileDescriptor::dup`. Useful when you must both keep an fd and
     /// hand a copy to a parcel.
     pub fn try_clone(&self) -> Result<Self> {
-        let dup = rustix::io::fcntl_dupfd_cloexec(&self.0, 0).map_err(errno_status)?;
-        Ok(Self(dup))
+        Ok(Self(dup_cloexec(self.0.as_fd())?))
     }
 
     /// A new pipe as two `ParcelFileDescriptor`s, `(read, write)` —
@@ -256,6 +255,11 @@ pub(crate) fn write_raw_fd(parcel: &mut Parcel, fd: BorrowedFd<'_>) -> Result<()
 /// Fd-mode gate + dup, run before writing anything so a failure leaves the parcel untouched.
 fn dup_for_parcel(parcel: &Parcel, fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     rpc_fd_profile(parcel)?;
+    dup_cloexec(fd)
+}
+
+/// `fcntl(F_DUPFD_CLOEXEC, 0)`: the lowest free fd, as AOSP's `dup`; std's `try_clone` starts at 3.
+pub(crate) fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(errno_status)
 }
 

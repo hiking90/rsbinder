@@ -486,9 +486,9 @@ impl<I: FromIBinder + ?Sized> std::fmt::Debug for Rewrap<I> {
     }
 }
 
-// Thin data address (vtables may differ); `Entry.remote`'s `Weak` keeps it from being reused.
+// `Entry.remote`'s `Weak` keeps the allocation, so the address is not reused while keyed.
 fn key_of(binder: &SIBinder) -> usize {
-    Arc::as_ptr(binder.as_arc()) as *const () as usize
+    binder.addr()
 }
 
 #[cfg(test)]

@@ -310,10 +310,7 @@ impl<'a> SharedBytes<'a> {
 
     /// The sub-window `[off, off + len)`, or `None` if out of bounds.
     pub fn slice(&self, off: usize, len: usize) -> Option<SharedBytes<'a>> {
-        let end = off.checked_add(len)?;
-        if end > self.len {
-            return None;
-        }
+        check_range(self.len, off, len).ok()?;
         Some(Self {
             area: self.area,
             off: self.off + off,

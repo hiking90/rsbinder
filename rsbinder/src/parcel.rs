@@ -2229,8 +2229,7 @@ impl Parcel {
 
     /// A dup of the fd of the FD object at the cursor; the parcel keeps its own.
     pub(crate) fn read_kernel_fd_dup(&mut self) -> Result<OwnedFd> {
-        self.read_kernel_fd_with(|fd| rustix::io::fcntl_dupfd_cloexec(fd, 0))?
-            .map_err(crate::error::errno_status)
+        self.read_kernel_fd_with(crate::file_descriptor::dup_cloexec)?
     }
 
     /// The fd of this parcel's FD object at `at`: the table's entry, or a `from_ipc_parts` handle.
@@ -2499,8 +2498,7 @@ impl Parcel {
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
                     // `off` is uncommitted until the push below, so a failed dup leaves no entry.
-                    let newfd = rustix::io::fcntl_dupfd_cloexec(other.kernel_fd_at(src)?, 0)
-                        .map_err(crate::error::errno_status)?;
+                    let newfd = crate::file_descriptor::dup_cloexec(other.kernel_fd_at(src)?)?;
                     flat.set_handle(std::os::fd::AsRawFd::as_raw_fd(&newfd) as _);
                     flat.set_cookie(1);
                     write_flat_binder(self.data.as_mut_slice(), off, &flat)?;
@@ -2553,8 +2551,7 @@ impl Parcel {
                         .and_then(|idx| usize::try_from(idx).ok())
                         .and_then(|idx| other.rpc.as_ref()?.source_fd(idx))
                         .ok_or(StatusCode::BadValue)?;
-                    let dup = rustix::io::fcntl_dupfd_cloexec(fd, 0)
-                        .map_err(|e| StatusCode::from(std::io::Error::from(e)))?;
+                    let dup = crate::file_descriptor::dup_cloexec(fd)?;
                     fds.push((rel + 4, dup));
                 }
                 Some(_) => {

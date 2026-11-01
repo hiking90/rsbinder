@@ -330,15 +330,10 @@ impl std::fmt::Debug for CancellationToken {
 pub fn cancel_remote(binder: &SIBinder) -> Result<()> {
     let expected = <BpCancellationSignal as crate::Proxy>::descriptor();
     // An interface not known without a transaction is not asked for (plan 16 D6), nor by the cast.
-    if let Some(actual) = binder.cached_descriptor() {
-        if actual != expected {
-            log::error!("cancel_remote: not an {expected}: {actual:?}");
-            return Err(StatusCode::BadType);
-        }
-    }
+    binder.refuse_known_other(expected, "cancel_remote")?;
     let signal: Strong<dyn ICancellationSignal> =
         FromIBinder::try_from(binder.clone()).map_err(|e| {
-            log::error!("cancel_remote: not an android.os.ICancellationSignal: {e:?}");
+            log::error!("cancel_remote: not an {expected}: {e:?}");
             StatusCode::BadType
         })?;
     signal.r#cancel().map_err(StatusCode::from)

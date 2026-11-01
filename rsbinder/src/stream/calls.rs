@@ -325,12 +325,7 @@ fn resolve_peer<I>(binder: &SIBinder, expected: &str, what: &str) -> Result<Peer
 where
     I: FromIBinder + ?Sized,
 {
-    if let Some(actual) = binder.cached_descriptor() {
-        if actual != expected {
-            log::error!("{what}: not an {expected}: {actual:?}");
-            return Err(StatusCode::BadType);
-        }
-    }
+    binder.refuse_known_other(expected, what)?;
     let typed = FromIBinder::try_from(binder.clone()).map_err(|e| {
         log::error!("{what}: not an {expected}: {e:?}");
         StatusCode::BadType

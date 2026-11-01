@@ -1393,6 +1393,26 @@ impl SIBinder {
         FromIBinder::try_from(self)
     }
 
+    /// The data address of the binder's allocation, its identity as a map key: not the
+    /// trait-object pointer, whose vtable half may differ between two `Arc`s of one binder.
+    /// It names that binder only while something keeps the allocation alive.
+    pub(crate) fn addr(&self) -> usize {
+        Arc::as_ptr(self.as_arc()) as *const () as usize
+    }
+
+    /// `BadType` when this binder's descriptor is known without a transaction and is not
+    /// `expected`; `Ok` when it matches or is not known, which nothing here asks (plan 16 D6).
+    /// `what` names the caller in the log.
+    pub(crate) fn refuse_known_other(&self, expected: &str, what: &str) -> Result<()> {
+        match self.cached_descriptor() {
+            Some(actual) if actual != expected => {
+                log::error!("{what}: not an {expected}: {actual:?}");
+                Err(StatusCode::BadType)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// [`into_interface`](Self::into_interface) that also asks a remote
     /// binder for its interface descriptor and refuses another interface
     /// with [`StatusCode::BadType`] (AOSP C++ `checked_interface_cast`).
