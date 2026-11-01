@@ -366,13 +366,10 @@ impl IBinder for RpcProxy {
     }
 
     fn descriptor(&self) -> &str {
-        self.try_descriptor().unwrap_or_else(|err| {
-            log::warn!(
-                "RPC addr {:?}: interface descriptor query failed: {err:?}",
-                self.addr
-            );
-            ""
-        })
+        crate::binder::descriptor_or_empty(
+            self.try_descriptor(),
+            format_args!("RPC addr {:?}", self.addr),
+        )
     }
 
     fn try_descriptor(&self) -> Result<&str> {

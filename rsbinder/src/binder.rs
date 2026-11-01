@@ -775,6 +775,18 @@ pub(crate) fn read_interface_reply(reply: Option<Parcel>) -> Result<String> {
     Ok(interface.unwrap_or_default())
 }
 
+/// A proxy's `descriptor()`: its `try_descriptor` answer, or `""` after logging which proxy
+/// (`who`) could not say.
+pub(crate) fn descriptor_or_empty<'a>(
+    answer: Result<&'a str>,
+    who: std::fmt::Arguments<'_>,
+) -> &'a str {
+    answer.unwrap_or_else(|err| {
+        log::warn!("interface descriptor of {who} unavailable: {err:?}");
+        ""
+    })
+}
+
 /// `Debug`'s descriptor, never a transaction (AOSP `BPBINDER_BEST_DESCRIPTOR_LOCKED`).
 fn descriptor_for_debug(binder: &dyn IBinder) -> &str {
     binder.cached_descriptor().unwrap_or("(not cached)")

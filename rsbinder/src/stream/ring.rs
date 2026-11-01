@@ -377,6 +377,19 @@ impl Transit {
     }
 }
 
+/// `BadValue` for a ring of `capacity` bytes that leaves no item record, a header and a byte of
+/// payload, past the reserve the end record keeps; both ends refuse one.
+fn room_for_an_item(capacity: usize, who: &str) -> Result<()> {
+    if capacity <= END_RESERVE + HEADER {
+        log::error!(
+            "{who}: a ring of {capacity} bytes leaves no room for an item past the \
+             {END_RESERVE}-byte reserve for the end record"
+        );
+        return Err(StatusCode::BadValue);
+    }
+    Ok(())
+}
+
 // --- Records ---
 
 fn item_header(len: usize) -> u32 {
@@ -508,14 +521,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             StatusCode::from(e)
         })?;
         let capacity = queue.capacity();
-        // An item record needs its header and a payload byte past the reserve.
-        if capacity <= END_RESERVE + HEADER {
-            log::error!(
-                "Sink::open: a ring of {capacity} bytes leaves no room for an item past the \
-                 {END_RESERVE}-byte reserve for the end record"
-            );
-            return Err(StatusCode::BadValue);
-        }
+        room_for_an_item(capacity, "Sink::open")?;
         // `require_event_flag` above makes this `Some`.
         let flag = queue.event_flag().ok_or(StatusCode::InvalidOperation)?;
         let shared = Shared::new(queue, flag, capacity);
@@ -959,15 +965,7 @@ pub(super) struct Consumer<T> {
 impl<T: Deserialize> Consumer<T> {
     /// Make the ring and the sink binder; the caller builds the endpoint.
     pub(super) fn new(policy: &ReceiverPolicy) -> Result<(Self, Ring, SIBinder)> {
-        // Same bound as `Producer::open`: a header and a byte of payload past the reserve.
-        if policy.ring_bytes <= END_RESERVE + HEADER {
-            log::error!(
-                "Receiver::new: a ring of {} bytes leaves no room for an item past the \
-                 {END_RESERVE}-byte reserve for the end record",
-                policy.ring_bytes
-            );
-            return Err(StatusCode::BadValue);
-        }
+        room_for_an_item(policy.ring_bytes, "Receiver::new")?;
         let queue = MessageQueue::<u8>::create(policy.ring_bytes, true).map_err(|e| {
             log::error!("Receiver::new: the ring cannot be made: {e}");
             StatusCode::from(e)

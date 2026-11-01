@@ -280,13 +280,10 @@ impl ProxyHandle {
     /// for its answer; see [`try_descriptor`](Self::try_descriptor). Do not call it under a lock
     /// another binder thread may need.
     pub fn descriptor(&self) -> &str {
-        self.try_descriptor().unwrap_or_else(|err| {
-            log::warn!(
-                "interface descriptor of handle {} unavailable: {err:?}",
-                self.handle
-            );
-            ""
-        })
+        crate::binder::descriptor_or_empty(
+            self.try_descriptor(),
+            format_args!("handle {}", self.handle),
+        )
     }
 
     /// The remote object's interface descriptor, asked for on the first call (AOSP
