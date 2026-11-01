@@ -347,13 +347,36 @@ struct ThreadExitGuard {
 impl Drop for ThreadExitGuard {
     fn drop(&mut self) {
         // TLS destruction order is unspecified; `THREAD_STATE` may already be gone.
-        if THREAD_STATE.try_with(|_| ()).is_ok() {
-            if let Err(e) = flush_commands() {
-                log::warn!("flush on binder thread exit failed: {e}");
-            }
+        if let Err(e) = flush_commands_if_alive() {
+            log::warn!("flush on binder thread exit failed: {e}");
         }
-        if let Err(e) = binder::thread_exit(&*self.driver, 0) {
-            log::warn!("BINDER_THREAD_EXIT failed: {e}");
+        exit_thread(&self.driver, "");
+    }
+}
+
+/// `BINDER_THREAD_EXIT`, a failure logged with `when`: the driver forgets this thread.
+fn exit_thread(driver: &File, when: &str) {
+    if let Err(e) = binder::thread_exit(driver, 0) {
+        log::warn!("BINDER_THREAD_EXIT{when} failed: {e}");
+    }
+}
+
+/// `BINDER_WRITE_READ`, made again when a signal interrupts it.
+///
+/// # Safety
+///
+/// As [`binder::write_read`]: `write` frees a buffer only through `free_buffer` (`sys` doc).
+unsafe fn write_read_retrying(
+    driver: &File,
+    write: &[u8],
+    read: &mut [u8],
+    bwr: &mut binder::binder_write_read,
+) -> rustix::io::Result<()> {
+    loop {
+        // SAFETY: the caller's contract, as above.
+        match unsafe { binder::write_read(driver, write, read, bwr) } {
+            Err(rustix::io::Errno::INTR) => {}
+            res => return res,
         }
     }
 }
@@ -936,9 +959,22 @@ impl ThreadState {
         self.strict_mode_policy = policy;
     }
 
-    /// Next command's `(flush epoch, out_parcel length)`, for `discard_unflushed_commands`.
+    /// Next command's `(flush epoch, out_parcel length)`, for [`rewind_to`](Self::rewind_to).
     fn unflushed_mark(&self) -> (u64, usize) {
         (self.out_flush_epoch, self.out_parcel.data_size())
+    }
+
+    /// Drops what was queued since `mark` if the driver has consumed nothing since: the bytes
+    /// dropped, `None` when there were none or they went out (module doc "Rewinding unflushed
+    /// commands").
+    fn rewind_to(&mut self, mark: (u64, usize)) -> Option<usize> {
+        let (epoch, len) = mark;
+        let queued = self.out_parcel.data_size();
+        if self.out_flush_epoch != epoch || queued <= len {
+            return None;
+        }
+        let _ = self.out_parcel.set_data_size(len);
+        Some(queued - len)
     }
 
     pub(crate) fn _strict_mode_policy(&self) -> i32 {
@@ -1252,20 +1288,10 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                 binder::BR_DEAD_REPLY => {
                     return Err(StatusCode::DeadObject);
                 }
-                binder::BR_FAILED_REPLY => {
+                binder::BR_FAILED_REPLY | binder::BR_FROZEN_REPLY => {
                     log::error!(
-                        "Received FAILED_REPLY transaction reply for pid {}",
-                        thread_state
-                            .borrow()
-                            .transaction
-                            .as_ref()
-                            .map_or(0, |state| state.calling_pid)
-                    );
-                    return Err(StatusCode::FailedTransaction);
-                }
-                binder::BR_FROZEN_REPLY => {
-                    log::error!(
-                        "Received FROZEN_REPLY transaction reply for pid {}",
+                        "Received {} transaction reply for pid {}",
+                        return_to_str(cmd as _),
                         thread_state
                             .borrow()
                             .transaction
@@ -1283,26 +1309,16 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                 }
                 binder::BR_REPLY => {
                     let tr = thread_state.borrow_mut().in_parcel.read_transaction()?;
-                    let (buffer, offsets) = (tr.buffer, tr.offsets);
                     if let UntilResponse::Reply = until {
                         if (tr.flags & TF_STATUS_CODE) == 0 {
-                            // SAFETY: the driver's BR_REPLY buffer, unshared until `free_buffer`.
-                            let reply = unsafe {
-                                Parcel::from_driver_buffer(
-                                    buffer as _,
-                                    tr.data_size as _,
-                                    offsets as _,
-                                    (tr.offsets_size as usize)
-                                        / std::mem::size_of::<binder::binder_size_t>(),
-                                    free_buffer,
-                                )
-                            };
+                            // SAFETY: the BR_REPLY just read, its buffer unshared until freed.
+                            let reply = unsafe { driver_parcel(&tr) };
                             return Ok(Some(reply));
                         } else {
                             // SAFETY: guarded by the size check; buffer live until `free_buffer`.
                             let status: StatusCode =
                                 if tr.data_size >= std::mem::size_of::<i32>() as u64 {
-                                    unsafe { (*(buffer as *const i32)).into() }
+                                    unsafe { (*(tr.buffer as *const i32)).into() }
                                 } else {
                                     log::error!(
                                         "Buffer too small for status code: {} < {}",
@@ -1312,13 +1328,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                                     StatusCode::BadValue
                                 };
                             log::trace!("binder::BR_REPLY ({status})");
-                            free_buffer(
-                                None,
-                                buffer,
-                                tr.data_size as _,
-                                offsets,
-                                (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>(),
-                            )?;
+                            free_driver_buffer(&tr)?;
 
                             if status != StatusCode::Ok {
                                 log::warn!("binder::BR_REPLY ({status})");
@@ -1328,13 +1338,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
                             return Ok(Some(Parcel::new()));
                         }
                     } else {
-                        free_buffer(
-                            None,
-                            buffer,
-                            tr.data_size as _,
-                            offsets,
-                            (tr.offsets_size as usize) / std::mem::size_of::<binder_size_t>(),
-                        )?;
+                        free_driver_buffer(&tr)?;
                     }
                 }
                 _ => {
@@ -1444,6 +1448,70 @@ fn dispatch_kernel_observed(
     .map_err(handler_reply_status)
 }
 
+/// The local binder a `BR_TRANSACTION` is for: the native with `publish_native` id
+/// `target_ptr` (lifetime: module doc "Dispatch notes"), or for 0 the context manager.
+/// `DeadObject` when there is none.
+fn transaction_target(target_ptr: binder_uintptr_t) -> Result<SIBinder> {
+    if target_ptr != 0 {
+        let id = target_ptr;
+        return match ProcessState::as_self().lookup_native(id) {
+            Some(arc) => Ok(SIBinder::from_arc(arc)),
+            None => {
+                log::error!("BR_TRANSACTION for unknown native id {id}");
+                Err(StatusCode::DeadObject)
+            }
+        };
+    }
+    ProcessState::as_self().context_manager().ok_or_else(|| {
+        log::error!("BR_TRANSACTION to handle 0 but no context manager set");
+        StatusCode::DeadObject
+    })
+}
+
+/// `BR_INCREFS`/`BR_ACQUIRE` (`cmd`): the native's count, then `done` with id and cookie.
+fn acknowledge_ref(thread_state: &RefCell<ThreadState>, cmd: u32, done: u32) -> Result<()> {
+    let (id, cookie_echo) = {
+        let mut state = thread_state.borrow_mut();
+        let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+        // The cookie (0 for our natives) is echoed verbatim in the done.
+        (id, state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?)
+    };
+    // Id bookkeeping only; the table entry keeps the native alive.
+    if ProcessState::as_self().ref_native_kernel(id).is_none() {
+        let name = return_to_str(cmd);
+        log::error!("{name} for unknown native id {id}");
+        debug_assert!(false, "{name} for unknown native id {id}");
+    }
+    let mut state = thread_state.borrow_mut();
+    state.out_parcel.write_cmd::<u32>(&done)?;
+    state
+        .out_parcel
+        .write_cmd::<binder::binder_uintptr_t>(&id)?;
+    state
+        .out_parcel
+        .write_cmd::<binder::binder_uintptr_t>(&cookie_echo)
+}
+
+/// `BR_RELEASE` (`strong`) or `BR_DECREFS`: queued for `process_pending_derefs`, as AOSP.
+fn defer_deref(thread_state: &RefCell<ThreadState>, strong: bool) -> Result<()> {
+    let id = {
+        let mut state = thread_state.borrow_mut();
+        let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+        // The cookie echo is unused on the deferred-deref path.
+        state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
+        id
+    };
+    BINDER_DEREFS.with(|binder_derefs| {
+        let mut binder_derefs = binder_derefs.borrow_mut();
+        if strong {
+            binder_derefs.pending_strong_derefs.push_back(id);
+        } else {
+            binder_derefs.pending_weak_derefs.push_back(id);
+        }
+    });
+    Ok(())
+}
+
 fn execute_command(cmd: i32) -> Result<()> {
     let cmd: std::os::raw::c_uint = cmd as _;
 
@@ -1474,16 +1542,8 @@ fn execute_command(cmd: i32) -> Result<()> {
                 };
 
                 let tr = &tr_secctx.transaction_data;
-                // SAFETY: the driver's BR_TRANSACTION buffer (`data.ptr`), unshared until freed.
-                let mut reader = unsafe {
-                    Parcel::from_driver_buffer(
-                        tr.buffer as _,
-                        tr.data_size as _,
-                        tr.offsets as _,
-                        (tr.offsets_size as usize) / std::mem::size_of::<binder::binder_size_t>(),
-                        free_buffer,
-                    )
-                };
+                // SAFETY: the BR_TRANSACTION just read; its buffer is unshared until freed.
+                let mut reader = unsafe { driver_parcel(tr) };
 
                 // TODO: AOSP `mServingStackPointer` is not tracked.
 
@@ -1508,58 +1568,25 @@ fn execute_command(cmd: i32) -> Result<()> {
                     Parcel::new()
                 };
 
-                let result = {
-                    let target_ptr = tr.target_ptr();
-                    if target_ptr != 0 {
-                        // A `publish_native` id; lifetime: module doc "Dispatch notes".
-                        let id = target_ptr;
-                        match ProcessState::as_self().lookup_native(id) {
-                            Some(arc) => {
-                                let strong = SIBinder::from_arc(arc);
-                                // May be `None` for a user `IBinder`: reject, no panic.
-                                match strong.as_transactable() {
-                                    Some(t) => dispatch_kernel_observed(
-                                        &strong,
-                                        t,
-                                        &tr_secctx.transaction_data,
-                                        &mut reader,
-                                        &mut reply,
-                                    ),
-                                    None => {
-                                        log::error!("native id {id} is not Transactable");
-                                        Err(StatusCode::UnknownTransaction)
-                                    }
-                                }
-                            }
-                            None => {
-                                log::error!("BR_TRANSACTION for unknown native id {id}");
-                                Err(StatusCode::DeadObject)
-                            }
-                        }
-                    } else {
-                        match ProcessState::as_self().context_manager() {
-                            Some(context) => match context.as_transactable() {
-                                Some(t) => dispatch_kernel_observed(
-                                    &context,
-                                    t,
-                                    &tr_secctx.transaction_data,
-                                    &mut reader,
-                                    &mut reply,
-                                ),
-                                None => {
-                                    log::error!("context manager is not Transactable");
-                                    Err(StatusCode::UnknownTransaction)
-                                }
-                            },
-                            None => {
-                                log::error!(
-                                    "BR_TRANSACTION to handle 0 but no context manager set"
-                                );
-                                Err(StatusCode::DeadObject)
-                            }
+                let result = transaction_target(tr.target_ptr()).and_then(|target| {
+                    // May be `None` for a user `IBinder`: reject, no panic.
+                    match target.as_transactable() {
+                        Some(t) => dispatch_kernel_observed(
+                            &target,
+                            t,
+                            &tr_secctx.transaction_data,
+                            &mut reader,
+                            &mut reply,
+                        ),
+                        None => {
+                            let id = tr.target_ptr();
+                            log::error!(
+                                "the target of BR_TRANSACTION (id {id}) is not Transactable"
+                            );
+                            Err(StatusCode::UnknownTransaction)
                         }
                     }
-                };
+                });
                 // Freed before the reply, as AOSP `executeCommand` does (b/238777741).
                 drop(reader);
                 let flags = tr_secctx.transaction_data.flags;
@@ -1624,74 +1651,10 @@ fn execute_command(cmd: i32) -> Result<()> {
                 }
             }
 
-            binder::BR_INCREFS => {
-                let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                // Cookie (0 for our natives) is echoed verbatim in BC_INCREFS_DONE.
-                let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                drop(state);
-
-                // Id bookkeeping only; the table entry keeps the native alive.
-                if ProcessState::as_self().ref_native_kernel(id).is_none() {
-                    log::error!("BR_INCREFS for unknown native id {id}");
-                    debug_assert!(false, "BR_INCREFS for unknown native id {id}");
-                }
-
-                let mut state = thread_state.borrow_mut();
-                state
-                    .out_parcel
-                    .write_cmd::<u32>(&binder::BC_INCREFS_DONE)?;
-                state
-                    .out_parcel
-                    .write_cmd::<binder::binder_uintptr_t>(&id)?;
-                state
-                    .out_parcel
-                    .write_cmd::<binder::binder_uintptr_t>(&cookie_echo)?;
-            }
-            binder::BR_ACQUIRE => {
-                let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                let cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                drop(state);
-
-                // Bookkeeping only, as BR_INCREFS.
-                if ProcessState::as_self().ref_native_kernel(id).is_none() {
-                    log::error!("BR_ACQUIRE for unknown native id {id}");
-                    debug_assert!(false, "BR_ACQUIRE for unknown native id {id}");
-                }
-
-                let mut state = thread_state.borrow_mut();
-                state
-                    .out_parcel
-                    .write_cmd::<u32>(&(binder::BC_ACQUIRE_DONE))?;
-                state
-                    .out_parcel
-                    .write_cmd::<binder::binder_uintptr_t>(&id)?;
-                state
-                    .out_parcel
-                    .write_cmd::<binder::binder_uintptr_t>(&cookie_echo)?;
-            }
-            binder::BR_RELEASE => {
-                let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                // cookie echo unused on the deferred-deref path.
-                let _cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-
-                BINDER_DEREFS.with(|binder_derefs| {
-                    let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_strong_derefs.push_back(id);
-                });
-            }
-            binder::BR_DECREFS => {
-                let mut state = thread_state.borrow_mut();
-                let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-                let _cookie_echo = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
-
-                BINDER_DEREFS.with(|binder_derefs| {
-                    let mut binder_derefs = binder_derefs.borrow_mut();
-                    binder_derefs.pending_weak_derefs.push_back(id);
-                });
-            }
+            binder::BR_INCREFS => acknowledge_ref(thread_state, cmd, binder::BC_INCREFS_DONE)?,
+            binder::BR_ACQUIRE => acknowledge_ref(thread_state, cmd, binder::BC_ACQUIRE_DONE)?,
+            binder::BR_RELEASE => defer_deref(thread_state, true)?,
+            binder::BR_DECREFS => defer_deref(thread_state, false)?,
             binder::BR_ATTEMPT_ACQUIRE => {
                 let mut state = thread_state.borrow_mut();
                 let id = state.in_parcel.read_cmd::<binder::binder_uintptr_t>()?;
@@ -1894,13 +1857,8 @@ fn talk_with_driver(do_receive: bool) -> Result<()> {
             &mut []
         };
         let mut bwr = empty_write_read();
-        let res = loop {
-            // SAFETY: `out_parcel` frees buffers only through `free_buffer` (`sys` module doc).
-            match unsafe { binder::write_read(&thread_state.driver, write, read, &mut bwr) } {
-                Err(rustix::io::Errno::INTR) => {}
-                res => break res,
-            }
-        };
+        // SAFETY: `out_parcel` frees buffers only through `free_buffer` (`sys` module doc).
+        let res = unsafe { write_read_retrying(&thread_state.driver, write, read, &mut bwr) };
 
         if receive {
             let filled = if res.is_ok() {
@@ -2066,20 +2024,12 @@ fn write_without_thread_state_with(
     let driver = ProcessState::as_self().driver();
     let write = out.as_bytes()?;
     let mut bwr = empty_write_read();
-    loop {
-        // SAFETY: one command; a `BC_FREE_BUFFER` here comes from `free_buffer` (`sys` module doc).
-        match unsafe { binder::write_read(&*driver, write, &mut [], &mut bwr) } {
-            Ok(()) => break,
-            Err(errno) if errno == rustix::io::Errno::INTR => {}
-            Err(errno) => {
-                log::error!("binder::write_read() after thread-local teardown: {errno}");
-                return Err(errno_status(errno));
-            }
-        }
+    // SAFETY: one command; a `BC_FREE_BUFFER` here comes from `free_buffer` (`sys` module doc).
+    if let Err(errno) = unsafe { write_read_retrying(&driver, write, &mut [], &mut bwr) } {
+        log::error!("binder::write_read() after thread-local teardown: {errno}");
+        return Err(errno_status(errno));
     }
-    if let Err(e) = binder::thread_exit(&*driver, 0) {
-        log::warn!("BINDER_THREAD_EXIT after thread-local teardown failed: {e}");
-    }
+    exit_thread(&driver, " after thread-local teardown");
     Ok(())
 }
 
@@ -2239,15 +2189,41 @@ fn discard_unflushed_commands(
             log::warn!("flush after failed reply also failed: {e}");
         }
     }
-    let (epoch, queued_at) = queued_at;
-    let mut ts = thread_state.borrow_mut();
-    if ts.out_flush_epoch == epoch && ts.out_parcel.data_size() > queued_at {
+    if let Some(dropped) = thread_state.borrow_mut().rewind_to(queued_at) {
         log::error!(
-            "discarding {} unflushed out_parcel bytes that reference released memory",
-            ts.out_parcel.data_size() - queued_at
+            "discarded {dropped} unflushed out_parcel bytes that reference released memory"
         );
-        let _ = ts.out_parcel.set_data_size(queued_at);
     }
+}
+
+/// The parcel over the buffer the driver delivered with `tr`; dropping it calls `free_buffer`.
+///
+/// # Safety
+///
+/// `tr` is a `BR_TRANSACTION` or `BR_REPLY` this thread has just read, so its buffer is the
+/// driver's, unshared and live until freed, which is `Parcel::from_driver_buffer`'s contract.
+unsafe fn driver_parcel(tr: &TransactionData) -> Parcel {
+    // SAFETY: the caller's contract, as above.
+    unsafe {
+        Parcel::from_driver_buffer(
+            tr.buffer as _,
+            tr.data_size as _,
+            tr.offsets as _,
+            tr.offsets_count(),
+            free_buffer,
+        )
+    }
+}
+
+/// Gives back a delivered buffer no parcel took, as [`driver_parcel`]'s drop would.
+fn free_driver_buffer(tr: &TransactionData) -> Result<()> {
+    free_buffer(
+        None,
+        tr.buffer,
+        tr.data_size as _,
+        tr.offsets,
+        tr.offsets_count(),
+    )
 }
 
 // A parcel's fds are closed by its `Drop` before this runs (parcel module doc "Kernel fds").
@@ -2409,14 +2385,7 @@ fn send_flushed(
                 flush_commands()?;
             }
             let mark = thread_state.borrow().unflushed_mark();
-            let rewind = || {
-                let mut ts = thread_state.borrow_mut();
-                let rewound = ts.out_flush_epoch == mark.0 && ts.out_parcel.data_size() > mark.1;
-                if rewound {
-                    let _ = ts.out_parcel.set_data_size(mark.1);
-                }
-                rewound
-            };
+            let rewind = || thread_state.borrow_mut().rewind_to(mark).is_some();
             let written = build(&mut thread_state.borrow_mut().out_parcel);
             if let Err(err) = written {
                 rewind();
