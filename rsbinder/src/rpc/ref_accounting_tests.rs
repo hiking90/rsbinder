@@ -51,6 +51,8 @@
 //!   handler wrote is dropped before the `REPLY`, and with it the release of a proxy in it.
 //! - `t16_a_panicking_drop_of_the_discarded_reply_is_contained`: that drop's own panic (a
 //!   released node's `Drop`) is caught too, and the session keeps serving.
+//! - `t17_a_panic_escaping_a_frame_ends_the_session`: the same `Drop` after an `Err` reply,
+//!   outside any handler guard, ends the serve loop as `Dispatch(Unknown)` and the session.
 //!
 //! # Mutation gates
 //!
@@ -112,6 +114,8 @@ const TX_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 6;
 const TX_ECHO_THEN_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 7;
 /// A fresh binder whose drop panics, written into the reply, then a panic.
 const TX_BOMB_THEN_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 8;
+/// The same binder in the reply, then `Err(BadValue)`: the reply drops after the `REPLY`.
+const TX_BOMB_THEN_ERR: TransactionCode = FIRST_CALL_TRANSACTION + 9;
 
 #[derive(Default)]
 struct Acct {
@@ -176,6 +180,10 @@ impl Remotable for Acct {
             TX_BOMB_THEN_PANIC => {
                 reply.write(&Interface::as_binder(&Binder::new(Bomb)))?;
                 panic!("TX_BOMB_THEN_PANIC")
+            }
+            TX_BOMB_THEN_ERR => {
+                reply.write(&Interface::as_binder(&Binder::new(Bomb)))?;
+                Err(StatusCode::BadValue)
             }
             _ => Err(StatusCode::UnknownTransaction),
         }
@@ -1070,6 +1078,34 @@ fn t16_a_panicking_drop_of_the_discarded_reply_is_contained() {
             p.server.local_node_count(),
             1,
             "{wire:?}: the bomb's node went"
+        );
+    }
+}
+
+/// T17: a panic that escapes the dispatch of a frame (here a released node's `Drop`, after the
+/// `REPLY`) ends the serve loop as `Dispatch(Unknown)` and with it the session, so the caller's
+/// next call fails instead of waiting on a connection no one reads (module doc "Session end").
+#[test]
+fn t17_a_panic_escaping_a_frame_ends_the_session() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let mut p = Pair::new(wire);
+        assert_eq!(
+            p.call(TX_BOMB_THEN_ERR, None).map(drop),
+            Err(StatusCode::BadValue),
+            "{wire:?}: the reply went out before the drop"
+        );
+        let serve = p.serve.take().expect("serve loop");
+        let end = serve.join().expect("the serve loop returns, not unwinds");
+        assert_eq!(
+            end.reason,
+            EndReason::Dispatch(StatusCode::Unknown),
+            "{wire:?}"
+        );
+        assert!(p.server.is_ended(), "{wire:?}");
+        assert_eq!(
+            p.call(TX_ECHO, None).map(drop),
+            Err(StatusCode::DeadObject),
+            "{wire:?}"
         );
     }
 }

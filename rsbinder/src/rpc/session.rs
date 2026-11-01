@@ -590,7 +590,11 @@
 //!   ("Slot pool" "Leaving"). It leaves `ended_locally` alone, so the loops it wakes report `NotLocal`.
 //!
 //! A serve loop's end ends the session whichever connection it served: its worker calls
-//! `close` when `SessionEnd::by` is `Local` and `fail_session` otherwise. The death sequence
+//! `close` when `SessionEnd::by` is `Local` and `fail_session` otherwise. A panic that escapes
+//! a frame's dispatch (a handler's own is caught by `binder::run_handler`; this is user code
+//! run by a release, such as a node's `Drop`) is caught in the loop and ends it as
+//! `EndReason::Dispatch(Unknown)`: unwinding past the worker would leave the session live with
+//! no reader on that connection, so a peer's call on it would wait for good. The death sequence
 //! empties the pool, so the other loops stop with what their transport's shutdown gives them,
 //! or with `EndReason::SessionEnded` when `find_conn_pinned` finds their slot gone between
 //! frames; a loop that ends that way touches nothing, because whoever ended the session ran the
@@ -5092,7 +5096,19 @@ impl RpcSession {
             #[cfg(test)]
             self.inner.shared.run_serve_wait_hook();
             loop {
-                match self.inner.serve_once_on_slot(slot_id) {
+                // An unwind would skip the session end below: module doc "Session end".
+                let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.inner.serve_once_on_slot(slot_id)
+                }));
+                let step = match step {
+                    Ok(step) => step,
+                    Err(payload) => {
+                        let msg = crate::error::panic_message(&payload);
+                        log::error!("RPC: serving slot {slot_id} panicked ({msg}); session ends");
+                        break (EndReason::Dispatch(StatusCode::Unknown), deadline_armed);
+                    }
+                };
+                match step {
                     ServeStep::Continue => {
                         // Lift the admission deadline: later idle waits are unbounded.
                         if first {
