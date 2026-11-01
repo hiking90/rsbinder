@@ -466,8 +466,15 @@ fn drive_handshake_within(
     let Some(d) = deadline else {
         return drive_handshake(conn, stream);
     };
-    stream.set_read_timeout(Some(d))?;
-    stream.set_write_timeout(Some(d))?;
+    let armed = stream
+        .set_read_timeout(Some(d))
+        .and_then(|()| stream.set_write_timeout(Some(d)));
+    match armed {
+        Ok(()) => {}
+        // As `HandshakeDeadline::arm`: XNU refuses it on a shut socket, whose reads end at EOF.
+        Err(_) if stream.peer_closed() == Some(true) => return drive_handshake(conn, stream),
+        Err(e) => return Err(e.into()),
+    }
     // Each wait above; the whole handshake here, against a peer that sends a byte at a time.
     let mut whole = crate::rpc::deadline::PhaseDeadline::arm_with(Some(d), || {
         stream.socket().and_then(super::socket_shutdown_handle)
