@@ -312,9 +312,7 @@ impl<T: Remotable> Inner<T> {
                 log::error!("recording transactions are not supported");
                 Err(StatusCode::InvalidOperation)
             }
-            DEBUG_PID_TRANSACTION => {
-                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
-            }
+            DEBUG_PID_TRANSACTION => reply.write::<i32>(&crate::thread_state::own_pid()),
             _ => match self.remotable.on_transact(code, reader, reply) {
                 Err(StatusCode::UnknownTransaction) => self.on_transact(code, reader, reply),
                 result => result,

@@ -40,6 +40,8 @@
 //!     (`send_weak_pin`, `send_death_request`, `send_freeze_request`), and
 //!     `process_pending_derefs`. `queue_cmd`'s `build` closure only writes into
 //!     the borrowed `out_parcel`; every flush comes after the borrow ends.
+//!     `kernel_transaction`'s `read` closure runs under a shared borrow and
+//!     reads fields of the transaction, nothing more.
 //!
 //! Violation manifests as a `RefCell` panic ("already borrowed" /
 //! "already mutably borrowed"). Binder's nested-IPC protocol means user
@@ -548,18 +550,15 @@ pub fn calling_caller() -> Option<Caller> {
     if !ProcessState::is_initialized() {
         return None;
     }
-    let kernel = THREAD_STATE.with(|thread_state| {
-        let thread_state = thread_state.borrow();
-        thread_state.transaction.as_ref().map(|tr| Caller::Kernel {
-            uid: tr.calling_uid,
-            pid: tr.calling_pid,
-            sid: tr.calling_sid.clone(),
-        })
+    let kernel = kernel_transaction(|tr| Caller::Kernel {
+        uid: tr.calling_uid,
+        pid: tr.calling_pid,
+        sid: tr.calling_sid.clone(),
     });
     kernel.or_else(|| {
         IN_PROCESS_CALL.with(Cell::get).then(|| Caller::InProcess {
-            uid: rustix::process::getuid().as_raw(),
-            pid: rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t,
+            uid: own_uid(),
+            pid: own_pid(),
         })
     })
 }
@@ -674,16 +673,7 @@ pub fn calling_caps() -> Option<crate::TransportCaps> {
             return Some(caps);
         }
     }
-    if !ProcessState::is_initialized() {
-        return None;
-    }
-    THREAD_STATE.with(|thread_state| {
-        let thread_state = thread_state.borrow();
-        thread_state
-            .transaction
-            .as_ref()
-            .map(|_| crate::TransportCaps::KERNEL)
-    })
+    kernel_transaction(|_| crate::TransportCaps::KERNEL)
 }
 
 // `return_to_str` special-cases BR_TRANSACTION_SEC_CTX (nr=2), so nr=20 is PENDING_FROZEN.
@@ -2482,30 +2472,18 @@ impl CallingContext {
                 sid: None,
             };
         }
-        // Pure-RPC process: `THREAD_STATE` would panic; answer with the self identity.
-        if !ProcessState::is_initialized() {
-            return CallingContext {
-                pid: rustix::process::getpid().as_raw_nonzero().get() as _,
-                uid: rustix::process::getuid().as_raw(),
+        let kernel = kernel_transaction(|transaction| CallingContext {
+            pid: transaction.calling_pid,
+            uid: transaction.calling_uid,
+            sid: transaction.calling_sid.clone(),
+        });
+        // Outside a transaction, a pure-RPC process included: the self identity.
+        kernel.unwrap_or_else(|| {
+            log::debug!("CallingContext::current() called outside of transaction");
+            CallingContext {
+                pid: own_pid(),
+                uid: own_uid(),
                 sid: None,
-            };
-        }
-        THREAD_STATE.with(|thread_state| -> CallingContext {
-            let thread_state = thread_state.borrow();
-            match thread_state.transaction.as_ref() {
-                Some(transaction) => CallingContext {
-                    pid: transaction.calling_pid,
-                    uid: transaction.calling_uid,
-                    sid: transaction.calling_sid.clone(),
-                },
-                None => {
-                    log::debug!("CallingContext::current() called outside of transaction");
-                    CallingContext {
-                        pid: rustix::process::getpid().as_raw_nonzero().get() as _,
-                        uid: rustix::process::getuid().as_raw(),
-                        sid: None,
-                    }
-                }
             }
         })
     }
@@ -2513,11 +2491,28 @@ impl CallingContext {
 
 pub(crate) fn is_handling_transaction() -> bool {
     // An in-flight RPC transaction counts, detected without forcing `THREAD_STATE`.
-    if rpc_calling().is_some() {
-        return true;
+    rpc_calling().is_some() || kernel_transaction(|_| ()).is_some()
+}
+
+/// `read` of the kernel transaction this thread is handling; `None` outside one, and in a
+/// process that never initialized `ProcessState`, where `THREAD_STATE` would panic.
+///
+/// R1: `read` runs under the borrow, so it reads fields and calls out to nothing.
+fn kernel_transaction<R>(read: impl FnOnce(&TransactionState) -> R) -> Option<R> {
+    if !ProcessState::is_initialized() {
+        return None;
     }
-    ProcessState::is_initialized()
-        && THREAD_STATE.with(|thread_state| thread_state.borrow().transaction.is_some())
+    THREAD_STATE.with(|thread_state| thread_state.borrow().transaction.as_ref().map(read))
+}
+
+/// This process's pid: the caller outside any transaction, as AOSP `clearCaller` sets it.
+pub(crate) fn own_pid() -> binder::pid_t {
+    rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t
+}
+
+/// This process's uid, as [`own_pid`].
+pub(crate) fn own_uid() -> binder::uid_t {
+    rustix::process::getuid().as_raw()
 }
 
 /// SELinux security context of the caller for the current in-flight
@@ -2587,13 +2582,10 @@ pub(crate) fn is_handling_transaction() -> bool {
 ///
 pub fn get_calling_sid() -> Option<CString> {
     // RPC has no SELinux context; return early without forcing `THREAD_STATE`.
-    if rpc_calling().is_some() || !ProcessState::is_initialized() {
+    if rpc_calling().is_some() {
         return None;
     }
-    THREAD_STATE.with(|thread_state| {
-        let thread_state = thread_state.borrow();
-        thread_state.transaction.as_ref()?.calling_sid.clone()
-    })
+    kernel_transaction(|tr| tr.calling_sid.clone()).flatten()
 }
 
 /// PID of the caller for the current in-flight binder transaction.
@@ -2614,19 +2606,7 @@ pub fn get_calling_pid() -> binder::pid_t {
     if let Some((_, pid)) = rpc_calling() {
         return pid;
     }
-    let own_pid = || rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t;
-    if !ProcessState::is_initialized() {
-        return own_pid();
-    }
-    THREAD_STATE
-        .with(|thread_state| {
-            thread_state
-                .borrow()
-                .transaction
-                .as_ref()
-                .map(|tr| tr.calling_pid)
-        })
-        .unwrap_or_else(own_pid)
+    kernel_transaction(|tr| tr.calling_pid).unwrap_or_else(own_pid)
 }
 
 /// UID of the caller for the current in-flight binder transaction.
@@ -2667,18 +2647,7 @@ pub fn get_calling_uid() -> binder::uid_t {
     if let Some((uid, _)) = rpc_calling() {
         return uid;
     }
-    if !ProcessState::is_initialized() {
-        return rustix::process::getuid().as_raw();
-    }
-    THREAD_STATE
-        .with(|thread_state| {
-            thread_state
-                .borrow()
-                .transaction
-                .as_ref()
-                .map(|tr| tr.calling_uid)
-        })
-        .unwrap_or_else(|| rustix::process::getuid().as_raw())
+    kernel_transaction(|tr| tr.calling_uid).unwrap_or_else(own_uid)
 }
 
 /// Temporarily override the kernel-delivered calling identity with the
@@ -2728,10 +2697,7 @@ pub fn get_calling_uid() -> binder::uid_t {
 /// back. Authorize an RPC caller through [`calling_caller`] or
 /// `RpcServer::set_authorizer` instead.
 pub fn clear_calling_identity() -> i64 {
-    let own = || {
-        let pid = rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t;
-        pack_calling_identity(false, rustix::process::getuid().as_raw(), pid)
-    };
+    let own = || pack_calling_identity(false, own_uid(), own_pid());
     // An RPC dispatch is innermost: the kernel transaction under it is an outer frame's.
     if rpc_calling().is_some() || !ProcessState::is_initialized() {
         return own();
@@ -2743,8 +2709,8 @@ pub fn clear_calling_identity() -> i64 {
         };
         let token = pack_calling_identity(tr.has_explicit_identity, tr.calling_uid, tr.calling_pid);
         // AOSP `clearCaller()`: own uid/pid, SID dropped ("expensive to lookup").
-        tr.calling_uid = rustix::process::getuid().as_raw();
-        tr.calling_pid = rustix::process::getpid().as_raw_nonzero().get() as _;
+        tr.calling_uid = own_uid();
+        tr.calling_pid = own_pid();
         tr.calling_sid = None;
         tr.has_explicit_identity = true;
         token
@@ -2923,16 +2889,10 @@ pub fn get_extended_error() -> Result<ExtendedError> {
 /// is a no-op there, and the kernel transaction that may sit underneath a
 /// nested RPC dispatch belongs to an outer frame.
 pub fn has_explicit_identity() -> bool {
-    if rpc_calling().is_some() || !ProcessState::is_initialized() {
+    if rpc_calling().is_some() {
         return false;
     }
-    THREAD_STATE.with(|thread_state| {
-        thread_state
-            .borrow()
-            .transaction
-            .as_ref()
-            .is_some_and(|tr| tr.has_explicit_identity)
-    })
+    kernel_transaction(|tr| tr.has_explicit_identity).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -2972,16 +2932,6 @@ mod tests {
     //!   `a_sid_copy_crosses_pages_and_keeps_to_its_bound` pins the bound and the SELinux gate.
 
     use super::*;
-
-    #[cfg(any(feature = "rpc", target_os = "linux"))]
-    fn own_uid() -> binder::uid_t {
-        rustix::process::getuid().as_raw()
-    }
-
-    #[cfg(any(feature = "rpc", target_os = "linux"))]
-    fn own_pid() -> binder::pid_t {
-        rustix::process::getpid().as_raw_nonzero().get() as binder::pid_t
-    }
 
     /// Accessors read the RPC context, restore and nest with the guard, and fail closed.
     #[cfg(feature = "rpc")]
