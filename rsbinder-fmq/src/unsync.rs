@@ -570,9 +570,9 @@ impl ReaderCore {
         let bytes = self.shape.bytes as usize;
         assert!(dst.len() <= bytes, "a copy longer than the ring");
         let offset = (position % self.shape.bytes) as usize;
-        let (head, tail) = dst.split_at_mut(dst.len().min(bytes - offset));
-        self.ring.load_acquire(offset, head);
-        self.ring.load_acquire(0, tail);
+        shm::ring_parts(bytes, offset, dst.len(), |at, range| {
+            self.ring.load_acquire(at, &mut dst[range]);
+        });
     }
 
     /// Move to `resume`, where `View::lapped` put this reader.

@@ -104,7 +104,8 @@ pub use memfd::{
     add_seals, create, seal_unsupported, seals, verify_received, CreateOptions, Seals,
 };
 pub use piece::{
-    AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType, Words,
+    ring_parts, AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType,
+    Words,
 };
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.
 pub use word::*;

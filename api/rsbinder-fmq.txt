@@ -314,6 +314,7 @@ pub fn rsbinder_fmq::shm::futex_wait(&core::sync::atomic::AtomicU32, u32, core::
 pub fn rsbinder_fmq::shm::futex_wake(&core::sync::atomic::AtomicU32, core::num::nonzero::NonZeroU32) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::shm::is_ashmem_fd(std::os::fd::owned::BorrowedFd<'_>) -> bool
 pub fn rsbinder_fmq::shm::region_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
+pub fn rsbinder_fmq::shm::ring_parts(usize, usize, usize, impl core::ops::function::FnMut(usize, core::ops::range::Range<usize>))
 pub fn rsbinder_fmq::shm::seal_unsupported(rsbinder_fmq::shm::Seals, &rsbinder_fmq::Error) -> bool
 pub fn rsbinder_fmq::shm::seals(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<rsbinder_fmq::shm::Seals>
 pub fn rsbinder_fmq::shm::shrink_sealed(std::os::fd::owned::BorrowedFd<'_>) -> bool

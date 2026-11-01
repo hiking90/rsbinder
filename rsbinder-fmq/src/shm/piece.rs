@@ -710,6 +710,42 @@ impl std::fmt::Debug for RoBytes {
     }
 }
 
+/// The parts of a copy that wraps at the end of a ring of `capacity` bytes, for a ring kept
+/// in a [`Bytes`] or a [`RoBytes`].
+///
+/// The copy is `len` bytes from ring byte `offset`. `part(at, range)` runs for the bytes
+/// before the ring's end: ring byte `at`, bytes `range` of the copy. It runs again, with `at`
+/// zero, for the bytes after the wrap, and not at all for that part when it is empty, which is
+/// the common case. `offset` is a ring byte, already reduced below `capacity`, and `len` is
+/// at most `capacity`, as the caller checked; a part past the area otherwise panics in the
+/// copy method, as any copy past it does.
+///
+/// The parts are the two calls a copy method makes, of whichever order the protocol needs:
+///
+/// ```
+/// # use rsbinder_fmq::shm::{ring_parts, Mapping};
+/// let ring = Mapping::heap(64).unwrap().carve().bytes(0, 64).unwrap();
+/// let src = [7u8; 16];
+/// // 16 bytes from byte 56: 8 before the end, 8 from the start.
+/// ring_parts(ring.len(), 56, src.len(), |at, range| ring.store(at, &src[range]));
+/// let mut wrapped = [0u8; 8];
+/// ring.load(0, &mut wrapped);
+/// assert_eq!(wrapped, [7; 8]);
+/// ```
+#[inline]
+pub fn ring_parts(
+    capacity: usize,
+    offset: usize,
+    len: usize,
+    mut part: impl FnMut(usize, Range<usize>),
+) {
+    let before = len.min(capacity.saturating_sub(offset));
+    part(offset, 0..before);
+    if before < len {
+        part(0, before..len);
+    }
+}
+
 /// A byte area whose bytes may also be read and written in place: [`Bytes`],
 /// and slices through `unsafe`.
 ///

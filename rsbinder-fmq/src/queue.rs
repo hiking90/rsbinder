@@ -1074,14 +1074,17 @@ impl<T: Element> Regions<'_, T> {
         self.second_len
     }
 
-    /// Where elements `start..start + n` lie: ring bytes before and after the wrap, and how many
-    /// of them come before it.
-    fn split(&self, start: usize, n: usize) -> (usize, usize, usize) {
+    /// Run `part` on the ring parts of elements `start..start + n` ([`shm::ring_parts`]), with
+    /// the parts' ranges in elements.
+    fn parts(&self, start: usize, n: usize, mut part: impl FnMut(usize, std::ops::Range<usize>)) {
         let q = size_of::<T>();
-        let head = self.first_len.saturating_sub(start).min(n);
-        let first = self.first_at + start.min(self.first_len) * q;
-        let second = start.saturating_sub(self.first_len) * q;
-        (first, second, head)
+        let bytes = self.ring.len();
+        // Past a wrap the first part ends at the ring's end, so one subtraction reduces it.
+        let at = self.first_at + start * q;
+        let at = if at >= bytes { at - bytes } else { at };
+        shm::ring_parts(bytes, at, n * q, |at, range| {
+            part(at, range.start / q..range.end / q);
+        });
     }
 
     /// Copy `src` into the elements starting at `start`. `BadValue` when
@@ -1093,20 +1096,13 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("write past the reserved elements"));
         }
-        let (first, second, head) = self.split(start, src.len());
-        let (to_first, to_second) = src.split_at(head);
-        // The part after the wrap is most often empty; a copy of nothing is left out.
-        if self.release {
-            self.ring.store_release(first, to_first);
-            if !to_second.is_empty() {
-                self.ring.store_release(second, to_second);
+        self.parts(start, src.len(), |at, range| {
+            if self.release {
+                self.ring.store_release(at, &src[range]);
+            } else {
+                self.ring.store(at, &src[range]);
             }
-        } else {
-            self.ring.store(first, to_first);
-            if !to_second.is_empty() {
-                self.ring.store(second, to_second);
-            }
-        }
+        });
         Ok(())
     }
 
@@ -1119,12 +1115,9 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("read past the available elements"));
         }
-        let (first, second, head) = self.split(start, dst.len());
-        let (to_first, to_second) = dst.split_at_mut(head);
-        self.ring.load(first, to_first);
-        if !to_second.is_empty() {
-            self.ring.load(second, to_second);
-        }
+        self.parts(start, dst.len(), |at, range| {
+            self.ring.load(at, &mut dst[range]);
+        });
         Ok(())
     }
 }

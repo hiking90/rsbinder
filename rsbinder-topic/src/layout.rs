@@ -260,14 +260,13 @@ fn expect_word(carve: &mut RoCarve, offset: usize, want: u32, what: &'static str
     Ok(())
 }
 
-/// The start of a ring copy and the bytes of it that precede the ring's end.
-fn split(capacity: usize, position: u64, len: usize) -> (usize, usize) {
+/// The ring byte a copy at `position` starts at, once the copy passes the format's checks.
+fn ring_offset(capacity: usize, position: u64, len: usize) -> usize {
     assert!(
         position % 8 == 0 && len % 8 == 0 && len <= capacity,
         "a ring copy off the 8-byte grid or longer than the ring"
     );
-    let offset = (position % capacity as u64) as usize;
-    (offset, len.min(capacity - offset))
+    (position % capacity as u64) as usize
 }
 
 /// Topic memory as its one writer reaches it: the words of the header and the ring, as pieces.
@@ -350,10 +349,11 @@ impl Stores for Stored {
     }
 
     fn store_ring(&self, position: u64, src: &[u8]) {
-        let (offset, first) = split(self.ring.len(), position, src.len());
-        let (head, wrapped) = src.split_at(first);
-        self.ring.store_release(offset, head);
-        self.ring.store_release(0, wrapped);
+        let capacity = self.ring.len();
+        let offset = ring_offset(capacity, position, src.len());
+        shm::ring_parts(capacity, offset, src.len(), |at, range| {
+            self.ring.store_release(at, &src[range]);
+        });
     }
 }
 
@@ -432,16 +432,19 @@ impl Loads for Loaded {
     }
 
     fn load_ring(&self, position: u64, dst: &mut [u8]) {
-        let (offset, first) = split(self.ring.len(), position, dst.len());
-        let (head, wrapped) = dst.split_at_mut(first);
-        self.ring.load(offset, head);
-        self.ring.load(0, wrapped);
+        let capacity = self.ring.len();
+        let offset = ring_offset(capacity, position, dst.len());
+        shm::ring_parts(capacity, offset, dst.len(), |at, range| {
+            self.ring.load(at, &mut dst[range]);
+        });
     }
 
     fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
-        let (offset, first) = split(self.ring.len(), position, len);
-        self.ring.load_extend(offset, first, dst);
-        self.ring.load_extend(0, len - first, dst);
+        let capacity = self.ring.len();
+        let offset = ring_offset(capacity, position, len);
+        shm::ring_parts(capacity, offset, len, |at, range| {
+            self.ring.load_extend(at, range.len(), dst);
+        });
     }
 
     fn fence(&self) {

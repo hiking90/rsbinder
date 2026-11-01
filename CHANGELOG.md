@@ -32,6 +32,10 @@ This changelog starts at 0.9.0. For earlier releases, see the
   ring sends after each committed record.
 - **`rsbinder_fmq::shm::Deadline::until`**: the futex deadline at an
   `Instant`, as `Deadline::after` the time left until it.
+- **`rsbinder_fmq::shm::ring_parts`**: the one or two parts of a copy
+  that wraps at a ring's end, handed to a closure that makes the copy
+  with whichever `Bytes`/`RoBytes` method the protocol needs. The FMQ
+  queues and `rsbinder-topic` copy through it.
 
 ### Changed
 
