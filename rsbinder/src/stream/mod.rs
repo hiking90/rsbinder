@@ -1812,10 +1812,12 @@ impl<T: Deserialize> Receiver<T> {
     /// to a `futures-core` major version. Adapt it where you need one.
     ///
     /// Cancel-safe: a future dropped mid-wait loses no item. On the ring
-    /// the wait it left on the pool is joined by the next call, so the
-    /// wake it consumes is not lost; on the RPC path a grant already
-    /// handed to the pool still goes out, and the next call may send the
-    /// same running total again, which the producer counts once.
+    /// a wait the pool has not started goes with the future, and one it has
+    /// started is joined by the next call, so the wake it consumes is not
+    /// lost and a pool with no free thread holds up no record; on the RPC
+    /// path a grant already handed to the pool still goes out, and the next
+    /// call may send the same running total again, which the producer counts
+    /// once.
     ///
     /// # Panics
     ///

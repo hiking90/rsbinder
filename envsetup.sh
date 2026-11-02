@@ -9,10 +9,11 @@ else
     echo "TOP_DIR is already set to $TOP_DIR."
 fi
 
+# Android Studio's default SDK location, only when the environment names none.
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    export ANDROID_HOME=$HOME/Library/Android/sdk
-elif [ "$OSTYPE" = "linux"* ]; then
-    export ANDROID_HOME=$HOME/Android/Sdk
+    export ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk}
+elif [[ "$OSTYPE" == "linux"* ]]; then
+    export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
 fi
 
 if ! echo "$PATH" | grep -q -E "(^|:)$ANDROID_HOME/tools(:|$)"; then
@@ -264,9 +265,27 @@ function publish_dry_run() {
     publish --dry-run
 }
 
+# Set every published crate to one version: `[workspace.package] version` and each `rsbinder*`
+# dependency requirement, keeping an `=` pin (`rsbinder-aidl`'s). Only the tracked manifests
+# outside bench/ and fuzz/ change, so target/ copies and those two crates' own 0.0.0 do not.
+# The workspace lockfile and the excluded crates' lockfiles follow.
 function version_update() {
     local NEW_VERSION="$1"
-
-    find . -name "Cargo.toml" -exec sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" {} \;
-    find . -name "Cargo.toml" -exec sed -i '' "/version = \"[^\"]*\", path =/ s/version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" {} \;
+    if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "usage: version_update X.Y.Z" >&2
+        return 1
+    fi
+    (
+        set -e
+        cd "$TOP_DIR"
+        # `-i.bak` is the in-place form GNU and BSD sed both take.
+        sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" Cargo.toml
+        rm Cargo.toml.bak
+        for manifest in $(git ls-files '*Cargo.toml' | grep -v -e '^bench/' -e '^fuzz/'); do
+            sed -i.bak -E "s/^(rsbinder[a-z-]* = \{ version = \"=?)[^\"]*\"/\1$NEW_VERSION\"/" "$manifest"
+            rm "$manifest.bak"
+        done
+        cargo metadata --format-version 1 > /dev/null
+        scripts/excluded_lockfiles.sh
+    )
 }

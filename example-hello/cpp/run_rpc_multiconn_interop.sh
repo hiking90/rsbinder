@@ -149,4 +149,13 @@ if ! grep -q '(d) PASS' <<<"$launcher_out"; then
     echo "FAIL: gate (d) (callback outside a handler) did not pass"
     exit 1
 fi
-echo "PASS: AC-12.6 (a)(b)(c) + plan 2-20 (d)"
+# (e) needs Android 17's getExtension, which is the first to reach an RPC server.
+if [[ "$sdk" -ge 37 ]] && ! grep -q '(e) PASS' <<<"$launcher_out"; then
+    echo "FAIL: gate (e) (getExtension with no interface token) did not pass"
+    exit 1
+fi
+if [[ "$sdk" -ge 37 ]]; then
+    echo "PASS: AC-12.6 (a)(b)(c) + plan 2-20 (d) + plan 18 D1 (e)"
+else
+    echo "PASS: AC-12.6 (a)(b)(c) + plan 2-20 (d); (e) needs SDK 37"
+fi

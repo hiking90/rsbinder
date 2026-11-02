@@ -230,6 +230,10 @@ name = "ac61.declared.IFoo/secondary"
 
 [[service]]
 name = "ac61.declared.IBar/default"
+
+[[service]]
+name = "ac61.declared.ISleep/default"
+start = { exec = ["/usr/bin/sleep", "61.25"] }
 EOF
 kill -HUP "$HUB_PID"; sleep 1
 grep -q "service declaration(s)" "$LOG" && ok "reload reports the declarations" || bad "no declaration count: $(tail -2 "$LOG")"
@@ -256,6 +260,28 @@ kill -0 "$HUB_PID" 2>/dev/null && ok "hub survived the activation" || bad "hub d
 # A declaration without `start` must be inert rather than an error.
 run_probe get:ac61.declared.IFoo/secondary
 want_result get ac61.declared.IFoo/secondary NOTFOUND "a declaration without start is inert"
+
+note "6-7 E1  an exec child takes SIGTERM: it does not inherit the hub's signal mask"
+run_probe get:ac61.declared.ISleep/default
+CHILD=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    CHILD=$(pgrep -xf '/usr/bin/sleep 61.25') && break
+    sleep 0.5
+done
+if [ -n "$CHILD" ]; then
+    MASK=$(awk '/^SigBlk:/ { print $2 }' "/proc/$CHILD/status")
+    [ "$((16#$MASK))" -eq 0 ] && ok "exec child blocks no signal" || bad "exec child SigBlk=$MASK"
+    kill -TERM "$CHILD"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$CHILD" 2>/dev/null || break; sleep 0.2; done
+    if kill -0 "$CHILD" 2>/dev/null; then
+        bad "exec child survived SIGTERM"
+        kill -KILL "$CHILD"
+    else
+        ok "exec child ended on SIGTERM"
+    fi
+else
+    bad "the exec child did not start"
+fi
 ######################################################################
 # Plan 6-5: the diagnostic CLI. It is a plain binder client, so these gates
 # also re-prove the policy from a second, independent implementation of the
@@ -323,7 +349,7 @@ want_out "ac61.allowed.live"          "dump lists a findable registration"
 want_out "pid=$HOLD_PID"              "dump attributes it to the registering pid"
 reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
 want_out "hidden by policy"           "dump says the view is partial"
-want_out "declarations: 3"            "dump counts the loaded declarations"
+want_out "declarations: 4"            "dump counts the loaded declarations"
 
 run_svc dump manager ac61.allowed
 want_rc 0 "dump with a filter exits 0"
