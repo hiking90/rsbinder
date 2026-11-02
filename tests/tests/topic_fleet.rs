@@ -1275,6 +1275,21 @@ fn stop_point(
         }
     }
 
+    // Before the list: over sockets it opens a session of the hub's, whose threads end after it.
+    let snapshot = Snapshot {
+        processes: topology
+            .nodes
+            .iter()
+            .map(|(node, _)| {
+                (
+                    (node.clone(), fleet.starts[node.as_str()]),
+                    memfd_counts(fleet.pid(node)),
+                )
+            })
+            .collect(),
+        hub_fds: hub_fds(),
+    };
+
     // Android 10's service manager lists a dead service's name for good, an earlier run's too.
     let (prefix, suffix) = (
         format!("rsb.fleet.{}.", fleet.tag),
@@ -1298,19 +1313,7 @@ fn stop_point(
     if !wrong.is_empty() {
         return Err(fleet.failure(None, format!("stop point:\n  {}", wrong.join("\n  "))));
     }
-    Ok(Snapshot {
-        processes: topology
-            .nodes
-            .iter()
-            .map(|(node, _)| {
-                (
-                    (node.clone(), fleet.starts[node.as_str()]),
-                    memfd_counts(fleet.pid(node)),
-                )
-            })
-            .collect(),
-        hub_fds: hub_fds(),
-    })
+    Ok(snapshot)
 }
 
 /// A stop point that holds within `within`: asked again while it fails, as the fleet converges
@@ -2624,7 +2627,8 @@ impl Chaos<'_> {
             .nodes
             .iter()
             .map(|(node, _)| node.clone())
-            .filter(|node| !PRODUCERS.contains(&node.as_str()))
+            // The hub over sockets stands for the service manager, which no fault here hits.
+            .filter(|node| !PRODUCERS.contains(&node.as_str()) && node != "hub")
             .collect();
         match self.rng.below(4) {
             0 => {
