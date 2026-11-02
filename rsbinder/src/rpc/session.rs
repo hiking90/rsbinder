@@ -73,8 +73,8 @@
 //! ends inside them, and no borrow is held across the user callback a nested dispatch runs.
 //!
 //! A proxy kept in a user `thread_local!` may drop after `DRIVING` is destroyed. The helpers
-//! report that apart from an empty stack, and the rule follows the kernel path's
-//! `send_request_flushed`: a `DEC_STRONG` is still sent, on a free `Outgoing` slot claimed with
+//! report that apart from an empty stack, and the rule follows the kernel path's `queue_cmd`
+//! and `send_flushed`: a `DEC_STRONG` is still sent, on a free `Outgoing` slot claimed with
 //! no marker, and a new call or a reply is refused with `InvalidOperation`. Treating the stack as
 //! empty instead would let a nested call made from that destructor pick a slot this thread
 //! already holds and, on its guard's drop, release the outer frame's `exclusive_tid`.
@@ -1382,8 +1382,7 @@ thread_local! {
     static ARMED_READ: RefCell<Vec<(usize, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `DRIVING` or `ARMED_READ`. Each helper's borrow ends inside it (R1), and each is `Err`
-/// once this thread's locals are being destroyed, which a caller tells from an empty stack.
+/// `DRIVING` or `ARMED_READ`; helpers end their borrow (R1) and are `Err` during TLS teardown.
 type Stack<T> = &'static LocalKey<RefCell<Vec<T>>>;
 type StackResult<T> = std::result::Result<T, AccessError>;
 
@@ -1686,7 +1685,7 @@ thread_local! {
     static DRIVING: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A call or reply on a thread whose `DRIVING` is destroyed (kernel `send_request_flushed`).
+/// A call or reply on a thread whose `DRIVING` is destroyed (kernel `send_flushed`).
 fn refuse_without_driving() -> StatusCode {
     log::error!("RPC: a call from a thread-local destructor, after `DRIVING` is gone; refused");
     StatusCode::InvalidOperation
@@ -4052,7 +4051,7 @@ impl RpcSessionInner {
                 } else {
                     Ok(())
                 };
-                // Caught: unwinding would skip the serve loop's slot cleanup.
+                // Caught here, so a handler panic is an `Unknown` reply and the session serves on.
                 token.and_then(|()| {
                     crate::binder::run_handler(code, &mut reply, |reply| {
                         let token = crate::binder::sealed::Token::new();

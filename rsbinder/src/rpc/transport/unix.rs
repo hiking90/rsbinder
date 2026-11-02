@@ -664,7 +664,7 @@ impl RpcTransport for UnixTransport {
                     RECV_FLAGS,
                 ) {
                     Ok(r) => return Ok(r),
-                    // EINTR retry, symmetric with read_header.
+                    // EINTR retry, as `read_once` does.
                     Err(rustix::io::Errno::INTR) => continue,
                     Err(e) => {
                         let io_err = std::io::Error::from(e);
@@ -810,8 +810,7 @@ mod tests {
     use crate::rpc::RpcError;
     use std::sync::Arc;
 
-    /// A send deadline is `Timeout` while nothing went out and `Io(WouldBlock)` once a byte did,
-    /// waiting in `poll` or blocking in `sendmsg` (`transport` module doc "Mutation gates").
+    /// A send deadline: `Timeout` before the first byte, then `Io(WouldBlock)`; poll and sendmsg.
     #[test]
     fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
         use std::io::IoSlice;
@@ -845,7 +844,7 @@ mod tests {
 
     #[test]
     fn unix_roundtrip_all_sizes() {
-        // A worker sends: 1 MiB + 1 exceeds the socket buffer and tests `read_body` reassembly.
+        // A worker sends: 1 MiB + 1 exceeds the socket buffer and tests `fill_exact` reassembly.
         let (a, b) = UnixTransport::pair().expect("socketpair");
         let a = Arc::new(a);
         for size in [0usize, 1, 64 * 1024, 1 << 20, (1 << 20) + 1] {
@@ -1070,7 +1069,7 @@ mod tests {
 
     #[test]
     fn unix_partial_header_then_close_is_truncated() {
-        // 2-of-4 header bytes then EOF must be `Truncated` (`read_header`: `filled > 0`).
+        // 2-of-4 header bytes then EOF must be `Truncated` (`fill_exact`: the frame had begun).
         let (a, b) = UnixTransport::pair().expect("socketpair");
         {
             use std::io::Write;

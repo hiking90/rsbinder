@@ -229,9 +229,7 @@ fn seal(fd: BorrowedFd<'_>) -> Result<()> {
     }
 }
 
-/// Make a memfd named `name` of `size` bytes, lay it out with `fill` through this process's
-/// writable mapping, then [`seal`] it: the mapping comes first, as the seal refuses every
-/// writable mapping made after it.
+/// A memfd laid out by `fill` through a writable mapping, then sealed, which refuses later ones.
 fn make<T>(
     name: &str,
     size: u64,
@@ -244,8 +242,7 @@ fn make<T>(
     Ok((fd, laid))
 }
 
-/// Map an fd a peer sent, read-only, once it passes [`shm::verify_received`] and `sized`, which
-/// judges its size.
+/// Map a peer's fd read-only once it passes [`shm::verify_received`] and `sized` (its size).
 fn received<R>(fd: BorrowedFd<'_>, sized: impl FnOnce(u64) -> Result<R>) -> Result<(R, RoCarve)> {
     let size = shm::verify_received(fd)?;
     let judged = sized(size)?;

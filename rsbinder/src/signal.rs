@@ -229,8 +229,7 @@ mod tests {
         assert!(took < Duration::from_secs(3), "missed the wake: {took:?}");
     }
 
-    /// The gate stays up while the settle writes the book, so a look that sees it down, with or
-    /// without the lock, sees what was written.
+    /// The gate stays up while the settle writes, so a look that sees it down sees the book.
     #[test]
     fn the_gate_stays_up_until_the_book_is_written() {
         let gate = Arc::new(PoolGate::<u32>::default());
@@ -264,8 +263,7 @@ mod tests {
         assert!(gate.busy());
     }
 
-    /// A change that lands between `wait_async`'s look and its await still ends the wait: the
-    /// look below makes the change and wakes, so only a `Notified` made before it hears it.
+    /// A change between `wait_async`'s look and its await ends the wait (the look makes it here).
     #[cfg(feature = "tokio")]
     #[test]
     fn a_wake_between_the_look_and_the_await_ends_wait_async() {

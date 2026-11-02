@@ -377,8 +377,7 @@ impl Transit {
     }
 }
 
-/// `BadValue` for a ring of `capacity` bytes that leaves no item record, a header and a byte of
-/// payload, past the reserve the end record keeps; both ends refuse one.
+/// `BadValue` if past the end record's reserve no header plus one payload byte fits (both ends).
 fn room_for_an_item(capacity: usize, who: &str) -> Result<()> {
     if capacity <= END_RESERVE + HEADER {
         log::error!(

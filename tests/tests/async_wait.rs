@@ -483,10 +483,7 @@ fn a_dropped_wait_leaves_no_callback_registered() {
     panic!("the dropped wait kept its callback registered: the list stayed at the cap ({last:?})");
 }
 
-/// `hub::watch` hands its closure the binder registered under the name.
-///
-/// Mutant: a watch that registers no callback, or a callback that does not
-/// call the closure, leaves the channel empty.
+/// `hub::watch` hands its closure the registered binder (mutant: no callback, or no closure call).
 #[test]
 #[ignore = "needs a kernel binder device and a running service manager"]
 fn a_service_watch_hears_the_registration() {
@@ -514,13 +511,7 @@ fn a_service_watch_hears_the_registration() {
     drop(watch);
 }
 
-/// Dropping a `ServiceWatch` unregisters its callback before `drop` returns.
-///
-/// Same instrument as `a_dropped_wait_leaves_no_callback_registered`, and
-/// the same Linux/`rsb_hub` restriction. The unregister is a two-way call
-/// inside `drop`, so one registration right after it must be accepted.
-///
-/// Mutant: a `WatchGuard` without its `Drop` keeps the list at the cap.
+/// `drop` of a `ServiceWatch` unregisters before it returns (no retry, unlike the wait test).
 #[test]
 #[ignore = "needs a kernel binder device and a running rsb_hub"]
 fn a_dropped_service_watch_leaves_no_callback_registered() {

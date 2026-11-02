@@ -1000,8 +1000,7 @@ fn t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on() {
     }
 }
 
-/// T15: a panicking handler's reply is discarded before the `REPLY`, so the release of a proxy
-/// it wrote there precedes the `REPLY` (module doc "Deferred `DEC_STRONG`" of `session.rs`).
+/// T15: a proxy in a panicked handler's reply is released before the `REPLY` (`session.rs` doc).
 #[test]
 fn t15_a_panicking_handlers_reply_is_released_before_the_reply() {
     for version in [1, PROTOCOL_V2] {
@@ -1062,8 +1061,7 @@ fn t15_a_panicking_handlers_reply_is_released_before_the_reply() {
     }
 }
 
-/// T16: a panic in the drop of a panicked handler's discarded reply is caught too; the caller
-/// reads `Unknown` and the session keeps serving.
+/// T16: a panic dropping a panicked handler's reply is caught: `Unknown`, and the session serves.
 #[test]
 fn t16_a_panicking_drop_of_the_discarded_reply_is_contained() {
     for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
@@ -1082,9 +1080,7 @@ fn t16_a_panicking_drop_of_the_discarded_reply_is_contained() {
     }
 }
 
-/// T17: a panic that escapes the dispatch of a frame (here a released node's `Drop`, after the
-/// `REPLY`) ends the serve loop as `Dispatch(Unknown)` and with it the session, so the caller's
-/// next call fails instead of waiting on a connection no one reads (module doc "Session end").
+/// T17: a panic escaping a frame's dispatch ends the session, `Dispatch(Unknown)` ("Session end").
 #[test]
 fn t17_a_panic_escaping_a_frame_ends_the_session() {
     for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
@@ -1110,10 +1106,9 @@ fn t17_a_panic_escaping_a_frame_ends_the_session() {
     }
 }
 
-/// A proxy dropped by a thread-local's destructor after `DRIVING`'s is still released, and a
-/// call from there is refused (module doc "The `DRIVING` marker"). In a child: it aborted.
-/// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+/// After `DRIVING` is destroyed a dropped proxy is released, a call refused (child: a bug aborts).
 #[test]
+// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     not(target_arch = "s390x")

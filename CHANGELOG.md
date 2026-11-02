@@ -106,9 +106,15 @@ accepts both the 0.12.0 bytes and the new ones.
 - `ProcessState::start_thread_pool` leaves the pool unstarted when its first
   worker cannot be created; a `binder://` `Client` and a kernel `Server`
   return the failure.
-- A kernel proxy lookup whose `BC_INCREFS` the driver never took fails
-  with that error, not `DeadObject`; one made from a TLS destructor after
-  the binder thread state's is `InvalidOperation`, where 0.12.0 aborted.
+- A kernel proxy lookup fails on a flush only when the driver never took
+  the proxy cache's `BC_INCREFS`: with the driver's error on every thread,
+  or `InvalidOperation` when the flush succeeded without the driver taking
+  it. Any other failed flush, of a `BC_INCREFS` the driver took or of the
+  proxy's `BC_ACQUIRE`, is logged and the proxy is returned (AOSP
+  `incStrongHandle`). 0.12.0 failed the lookup on a failed flush of either
+  command off a binder thread (the driver's error) and of `BC_INCREFS` on
+  one (`DeadObject`). One made from a TLS destructor after the binder
+  thread state's is `InvalidOperation`, where 0.12.0 aborted.
 
 **Calling identity and permissions**
 
@@ -232,6 +238,11 @@ accepts both the 0.12.0 bytes and the new ones.
   `VsockTransport` reports a send deadline that expired before the first
   byte as `RpcError::Timeout`, not `Io(WouldBlock)`; their `recv_frame`
   extends its read deadline while the peer takes this end's bytes.
+- Two transport errors carry another code. Fds that arrive with no byte
+  are `RpcError::Truncated` in the android-13+ reader too; 0.12.0 read
+  them as a clean end (`EndOfStream`). A `sendmsg` with fds that takes
+  nothing is `WriteZero` on Apple too; 0.12.0 returned `EndOfStream`
+  there.
 
 **Streams and topics**
 
@@ -316,10 +327,10 @@ accepts both the 0.12.0 bytes and the new ones.
   has it.
 - **`DeathLink`**: a death notification that unregisters when it drops.
   `DeathLink::new(&binder, recipient)` links and keeps both strongly; the
-  drop unlinks and drops the binder under `catch_unwind`, so a panic there
-  is logged instead of unwinding (an abort when the link drops during
-  another unwind), and an unlink error such as `DeadObject` after the
-  obituary is logged at debug level.
+  drop unlinks and drops the binder and the recipient under `catch_unwind`,
+  so a panic there is logged instead of unwinding (an abort when the link
+  drops during another unwind), and an unlink error such as `DeadObject`
+  after the obituary is logged at debug level.
 - **`hub::is_valid_service_name`**: whether a name is one the service
   manager accepts (AOSP `isValidServiceName`: 1 to 127 bytes of
   `[A-Za-z0-9._/-]`). `rsb_hub`'s configuration and `rsbinder-topic`'s
@@ -437,6 +448,9 @@ accepts both the 0.12.0 bytes and the new ones.
     `Closed::End`, `close_with(&Status)` with a status. `Publisher::new`
     returns `BinderResult` as the other constructors do
     (`EX_ILLEGAL_ARGUMENT` with the failed check for a policy out of range).
+    A receive that ends with `Closed::Corrupted`, and a subscription refused
+    for it, logs once per subscription which check of the topic's memory or
+    pool failed.
   - `Publisher::advertise` and `NamedSubscriber`: a topic found by a service
     manager name, the subscriber reconnecting to whichever publisher holds
     it (`RecvError::Disconnected` between connections). A registration
@@ -671,14 +685,14 @@ accepts both the 0.12.0 bytes and the new ones.
   order the session keeps for every other release; it followed the reply.
   The kernel and RPC handler steps share one function, and a handler panic
   logs one line on both: `a transaction handler panicked for code N: …`.
-- **Every caught panic logs its message.** The death-link, obituary,
+- **Every caught panic logs its message.** The death-link,
   freeze-notification, reply-path, `Rewrap` and `Reconnecting` catches
   logged a fixed line; they now append the panic's text.
 - **The frame API of the socket transports follows their raw sends and
   reads** (see *Migrating*). `UnixTransport`, `TcpDebugTransport`,
   `VsockTransport` and `TlsTransport` keep the trait's `send_frame` /
   `recv_frame`, which frame over `send_raw` / `recv_raw`, and every socket
-  send but TLS's goes through one loop. A send deadline that expires
+  send but TLS's goes through one loop, where a send deadline that expires
   before the frame's first byte is `RpcError::Timeout` and after it
   `Io(WouldBlock)`, counted from the peer's last progress; `send_frame`
   on unix, tcp_debug and vsock reported `Io(WouldBlock)` at any position.
@@ -743,10 +757,6 @@ accepts both the 0.12.0 bytes and the new ones.
   versions, minus the registration notice: after the first lookup misses,
   the next comes a second later rather than at once, and a missing service
   logs the same "still waiting" warning every ten seconds (see *Migrating*).
-- **`rsbinder-topic`** logs, once per subscription, which check of the
-  topic's memory or pool failed when a receive ends with
-  `Closed::Corrupted`, and when a subscription is refused for it; the
-  error itself is unchanged.
 
 ### Fixed
 
@@ -861,7 +871,11 @@ accepts both the 0.12.0 bytes and the new ones.
   own lock checks) unwound past `BC_DEAD_BINDER_DONE`, so the driver held
   the death's clear notification and the pin release behind it. The panic
   is now caught and logged and the done is queued, as the frozen-binder
-  handshake already did.
+  handshake already did, and on a kernel or RPC proxy the recipients after
+  a panicking one's `Drop` are still notified. A kernel proxy's recipient
+  lock recovers from poison instead of panicking in `link_to_death`,
+  `unlink_to_death` and the obituary, and an obituary whose unlink panics
+  still reaches the recipients.
 - **An RPC proxy dropped by a `thread_local!` destructor no longer aborts
   the process.** When the destructor ran after the RPC session's own
   thread-local, the release panicked inside it, which aborts. The release is
@@ -893,10 +907,10 @@ accepts both the 0.12.0 bytes and the new ones.
   decrements, as it did.
 - **A failed flush no longer leaks a kernel reference count.** The proxy
   cache's `BC_INCREFS` is taken back when the driver never consumed it
-  (the lookup fails with the driver's error, no longer `DeadObject`; see
-  *Migrating*) and counts as sent when it did; a `BC_ACQUIRE` counts as
-  sent once queued, as in AOSP `incStrongHandle`. Before, either failure
-  left a count the matching decrement never undid.
+  and counts as sent when it did; a `BC_ACQUIRE` counts as sent once
+  queued, as in AOSP `incStrongHandle` (what a lookup returns: see
+  *Migrating*). Before, either failure left a count the matching decrement
+  never undid.
 
 ### Security
 

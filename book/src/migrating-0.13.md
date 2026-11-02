@@ -128,8 +128,10 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `wait_for_service` and `wait_for_interface` wait in the loop the later
   versions use: after the first lookup misses, the next one comes a second
   later, not at once, and a service still missing logs "still waiting"
-  every ten seconds. 0.12.0 looked again at once and logged nothing. The
-  answer is the same; only a test that times the second lookup sees it.
+  every ten seconds. 0.12.0 looked again at once and logged one
+  `register_for_notifications: not supported on Android 10` error per
+  wait, but no "still waiting". The answer is the same; only a test that
+  times the second lookup sees it.
 
 ## Binder objects and process state
 
@@ -244,16 +246,28 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `binder://` `Client` and starting a kernel `Server` now return the
   failure as an `Err` (`try_start_thread_pool`, CHANGELOG *Added*) instead
   of succeeding with no pool.
-- **A kernel proxy lookup whose `BC_INCREFS` the driver never took fails
-  with the driver's error**, not `DeadObject` (`hub` lookups, a parcel's
-  binder read, `ProcessState::strong_proxy_for_handle`). The command is
-  taken back first, so no reference count is left behind; 0.12.0 returned
-  `DeadObject` and left the command queued, to be applied by the next
-  write with no decrement to match it. When the driver did take it and
-  the ioctl still failed, the lookup now succeeds and the proxy's drop
-  undoes the count. A lookup made from a TLS destructor that runs after
-  the binder thread state's own is `InvalidOperation`; 0.12.0 panicked
-  there, which aborts the process.
+- **A kernel proxy lookup (`hub` lookups, a parcel's binder read,
+  `ProcessState::strong_proxy_for_handle`) fails on a flush only when the
+  driver never took the proxy cache's `BC_INCREFS`**, and then with the
+  driver's error on every thread. That command is taken back first, so no
+  reference count is left behind. A flush that succeeds without the driver
+  taking it (a pending `return_error` on the thread) fails the lookup with
+  `InvalidOperation`. Any other failed flush, of a `BC_INCREFS` the driver
+  took or of the proxy's `BC_ACQUIRE`, is logged and the lookup returns the
+  proxy, whose drop sends the matching decrement, as AOSP
+  `incStrongHandle` keeps a queued `BC_ACQUIRE`. 0.12.0 failed the lookup
+  on a failed flush of either command: off a binder thread with the
+  driver's error, and on a binder thread (one that joined the thread pool)
+  with `DeadObject` for `BC_INCREFS`, the only one it flushed there; either
+  way it left the command queued or applied with no decrement to match it.
+  Where the flush succeeded without the driver taking `BC_INCREFS`, 0.12.0
+  went on to the lookup's next transaction (a ping or the descriptor
+  query), whose read takes the pending error first: the lookup failed with
+  it (`FailedTransaction`, `DeadObject`), or returned the proxy when that
+  error was the `BR_TRANSACTION_COMPLETE` a failed reply leaves or no
+  transaction was sent (handle 0 on Android 10). A lookup made from a TLS
+  destructor that runs after the binder thread state's own is
+  `InvalidOperation`; 0.12.0 panicked there, which aborts the process.
 
 ## Calling identity and permissions
 
@@ -578,6 +592,12 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   for a session. `UnixTransport::send_frame_with_fds` waits for room in
   `poll` on Linux and Android instead of blocking in `sendmsg`; its deadline
   follows the same rule. Frames on the wire are unchanged.
+- **Two transport errors carry another code.** Fds that arrive with no
+  byte are `RpcError::Truncated` in the android-13+ reader too, where
+  0.12.0 read them as a clean end (`EndOfStream`). A `sendmsg` with fds
+  that takes nothing is `WriteZero` on Apple too, where 0.12.0 returned
+  `EndOfStream`. Code that matched `EndOfStream` for these cases matches
+  the new codes.
 
 ## Streams and topics
 

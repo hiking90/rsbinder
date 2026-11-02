@@ -839,8 +839,7 @@ pub(crate) fn read_aosp_message_gated<R: Read>(
     read_aosp_message_with(|b| read_raw(r, b), gate)
 }
 
-/// One `[header | body]` message through `read_one` (as `fill_exact` takes it): the header,
-/// `gate`, the body's cap before any allocation, then the body into the same buffer.
+/// One `[header | body]` through `read_one`: header, `gate`, body cap before allocating, body.
 fn read_aosp_message_with(
     mut read_one: impl FnMut(&mut [u8]) -> RpcResult<usize>,
     gate: impl FnOnce(&[u8]) -> RpcResult<()>,

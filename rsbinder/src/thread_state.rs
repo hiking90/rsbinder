@@ -180,6 +180,13 @@
 //! round trip goes through, so every thread that touched the driver gets
 //! exactly one.
 //!
+//! Once `THREAD_STATE` is torn down (a TLS destructor that runs after its
+//! own), `queue_cmd` writes a `fallback` command to the driver directly and
+//! refuses any other with `InvalidOperation`. Its `build` only writes. A
+//! command taken back with nothing sent, as an `inc_*` is, does not fall
+//! back: a count it raised alone would let the matching decrement take
+//! another holder's.
+//!
 //! # Dispatch notes
 //!
 //! - **`TF_STATUS_CODE` reply carrying 0.** AOSP
@@ -199,8 +206,12 @@
 //!   every exit (an `Err` or panic must not leak it into the next command):
 //!   `TransactionFrame` holds it and restores it on drop, so a panic outside
 //!   every catch (the arm's last drop of a native, which runs its `Drop`)
-//!   restores it too. A panic from the reply flush/await — `talk_with_driver` or a nested
-//!   dispatch; OOM aborts and is not catchable — is caught rather than
+//!   restores it too. Only the arm in `execute_command` makes one, already
+//!   inside `THREAD_STATE.with`, so the cell outlives it; the restore takes a
+//!   fresh borrow and, if one is still out, logs instead of panicking, which
+//!   during an unwind would abort. A panic from the reply flush/await —
+//!   `talk_with_driver` or a nested dispatch; OOM aborts and is not
+//!   catchable — is caught rather than
 //!   unwinding the worker loop (as `binder::run_handler` does; a dropped
 //!   reply reaches a sync caller as `BR_DEAD_REPLY`). The `unflushed_mark` is
 //!   taken outside `catch_unwind` so the panic arm can rewind to it too. That
@@ -233,7 +244,8 @@
 //!   mark for a command it sends alone (a death or freeze request, the proxy
 //!   cache's `BC_INCREFS`): one the driver never consumed is rewound and
 //!   reported as not sent, so the caller owes no undo; one it consumed counts
-//!   as sent even when the ioctl failed.
+//!   as sent even when the ioctl failed, and the caller's undo (a pin's
+//!   `BC_DECREFS`, a registry's clear) keeps the count right.
 //! - **Handler panics.** `binder::run_handler`, which the RPC server's
 //!   dispatch calls too, catches a panic from `Transactable::transact`,
 //!   discards the partial reply, and returns `StatusCode::Unknown`, so the
@@ -290,7 +302,7 @@
 //!   `talkWithDriver` (android-17.0.0_r1 `IPCThreadState.cpp:1358-1362`, same
 //!   in 16.0.0_r4) returns every errno with `mOut` as is and resends all of it
 //!   on the next call, applied commands included; only its short write without
-//!   an errno is fatal (`:1333-1340`). `send_request_flushed` flushes what is
+//!   an errno is fatal (`:1333-1340`). `send_flushed` flushes what is
 //!   already queued before it writes a death or freeze request, so the request
 //!   goes out alone and a refusal returns its errno instead of aborting: C
 //!   drivers before `ca63c66935b9` refuse a freeze request on a dead node.
@@ -605,12 +617,7 @@ impl Drop for LocalCallGuard {
     }
 }
 
-/// A `BR_TRANSACTION`'s frame on this thread: installs its calling identity, and on drop gives
-/// back the outer frame and strict-mode policy, an unwind included (R1, pattern P3).
-///
-/// Only the arm in `execute_command` makes one, already inside `THREAD_STATE.with`, so the
-/// cell outlives it. The restore takes a fresh borrow; if one is still out it logs instead of
-/// panicking, which during an unwind would abort.
+/// A `BR_TRANSACTION`'s identity; drop restores the outer frame and policy (module doc, R1 P3).
 struct TransactionFrame<'a> {
     thread_state: &'a RefCell<ThreadState>,
     transaction: Option<TransactionState>,
@@ -954,9 +961,7 @@ impl ThreadState {
         (self.out_flush_epoch, self.out_parcel.data_size())
     }
 
-    /// Drops what was queued since `mark` if the driver has consumed nothing since: the bytes
-    /// dropped, `None` when there were none or they went out (module doc "Rewinding unflushed
-    /// commands").
+    /// Drops the bytes queued since `mark` unless they went out; `None` if none (module doc).
     fn rewind_to(&mut self, mark: (u64, usize)) -> Option<usize> {
         let (epoch, len) = mark;
         let queued = self.out_parcel.data_size();
@@ -1340,7 +1345,7 @@ fn wait_for_response(until: UntilResponse) -> Result<Option<Parcel>> {
     })
 }
 
-/// `BR_DEAD_BINDER` phases; a `queue_done` error or an obituary panic skips `flush`. See module doc.
+/// `BR_DEAD_BINDER` phases; a `queue_done` error or an obituary panic skips `flush` (module doc).
 fn drive_dead_binder_handshake<O, Q, F>(
     handle: binder::binder_uintptr_t,
     obituary: O,
@@ -1438,9 +1443,7 @@ fn dispatch_kernel_observed(
     .map_err(handler_reply_status)
 }
 
-/// The local binder a `BR_TRANSACTION` is for: the native with `publish_native` id
-/// `target_ptr` (lifetime: module doc "Dispatch notes"), or for 0 the context manager.
-/// `DeadObject` when there is none.
+/// The native with `publish_native` id `target_ptr`, for 0 the context manager; else `DeadObject`.
 fn transaction_target(target_ptr: binder_uintptr_t) -> Result<SIBinder> {
     if target_ptr != 0 {
         let id = target_ptr;
@@ -1971,11 +1974,7 @@ enum Queued {
     SentDirectly,
 }
 
-/// Write one command with `build` into this thread's `out_parcel`. With `THREAD_STATE` torn
-/// down, a `fallback` command goes to the driver directly; any other is `InvalidOperation`.
-///
-/// `build` only writes. A command taken back with nothing sent, as an `inc_*` is, does not
-/// fall back: a count it raised alone would let the matching decrement take another holder's.
+/// Write one command with `build` into `out_parcel` (after teardown: module doc "Thread exit").
 fn queue_cmd(fallback: bool, build: impl Fn(&mut CommandStream) -> Result<()>) -> Result<Queued> {
     match THREAD_STATE.try_with(|thread_state| build(&mut thread_state.borrow_mut().out_parcel)) {
         Ok(written) => written.map(|()| Queued::InThreadState),
@@ -2358,9 +2357,6 @@ fn write_handle_cookie(out: &mut CommandStream, cmd: u32, handle: u32) -> Result
 }
 
 /// Writes one command with `build` and flushes it; `Err` only if the kernel never got it (rewound).
-///
-/// A failed flush that the driver consumed leaves the command applied, so the call succeeds and
-/// the caller's undo (a pin's `BC_DECREFS`, a registry's clear) keeps the count right.
 fn send_flushed(
     cmd: u32,
     handle: u32,
@@ -2494,10 +2490,7 @@ pub(crate) fn is_handling_transaction() -> bool {
     rpc_calling().is_some() || kernel_transaction(|_| ()).is_some()
 }
 
-/// `read` of the kernel transaction this thread is handling; `None` outside one, and in a
-/// process that never initialized `ProcessState`, where `THREAD_STATE` would panic.
-///
-/// R1: `read` runs under the borrow, so it reads fields and calls out to nothing.
+/// `read` of the kernel transaction in hand; `None` outside one or before `ProcessState` (R1).
 fn kernel_transaction<R>(read: impl FnOnce(&TransactionState) -> R) -> Option<R> {
     if !ProcessState::is_initialized() {
         return None;
@@ -3864,8 +3857,7 @@ mod tests {
         }
     }
 
-    /// D6 (plan 18): a panic outside the handler's guard, here the arm's last drop of a native
-    /// the handler unpublished, still restores the frame: no transaction, the caller's policy.
+    /// Plan 18 D6: a panic in the arm's last drop of an unpublished native restores the frame.
     #[test]
     #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
@@ -4050,9 +4042,7 @@ mod tests {
         );
     }
 
-    /// From a TLS destructor that runs after `THREAD_STATE`'s, an `inc_*` and a proxy lookup are
-    /// refused, and a proxy dropped there still sends its decrements. A panic in a TLS destructor
-    /// aborts, which is what an `inc_*` through `THREAD_STATE.with` did.
+    /// After `THREAD_STATE`'s teardown an `inc_*` and a lookup are refused; a dropped proxy sends.
     #[test]
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[serial_test::serial(binder)]

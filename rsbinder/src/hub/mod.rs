@@ -1709,7 +1709,8 @@ impl WaitEnd {
     }
 }
 
-/// Shared by [`Waiter`], the blocked waiter and `cancel`: one `cv` for both wake-ups.
+/// Shared by the watch's closure (`deliver`), the blocked waiter and `cancel`: one `cv` for
+/// both wake-ups.
 #[derive(Default)]
 pub(crate) struct WaiterState {
     inner: std::sync::Mutex<WaiterInner>,
@@ -2089,8 +2090,7 @@ pub fn is_valid_service_name(name: &str) -> bool {
 mod name_tests {
     use super::is_valid_service_name;
 
-    /// The AOSP rule by input: length bounds in bytes, the four punctuation marks, and no
-    /// other byte, a multibyte character's included.
+    /// The AOSP rule: length in bytes, the four punctuation marks, no other byte (multibyte too).
     #[test]
     fn a_service_name_is_1_to_127_bytes_of_the_aosp_set() {
         let mut names: Vec<(String, bool)> = vec![

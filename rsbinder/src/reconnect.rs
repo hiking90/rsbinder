@@ -1346,8 +1346,7 @@ fn refused_at_build(mode: Mode, code: StatusCode) -> bool {
     }
 }
 
-/// A lookup's or a cast's `code`: `BadType` is another interface (or a libbinder root asked for
-/// a name), which a retry gets again; the rest may pass.
+/// `BadType` (another interface, or a libbinder root) recurs on a retry; other codes may pass.
 fn lookup_failure(code: StatusCode) -> Failure {
     Failure {
         code,

@@ -269,8 +269,7 @@ fn copies_at_different_starts_race_as_atomics() {
     });
 }
 
-/// Every start and length of a copy on a small ring lands where modular indexing puts it, in at
-/// most two parts, the second never empty.
+/// Every copy on a small ring lands at its modular index, in one part or two, the second non-empty.
 #[test]
 fn a_wrapped_copy_lands_where_the_ring_wraps_it() {
     let capacity = if cfg!(miri) { WORD + 3 } else { 3 * WORD + 5 };

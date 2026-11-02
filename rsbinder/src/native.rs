@@ -294,8 +294,7 @@ impl<T: Remotable> Inner<T> {
         Ok(())
     }
 
-    /// After the token, kernel and RPC alike: AOSP `BBinder::transact`'s special codes, the
-    /// stub, then the `onTransact` fallbacks below.
+    /// After the token, both paths: `BBinder::transact`'s special codes, the stub, the fallbacks.
     fn dispatch_common(
         &self,
         code: TransactionCode,
@@ -1229,8 +1228,7 @@ mod rpc_dispatch_tests {
         handle.join().unwrap();
     }
 
-    /// The kernel `transact` and `rpc_transact` answer every non-call code from one table: the
-    /// same status and reply bytes (`EXTENSION`, which writes a binder, is checked above).
+    /// `transact` and `rpc_transact` answer a non-call code alike (`EXTENSION` is checked above).
     #[test]
     fn kernel_and_rpc_dispatch_answer_non_call_codes_alike() {
         let b = Interface::as_binder(&Binder::new(Echo));

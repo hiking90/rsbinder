@@ -629,8 +629,7 @@ impl<T: Element> State<T> {
         Ok((read, write))
     }
 
-    /// A read counter against the write counter: not past it, at most a ring behind it, and on
-    /// an element; what `positions` and a cached writer's reload both check.
+    /// `read` is not past `write`, at most a ring behind, on an element (`positions`, reload).
     fn check_read(&self, read: u64, write: u64) -> Result<()> {
         if read > write {
             return Err(Error::Corrupted("read counter ahead of the write counter"));
@@ -1075,8 +1074,7 @@ impl<T: Element> Regions<'_, T> {
         Ok(())
     }
 
-    /// Run `part` on the ring parts of elements `start..start + n` ([`shm::ring_parts`]), with
-    /// the parts' ranges in elements.
+    /// `part` on each ring part of elements `start..start + n`, ranges in elements (`ring_parts`).
     fn parts(&self, start: usize, n: usize, mut part: impl FnMut(usize, std::ops::Range<usize>)) {
         let q = size_of::<T>();
         let bytes = self.ring.len();

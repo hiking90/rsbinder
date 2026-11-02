@@ -6,11 +6,12 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Eight remain: refuted prose, the one slot un-push, the files a
+//! Nine remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in, the method surface of
 //! `CommandStream`, the places a raw fd number becomes an fd, the
 //! public types whose drop ends something, the library threads made by
-//! a call that panics, and the places an async API chooses its thread —
+//! a call that panics, the places an async API chooses its thread, and
+//! the library's death links held as `DeathLink` —
 //! each a closed set, not an enumeration of ways to get it wrong. The call sites of the layer split
 //! are not scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
@@ -153,12 +154,13 @@
 //! # Death links
 //!
 //! A death link the library holds is a `DeathLink`, whose drop unlinks and
-//! drops the binder under `catch_unwind` (plan 18 U1). A hand-written unlink
+//! drops the binder and the recipient under `catch_unwind` (plan 18 U1). A hand-written unlink
 //! in a `Drop` is where a poisoned lock or a proxy's own drop panicking would
 //! unwind, and an unwind out of a drop during another one aborts.
-//! `death_links_go_through_death_link` finds every `.unlink_to_death(` and
-//! `.unlink_to_death_arc(` call in the code of `rsbinder` and
-//! `rsbinder-topic`, with the test-code mask of the thread-creation test, and
+//! `death_links_go_through_death_link` finds every `unlink_to_death(` and
+//! `unlink_to_death_arc(` call, as a method (`.`) or a path (`::`), in the
+//! code of `rsbinder` and `rsbinder-topic`, with the test-code mask of the
+//! thread-creation test, fails unless it finds the one in `DeathLink::drop`, and
 //! allows only `death.rs` (the link itself), `binder.rs` (the `_arc`
 //! forwarders), `hub/accessor_16.rs` (an `IBinder` that forwards) and
 //! `bridge.rs`, whose entries hold the remote weakly and so cannot be a
@@ -795,6 +797,8 @@ fn death_links_go_through_death_link() {
     ];
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut found = Vec::new();
+    // `DeathLink::drop`'s own unlink: a scan that no longer sees it sees nothing.
+    let mut pinned = false;
     for krate in ["rsbinder", "rsbinder-topic"] {
         let src_root = workspace.join(krate).join("src");
         if !src_root.is_dir() {
@@ -810,24 +814,35 @@ fn death_links_go_through_death_link() {
             }
             let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
             let rel = rel.replace('\\', "/");
-            if ALLOWED.iter().any(|&(k, f)| k == krate && f == rel) {
-                return;
-            }
+            let allowed = ALLOWED.iter().any(|&(k, f)| k == krate && f == rel);
             let lines: Vec<&str> = content.lines().map(code_only).collect();
             let test = test_module_lines(&lines);
             for (i, line) in lines.iter().enumerate() {
-                let unlinks = line.matches(".unlink_to_death(").count()
-                    + line.matches(".unlink_to_death_arc(").count();
-                if !test[i] && unlinks > 0 {
+                // A method call or a path call (`IBinder::unlink_to_death(&b, w)`), not a `fn`.
+                let unlinks = ["unlink_to_death(", "unlink_to_death_arc("]
+                    .iter()
+                    .flat_map(|word| line.match_indices(word))
+                    .filter(|&(at, _)| line[..at].ends_with(['.', ':']))
+                    .count();
+                if test[i] || unlinks == 0 {
+                    continue;
+                }
+                if krate == "rsbinder"
+                    && rel == "death.rs"
+                    && enclosing_fn(&lines, i + 1).is_some_and(|f| f.starts_with("fn drop("))
+                {
+                    pinned = true;
+                }
+                if !allowed {
                     found.push(format!("{krate}/src/{rel}:{}", i + 1));
                 }
             }
         });
     }
     assert!(
-        found.is_empty(),
-        "an unlink outside `DeathLink`; hold the link as a `DeathLink`, see this test's doc:\n\
-         {found:#?}"
+        found.is_empty() && pinned,
+        "an unlink outside `DeathLink`, or `DeathLink::drop`'s unlink moved; hold the link as a \
+         `DeathLink`, see this test's doc:\nunpinned: {found:#?}\npinned found: {pinned}"
     );
 }
 

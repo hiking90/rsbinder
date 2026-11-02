@@ -776,8 +776,7 @@ impl Ping {
         None
     }
 
-    /// When a quiet wait wakes, and whether it then pings: at the ping if that comes no later
-    /// than `deadline`, else at `deadline` without one.
+    /// When a quiet wait wakes and whether it pings: at a ping no later than `deadline`, else then.
     fn wake_at(ping: Option<&Ping>, deadline: Option<Instant>) -> (Option<Instant>, bool) {
         let quiet_until = ping.and_then(|ping| Instant::now().checked_add(ping.every));
         let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
@@ -912,19 +911,14 @@ impl Book {
 enum EndDecision {
     /// Nobody is left to tell: nothing is sent, and the end returns `DeadObject`.
     Dead,
-    /// Send the caller's end, or `truncated` in its place when items went missing; the end
-    /// returns `failed` if set, else what the send returned.
+    /// Send the caller's end, or `truncated` if items went missing; return `failed`, else the send.
     Send {
         truncated: Option<String>,
         failed: Option<StatusCode>,
     },
 }
 
-/// How `end` (and `end_async`) ends a stream after an earlier failure `failed`, with `lost`
-/// items never delivered and the caller's end carrying `exception`.
-///
-/// `dead` is the ring's `dead` flag. The RPC path passes `false`: it does not consult the
-/// sink's death here and sends the end anyway, which a dead sink then refuses.
+/// How `end`/`end_async` ends a stream after `failed`, with `lost` items and `exception` ending.
 fn end_decision(
     failed: Option<StatusCode>,
     dead: bool,
@@ -932,6 +926,7 @@ fn end_decision(
     lost: i32,
     exception: i32,
 ) -> EndDecision {
+    // `dead`: the ring's flag; the RPC path passes `false` and lets a dead sink refuse the end.
     if dead || failed == Some(StatusCode::DeadObject) {
         return EndDecision::Dead;
     }
@@ -949,8 +944,7 @@ fn end_decision(
 }
 
 impl EndDecision {
-    /// Send the end with `send` (given the truncated message, `None` for the caller's end) and
-    /// return the end's result; an earlier failure wins, and a failed send is then only logged.
+    /// Send the end (`None`: the caller's); after an earlier failure, a failed send is only logged.
     fn send(self, send: impl FnOnce(Option<&str>) -> Result<()>) -> Result<()> {
         let EndDecision::Send { truncated, failed } = self else {
             return Err(StatusCode::DeadObject);
@@ -1010,8 +1004,7 @@ fn exception_from_i32(exception: i32) -> Result<ExceptionCode> {
     }
 }
 
-/// Whether a terminator may carry `code`, sent or received: not the reply-header markers, the
-/// binder-layer failure (`-129`) or `JustError`, none of which a call ends with.
+/// Whether a terminator may carry `code`: not a reply-header marker, `-129` or `JustError`.
 fn ends_a_stream(code: ExceptionCode) -> bool {
     !matches!(
         code,
@@ -1931,10 +1924,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    /// Every combination: death sends nothing; a cancel sends the caller's end and reports
-    /// nothing earlier; otherwise losses cut the end and an earlier failure is passed on. The
-    /// RPC path's `dead` is always `false` (`end_decision`'s doc), so its rows are the
-    /// `dead = false` half.
+    /// Every combination; the RPC path's rows are the `dead = false` half (`end_decision`).
     #[test]
     fn an_end_is_decided_alike_on_both_paths() {
         let ok = ExceptionCode::None as i32;

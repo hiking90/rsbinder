@@ -329,7 +329,6 @@ where
 // ---- Producer ----
 
 /// Batch outcomes, written by the pool task: dropping a `*_async` future detaches, not cancels it.
-/// A failed send whose delivery is unknown breaks the stream: its credit is unknown too.
 #[derive(Default)]
 struct Ledger {
     /// Up while a batch is on its way; nothing may be sent past it, lest it arrive out of order.
@@ -534,7 +533,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         let death = watch_death(sink, SinkDeath(credit.clone()))?;
         // First, so the consumer knows where to grant and whom to watch before any batch lands.
         if let Err(e) = peer.on_start(&source, declared) {
-            // No producer is built, so nothing else will undo the link.
+            // Unlinked before the error returns.
             drop(death);
             return Err(e);
         }
@@ -571,7 +570,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         self.send_with_credit()
     }
 
-    /// The error that broke the stream, if one has: see [`Ledger`].
+    /// The error that broke the stream, if one has: a send whose delivery is unknown breaks it.
     fn usable(&self) -> Result<()> {
         self.ledger.lock().usable()
     }
@@ -851,7 +850,7 @@ impl<T: ?Sized> Producer<T> {
 impl<T: ?Sized> Drop for Producer<T> {
     /// Deliver what is queued and end the stream without waiting for credit.
     fn drop(&mut self) {
-        // Unlink regardless: a dropped recipient leaves a dead `Weak` in the sink's list for good.
+        // Unlinked first, before the batch and the terminator go out.
         drop(self.death.take());
         if self.ended {
             return;
@@ -2985,9 +2984,7 @@ mod tests {
         });
     }
 
-    /// A pinged wait whose pool is gone waits for the next change rather than spin: the
-    /// pooled wait's `Abandon` wakes threads only, so the `Notified` made before it stays
-    /// pending and the first poll returns.
+    /// A pinged wait with no pool waits for a change, not spins: `Abandon` wakes threads only.
     #[cfg(all(feature = "tokio", feature = "rpc"))]
     #[test]
     fn a_consumer_whose_pool_is_gone_waits_unpinged_rather_than_spin() {

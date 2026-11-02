@@ -1297,8 +1297,7 @@ impl ProcessState {
         );
     }
 
-    /// A clear's done for `registry`: the request a registration made during the clear asked
-    /// for, flushed under the lock (or the slot forgotten), then the pins the clear held.
+    /// A clear-done: the deferred request flushed under the lock (or forgotten), then the pins.
     fn finish_clear<R: Registrations>(
         &self,
         mut registry: sync::MutexGuard<'_, R>,
