@@ -48,6 +48,10 @@ pub(crate) enum Refused {
     /// The death link failed; nothing changed.
     Link(rsbinder::Status),
     /// `commit` of an allocation that was replaced, withdrawn or never made.
+    #[cfg_attr(
+        not(all(feature = "uds", any(target_os = "linux", target_os = "android"))),
+        expect(dead_code, reason = "only a registry on a socket allocates")
+    )]
     NoAllocation,
 }
 
@@ -105,6 +109,10 @@ struct Owed<W> {
 }
 
 /// An allocation of a name that is not committed yet: nothing finds it.
+#[cfg_attr(
+    not(all(feature = "uds", any(target_os = "linux", target_os = "android"))),
+    expect(dead_code, reason = "only a registry on a socket allocates")
+)]
 struct Pending<T> {
     key: T,
     uid: u32,
@@ -122,6 +130,10 @@ struct Uses {
 enum Use {
     Topic,
     Watch,
+    #[cfg_attr(
+        not(all(feature = "uds", any(target_os = "linux", target_os = "android"))),
+        expect(dead_code, reason = "only a registry on a socket allocates")
+    )]
     Pending,
 }
 
@@ -266,7 +278,11 @@ impl<T: Key, W: Key> Table<T, W> {
     fn pending_count(&self) -> usize {
         self.pending.values().map(Vec::len).sum()
     }
+}
 
+/// What only a registry on a socket does: a name given in two steps (plan 15-pubsub-uds §4.5).
+#[cfg(all(feature = "uds", any(target_os = "linux", target_os = "android")))]
+impl<T: Key, W: Key> Table<T, W> {
     /// Make `key` the pending allocation of `name` for its handle, in place of one it had.
     /// `Taken` as for a change of the name, which is judged again at the commit.
     pub(crate) fn allocate(
@@ -356,7 +372,9 @@ impl<T: Key, W: Key> Table<T, W> {
         }
         true
     }
+}
 
+impl<T: Key, W: Key> Table<T, W> {
     /// The topic `name` has and the generation of the change that gave it; with none, now's.
     pub(crate) fn lookup(&self, name: &str) -> (Option<T>, u64) {
         match self.topics.get(name) {

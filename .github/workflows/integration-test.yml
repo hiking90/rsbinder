@@ -408,6 +408,12 @@ jobs:
             exit 1
           }
 
+      - name: Run the topic fleet over Unix sockets, in a container with no binder
+        env:
+          FLEET_SECS: ${{ github.event.inputs.fleet_secs || '60' }}
+          RSB_CONTAINER_REQUIRED: 1
+        run: tests/container/topic_fleet_uds.sh --release
+
       - name: Restart test_service for test_death_recipient
         run: |
           # Each #[ignore]'d destructive test consumes a live

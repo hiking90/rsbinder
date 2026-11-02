@@ -140,14 +140,14 @@ pub fn advertise<T: Payload + 'static>(
 }
 
 /// Give `name` to the topic of `publisher`, as one made before it was found by name is, or one
-/// whose name was taken from it is again. Over a socket that is a new socket, so a subscriber
-/// connected to the old one reads it as another publisher.
+/// whose name was taken from it is again. Over a socket that is a new socket and a new binder,
+/// of the same topic.
 pub fn register<T: Payload + 'static>(name: &str, publisher: &Publisher<T>) -> BinderResult<()> {
     #[cfg(feature = "topic-uds")]
     if let Some(dir) = sockets() {
         return publisher.advertise_on(name, &socket::resolver(&dir, &Via::ServiceManager)?);
     }
-    Ok(hub::add_service(name, publisher.as_binder())?)
+    hub::add_service(name, publisher.as_binder())
 }
 
 /// A subscription to the topic registered under `name` with the service manager now;
@@ -194,7 +194,7 @@ impl Served {
         if self._handle.is_some() {
             return Ok(());
         }
-        Ok(hub::add_service(&self.service, self.binder.clone())?)
+        hub::add_service(&self.service, self.binder.clone())
     }
 }
 
