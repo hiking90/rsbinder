@@ -1549,7 +1549,15 @@ impl<T: Payload + 'static> Named<T> {
             // Counted, not compared: a notice of the binder `latest` already holds is a notice too.
             let before = state.registrations;
             drop(state);
-            let found = lookup().ok().flatten();
+            // Caught here, a panic leaves the notices counted below to connect, as an `Err` does.
+            let found = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lookup())) {
+                Ok(found) => found.ok().flatten(),
+                Err(payload) => {
+                    let panic = rsbinder::__panic_message(&payload);
+                    log::error!("topic: the name's lookup panicked ({panic}); taken as no binder");
+                    None
+                }
+            };
             state = self.lock();
             if state.dropped || state.closed.is_some() {
                 break None;
@@ -1573,7 +1581,7 @@ impl<T: Payload + 'static> Named<T> {
     }
 }
 
-/// Clears `connecting` when the connection thread unwinds (a resolver's lookup may panic).
+/// Clears `connecting` when the connection thread unwinds (a poisoned lock, a request's panic).
 struct Connecting<'n, T: Payload>(&'n Named<T>);
 
 impl<T: Payload> Drop for Connecting<'_, T> {

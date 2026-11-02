@@ -2096,17 +2096,21 @@ fn an_ended_publisher_with_no_binder_after_it_asks_the_lookup() {
     assert_eq!(names.lookups(), 1);
 }
 
-/// A lookup that panics ends its connection thread, and the next notice starts another.
+/// The one notice that comes while a lookup runs connects, though the lookup then panics.
 #[test]
-fn a_lookup_that_panics_leaves_the_next_notice_free_to_connect() {
+fn a_notice_during_a_lookup_that_panics_connects() {
     let names = Names::looking();
     let first = advertise(&names, &policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
+    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    next.publish(&bytes(5)).unwrap();
     let (panicked, seen) = mpsc::channel();
+    let (given, binder) = (names.clone(), next.as_binder());
     let calls = AtomicUsize::new(0);
     names.before_lookup(move || {
         if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            given.give(NAME, binder.clone());
             panicked.send(()).unwrap();
             panic!("the test's lookup panics");
         }
@@ -2117,14 +2121,7 @@ fn a_lookup_that_panics_leaves_the_next_notice_free_to_connect() {
         Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
     );
     seen.recv_timeout(WAIT).expect("the lookup was asked");
-    let next = Publisher::<Bytes>::new(&policy()).unwrap();
-    next.publish(&bytes(5)).unwrap();
-    // A notice while the thread still unwinds finds `connecting` set: give it again.
-    let deadline = Instant::now() + WAIT;
-    while !subscriber.wait_connected(Duration::from_millis(20)) {
-        assert!(Instant::now() < deadline, "connected within {WAIT:?}");
-        names.give(NAME, next.as_binder());
-    }
+    assert!(subscriber.wait_connected(WAIT), "connected within {WAIT:?}");
     assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
 }
 

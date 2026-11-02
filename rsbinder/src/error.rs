@@ -437,7 +437,7 @@ fn unnamed_errno(raw: i32) -> StatusCode {
 }
 
 /// The text of a caught panic. A `&dyn Any` parameter would take `&Box<dyn Any>` and read no text.
-pub(crate) fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
     payload
         .downcast_ref::<&'static str>()
         .copied()

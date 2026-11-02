@@ -126,8 +126,14 @@ impl Watch {
     /// answer, and once when the publisher of its connection ends and no other binder has been
     /// given the name. It asks from a thread of its own, never one that receives, and uses the
     /// answer only when no call of the watch came while it asked; after a call of a binder it
-    /// cannot use, it asks once more. An `Err` counts as `None`. Without a lookup
-    /// ([`Watch::new`]) the subscriber waits for the next call.
+    /// cannot use, it asks once more. An `Err` counts as `None`, and so does a panic of
+    /// `lookup`, which is caught and logged; a call that came while it ran is used. Without a
+    /// lookup ([`Watch::new`]) the subscriber waits for the next call.
+    ///
+    /// The catch does not repair `lookup`'s own state, and `lookup` is asked again at the next
+    /// occasion (one that panicked over a poisoned lock of its own panics each time), so keep it
+    /// panic-free and treat the catch as a safety net. It relies on `panic = "unwind"` (Rust's
+    /// default); a `panic = "abort"` build ends the process at the panic.
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     pub fn with_lookup(

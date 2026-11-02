@@ -398,6 +398,9 @@ pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 pub use binder_async::__spawn_transact;
 pub use death::DeathLink;
 pub use error::{Result, StatusCode};
+// `rsbinder-topic` logs the panics it catches with the same text.
+#[doc(hidden)]
+pub use error::panic_message as __panic_message;
 pub use file_descriptor::ParcelFileDescriptor;
 // Fuzz entry points: the out-of-workspace `fuzz/` crate reaches them only via the root.
 #[cfg(all(feature = "rpc", feature = "fuzzing"))]
