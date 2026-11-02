@@ -33,7 +33,7 @@ use crate::layout;
 use crate::poll::{Sealed, Wait};
 use crate::receive::Held;
 use crate::resolve::{Lookup, Resolved, Resolver, ServiceManager, Watch};
-use crate::subscriber::Interrupt;
+use crate::subscriber::{Interrupt, RingId};
 use crate::wake::NamedFds;
 use crate::{
     Bytes, Closed, Disconnected, Interrupter, Payload, RecvError, Sample, Start, Subscriber,
@@ -129,8 +129,9 @@ pub enum NamedState {
 /// again. A connection counts from the receive that takes it; one whose fd the subscriber's
 /// epoll instance refuses ([`Disconnected::Rejected`]) does not.
 ///
-/// The subscriber remembers a publisher it was connected to by a reference to its binder, and
-/// forgets it only on what a connection to it saw: the connection read the end record of its
+/// The subscriber remembers a publisher it was connected to by its topic's memory, which stays
+/// the same however it is reached: a publisher a registry on a socket gave a new socket is still
+/// the publisher it read. It forgets one only on what a connection to it saw: the connection read the end record of its
 /// topic (what [`Closed::End`] and [`Closed::Status`] report), after which the publisher refuses
 /// every later subscription, or the notice of its binder's death arrived while the connection
 /// was held. How the connection ended does not decide it, so a publisher no connection saw end
@@ -355,9 +356,9 @@ struct State<T: Payload> {
     notices: VecDeque<Disconnected>,
     /// Ends the wait of the subscriber's connection when the state changes.
     wake: Option<Interrupter>,
-    /// Binders joined, each once; one leaves when its connection saw the topic's end or its death.
-    joined: Vec<SIBinder>,
-    /// A connection has joined: a later one to a binder not joined starts at `Oldest`, or `Last`.
+    /// Topics joined, each once; one leaves when its connection saw the topic's end or its death.
+    joined: Vec<RingId>,
+    /// A connection has joined: a later one to a topic not joined starts at `Oldest`, or `Last`.
     later: bool,
     /// The wait before asking again a publisher whose connection failed to join; zero after a join.
     rejoin: Duration,
@@ -870,8 +871,8 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
                 }
                 state.rejoin = Duration::ZERO;
                 state.later = true;
-                if !state.joined.contains(&binder) {
-                    state.joined.push(binder.clone());
+                if !state.joined.contains(&subscriber.ring()) {
+                    state.joined.push(subscriber.ring());
                 }
                 let wake = subscriber.interrupter();
                 if state.interrupted {
@@ -1047,10 +1048,10 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         state.corrupt = old.filter(|_| corrupt).cloned();
         // Not by `why`: an ended topic refuses every later subscription, a dead binder every call.
         let ended = gone.as_ref().filter(|c| c.subscriber.saw_publisher_end());
-        let forgotten = ended.and_then(|connection| {
-            let at = state.joined.iter().position(|j| *j == connection.binder);
-            at.map(|at| state.joined.swap_remove(at))
-        });
+        if let Some(connection) = ended {
+            let ring = connection.subscriber.ring();
+            state.joined.retain(|joined| *joined != ring);
+        }
         let next = state
             .latest
             .clone()
@@ -1078,7 +1079,6 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         }
         // Unmapped outside the lock.
         drop(gone);
-        drop(forgotten);
         RecvError::Disconnected(why)
     }
 
@@ -1315,15 +1315,17 @@ impl<T: Payload> Named<T> {
         }
     }
 
-    /// Where a connection to `binder` starts, by the rule of [`NamedSubscriber`]'s documentation.
-    fn policy(&self, state: &State<T>, binder: &SIBinder) -> SubscriberPolicy {
-        let mut policy = self.policy.clone();
-        if state.joined.contains(binder) {
-            policy.start = Start::Latest;
-        } else if state.later && policy.start != Start::Last {
-            policy.start = Start::Oldest;
+    /// Where a connection to the topic of `ring` starts, by the rule of [`NamedSubscriber`]'s
+    /// documentation.
+    fn start_of(&self, ring: RingId) -> Start {
+        let state = self.lock();
+        if state.joined.contains(&ring) {
+            Start::Latest
+        } else if state.later && self.policy.start != Start::Last {
+            Start::Oldest
+        } else {
+            self.policy.start
         }
-        policy
     }
 }
 
@@ -1421,15 +1423,16 @@ impl<T: Payload + 'static> Named<T> {
             }
         }
         loop {
-            let policy = {
+            {
                 let mut state = self.lock();
                 if state.dropped || state.closed.is_some() {
                     state.connecting = false;
                     return;
                 }
-                self.policy(&state, &binder)
-            };
-            let result = Subscriber::<T>::request(&binder, &policy);
+            }
+            let result = Subscriber::<T>::request_starting(&binder, &self.policy, |ring| {
+                self.start_of(ring)
+            });
             let mut state = self.lock();
             let newer = state.latest.clone().filter(|latest| *latest != binder);
             if state.dropped || state.closed.is_some() {

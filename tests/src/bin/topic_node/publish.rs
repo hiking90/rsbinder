@@ -9,7 +9,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::hub;
 use rsbinder_topic::{Backpressure, Bytes, PoolPolicy, Publisher, PublisherPolicy, PublisherStats};
 use tests::topic_fleet::event::{Kind, Subscribed};
 use tests::topic_fleet::payload::{FleetPayload, FleetRecord};
@@ -120,7 +119,7 @@ fn make<T: FleetPayload>(
         };
         write(&publisher, &stamp).map_err(|err| format!("publish {topic} seq {seq}: {err}"))?;
     }
-    hub::add_service(topic, publisher.as_binder())
+    transport::register(topic, &publisher)
         .map_err(|status| format!("addService {topic}: {status}"))?;
     Ok((publisher, records))
 }
@@ -214,10 +213,10 @@ fn run<T: FleetPayload>(
                     continue;
                 }
                 Ok(Request::Command(Command::Readvertise, _)) if publisher.is_some() => {
-                    let binder = publisher.as_ref().map(Publisher::as_binder);
-                    if let Some(Err(status)) =
-                        binder.map(|binder| hub::add_service(&spec.topic, binder))
-                    {
+                    let given = publisher
+                        .as_ref()
+                        .map(|publisher| transport::register(&spec.topic, publisher));
+                    if let Some(Err(status)) = given {
                         out.fault(format!("addService {}: {status}", spec.topic));
                     }
                     continue;

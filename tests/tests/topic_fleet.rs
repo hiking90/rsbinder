@@ -20,6 +20,10 @@
 //! `TOPIC_NODE_BIN` replaces the node binary and `TOPIC_FLEET_DIR` the directory the run
 //! directories go in (`target/tmp/topic-fleet`), for a device the binaries were pushed to.
 //!
+//! With the feature `topic-uds` and `TOPIC_FLEET_SOCKETS` set to a directory, the fleet runs over
+//! Unix sockets and opens no binder device: `tests/container/topic_uds.sh` runs it in a container
+//! that has none. `steady_state_fleet`, `scripted_faults` and `chaos_faults` take it.
+//!
 //! On Android the platform service manager is the context manager and the nodes run as root:
 //! `su` is a permissive domain on a userdebug build, so any name can be added under enforcing
 //! SELinux. `hub_restarts` does not apply there. Android 10's service manager sends no
@@ -38,7 +42,7 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use rsbinder::{hub, ProcessState, StatusCode};
+use rsbinder::{hub, StatusCode};
 use rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
 use rsbinder_topic::{Resolver, ServiceManager, Start};
 use rustix::process::{Pid, Signal};
@@ -49,6 +53,7 @@ use tests::topic_fleet::judge::{
 };
 use tests::topic_fleet::now_ns;
 use tests::topic_fleet::record::Incarnation;
+use tests::topic_fleet::transport;
 
 /// From a spawn to the node's `READY`.
 const READY: Duration = Duration::from_secs(10);
@@ -728,16 +733,16 @@ fn a_node_that_panics_fails_the_run() {
 /// This process's binder, for the service manager's list of names.
 fn init() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        ProcessState::init_default().expect("a binder device");
-        ProcessState::start_thread_pool();
-    });
+    ONCE.call_once(transport::init);
 }
 
 /// Whether the service manager sends registration notices. Android 10's has none, so a named
 /// subscriber can follow a name only through the registry there (`rsbinder_topic::ServiceManager`).
 fn registration_notices() -> bool {
     init();
+    if transport::sockets().is_some() {
+        return true;
+    }
     let probe = format!("rsb.fleet.probe.{}", std::process::id());
     match ServiceManager.watch(&probe, Box::new(|_| {})) {
         Ok(_) => true,
@@ -827,6 +832,15 @@ impl Topology {
             pins: String::new(),
             notices: registration_notices(),
         };
+        // Over sockets a registry stands for the service manager, which holds only topics.
+        #[cfg(feature = "topic-uds")]
+        if transport::sockets().is_some() {
+            let hub = transport::HUB;
+            topology.node(hub, &[("--registry", format!("service={hub}"))]);
+            topology
+                .registered
+                .retain(|name| *name != service && *name != registry);
+        }
         topology.node("registry", &[("--registry", format!("service={registry}"))]);
         topology.node(
             "p-status",
@@ -1129,8 +1143,10 @@ fn stop_point(
                 }
                 Kind::Reported { sent, .. } => reported.push((node.to_string(), sent)),
                 Kind::RegStats {
-                    topics, watchers, ..
-                } => registry = Some((topics, watchers)),
+                    service,
+                    topics,
+                    watchers,
+                } if service == topology.registry => registry = Some((topics, watchers)),
                 _ => {}
             }
         }
@@ -1264,7 +1280,7 @@ fn stop_point(
         format!("rsb.fleet.{}.", fleet.tag),
         format!(".{}", std::process::id()),
     );
-    let mut listed: Vec<String> = hub::list_services(hub::DUMP_FLAG_PRIORITY_ALL)
+    let mut listed: Vec<String> = transport::registered()
         .into_iter()
         .filter(|name| {
             (name.starts_with(&prefix) && name.ends_with(&suffix)) || *name == topology.registry

@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder::{hub, BinderResult, Interface, Strong};
-use rsbinder_topic::registry::{AllowAll, Registry};
+use rsbinder::{BinderResult, Interface, Strong};
+use rsbinder_topic::registry::AllowAll;
 use rsbinder_topic::{Publisher, PublisherPolicy};
 use tests::topic_fleet::event::Kind;
 use tests::topic_fleet::payload::{
@@ -87,7 +87,7 @@ pub fn relay(
         out: out.clone(),
     };
     let binder = BnFleetStatus::new_binder(relay).as_binder();
-    hub::add_service(&service, binder.clone())
+    let served = transport::serve_service(&service, binder)
         .map_err(|status| format!("addService {service}: {status}"))?;
     let (requests, requested) = mpsc::channel();
     let out = out.clone();
@@ -120,7 +120,7 @@ pub fn relay(
                         Err(status) => out.fault(format!("advertise {topic}: {status}")),
                     }
                     drop(relayed);
-                    if let Err(status) = hub::add_service(&service, binder.clone()) {
+                    if let Err(status) = served.again() {
                         out.fault(format!("addService {service}: {status}"));
                     }
                 }
@@ -170,7 +170,7 @@ pub fn report(out: &Out, service: String, hz: u32, incarnation: Incarnation) -> 
             }
             next_at += period;
             if relay.is_none() {
-                relay = hub::check_interface::<dyn IFleetStatus>(&service).ok();
+                relay = transport::status_service(&service);
             }
             let Some(to) = &relay else {
                 continue;
@@ -192,9 +192,7 @@ pub fn report(out: &Out, service: String, hz: u32, incarnation: Incarnation) -> 
 
 /// Host a topic registry under `service`.
 pub fn registry(service: String) -> Result<Running, String> {
-    let registry = Registry::new(AllowAll);
-    hub::add_service(&service, registry.as_binder())
-        .map_err(|status| format!("addService {service}: {status}"))?;
+    let registry = transport::host_registry(&service, AllowAll)?;
     let (requests, requested) = mpsc::channel();
     let name = service.clone();
     let thread = thread::spawn(move || {
@@ -210,7 +208,7 @@ pub fn registry(service: String) -> Result<Running, String> {
                 }
                 // The service manager started again (X10): the registry is registered again.
                 Ok(Request::Command(Command::Readvertise, _)) => {
-                    if let Err(status) = hub::add_service(&service, registry.as_binder()) {
+                    if let Err(status) = registry.again() {
                         eprintln!("topic_node: addService {service}: {status}");
                     }
                 }

@@ -860,7 +860,7 @@ pub fn fuse(
         readvertise: Box::new({
             let (publisher, topic, out) = (publisher.clone(), topic.clone(), out.clone());
             move || {
-                if let Err(status) = rsbinder::hub::add_service(&topic, publisher.as_binder()) {
+                if let Err(status) = transport::register(&topic, &publisher) {
                     out.fault(format!("addService {topic}: {status}"));
                 }
             }

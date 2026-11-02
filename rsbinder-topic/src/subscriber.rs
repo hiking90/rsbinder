@@ -178,6 +178,7 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     read_end: bool,
     /// What keeps the session of an RPC binder open; dropped after the death link it serves.
     session: Option<Arc<dyn Any + Send + Sync>>,
+    ring: RingId,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -202,6 +203,10 @@ pub(crate) struct Trace {
     /// How each sleep ended, how long it lasted, and the `seq` it slept on.
     pub(crate) parks: Vec<(Slept, Duration, u32)>,
 }
+
+/// Which memory a topic's ring is: its memfd's device and inode, the same however the publisher
+/// was reached, through whichever binder or socket.
+pub(crate) type RingId = (u64, u64);
 
 /// The control page, marked `CLOSED` when dropped. A wait left on the pool shares it.
 struct Closing(Arc<ControlPage>);
@@ -238,6 +243,16 @@ impl<T: Payload> Subscriber<T> {
     /// through the session's incoming connection instead, and the caller keeps the session open
     /// for as long as the subscriber.
     pub fn request(topic: &SIBinder, policy: &SubscriberPolicy) -> BinderResult<Self> {
+        Self::request_starting(topic, policy, |_| policy.start)
+    }
+
+    /// [`request`](Self::request), with where it starts chosen once the reply says which topic
+    /// it is. Nothing of the subscription call depends on it: the start is this side's to apply.
+    pub(crate) fn request_starting(
+        topic: &SIBinder,
+        policy: &SubscriberPolicy,
+        start: impl FnOnce(RingId) -> Start,
+    ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
@@ -282,7 +297,7 @@ impl<T: Payload> Subscriber<T> {
         };
         // The publisher holds its own fds now; this side keeps the mapping and a duplicate.
         drop(request);
-        let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
+        let (memory, ring) = map_endpoint(&endpoint, policy.max_ring_bytes)?;
         let pool = match &endpoint.pool {
             Some(pool) => {
                 let pool = map_pool(pool, policy.max_pool_bytes)?;
@@ -295,7 +310,7 @@ impl<T: Payload> Subscriber<T> {
             control: control.0.clone(),
             fd: fd_wake,
         });
-        let start = match policy.start {
+        let start = match start(ring) {
             // The bits of the position and the index, as the publisher wrote them.
             Start::Latest => ring::Start::Latest {
                 at: endpoint.start as u64,
@@ -328,6 +343,7 @@ impl<T: Payload> Subscriber<T> {
             dead,
             read_end: false,
             session: None,
+            ring,
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -352,6 +368,11 @@ impl<T: Payload> Subscriber<T> {
 }
 
 impl<T: Payload, M: Trust> Subscriber<T, M> {
+    /// Which memory this subscription reads.
+    pub(crate) fn ring(&self) -> RingId {
+        self.ring
+    }
+
     /// The next value, without waiting.
     ///
     /// [`RecvError::Empty`] when no record is unread. After the publisher's process died, every
@@ -864,6 +885,7 @@ impl<T: Payload> Subscriber<T> {
             dead,
             read_end,
             session,
+            ring,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -890,6 +912,7 @@ impl<T: Payload> Subscriber<T> {
             dead,
             read_end,
             session,
+            ring,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1196,7 +1219,7 @@ impl fmt::Debug for Interrupter {
 }
 
 /// SUB6 and SUB7: the reply's version and descriptor, then the topic memory it names, mapped.
-fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loaded> {
+fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<(Loaded, RingId)> {
     if endpoint.version != VERSION as i32 {
         return Err(refuse(ERROR_VERSION, "publisher of another layout version"));
     }
@@ -1215,7 +1238,9 @@ fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loade
     if ring.grantors != layout::grantors(memory.capacity()) {
         return Err(bad_value());
     }
-    Ok(memory)
+    let stat = rustix::fs::fstat(fd.as_fd())
+        .map_err(|errno| StatusCode::from(std::io::Error::from(errno)))?;
+    Ok((memory, (stat.st_dev as u64, stat.st_ino as u64)))
 }
 
 /// Map the pool an endpoint names, no larger than `max_pool`.

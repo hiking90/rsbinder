@@ -713,6 +713,61 @@ fn a_remote_binder_is_not_advertised() {
     assert_eq!(fixture.registry.stats().pending, 0);
 }
 
+/// A new socket is not a new publisher: what the subscriber read is not read again.
+#[test]
+fn a_publisher_given_a_new_socket_is_the_publisher_a_subscriber_read() {
+    let fixture = Fixture::new("resocket", AllowAll);
+    let policy = SubscriberPolicy {
+        start: crate::Start::Oldest,
+        ..SubscriberPolicy::default()
+    };
+    let first = fixture.resolver();
+    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    publisher.advertise_on("a.name", &first).unwrap();
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    let mut subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy, &fixture.resolver()).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    let second = fixture.resolver();
+    publisher.advertise_on("a.name", &second).unwrap();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+    // Another publisher starts where the policy says: its first record is not missed.
+    let other = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    other.publish(&Bytes(vec![3])).unwrap();
+    other.advertise_on("a.name", &first).unwrap();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![3])));
+}
+
+#[test]
+fn a_resolver_subscribes_to_the_topic_a_name_has_now() {
+    let fixture = Fixture::new("plain", AllowAll);
+    let resolver = fixture.resolver();
+    let refused = resolver.subscribe::<Bytes>("a.name", &policy());
+    assert_eq!(
+        refused.err().map(|status| status.transaction_error()),
+        Some(StatusCode::NameNotFound)
+    );
+    let publisher =
+        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
+            .unwrap();
+    let mut subscriber = fixture
+        .resolver()
+        .subscribe::<Bytes>("a.name", &policy())
+        .unwrap();
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+}
+
 /// A commit the resolver loses keeps what the publisher had, and stops the server it made.
 #[test]
 fn a_commit_a_policy_refuses_leaves_the_publisher_its_name() {

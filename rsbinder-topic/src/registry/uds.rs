@@ -59,6 +59,7 @@ use crate::connect::refuse;
 use crate::registry::TopicListing;
 use crate::resolve::{Advertisement, Resolved, Resolver, Watch};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
+use crate::{Payload, Subscriber, SubscriberPolicy};
 
 /// The directory a [`UdsRegistry`] makes its sockets in, held by a descriptor.
 ///
@@ -834,6 +835,19 @@ impl UdsResolver {
     pub fn list(&self, prefix: &str) -> BinderResult<Vec<TopicListing>> {
         let listed = self.host.registry.r#list(prefix)?;
         Ok(listed.into_iter().map(TopicListing::from).collect())
+    }
+
+    /// A subscription to the topic `name` has now: `NameNotFound` when it has none, or the host's
+    /// policy does not let this process subscribe to it. It holds a session of its own and goes
+    /// on after this resolver drops.
+    pub fn subscribe<T: Payload>(
+        &self,
+        name: &str,
+        policy: &SubscriberPolicy,
+    ) -> BinderResult<Subscriber<T>> {
+        let (address, _) = parts(self.host.registry.r#lookup(name)?);
+        let address = address.ok_or(StatusCode::NameNotFound)?;
+        uds::subscribe_with(Endpoint::Fd(address), policy, &self.host.publisher)
     }
 
     fn serve(socket: OwnedFd, topic: SIBinder) -> BinderResult<Arc<RpcServer>> {

@@ -404,6 +404,11 @@ tier_kernel() {
     # Debug, as the other kernel steps: its nodes take about three cores (CI runs it in release).
     run "topic fleet" tpass cargo test -p tests --test topic_fleet \
         -- --ignored --test-threads=1 --skip hub_restarts
+    if docker info >/dev/null 2>&1; then
+        run "topic fleet over sockets (a container with no binder)" tests/container/topic_fleet_uds.sh
+    else
+        skip "topic fleet over sockets (a container with no binder)" "needs a running docker"
+    fi
     run "reconnect_kernel" tpass cargo test -p tests --features rpc \
         --test reconnect_kernel -- --ignored --test-threads=1
     run "freeze_kernel" tpass cargo test -p tests --features rpc \
