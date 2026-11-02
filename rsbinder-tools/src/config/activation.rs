@@ -11,6 +11,7 @@
 //! is up.
 
 use std::os::fd::AsFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -198,11 +199,28 @@ fn exec_command(root: At<'_>, argv: &[String], our_uid: u32) -> Result<Command, 
     Ok(c)
 }
 
-/// `program` without the hub's `$NOTIFY_SOCKET`, which `Notifier::from_environment` leaves set.
+/// `program` without the hub's `$NOTIFY_SOCKET`, which `Notifier::from_environment` leaves set,
+/// and without its signal mask: `Command` keeps a mask, and `rsb_hub` blocks what `sigwait` takes.
 fn child_command(program: &str) -> Command {
     let mut c = Command::new(program);
     c.env_remove(crate::notify::NOTIFY_SOCKET);
+    // SAFETY: `unblock_all_signals` allocates nothing and calls only async-signal-safe functions.
+    unsafe { c.pre_exec(unblock_all_signals) };
     c
+}
+
+/// Between `fork` and `exec`, so async-signal-safe only.
+fn unblock_all_signals() -> std::io::Result<()> {
+    // SAFETY: `set` is local and initialized by `sigemptyset`; a null `oldset` is allowed.
+    let rc = unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut())
+    };
+    match rc {
+        0 => Ok(()),
+        rc => Err(std::io::Error::from_raw_os_error(rc)),
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +228,32 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// The hub blocks what `sigwait` takes; a child inheriting that would ignore `SIGTERM`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_child_starts_with_no_signal_blocked() {
+        // A thread of its own: the mask is per thread, and this one is never unblocked.
+        let out = std::thread::spawn(|| {
+            // SAFETY: `set` is local and initialized by `sigemptyset`; a null `oldset` is allowed.
+            let blocked = unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut())
+            };
+            assert_eq!(blocked, 0);
+            child_command("/bin/sh")
+                .args(["-c", "grep SigBlk /proc/self/status"])
+                .output()
+                .expect("spawn")
+        })
+        .join()
+        .expect("thread");
+        let line = String::from_utf8(out.stdout).expect("utf-8");
+        let mask = line.split_whitespace().nth(1).expect("a SigBlk line");
+        assert_eq!(u64::from_str_radix(mask, 16), Ok(0), "{line}");
+    }
 
     struct Recorder {
         started: mpsc::Sender<String>,

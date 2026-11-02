@@ -926,6 +926,11 @@ accepts both the 0.12.0 bytes and the new ones.
   queued, as in AOSP `incStrongHandle` (what a lookup returns: see
   *Migrating*). Before, either failure left a count the matching decrement
   never undid.
+- **A service `rsb_hub` starts no longer inherits its signal mask.** The hub
+  blocks `SIGHUP`, `SIGINT` and `SIGTERM` for its `sigwait`, and a child kept
+  that mask: an `exec` service ignored `SIGTERM`, so `systemctl stop` of a
+  unit holding one waited for its timeout and ended in `SIGKILL`. A child now
+  starts with no signal blocked.
 
 ### Security
 
