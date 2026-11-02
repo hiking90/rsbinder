@@ -64,9 +64,10 @@ use crate::notification::{ClearDone, Kernel, NotifyCmd, Registrations};
 /// [`unlink_to_death`](crate::IBinder::unlink_to_death) and then drops the
 /// binder reference.
 ///
-/// The drop never panics past itself: the unlink and the binder's drop run
-/// under `catch_unwind`, so a panic there (a poisoned lock inside rsbinder, or
-/// the last reference to a proxy whose own drop panics) is logged at error
+/// The drop never panics past itself: the unlink, the binder's drop and the
+/// recipient's drop run under `catch_unwind`, so a panic there (a poisoned lock
+/// inside rsbinder, or the last reference to a proxy or recipient whose own
+/// drop panics) is logged at error
 /// level instead of unwinding, which would abort the process if the link were
 /// dropped during another unwind. An unlink that returns an error is logged at
 /// debug level: [`StatusCode::DeadObject`] is what an unlink returns after
@@ -78,7 +79,8 @@ use crate::notification::{ClearDone, Kernel, NotifyCmd, Registrations};
 pub struct DeathLink {
     /// `None` only inside `Drop`, which drops it under the catch.
     binder: Option<SIBinder>,
-    recipient: Arc<dyn DeathRecipient>,
+    /// `None` only inside `Drop`, which drops it under the catch.
+    recipient: Option<Arc<dyn DeathRecipient>>,
 }
 
 impl DeathLink {
@@ -89,7 +91,7 @@ impl DeathLink {
         binder.link_to_death(Arc::downgrade(&recipient))?;
         Ok(Self {
             binder: Some(binder.clone()),
-            recipient,
+            recipient: Some(recipient),
         })
     }
 }
@@ -97,10 +99,11 @@ impl DeathLink {
 impl Drop for DeathLink {
     fn drop(&mut self) {
         let binder = self.binder.take();
-        let recipient = Arc::downgrade(&self.recipient);
+        let recipient = self.recipient.take();
         // Borrowed here: a binder dropped by this unwind could panic during cleanup and abort.
         let unlinked = catch_unwind(AssertUnwindSafe(|| {
-            binder.as_ref().map(|b| b.unlink_to_death(recipient))
+            let weak = Arc::downgrade(recipient.as_ref()?);
+            binder.as_ref().map(|b| b.unlink_to_death(weak))
         }));
         match unlinked {
             Ok(Some(Err(err))) => log::debug!("death link: unlink_to_death returned {err:?}"),
@@ -113,6 +116,12 @@ impl Drop for DeathLink {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(binder))) {
             log::error!(
                 "death link: the binder's drop panicked: {}",
+                panic_message(&payload)
+            );
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(move || drop(recipient))) {
+            log::error!(
+                "death link: the recipient's drop panicked: {}",
                 panic_message(&payload)
             );
         }
@@ -604,6 +613,31 @@ mod tests {
         fn a_panicking_binder_drop_stays_inside_the_drop() {
             let (link, _) = link(Unlink::Ok, true);
             assert!(catch_unwind(AssertUnwindSafe(|| drop(link))).is_ok());
+        }
+
+        struct PanicsOnDrop;
+        impl DeathRecipient for PanicsOnDrop {
+            fn binder_died(&self, _: &WIBinder) {}
+        }
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                panic!("the recipient's drop panics");
+            }
+        }
+
+        /// The link held the recipient's last reference, whose drop panics.
+        #[test]
+        fn a_panicking_recipient_drop_stays_inside_the_drop() {
+            let unlinked = Arc::new(AtomicUsize::new(0));
+            let binder = SIBinder::from_arc(Arc::new(Mock {
+                unlink: Unlink::Ok,
+                linked: std::sync::Mutex::new(None),
+                unlinked: unlinked.clone(),
+                drop_panics: false,
+            }));
+            let link = DeathLink::new(&binder, Arc::new(PanicsOnDrop)).expect("link");
+            assert!(catch_unwind(AssertUnwindSafe(|| drop(link))).is_ok());
+            assert_eq!(unlinked.load(Ordering::SeqCst), 1);
         }
 
         /// Dropped by another unwind: a panic escaping this drop would abort the test binary.
