@@ -80,7 +80,9 @@
 //! [`PublisherPolicy::authorize`].
 //!
 //! The subscription call never leaves a process whose publisher is in it, so a subscriber of a
-//! publisher of its own process needs no binder device. An RPC binder is not subscribed to.
+//! publisher of its own process needs no binder device. Over RPC on a Unix domain socket neither
+//! end needs one (`uds`, feature `uds`). A session that cannot pass fds, or has no incoming
+//! connection to hear of the publisher's death on, is refused.
 //!
 //! Topics need Linux or Android: a kernel with `F_SEAL_FUTURE_WRITE` (mainline 5.1, the
 //! Android common kernels from 4.14) and a target on which a 64-bit word of a read-only
@@ -110,6 +112,8 @@ mod sample;
 mod stats;
 mod subscriber;
 mod trust;
+#[cfg(feature = "uds")]
+pub mod uds;
 mod wait;
 mod wake;
 
@@ -165,6 +169,20 @@ mod connect_tests;
     )
 ))]
 mod rpc_tests;
+
+#[cfg(all(
+    test,
+    feature = "uds",
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod uds_tests;
 
 #[cfg(all(
     test,

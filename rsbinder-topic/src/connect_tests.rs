@@ -54,7 +54,7 @@ pub(crate) fn alone(name: &str) -> bool {
 }
 
 /// This process's memfds: the fds open on one, and the mappings of one.
-fn memfds() -> (usize, usize) {
+pub(crate) fn memfds() -> (usize, usize) {
     let fds = std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
@@ -1063,7 +1063,7 @@ fn a_refused_or_ended_subscription_leaves_no_memfd_behind() {
 }
 
 #[test]
-fn an_rpc_binder_is_not_subscribed_to() {
+fn an_rpc_binder_of_a_session_with_no_incoming_connection_is_refused() {
     use rsbinder::rpc::{RpcServer, RpcSession};
 
     let publisher = Publisher::<Bytes>::new(&policy()).unwrap();

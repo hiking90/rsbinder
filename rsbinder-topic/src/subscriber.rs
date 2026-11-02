@@ -12,6 +12,7 @@
 //! A receive that waits looks at the ring, spins a little (`rsbinder::fmq::shm::spin`), and
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
 
+use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -175,6 +176,8 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     dead: Arc<Dead>,
     /// A look read the topic's end record: the publisher refuses every later subscription.
     read_end: bool,
+    /// What keeps the session of an RPC binder open; dropped after the death link it serves.
+    session: Option<Arc<dyn Any + Send + Sync>>,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -210,13 +213,16 @@ impl Drop for Closing {
 }
 
 impl<T: Payload> Subscriber<T> {
-    /// Subscribe to the topic behind `topic`, an `ITopic` binder: a kernel binder proxy, or a
-    /// binder of this process. The subscriber does not vouch for the publisher ([`Untrusted`]).
+    /// Subscribe to the topic behind `topic`, an `ITopic` binder: a kernel binder proxy, a binder
+    /// of this process, or an RPC binder of a Unix-socket session that passes fds and has an
+    /// incoming connection. The subscriber does not vouch for the publisher ([`Untrusted`]).
     ///
     /// One twoway call; after it, receiving makes none. The refusals of the publisher come back
     /// as it sent them ([`Acceptor::accept`](crate::Acceptor::accept) lists them, and an
     /// application's `ITopic` may refuse with `EX_SECURITY`). Of its own, `request` returns
-    /// `InvalidOperation` for an RPC binder, `EX_UNSUPPORTED_OPERATION` where topics cannot work
+    /// `InvalidOperation` for an RPC binder of a session with no incoming connection, which would
+    /// not learn of its publisher's death, what the parcel answers to the fds of a session that
+    /// passes none, `EX_UNSUPPORTED_OPERATION` where topics cannot work
     /// (off Linux and Android, or on a kernel without `F_SEAL_FUTURE_WRITE`),
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
     /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
@@ -228,12 +234,11 @@ impl<T: Payload> Subscriber<T> {
     /// **The process has to run the binder thread pool**
     /// (`rsbinder::ProcessState::start_thread_pool`) for a publisher in another process: the
     /// notice of its death arrives on a pool thread, and without it a subscriber never learns
-    /// that its publisher died, and a wait for a record never ends.
+    /// that its publisher died, and a wait for a record never ends. Over RPC the notice arrives
+    /// through the session's incoming connection instead, and the caller keeps the session open
+    /// for as long as the subscriber.
     pub fn request(topic: &SIBinder, policy: &SubscriberPolicy) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
-        if topic.as_proxy().is_none() && topic.is_remote() {
-            return Err(StatusCode::InvalidOperation.into());
-        }
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
         let local = Arc::new(Local::new());
@@ -322,6 +327,7 @@ impl<T: Payload> Subscriber<T> {
             _death: death,
             dead,
             read_end: false,
+            session: None,
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -330,6 +336,19 @@ impl<T: Payload> Subscriber<T> {
             trace: Trace::default(),
             _trust: PhantomData,
         })
+    }
+
+    /// This subscriber, keeping `session` until it drops.
+    #[cfg(feature = "uds")]
+    pub(crate) fn with_session(mut self, session: Arc<dyn Any + Send + Sync>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// What [`with_session`](Self::with_session) gave it, for a test.
+    #[cfg(all(test, feature = "uds"))]
+    pub(crate) fn session_guard<G: Any + Send + Sync>(&self) -> Option<&G> {
+        self.session.as_ref()?.downcast_ref()
     }
 }
 
@@ -845,6 +864,7 @@ impl<T: Payload> Subscriber<T> {
             _death,
             dead,
             read_end,
+            session,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -870,6 +890,7 @@ impl<T: Payload> Subscriber<T> {
             _death,
             dead,
             read_end,
+            session,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]

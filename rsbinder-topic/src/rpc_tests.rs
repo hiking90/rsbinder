@@ -1,13 +1,14 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! A topic's binders over an RPC session within one process (plans/15-pubsub-uds §4.2): an RPC
+//! A topic's binders over an RPC session within one process (plan 15-pubsub-uds §4.2): an RPC
 //! proxy is one in the same process too, so these need no binder device.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rsbinder::rpc::transport::TcpDebugTransport;
 use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
 use rsbinder::{ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode, Strong};
 
@@ -20,7 +21,9 @@ use crate::layout::{ControlPage, MIN_RING, VERSION};
 use crate::link::{link_death, Dead};
 use crate::pool::MAX_PINS;
 use crate::registry::{AllowAll, Registry, RegistryResolver};
-use crate::{Bytes, Payload, Publisher, PublisherPolicy};
+use crate::{
+    Bytes, Closed, Payload, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy,
+};
 
 const WIRE: u32 = 2;
 const WAIT: Duration = Duration::from_secs(10);
@@ -142,6 +145,69 @@ fn a_token_of_the_publishers_own_process_from_over_rpc_is_refused() {
     assert_eq!(publisher.subscriber_count(), 0);
     session.close_session();
     server.terminate();
+}
+
+/// `Subscriber::request` over a session of the caller's: it keeps the session open.
+#[test]
+fn a_session_that_passes_fds_and_has_an_incoming_connection_subscribes() {
+    let publisher = publisher();
+    let (name, server) = serve(publisher.as_binder());
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    let mut subscriber = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    let subscriber = subscriber.as_mut().unwrap();
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    assert_eq!(publisher.subscriber_count(), 1);
+    server.terminate();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Closed(Closed::PublisherDied))
+    );
+    session.close_session();
+}
+
+#[test]
+fn a_unix_session_that_passes_no_fds_cannot_subscribe() {
+    let publisher = publisher();
+    let (name, server) = serve(publisher.as_binder());
+    let config = RpcClientConfig::unix_abstract(name, WIRE).incoming_connections(1);
+    let session = RpcSession::setup_client_android13plus_with_config(config).unwrap();
+    let topic = session.get_root().unwrap();
+    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    assert_eq!(
+        refused.err().map(|status| status.transaction_error()),
+        Some(StatusCode::FdsNotAllowed)
+    );
+    assert_eq!(publisher.subscriber_count(), 0);
+    session.close_session();
+    server.terminate();
+}
+
+#[test]
+fn a_session_over_tcp_cannot_subscribe() {
+    let publisher = publisher();
+    let listener = TcpDebugTransport::bind_loopback().unwrap();
+    let address = listener.local_addr().unwrap();
+    // The server object needs a listener of its own, which it never runs.
+    let (_, server) = serve(publisher.as_binder());
+    let serving = server.clone();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let transport = TcpDebugTransport::from_stream(stream).unwrap();
+            serving.serve_connection(Box::new(transport));
+        }
+    });
+    let config = RpcClientConfig::tcp_debug(address, WIRE).incoming_connections(1);
+    let session = RpcSession::setup_client_android13plus_with_config(config).unwrap();
+    let topic = session.get_root().unwrap();
+    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    assert_eq!(
+        refused.err().map(|status| status.transaction_error()),
+        Some(StatusCode::FdsNotAllowed)
+    );
+    session.close_session();
 }
 
 #[test]

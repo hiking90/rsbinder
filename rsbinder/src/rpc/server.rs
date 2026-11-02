@@ -227,6 +227,8 @@ enum BindAddress {
     },
     #[cfg(any(target_os = "linux", target_os = "android"))]
     UnixAbstract,
+    /// A socket another process bound: its file is not this server's to remove.
+    UnixFd,
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock { cid: u32, port: u32 },
     #[cfg(feature = "rpc-tls")]
@@ -604,6 +606,39 @@ impl RpcServer {
         let listener = ServerListener::Unix(UnixListener::bind_addr(&addr)?);
         listener.set_nonblocking(true)?;
         Ok(Self::wrap(listener, BindAddress::UnixAbstract))
+    }
+
+    /// Serve on a Unix stream socket that is already bound, typically received from the process
+    /// that made it (AOSP `RpcServer::setupRawSocketServer`). This call makes the socket listen,
+    /// so a client's `SO_PEERCRED` names this process and not the one that bound it; one already
+    /// listening keeps listening and takes this process's credentials likewise.
+    ///
+    /// [`StatusCode::BadValue`] when `fd` is not a socket, not a Unix one, not a stream one, or
+    /// has no address. The server has no path ([`path`](Self::path) is `None`) and its `Drop`
+    /// leaves the file system alone: the socket's file, if it still has one, belongs to whoever
+    /// bound it.
+    pub fn setup_unix_server_from_bound_fd(fd: std::os::fd::OwnedFd) -> Result<Arc<RpcServer>> {
+        let refused = |why: &str| {
+            log::error!("RpcServer::setup_unix_server_from_bound_fd: {why}");
+            StatusCode::BadValue
+        };
+        let kind = rustix::net::sockopt::socket_type(&fd);
+        let kind = kind.map_err(|_| refused("the descriptor is not a socket"))?;
+        if kind != rustix::net::SocketType::STREAM {
+            return Err(refused("the socket is not a stream socket"));
+        }
+        let listener = UnixListener::from(fd);
+        // std refuses an address of another family.
+        let address = listener.local_addr();
+        let address = address.map_err(|_| refused("the socket is not a Unix one"))?;
+        if address.is_unnamed() {
+            return Err(refused("the socket is not bound"));
+        }
+        // The backlog std's `UnixListener::bind` asks for on Linux: the kernel's `somaxconn`.
+        rustix::net::listen(&listener, -1).map_err(crate::error::errno_status)?;
+        let listener = ServerListener::Unix(listener);
+        listener.set_nonblocking(true)?;
+        Ok(Self::wrap(listener, BindAddress::UnixFd))
     }
 
     /// Bind + listen on a vsock `(cid, port)`. The
@@ -2219,6 +2254,7 @@ impl RpcServer {
             BindAddress::Unix { path, .. } => Some(path.as_path()),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
+            BindAddress::UnixFd => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
             #[cfg(feature = "rpc-tls")]
@@ -2235,6 +2271,7 @@ impl RpcServer {
             BindAddress::Vsock { cid, port } => Some((*cid, *port)),
             BindAddress::Unix { .. } => None,
             BindAddress::UnixAbstract => None,
+            BindAddress::UnixFd => None,
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => None,
         }
@@ -2251,6 +2288,7 @@ impl RpcServer {
             BindAddress::Unix { .. } => None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
+            BindAddress::UnixFd => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
         }
@@ -2302,6 +2340,7 @@ impl Drop for RpcServer {
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => {}
+            BindAddress::UnixFd => {}
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => {
                 // No filesystem entry; closing the listener fd releases the (cid, port).
@@ -2321,6 +2360,7 @@ impl std::fmt::Debug for RpcServer {
             BindAddress::Unix { path, .. } => d.field("bind", path),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => d.field("bind", &"unix-abstract"),
+            BindAddress::UnixFd => d.field("bind", &"unix-fd"),
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { cid, port } => {
                 d.field("bind", &format_args!("vsock {cid}:{port}"))

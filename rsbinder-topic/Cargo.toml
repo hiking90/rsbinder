@@ -20,6 +20,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 default = ["tokio"]
 # The async receive path. Without it the crate is its sync API alone.
 tokio = ["rsbinder/tokio", "dep:tokio"]
+# Topics without kernel binder: the subscription call over RPC on a Unix domain
+# socket (`uds`, plans/15-pubsub-uds).
+uds = ["rsbinder/rpc"]
 # The entry point the `fuzz/` crate calls, as `rsbinder`'s feature of the
 # same name: absent from every other build.
 fuzzing = []
@@ -50,8 +53,8 @@ miette = { workspace = true }
 
 [dev-dependencies]
 # `#[derive(rsbinder::Parcelable)]` for the tests' parcelables: the code `.aidl` generates.
-# `rpc`: an RPC binder, which a subscriber refuses.
-rsbinder = { version = "0.13.0", path = "../rsbinder", default-features = false, features = ["macros", "rpc"] }
+# `rpc`: the subscription call over a session of each kind. `rpc-tcp-debug`: one that passes no fds.
+rsbinder = { version = "0.13.0", path = "../rsbinder", default-features = false, features = ["macros", "rpc", "rpc-tcp-debug"] }
 # `setrlimit`, for a subscriber that cannot take the reply's fd. `pipe` and
 # `param`: an fd of the wrong kind for a wake, and the page a fault is held in.
 rustix = { workspace = true, features = ["process", "pipe", "param"] }

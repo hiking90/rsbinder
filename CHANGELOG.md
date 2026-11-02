@@ -445,6 +445,14 @@ accepts both the 0.12.0 bytes and the new ones.
   per proxy, and refuses another interface with `BadType`; a query that
   fails returns its error, such as `DeadObject`.
 
+- **A Unix-socket RPC server and client reached by descriptors**:
+  `RpcServer::setup_unix_server_from_bound_fd` serves on a socket another
+  party bound (AOSP `setupRawSocketServer`), and makes it listen, so a
+  client's `SO_PEERCRED` names this process. `RpcClientConfig::unix_fd`
+  connects through an `O_PATH` descriptor of the socket's file, which may be
+  unlinked: the session owns the descriptor, so all its connections go to one
+  socket. `RpcSession::peer_identity` is who is at the other end of the
+  founding connection.
 - **`rsbinder-topic`, a new crate (Experimental)**: one publisher and many
   subscribers over kernel binder, on Linux and Android. A binder call sets
   each subscription up; the records then travel through a ring in a sealed
@@ -452,6 +460,10 @@ accepts both the 0.12.0 bytes and the new ones.
   and receiving makes no binder call. See the book's
   [Topics](https://hiking90.github.io/rsbinder/topics.html) chapter and the
   crate's `examples/`.
+  - Its feature `uds` (off by default) makes the subscription call over RPC
+    on a Unix domain socket, where a binder device cannot be had:
+    `uds::subscribe` and `uds::serve`, with `uds::Options::expect_uid` to
+    check who listens by `SO_PEERCRED`.
   - `Publisher<T>` and `Subscriber<T>` for any parcelable or `Bytes`
     (`Payload`). A publish never waits: a subscriber that falls a ring
     behind gets `RecvError::Lagged` with the number it lost. With

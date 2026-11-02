@@ -690,6 +690,8 @@ struct Redial {
 /// Where a config connects; the connector is built once the handshake deadline is known.
 enum ClientSource {
     Unix(RpcUnixAddr),
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    UnixFd(std::os::fd::OwnedFd),
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock {
         cid: u32,
@@ -711,6 +713,8 @@ impl std::fmt::Debug for ClientSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientSource::Unix(addr) => f.debug_tuple("Unix").field(addr).finish(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ClientSource::UnixFd(fd) => f.debug_tuple("UnixFd").field(fd).finish(),
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             ClientSource::Vsock { cid, port } => f
                 .debug_struct("Vsock")
@@ -741,6 +745,14 @@ impl ClientSource {
         let _ = handshake_timeout;
         match self {
             ClientSource::Unix(addr) => Box::new(move || unix_connect(&addr)),
+            // The closure owns `fd`, so its number names this file for as long as the session.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ClientSource::UnixFd(fd) => Box::new(move || {
+                use std::os::fd::AsRawFd;
+                let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+                Ok(Box::new(super::transport::UnixTransport::connect(path)?)
+                    as Box<dyn RpcTransport>)
+            }),
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             ClientSource::Vsock { cid, port } => Box::new(move || {
                 Ok(
@@ -896,7 +908,7 @@ struct AttachParts {
 /// way the founding one was opened, with nothing to restate.
 ///
 /// One constructor per transport: [`unix`](Self::unix),
-/// `unix_abstract` (Linux/Android), `vsock` (`rpc-vsock`), `tls`
+/// `unix_abstract` and `unix_fd` (Linux/Android), `vsock` (`rpc-vsock`), `tls`
 /// (`rpc-tls`), `tcp_debug` (`rpc-tcp-debug`), or [`new`](Self::new)
 /// with a connect function of your own. The knobs are
 /// the same whichever one built it, because the setup opens every
@@ -966,6 +978,25 @@ impl RpcClientConfig {
     pub fn unix_abstract(name: impl AsRef<[u8]>, max_version: u32) -> Self {
         let name = name.as_ref().to_vec();
         Self::with_source(ClientSource::Unix(RpcUnixAddr::Abstract(name)), max_version)
+    }
+
+    /// Connect to the Unix socket whose file `path_fd` is an `O_PATH` descriptor of, through
+    /// `/proc/self/fd/<n>`. The socket file may have no name left: a server can unlink it right
+    /// after it binds, and then only a process that was given a descriptor reaches the socket.
+    ///
+    /// The config, and then the session it founds, owns `path_fd`: every connection of the
+    /// session goes through it and so to the same socket, and its number cannot name another
+    /// file meanwhile, as a `/proc/self/fd` path given to [`unix`](Self::unix) can once its
+    /// descriptor is closed. A connection fails with the transport's own code for what the kernel
+    /// answers: `ECONNREFUSED` once the socket's listener has closed.
+    ///
+    /// The connect is judged by the socket file's mode bits against this process, however
+    /// `path_fd` was obtained; the search permission of the directories above it is not
+    /// looked at. It needs `/proc` mounted; without it the connect fails with `ENOENT`, which
+    /// rsbinder reports as [`StatusCode::NameNotFound`].
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn unix_fd(path_fd: std::os::fd::OwnedFd, max_version: u32) -> Self {
+        Self::with_source(ClientSource::UnixFd(path_fd), max_version)
     }
 
     /// Connect to a vsock server (cid 2 = the host from inside a guest;
@@ -2229,6 +2260,8 @@ pub(crate) struct RpcSessionInner {
     conn_state: Mutex<ConnState>,
     /// AOSP `mAvailableConnectionCv`: `notify_all` on slot release, add and removal; no busy loop.
     slot_cv: Condvar,
+    /// The founding connection's peer, for [`RpcSession::peer_identity`].
+    peer: PeerIdentity,
     /// Wire profile, fixed per session as in AOSP; an attach on another version is refused.
     profile: WireProfile,
     self_weak: Weak<RpcSessionInner>,
@@ -4402,12 +4435,14 @@ impl RpcSession {
             AddressSpace::Acceptor => SlotRole::Incoming,
         };
         let traits = ConnTraits::of(&*transport);
+        let peer = transport.peer_identity();
         let founding: Arc<dyn RpcTransport> = Arc::from(transport);
         let armed = Arc::clone(&founding);
         let (dec_strong_tx, dec_strong_rx) = mpsc::channel();
         let inner = Arc::new_cyclic(|weak: &Weak<RpcSessionInner>| RpcSessionInner {
             conn_state: Mutex::new(ConnState::new(founding, founding_role, traits)),
             slot_cv: Condvar::new(),
+            peer,
             profile,
             self_weak: weak.clone(),
             parcel_ops: Arc::new(SessionParcelOps(weak.clone())),
@@ -4915,6 +4950,19 @@ impl RpcSession {
     /// peer locality.
     pub fn caps(&self) -> crate::TransportCaps {
         self.inner.caps()
+    }
+
+    /// Who is at the other end of this session's founding connection, as its transport
+    /// established it. It is fixed when the connection is made and stays after the session ends.
+    /// A further connection of the session is admitted only with the same principal (the uid
+    /// over a Unix socket), so it speaks for all of them as far as the principal goes.
+    ///
+    /// On a client over a Unix socket this is [`PeerIdentity::Local`] from `SO_PEERCRED`: the
+    /// credentials of the process that called `listen(2)` on the socket, which is not always the
+    /// one that made the socket. Across user namespaces a uid with no mapping reads 65534, and a
+    /// pid not visible in this pid namespace reads 0.
+    pub fn peer_identity(&self) -> PeerIdentity {
+        self.inner.peer.clone()
     }
 
     /// Publish the server's root object (returned by `get_root`).
