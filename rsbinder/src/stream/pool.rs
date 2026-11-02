@@ -17,6 +17,13 @@
 //! It goes through `__spawn_transact` with [`Tokio`](crate::Tokio) rather
 //! than `spawn_blocking` directly, because inside a transaction handler the
 //! work has to stay on the current thread and that rule lives there.
+//!
+//! [`wait_on_pool`] is for a task that only waits. A pool with no free thread
+//! may not start such a task for as long as its other tasks run, and a caller
+//! that joins the token before reading the ring would wait all that time with
+//! a record in front of it. So when the future drops first, it takes the token
+//! back and the task runs with nothing to do. A wait that has started keeps
+//! its token: the next wake ends it, whatever the pool is doing.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -82,6 +89,28 @@ where
             |result| async move { result },
         )
     })
+}
+
+/// [`on_pool`] for a task that only waits: handed over at the first poll, and taken back by a
+/// future dropped before a pool thread took it; see the module doc.
+pub(super) async fn wait_on_pool<R, F>(token: R, run: F) -> Result<()>
+where
+    R: Send + 'static,
+    F: FnOnce(R) -> Result<()> + Send + 'static,
+{
+    let slot = Arc::new(Mutex::new(Some(token)));
+    let mut give_back = TakeBack {
+        slot: slot.clone(),
+        armed: true,
+    };
+    let task = Carried { slot, run };
+    let ran = crate::__spawn_transact::<crate::Tokio, _, _, _, _, _, _>(
+        move || task.run(),
+        |result| async move { result },
+    )
+    .await;
+    give_back.armed = false;
+    ran
 }
 
 /// One of two futures with the same output, awaited by [`Either::run`].

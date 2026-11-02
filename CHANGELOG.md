@@ -931,6 +931,11 @@ accepts both the 0.12.0 bytes and the new ones.
   that mask: an `exec` service ignored `SIGTERM`, so `systemctl stop` of a
   unit holding one waited for its timeout and ended in `SIGKILL`. A child now
   starts with no signal blocked.
+- **A dropped `recv_async` no longer holds up the stream's next read when the
+  blocking pool is full.** On the ring, a wait the pool had not started stayed
+  queued, and the next `recv` or `recv_timeout` waited for it before reading:
+  `recv_timeout` returned nothing with a record in the ring, and `recv` waited
+  until a pool thread came free. The dropped future now takes such a wait back.
 
 ### Security
 

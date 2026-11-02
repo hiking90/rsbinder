@@ -23,7 +23,7 @@ use crate::SIBinder;
 
 use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink};
 #[cfg(feature = "tokio")]
-use super::pool::on_pool;
+use super::pool::{on_pool, wait_on_pool};
 use super::{
     decode_item, dropped_terminator, encode_item, end_decision, status_from_fields, watch_death,
     Book, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
@@ -299,6 +299,9 @@ struct Transit {
     gate: PoolGate<Book>,
     /// `unreported` or `broken` was ever set; never cleared, so while it is down neither is.
     flagged: std::sync::atomic::AtomicBool,
+    /// A pool thread took a `recv_async` wait, which its future can no longer take back.
+    #[cfg(all(test, feature = "tokio"))]
+    wait_started: std::sync::atomic::AtomicBool,
 }
 
 impl Transit {
@@ -884,6 +887,8 @@ impl WaitInTransit {
     }
 
     fn wait(mut self) {
+        #[cfg(test)]
+        self.transit.wait_started.store(true, Ordering::SeqCst);
         // On the pool, so the executor thread never spins.
         if self.shared.fills_within(None) {
             return;
@@ -1110,7 +1115,7 @@ impl<T: Deserialize> Consumer<T> {
                 hook();
             }
             let wait = WaitInTransit::new(self.shared.clone(), self.transit.clone());
-            if let Err(e) = on_pool(wait, |wait| {
+            if let Err(e) = wait_on_pool(wait, |wait| {
                 wait.wait();
                 Ok(())
             })
@@ -2084,16 +2089,7 @@ mod tests {
             .build()
             .expect("runtime");
         let (mut tx, mut rx) = pair::<i32>(512);
-        runtime.block_on(async {
-            let mut pending = std::pin::pin!(rx.recv_async());
-            // One poll: nothing to read, so the wait goes to the pool.
-            let polled = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
-            })
-            .await;
-            assert!(polled);
-        });
-        assert!(rx.transit.in_transit(), "the orphan is on the pool");
+        park_an_orphan(&runtime, &mut rx);
 
         // The consumer parks first, so the orphan takes the write's wake.
         let (done, watch) = mpsc::channel();
@@ -2117,11 +2113,7 @@ mod tests {
         }
 
         // And the async call, with the orphan made by a sync-side drop.
-        runtime.block_on(async {
-            let mut pending = std::pin::pin!(rx.recv_async());
-            let _ =
-                std::future::poll_fn(|cx| std::task::Poll::Ready(pending.as_mut().poll(cx))).await;
-        });
+        park_an_orphan(&runtime, &mut rx);
         let (done, watch) = mpsc::channel();
         let handle = runtime.handle().clone();
         thread::spawn(move || {
@@ -2142,9 +2134,25 @@ mod tests {
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
-    /// Leave one `recv_async` wait on the pool.
+    /// A saturated pool never starts a dropped future's wait: nothing may wait for it to end.
     #[cfg(feature = "tokio")]
-    fn park_an_orphan(runtime: &tokio::runtime::Runtime, rx: &mut Consumer<i32>) {
+    #[test]
+    fn a_dropped_wait_the_pool_never_started_holds_up_no_record() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        let (holding, held) = mpsc::channel();
+        let (release, hold) = mpsc::channel::<()>();
+        let blocker = runtime.spawn_blocking(move || {
+            holding.send(()).expect("the test waits");
+            let _ = hold.recv();
+        });
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the pool's one thread is taken");
+
+        let (mut tx, mut rx) = pair::<i32>(512);
         runtime.block_on(async {
             let mut pending = std::pin::pin!(rx.recv_async());
             let polled = std::future::poll_fn(|cx| {
@@ -2152,6 +2160,39 @@ mod tests {
             })
             .await;
             assert!(polled, "nothing to read, so the wait goes to the pool");
+        });
+        tx.send(&9, None).expect("send");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(300))
+                .expect("no error"),
+            Some(9),
+            "the record is in the ring, whatever the pool is doing"
+        );
+        assert!(!rx.transit.in_transit(), "taken back as its future dropped");
+
+        release.send(()).expect("the blocker waits");
+        runtime.block_on(blocker).expect("blocker");
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// Leave one `recv_async` wait on the pool.
+    #[cfg(feature = "tokio")]
+    fn park_an_orphan(runtime: &tokio::runtime::Runtime, rx: &mut Consumer<i32>) {
+        let transit = rx.transit.clone();
+        transit.wait_started.store(false, Ordering::SeqCst);
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(rx.recv_async());
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled, "nothing to read, so the wait goes to the pool");
+            // Dropped sooner, the future would take the wait back.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !transit.wait_started.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "a pool thread takes the wait");
+                thread::sleep(Duration::from_millis(1));
+            }
         });
         assert!(rx.transit.in_transit(), "the orphan is on the pool");
     }
