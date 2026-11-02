@@ -1,9 +1,10 @@
 # Topics (one publisher, many subscribers)
 
 **Experimental.** The `rsbinder-topic` crate carries records from one
-publisher to any number of subscribers over kernel binder. A binder call sets
-each subscription up; after it the records travel through shared memory, and
-no binder transaction is made for them:
+publisher to any number of subscribers over kernel binder, or
+[over a Unix domain socket](#topics-without-a-binder-device) where there is no
+binder device. A binder call sets each subscription up; after it the records
+travel through shared memory, and no binder transaction is made for them:
 
 - The publisher allocates the topic's memory, a ring of records in a sealed
   memfd, and every subscriber maps it read-only. One copy into the ring serves
@@ -27,7 +28,7 @@ versions refuse each other (`ITopic::ERROR_VERSION`).
 | Receivers | any number | one | one per registration |
 | Who allocates the shared memory | the publisher, once for all | the consumer | none: every value is a transaction |
 | A receiver that falls behind | loses the oldest records (`RecvError::Lagged`), or with backpressure holds the publisher up to a timeout and is then taken out | holds the sender back; nothing is lost | calls queue in the receiver's async buffer, and fail once it is full |
-| Transports | kernel binder | kernel binder and RPC | kernel binder and RPC |
+| Transports | kernel binder, and RPC on a Unix socket | kernel binder and RPC | kernel binder and RPC |
 
 A topic suits values that many processes read and where the newest matters
 more than every one: sensor readings, frames, state that keeps changing. A
@@ -150,6 +151,17 @@ the subscriber asks the service manager (`check_service`) for the binder the
 name has. It asks once more only when a notice that came during the call gave
 the name a binder it cannot use, one it refused or that ended.
 
+Subscribing by name does not start a publisher, except where a lookup of the
+service manager does:
+
+| How a subscriber finds it | Starts the publisher? |
+|---|---|
+| `wait_for_interface` and the like (`getService`), then `Subscriber::request` | yes: [on-demand start](./service-manager.md#starting-a-service-on-demand) |
+| `NamedSubscriber` through the service manager | no: it uses `check_service` and registration notices |
+| `NamedSubscriber` through a kernel registry | no: `lookup` and `watch` start nothing |
+| `NamedSubscriber` through a hub on a socket | no, for the same reason; that hub starts no service at all |
+| `uds::subscribe` | no: a publisher has to be at the endpoint |
+
 ## A registry of topic names
 
 Through the service manager, a topic's name is a service name: `[[rule]]`
@@ -185,8 +197,9 @@ in [Service Manager](./service-manager.md#topic-names)):
 
 `RegistryResolver::find` fails with `NameNotFound` when the service manager
 has nothing under `rsbinder.topic.registry` or its policy does not let the
-caller find that name. `list` returns the names under a
-prefix that the caller may subscribe to, sorted:
+caller find that name; the two cannot be told apart, so a hub whose `[[rule]]`
+lets nobody find the registry logs a warning as it loads. `list` returns the
+names under a prefix that the caller may subscribe to, sorted:
 
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_registry.rs:list}}
@@ -241,6 +254,109 @@ name to the next hub, and a `NamedSubscriber` watches nothing: make the
 `Publisher` and the `NamedSubscriber` again with a resolver of the new hub.
 The service manager path is the same, as its registrations and watches end
 with the hub too.
+
+## Topics without a binder device
+
+A binder call sets a subscription up and a binder death link tells each end of
+the other's end; the records never go through binder. With the feature `uds`,
+those two go over rsbinder's [RPC](./rpc-transport.md) on a Unix domain socket
+instead, for a Linux where binderfs cannot be used: a container without
+`CAP_SYS_ADMIN`, a kernel without `CONFIG_ANDROID_BINDERFS`, a CI runner with
+no binder device. It is not for macOS, which has no `F_SEAL_FUTURE_WRITE` and
+no futex, nor for Android yet, where how SELinux judges these sockets has not
+been measured.
+
+The plain form has no names. The publisher serves on a socket, and a subscriber
+gives the path; nothing else about a topic changes:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_uds.rs:serve}}
+```
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_uds.rs:subscribe}}
+```
+
+`uds::Endpoint` is a path, a Linux abstract socket or a descriptor. An abstract
+socket has no file mode, so any process of the network namespace can connect to
+it: prefer a path, whose mode bits and directories say who may, unless the
+topic's `authorize` checks its callers. `Options::expect_uid` refuses a
+publisher of any other uid, by `SO_PEERCRED` of the process that called
+`listen`. Kernel binder has no such check, and at a socket path it is the one
+way for a subscriber to know who listens there.
+
+A session of your own also works: `Subscriber::request` takes the root binder of
+a session opened with an incoming connection and `FileDescriptorTransportMode::Unix`,
+and refuses what cannot work: `InvalidOperation` for a session with no incoming
+connection, on which it would not hear of its publisher's death, and
+`FdsNotAllowed` for one that passes no fds, TCP and vsock among them. Keep such
+a session open for as long as the subscriber.
+
+### Names on a socket
+
+`rsb_hub --topic-socket PATH`, built with the features `topic` and `rpc`, serves
+the registry of topic names on a Unix socket and opens no binder device. Its
+`[[topic]]` and `[global] topics` rules are the same ones
+([Service Manager](./service-manager.md#a-hub-on-a-unix-socket)), judged by the
+caller's `SO_PEERCRED`. `UdsResolver` is that registry as a `Resolver`, with
+`advertise_with` and `subscribe_with` as above:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_uds.rs:hub}}
+```
+
+A binder cannot leave the RPC session it arrived on, so this registry hands out
+descriptors rather than binders. For each name the hub makes a socket in a
+private directory, binds it and unlinks its file. A publisher is given the bound
+socket and listens on it; a subscriber is given an `O_PATH` descriptor of the
+file and connects through `/proc/self/fd/<n>`. So:
+
+- **The policy says who can reach a topic.** The socket has no name in the file
+  system: only a process the hub gave a descriptor to can connect. A process can
+  pass its descriptor to another, as it can a kernel binder handle.
+- **A subscriber knows its publisher.** The publisher calls `listen`, so
+  `SO_PEERCRED` of a subscriber's connection names the publisher and not the hub;
+  `ResolverOptions::expect_publisher_uid` is a second check on it, for a hub that
+  was set up wrong.
+- **A publisher that ends takes its socket with it.** The hub keeps no copy, and
+  a connect through a descriptor kept since is `ECONNREFUSED`.
+
+A name lasts until it is withdrawn, or until the `UdsResolver` that advertised
+it and all it made have dropped, which closes the session with the hub; a
+process that ends does both. `Publisher` holds one advertisement, so one
+publisher is not on a kernel registry and on a socket hub at once. Registering
+its binder with the service manager takes no advertisement and goes with either.
+`rsb_service topics --topic-socket PATH` lists the names. When the hub ends, its
+names and watches end with it, as [a kernel registry's do](#when-the-hub-restarts).
+
+### What differs from kernel binder
+
+- **The caller's identity is fixed at connect.** Kernel binder names the caller
+  of each transaction. Here `Authorize` and `SubscriberInfo` see `SO_PEERCRED`
+  of the connection: a process that hands its connected socket to another makes
+  that one's calls look like its own.
+- **Resources grow per subscriber.** Kernel binder serves every peer with one
+  descriptor and one thread pool. Here each subscriber's session is two sockets
+  and two threads at each end, for as long as it lasts, so a server given
+  `RpcServer::set_max_connections` needs room for two per subscriber. A process
+  using a hub has one more session with it.
+- **Sessions outlive a dropped publisher.** A dropped `Publisher` withdraws its
+  name and stops accepting, and leaves the sessions it has, so that their
+  subscribers read its end record. Each closes as its subscriber ends, or with
+  the publisher's process.
+- **Death is the session's end.** The loss of any connection of a session is a
+  death, and a deadline that runs out on a session ends it too, which reads as
+  `Closed::PublisherDied`. The sessions topics make have a deadline while they
+  are set up (`Options::timeout`, 10 s) and none afterwards; one you give
+  `Subscriber::request` keeps what you set.
+- **A full accept queue is out of reach of a deadline.** Linux has a connect into
+  such a listener wait in `connect(2)` until the publisher accepts or ends. A
+  stopped publisher with room in its queue is found out by the handshake instead.
+- **`uid` and `pid` depend on the namespaces.** Across user namespaces a uid with
+  no mapping reads 65534 to `Authorize`, `Options::expect_uid` and a hub's policy,
+  and a pid outside this pid namespace reads 0.
+- **`/proc` has to be mounted** for a hub and for `Endpoint::Fd`: a sandbox that
+  hides it can use only the plain form with a path.
 
 ## Losing records, and backpressure
 
@@ -354,15 +470,17 @@ waits for a slot instead.
   subscribers out.
 - **One publisher.** Any thread of the publisher's process may publish; no
   other process writes the topic.
-- **Kernel binder only.** `Subscriber::request` refuses an RPC binder
-  (`InvalidOperation`). A subscriber of a publisher in its own process makes
-  no binder call and needs no binder device.
-- **The binder thread pool.** A subscriber's process runs it
+- **Kernel binder, or RPC on a Unix socket.** `Subscriber::request` refuses an
+  RPC session that cannot pass fds or has no incoming connection; see
+  [Topics without a binder device](#topics-without-a-binder-device). A subscriber
+  of a publisher in its own process makes no binder call and needs no binder
+  device.
+- **The binder thread pool, over kernel binder.** A subscriber's process runs it
   (`ProcessState::start_thread_pool`) to learn that the publisher died —
   without it a wait for a record never ends — and that it was taken out. A
   `NamedSubscriber` needs it for the service manager's or the registry's
   notice of the name. The publisher's process needs it to answer subscription
-  calls.
+  calls. Over a socket a session's own threads do this, and neither is needed.
 - **Linux or Android.** The kernel must have `F_SEAL_FUTURE_WRITE` (mainline
   5.1; the Android common kernels from 4.14), and the target must be able to
   load a 64-bit word from a read-only mapping

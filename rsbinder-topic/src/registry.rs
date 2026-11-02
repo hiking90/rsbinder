@@ -24,6 +24,9 @@
 //! A [`RegistryResolver`] is the client side: [`Publisher::advertise_with`] and
 //! [`NamedSubscriber::subscribe_with`] take it in place of the service manager.
 //!
+//! The module `uds` (feature `uds`, Linux and Android) is the same registry on a Unix socket, for
+//! a host with no binder device: `rsb_hub --topic-socket`.
+//!
 //! [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
 //! [`Publisher::advertise_with`]: crate::Publisher::advertise_with
 //! [`NamedSubscriber::subscribe_with`]: crate::NamedSubscriber::subscribe_with

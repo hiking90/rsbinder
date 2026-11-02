@@ -63,6 +63,10 @@ libc = { workspace = true }
 # A runtime for `recv_async`'s tests; `time` bounds a wait that a mutant would lose.
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 
+[[example]]
+name = "topic_uds"
+required-features = ["uds"]
+
 # loom is only used by the unit tests gated on `--cfg loom` (`src/ring/loom_tests.rs`).
 # Run with (a target dir of its own: the cfg rebuilds every dependency):
 #   CARGO_TARGET_DIR=target/loom RUSTFLAGS="--cfg loom" \

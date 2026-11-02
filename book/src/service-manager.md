@@ -602,6 +602,22 @@ every notice: a reload that takes it away stops a watch's notices and keeps
 the watch, and one that gives it back lets the next notice through. Under
 `--insecure-allow-all` every topic call from a caller with a uid is allowed.
 
+Give the registry's own name a `[[rule]]` too, or nobody finds it. A client that
+cannot find it gets `NameNotFound` from `RegistryResolver::find`, the answer for
+a hub with no registry at all, so a hub whose `[[topic]]` rules have no such
+`[[rule]]`, or one with no `find`, logs a warning as it loads and reloads:
+
+```toml
+[[rule]]
+name = "rsbinder.topic.registry"
+find = "any"
+
+[[topic]]
+name = "sensors.*"
+advertise = { user = ["sensord"] }
+subscribe = { group = ["sensors"] }
+```
+
 The name `rsbinder.topic.registry` is reserved: such a hub refuses it to
 every `add` a client asks for (`add_service`, `register_client_callback`,
 `try_unregister_service`) with `ExceptionCode::Security`, whatever the policy
@@ -618,6 +634,50 @@ service name, so a policy should grant no `add` on it.
 holds it and how many topic rules are in force, and its counters as
 `key=value` (`notices_failed` counts the sends of a notice that failed, for
 want of room or otherwise, those sent again included).
+
+### A hub on a Unix socket
+
+Built with the features `topic` and `rpc`
+(`cargo build -p rsbinder-tools --features topic,rpc`), `rsb_hub --topic-socket
+PATH` serves the registry of topic names on a Unix socket, where no binder device
+can be had (see [Topics](./topics.md#names-on-a-socket)). It opens no binder
+device and is no service manager, so it takes no `--device`. The hub on a device
+and the hub on a socket are two runs of one binary, each with names of its own:
+one process does not serve both, as a name would mean two things.
+
+| Run as | Socket | Its directory |
+|---|---|---|
+| a system service | `/run/rsbinder/topic.sock` | `/run/rsbinder/topic.d/` |
+| a systemd unit | as above, with `RuntimeDirectory=rsbinder` | as above |
+| a user | `$XDG_RUNTIME_DIR/rsbinder/topic.sock` | `$XDG_RUNTIME_DIR/rsbinder/topic.d/` |
+
+The directory is the socket's path with `.sock` replaced by `.d`. The hub makes
+the socket's parent if it has to, and makes the directory with mode 0700: a socket
+file lives there only between its bind and its unlink, and the hub empties the
+directory as it starts. It refuses a directory that a uid other than root or
+its own owns, that its group or anyone else can write, or that is a symlink.
+Clients need only see the socket: between containers, bind mount
+`/run/rsbinder` or the socket file alone.
+
+The socket's mode is 0666, whatever the umask, so that any local process can
+connect and be judged: as with `rsb_device --mode 0666` on a binder device, who may
+do what is the policy's to say, by `SO_PEERCRED` of the connection. To keep others
+from connecting at all, use the mode of a directory above it
+(`RuntimeDirectoryMode=` of a unit). Across user namespaces a uid with no mapping
+reads 65534, and that is the uid the policy judges.
+
+Of the configuration this hub uses only `[[topic]]` and `[global] topics`.
+`[[rule]]`, `[[service]]` and `[global] list` have nothing to apply to, and it logs
+a warning naming each as it loads and reloads, as one directory of files can
+configure both a device hub and a socket hub. A `[[service]]`'s `start` is not run.
+
+`rsb_hub` raises its soft `RLIMIT_NOFILE` to the hard limit as it starts: it holds
+a descriptor per name and two per session, where a systemd service's soft limit is
+1024. It logs a warning if the hard limit is still short of the registry's 10 000
+names and 1024 sessions; raise it with `LimitNOFILE=`.
+
+`rsb_service topics --topic-socket PATH [PREFIX]` lists the names, with no binder
+device. `rsb_service dump manager` does not apply: there is no manager to ask.
 
 ### What a caller can hold the hub up with
 

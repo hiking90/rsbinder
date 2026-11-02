@@ -46,7 +46,9 @@ pub struct RegistryResolver {
 
 impl RegistryResolver {
     /// The registry the service manager has under [`SERVICE_NAME`]: `NameNotFound` when it has
-    /// none, or its policy does not let this process find it.
+    /// none, or its policy does not let this process find it, which the answer cannot tell
+    /// apart. A hub whose `[[topic]]` rules have no `[[rule]]` letting anyone find it logs a
+    /// warning as it loads.
     ///
     /// [`SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
     pub fn find() -> BinderResult<Self> {

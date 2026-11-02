@@ -463,7 +463,11 @@ accepts both the 0.12.0 bytes and the new ones.
   - Its feature `uds` (off by default) makes the subscription call over RPC
     on a Unix domain socket, where a binder device cannot be had:
     `uds::subscribe` and `uds::serve`, with `uds::Options::expect_uid` to
-    check who listens by `SO_PEERCRED`.
+    check who listens by `SO_PEERCRED`. `registry::uds::UdsResolver` finds a
+    topic by name through a registry on a socket, `registry::uds::UdsRegistry`
+    with a `SocketDir` to serve one. `Resolver::watch_resolved` and `Resolved`
+    carry what a binder needs kept alive; the default keeps nothing, so a
+    resolver of the application's own is unchanged.
   - `Publisher<T>` and `Subscriber<T>` for any parcelable or `Bytes`
     (`Payload`). A publish never waits: a subscriber that falls a ring
     behind gets `RecvError::Lagged` with the number it lost. With
@@ -553,7 +557,12 @@ accepts both the 0.12.0 bytes and the new ones.
   without the feature refuses a file holding either. `rsb_service dump
   manager` reports the registry's counters, and `rsb_service topics
   [PREFIX]`, built with the same feature, lists the names a caller may
-  subscribe to with their uid, pid, age and watchers. In the library:
+  subscribe to with their uid, pid, age and watchers. A hub whose `[[topic]]`
+  rules have no `[[rule]]` letting anyone find the registry warns as it loads
+  and reloads. With the feature `rpc` too, `rsb_hub --topic-socket PATH` serves
+  the registry on a Unix socket with no binder device, under the same rules,
+  and warns of the `[[rule]]`, `[[service]]` and `[global] list` it does not
+  use; `rsb_service topics --topic-socket PATH` lists its names. In the library:
   `config::TopicPolicy`, `TopicRule`, `TopicPermission` and
   `Enforcer::check_topic`.
 - **The unsynchronized FMQ flavor in `rsbinder-fmq`** (also `rsbinder::fmq`):
