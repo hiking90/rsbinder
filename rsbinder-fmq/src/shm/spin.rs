@@ -84,7 +84,7 @@ pub fn spin_budget(deadline: Option<&Deadline>) -> Duration {
 /// reads a counter less often than every turn, takes one at the same point, so that it counts
 /// against the same limit.
 #[must_use = "the slot is given back when it drops"]
-pub struct SpinSlot;
+pub struct SpinSlot(());
 
 static SPINNERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -100,7 +100,7 @@ impl SpinSlot {
             SPINNERS.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
-        Some(SpinSlot)
+        Some(SpinSlot(()))
     }
 }
 
