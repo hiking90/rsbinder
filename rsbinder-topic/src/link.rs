@@ -23,7 +23,7 @@ pub(crate) fn link_death(
     binder: &SIBinder,
     recipient: impl DeathRecipient + 'static,
 ) -> rsbinder::Result<Option<DeathLink>> {
-    if binder.as_proxy().is_none() {
+    if !binder.is_remote() {
         return Ok(None);
     }
     DeathLink::new(binder, Arc::new(recipient)).map(Some)

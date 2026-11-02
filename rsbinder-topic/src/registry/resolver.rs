@@ -56,10 +56,15 @@ impl RegistryResolver {
 
     /// The registry `binder` is, found by other means than [`find`](Self::find). A registry of
     /// this process is `BadValue`: its calls would come from no transaction, which it refuses.
-    /// Another interface's binder is `BadType`.
+    /// An RPC binder is `InvalidOperation`: the registry refuses a caller over RPC, and a topic
+    /// binder cannot cross from one RPC session to another. Another interface's binder is
+    /// `BadType`.
     pub fn new(binder: SIBinder) -> BinderResult<Self> {
-        if binder.as_proxy().is_none() {
+        if !binder.is_remote() {
             return Err(StatusCode::BadValue.into());
+        }
+        if binder.as_proxy().is_none() {
+            return Err(StatusCode::InvalidOperation.into());
         }
         Ok(Self {
             registry: binder.into_interface_checked()?,

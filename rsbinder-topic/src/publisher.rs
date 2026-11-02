@@ -594,7 +594,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         };
         let token = request.token.as_ref().ok_or(StatusCode::UnexpectedNull)?;
         let control = request.control.as_ref().ok_or(StatusCode::UnexpectedNull)?;
-        if token.as_proxy().is_none() && !asked_here(request) {
+        if !token.is_remote() && !asked_here(request) {
             return Err(StatusCode::BadValue.into());
         }
         // No call: a remote token is not asked for its interface (plan 16); outside the lock too.
