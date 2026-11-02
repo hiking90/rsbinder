@@ -38,12 +38,7 @@ fn call(binder: &SIBinder, descriptor: &str, code: TransactionCode) -> Result<Pa
     let transport = binder.__transport().ok_or(StatusCode::BadType)?;
     if let Transport::Remote(_) = transport {
         // A cached other interface is refused unasked; the server's token check does the rest.
-        if let Some(actual) = binder.cached_descriptor() {
-            if actual != descriptor {
-                log::error!("shared memory: not an {descriptor}: {actual:?}");
-                return Err(StatusCode::BadType);
-            }
-        }
+        binder.refuse_known_other(descriptor, "shared memory")?;
     }
     // Local: `InvalidOperation` without kernel binder, from the shared in-process transport.
     let data = transport.prepare_request(descriptor)?;
@@ -307,13 +302,9 @@ impl IMemory for MemoryBase {
     }
 }
 
-/// AOSP `BpMemory::getMemory` bounds rule (`IMemory.cpp:195-209`).
+/// AOSP `BpMemory::getMemory` bounds rule (`IMemory.cpp:195-209`): the window lies in the heap.
 fn check_window(heap_size: usize, offset: usize, size: usize) -> Result<()> {
-    if size <= heap_size && offset <= heap_size - size {
-        Ok(())
-    } else {
-        Err(StatusCode::BadValue)
-    }
+    super::check_range(heap_size, offset, size)
 }
 
 /// Server stub: `android.utils.IMemory` over a [`MemoryBase`].
@@ -431,10 +422,7 @@ impl BpMemory {
     fn window(&self, off: usize, len: usize) -> Result<(Arc<MappedHeap>, usize)> {
         let heap = self.resolve()?;
         let r = self.resolved.get().ok_or(StatusCode::Unknown)?;
-        let end = off.checked_add(len).ok_or(StatusCode::BadValue)?;
-        if end > r.size {
-            return Err(StatusCode::BadValue);
-        }
+        super::check_range(r.size, off, len)?;
         let mapped = heap.map()?;
         Ok((mapped, r.offset + off))
     }

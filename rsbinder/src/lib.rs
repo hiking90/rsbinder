@@ -270,12 +270,14 @@ pub mod bridge;
 mod command_stream;
 // Error types; private, `Result` and `StatusCode` are re-exported at the crate root.
 mod error;
-// Per-handle death-registration bookkeeping behind `IBinder::link_to_death`.
+// Death recipients of every proxy, and the per-handle kernel registration behind them.
 mod death;
 // `ParcelFileDescriptor`, re-exported at the crate root.
 mod file_descriptor;
 // Per-handle freeze-notification bookkeeping behind `IBinder::add_frozen_state_change_callback`.
 mod freeze;
+// The kernel registration state the death and freeze registries share.
+mod notification;
 // `LazyServiceRegistrar`; documented inside (plain comment, same reason as `entry`).
 pub mod lazy_service;
 mod macros;
@@ -303,6 +305,8 @@ pub mod proxy_count;
 /// stubs so a heap fd can travel over the kernel binder or
 /// Unix-socket RPC. See the module docs.
 pub mod shared_memory;
+// Condvar waits with a deadline and a thread-and-future signal; `__sync` is the topic's path.
+mod signal;
 // Status and exception handling, re-exported at the crate root.
 mod status;
 mod sys;
@@ -392,7 +396,11 @@ pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 #[cfg(feature = "async")]
 #[doc(hidden)]
 pub use binder_async::__spawn_transact;
+pub use death::DeathLink;
 pub use error::{Result, StatusCode};
+// `rsbinder-topic` logs the panics it catches with the same text.
+#[doc(hidden)]
+pub use error::panic_message as __panic_message;
 pub use file_descriptor::ParcelFileDescriptor;
 // Fuzz entry points: the out-of-workspace `fuzz/` crate reaches them only via the root.
 #[cfg(all(feature = "rpc", feature = "fuzzing"))]
@@ -445,7 +453,16 @@ pub use rt::{
 };
 // `status` stays private: the root re-exports are the only path to these types.
 pub use status::{BinderResult, ExceptionCode, ServiceSpecificError, Status};
+// `stream`'s ring and `rsbinder-topic` write and read one end-record format through these.
+#[doc(hidden)]
+pub use status::{__decode_end_record, __encode_end_record};
 pub use transport_caps::TransportCaps;
+
+/// The waits `stream` and `rsbinder-topic` share: not part of the API.
+#[doc(hidden)]
+pub mod __sync {
+    pub use crate::signal::{wait_until, PoolGate, Signal, Waited};
+}
 
 /// Default path to the binder control device
 pub const DEFAULT_BINDER_CONTROL_PATH: &str = "/dev/binderfs/binder-control";
@@ -518,6 +535,38 @@ mod tests {
             .expect("spawn the child test");
         let stdout = String::from_utf8_lossy(&out.stdout);
         // Zero tests run exits 0 too: the filter must have found `test`.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child {test}: {:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    /// Runs this test's `body` in a child test process, so a fault fails the test, not the binary.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn in_child_process(test: &str, body: fn()) {
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        const CHILD: &str = "RSBINDER_CHILD_PROCESS_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let maximum = getrlimit(Resource::Core).maximum;
+            // A crash here is the regression under test; it should not leave a core file.
+            let _ = setrlimit(
+                Resource::Core,
+                Rlimit {
+                    current: Some(0),
+                    maximum,
+                },
+            );
+            body();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success() && stdout.contains("1 passed"),
             "child {test}: {:?}\n{stdout}\n{}",

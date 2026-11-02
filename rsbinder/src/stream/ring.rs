@@ -5,10 +5,10 @@
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use rsbinder_fmq::shm::spin::{spin_budget, spin_until, SpinGauge, SPIN_CLOCK_EVERY};
+use rsbinder_fmq::shm::spin::{spin_budget, SpinGauge, SpinSlot, SPIN_CLOCK_EVERY};
 use rsbinder_fmq::shm::Deadline;
 use rsbinder_fmq::{AttachPolicy, Descriptor, EventFlag, MessageQueue, NOT_EMPTY, NOT_FULL};
 
@@ -17,6 +17,7 @@ use crate::error::{Result, StatusCode};
 use crate::fmq::{MQDescriptor, SynchronizedReadWrite};
 use crate::parcel::Parcel;
 use crate::parcelable::{Deserialize, Serialize};
+use crate::signal::PoolGate;
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
@@ -24,8 +25,8 @@ use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink}
 #[cfg(feature = "tokio")]
 use super::pool::on_pool;
 use super::{
-    decode_item, dropped_terminator, encode_item, status_from_fields, truncated_terminator,
-    unlink_death, watch_death, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
+    decode_item, dropped_terminator, encode_item, end_decision, status_from_fields, watch_death,
+    Book, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
 };
 
 /// The descriptor type the endpoint carries: a ring of bytes.
@@ -46,21 +47,6 @@ const END_MESSAGE_MAX: usize = END_RESERVE - HEADER - END_FIELDS;
 
 /// Bytes a refill lets build while the producer adds: reading right behind it steals its line.
 const MIN_BATCH: usize = 4096;
-
-/// `EventFlag::wake_lazy` where the hardware also orders it against a libfmq waiter, else `wake`.
-fn wake_after_commit(flag: &EventFlag, bits: u32) -> rsbinder_fmq::Result<()> {
-    if cfg!(any(
-        target_arch = "x86_64",
-        target_arch = "x86",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64"
-    )) {
-        flag.wake_lazy(bits)
-    } else {
-        flag.wake(bits)
-    }
-}
 
 // --- The ring, as both ends and the pool see it ---
 
@@ -133,12 +119,7 @@ impl Shared {
             .ping
             .get()
             .and_then(|(peer, policy)| Ping::to(peer, *policy));
-        let quiet_until = ping
-            .as_ref()
-            .and_then(|ping| Instant::now().checked_add(ping.every));
-        // A caller's deadline that comes first ends the wait without a ping.
-        let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
-        let wake_at = if pings { quiet_until } else { deadline };
+        let (wake_at, pings) = Ping::wake_at(ping.as_ref(), deadline);
         let standing = self.flag.peek() & mask != 0;
         let parked_at = Instant::now();
         let timeout = wake_at.map(|at| at.saturating_duration_since(parked_at));
@@ -214,7 +195,7 @@ impl Shared {
                     drop(queue);
                     self.bump_activity();
                     // Committed is delivered: libfmq's `writeBlocking` ignores a failed wake too.
-                    if let Err(e) = wake_after_commit(&self.flag, NOT_EMPTY) {
+                    if let Err(e) = self.flag.wake_committed_lazy(NOT_EMPTY) {
                         log::error!("stream: the wake after a committed record failed: {e:?}");
                     }
                     return Ok(true);
@@ -258,27 +239,23 @@ impl Shared {
         is_end: bool,
         deadline: Option<&Deadline>,
     ) -> bool {
-        let budget = self.spin.budget(deadline);
         let mut queue = self.queue();
-        let (look, spun) = spin_until(budget, || {
+        let look = self.spin.look(deadline, || {
             self.dead.load(Ordering::Relaxed)
                 || (!is_end
                     && (self.flag.peek() & CANCEL != 0 || self.abandoned.load(Ordering::Relaxed)))
                 // A broken counter ends the spin too; the loop top reports it.
                 || !matches!(queue.begin_write_cached(n, limit), Ok(None))
         });
-        self.spin.spun(spun, look);
         look.is_found()
     }
 
     /// Look for a record or a death for a spin before parking, leaving the flag word alone.
     fn fills_within(&self, deadline: Option<&Deadline>) -> bool {
-        let budget = self.spin.budget(deadline);
         let queue = self.queue();
-        let (look, spun) = spin_until(budget, || {
+        let look = self.spin.look(deadline, || {
             self.dead.load(Ordering::Relaxed) || !matches!(queue.available_to_read(), Ok(0))
         });
-        self.spin.spun(spun, look);
         look.is_found()
     }
 }
@@ -317,40 +294,25 @@ impl WriteFailure {
 
 /// What a pool task left behind: one at most, which the owner waits for before writing or waiting.
 #[derive(Default)]
-struct TransitState {
-    /// Items accepted and never written. Only the terminator reports them.
-    lost: i32,
-    /// A failure with nobody told yet; the next call returns it.
-    unreported: Option<StatusCode>,
-    /// The ring is unusable; every later call returns this.
-    broken: Option<StatusCode>,
-}
-
-#[derive(Default)]
 struct Transit {
-    state: Mutex<TransitState>,
-    /// Written under `state`'s lock; read without it on the fast path.
-    in_transit: std::sync::atomic::AtomicBool,
+    /// Up while a token is on the pool; lowered as it settles into the book.
+    gate: PoolGate<Book>,
     /// `unreported` or `broken` was ever set; never cleared, so while it is down neither is.
     flagged: std::sync::atomic::AtomicBool,
-    idle: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
 }
 
 impl Transit {
-    fn lock(&self) -> std::sync::MutexGuard<'_, TransitState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.gate.lock()
     }
 
     #[cfg(feature = "tokio")]
     fn begin(&self) {
-        let _guard = self.lock();
-        self.in_transit.store(true, Ordering::SeqCst);
+        self.gate.begin();
     }
 
     fn in_transit(&self) -> bool {
-        self.in_transit.load(Ordering::SeqCst)
+        self.gate.busy()
     }
 
     fn lost(&self) -> i32 {
@@ -372,30 +334,20 @@ impl Transit {
 
     /// Nothing to wait out and nothing ever left to report: the owner may skip the lock.
     fn quiet(&self) -> bool {
-        // `settle` raises `flagged` before it lowers `in_transit`, so this order sees both.
-        !self.in_transit.load(Ordering::SeqCst) && !self.flagged.load(Ordering::SeqCst)
+        // `settle` raises `flagged` before it lowers the gate, so this order sees both.
+        !self.gate.busy() && !self.flagged.load(Ordering::SeqCst)
     }
 
     /// The token is done: leave `failure` for the next call; `lost` = its item did not go in.
     #[cfg(feature = "tokio")]
     fn settle(&self, failure: Option<StatusCode>, lost: bool, broken: bool) {
-        {
-            let mut state = self.lock();
-            if lost {
-                state.lost = state.lost.saturating_add(1);
-            }
+        self.gate.settle(|book| {
+            book.add_lost(i32::from(lost));
             if let Some(e) = failure {
-                state.unreported = Some(e);
-                if broken {
-                    state.broken.get_or_insert(e);
-                }
+                book.record_failure(e, broken);
                 self.flagged.store(true, Ordering::SeqCst);
             }
-            self.in_transit.store(false, Ordering::SeqCst);
-        }
-        self.idle.notify_all();
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        });
     }
 
     /// The awaiting future takes back its own record's timeout: reported to it, so not lost.
@@ -412,40 +364,29 @@ impl Transit {
 
     /// Block until nothing is in transit; `false` if `deadline` passes first.
     fn wait_idle_until(&self, deadline: Option<Instant>) -> bool {
-        let mut state = self.lock();
-        while self.in_transit.load(Ordering::SeqCst) {
-            let Some(deadline) = deadline else {
-                state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
-            };
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            state = self
-                .idle
-                .wait_timeout(state, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-        true
+        self.gate.join(deadline)
     }
 
     fn wait_idle(&self) {
-        self.wait_idle_until(None);
+        self.gate.join(None);
     }
 
     #[cfg(feature = "tokio")]
     async fn idle_async(&self) {
-        loop {
-            // Made before the check: a `Notified` gets `notify_waiters` from its creation on.
-            let notified = self.notify.notified();
-            if !self.in_transit.load(Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
+        self.gate.join_async().await;
     }
+}
+
+/// `BadValue` if past the end record's reserve no header plus one payload byte fits (both ends).
+fn room_for_an_item(capacity: usize, who: &str) -> Result<()> {
+    if capacity <= END_RESERVE + HEADER {
+        log::error!(
+            "{who}: a ring of {capacity} bytes leaves no room for an item past the \
+             {END_RESERVE}-byte reserve for the end record"
+        );
+        return Err(StatusCode::BadValue);
+    }
+    Ok(())
 }
 
 // --- Records ---
@@ -459,36 +400,17 @@ fn end_header(len: usize) -> u32 {
     KIND_END | len as u32
 }
 
-/// The longest prefix of `message` within `max` bytes that ends on a character boundary.
-fn fitted(message: &str, max: usize) -> &str {
-    if message.len() <= max {
-        return message;
-    }
-    let mut end = max;
-    while !message.is_char_boundary(end) {
-        end -= 1;
-    }
-    &message[..end]
-}
-
 /// The end record's payload: the three `onEnd` arguments, the message cut to fit the reserve.
 fn end_payload(exception: i32, service_specific: i32, message: Option<&str>) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(END_RESERVE - HEADER);
-    payload.extend_from_slice(&exception.to_le_bytes());
-    payload.extend_from_slice(&service_specific.to_le_bytes());
-    if let Some(message) = message {
-        payload.extend_from_slice(fitted(message, END_MESSAGE_MAX).as_bytes());
-    }
-    payload
+    crate::status::__encode_end_record(exception, service_specific, message, END_MESSAGE_MAX)
 }
 
 /// The status an end record carries; the reader checked `payload` holds `END_FIELDS`.
 fn end_status(payload: &[u8]) -> Status {
-    let exception = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let service_specific = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    let message = (payload.len() > END_FIELDS)
-        .then(|| String::from_utf8_lossy(&payload[END_FIELDS..]).into_owned());
-    match status_from_fields(exception, service_specific, message.as_deref()) {
+    let decoded = crate::status::__decode_end_record(payload).ok_or(StatusCode::BadValue);
+    match decoded.and_then(|(exception, service_specific, message)| {
+        status_from_fields(exception, service_specific, message.as_deref())
+    }) {
         Ok(status) => status,
         // Unreadable, yet the stream must stop; the decode failure is why.
         Err(code) => Status::from(code),
@@ -583,10 +505,8 @@ pub(super) struct Producer<T: ?Sized> {
     scratch: Box<Parcel>,
     /// Set once the end record is in, so `Drop` does not write a second.
     ended: bool,
-    /// The consumer's sink, kept for the unlink in `Drop`.
-    sink: SIBinder,
-    /// Holds the death link on the sink; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The death link on the consumer's sink; `None` for a local sink.
+    death: Option<crate::DeathLink>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -600,14 +520,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             StatusCode::from(e)
         })?;
         let capacity = queue.capacity();
-        // An item record needs its header and a payload byte past the reserve.
-        if capacity <= END_RESERVE + HEADER {
-            log::error!(
-                "Sink::open: a ring of {capacity} bytes leaves no room for an item past the \
-                 {END_RESERVE}-byte reserve for the end record"
-            );
-            return Err(StatusCode::BadValue);
-        }
+        room_for_an_item(capacity, "Sink::open")?;
         // `require_event_flag` above makes this `Some`.
         let flag = queue.event_flag().ok_or(StatusCode::InvalidOperation)?;
         let shared = Shared::new(queue, flag, capacity);
@@ -619,7 +532,6 @@ impl<T: Serialize + ?Sized> Producer<T> {
             transit: Arc::new(Transit::default()),
             scratch: Box::new(Parcel::new_data_only()),
             ended: false,
-            sink: sink.clone(),
             death,
             _item: PhantomData,
         })
@@ -771,13 +683,12 @@ impl<T: ?Sized> Producer<T> {
         if !self.transit.flagged.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.transit.broken().map_or(Ok(()), Err)
+        self.transit.lock().usable()
     }
 
     /// A transit failure, returned once; a broken ring's error, returned on every call.
     fn reported(&self) -> Result<()> {
-        let unreported = self.transit.take_unreported();
-        unreported.or(self.transit.broken()).map_or(Ok(()), Err)
+        self.transit.lock().reported()
     }
 
     /// Write the end record; `failed` is what an earlier record left unreported.
@@ -788,32 +699,20 @@ impl<T: ?Sized> Producer<T> {
         service_specific: i32,
         message: Option<&str>,
     ) -> Result<()> {
-        if self.shared.dead.load(Ordering::SeqCst) || failed == Some(StatusCode::DeadObject) {
-            // Nobody is left to tell.
-            return Err(StatusCode::DeadObject);
-        }
-        let canceled = self.is_canceled();
-        // After a cancel no loss is reported: the consumer asked for nothing more.
-        let truncated = match truncated_terminator(exception, self.transit.lost()) {
-            Some(truncated) if !canceled => Some(truncated),
-            _ => None,
-        };
-        let wrote = match &truncated {
+        let dead = self.shared.dead.load(Ordering::SeqCst);
+        let decision = end_decision(
+            failed,
+            dead,
+            self.is_canceled(),
+            self.transit.lost(),
+            exception,
+        );
+        decision.send(|truncated| match truncated {
             Some(truncated) => {
                 self.write_end(ExceptionCode::IllegalState as i32, 0, Some(truncated))
             }
             None => self.write_end(exception, service_specific, message),
-        };
-        match failed {
-            // The consumer still waits in `recv`, so the end went in; return the earlier failure.
-            Some(e) if !canceled => {
-                if let Err(end) = wrote {
-                    log::warn!("stream: the end record could not be written: {end:?}");
-                }
-                Err(e)
-            }
-            _ => wrote,
-        }
+        })
     }
 
     /// Never waits: the reserve keeps room, so no room means the consumer moved the read counter.
@@ -882,8 +781,7 @@ impl<T: ?Sized> Drop for Producer<T> {
     /// End the stream without waiting for the consumer; see [`Sink`](super::Sink)'s `Drop`.
     fn drop(&mut self) {
         // Unlink always: a dropped recipient leaves a dead `Weak` in the sink's list for good.
-        let death = self.death.take();
-        unlink_death(&self.sink, &death);
+        drop(self.death.take());
         if self.ended {
             return;
         }
@@ -1023,7 +921,7 @@ impl Wait {
     /// The deadline a spin budget is cut to, made once for the whole call.
     fn spin_deadline(&self) -> Option<Deadline> {
         match *self {
-            Wait::Until(at) => Deadline::after(at.saturating_duration_since(Instant::now())),
+            Wait::Until(at) => Deadline::until(at),
             Wait::Never | Wait::Forever => None,
         }
     }
@@ -1066,15 +964,7 @@ pub(super) struct Consumer<T> {
 impl<T: Deserialize> Consumer<T> {
     /// Make the ring and the sink binder; the caller builds the endpoint.
     pub(super) fn new(policy: &ReceiverPolicy) -> Result<(Self, Ring, SIBinder)> {
-        // Same bound as `Producer::open`: a header and a byte of payload past the reserve.
-        if policy.ring_bytes <= END_RESERVE + HEADER {
-            log::error!(
-                "Receiver::new: a ring of {} bytes leaves no room for an item past the \
-                 {END_RESERVE}-byte reserve for the end record",
-                policy.ring_bytes
-            );
-            return Err(StatusCode::BadValue);
-        }
+        room_for_an_item(policy.ring_bytes, "Receiver::new")?;
         let queue = MessageQueue::<u8>::create(policy.ring_bytes, true).map_err(|e| {
             log::error!("Receiver::new: the ring cannot be made: {e}");
             StatusCode::from(e)
@@ -1343,7 +1233,7 @@ impl<T: Deserialize> Consumer<T> {
         self.at = 0;
         self.filled = available;
         // The one point room is made; `StreamEndpoint.aidl` lets a multi-record read wake once.
-        let _ = wake_after_commit(&self.shared.flag, NOT_FULL);
+        let _ = self.shared.flag.wake_committed_lazy(NOT_FULL);
         Ok(true)
     }
 
@@ -1362,6 +1252,7 @@ impl<T: Deserialize> Consumer<T> {
             return;
         }
         let start = Instant::now();
+        let mut slot = None;
         loop {
             for _ in 0..SPIN_CLOCK_EVERY {
                 std::hint::spin_loop();
@@ -1369,6 +1260,13 @@ impl<T: Deserialize> Consumer<T> {
             match queue.available_to_read() {
                 Ok(now) if now > seen && now < MIN_BATCH && start.elapsed() < budget => seen = now,
                 _ => return,
+            }
+            // After the first round, as `spin_until`: a longer look takes a share of the process.
+            if slot.is_none() {
+                slot = SpinSlot::take();
+                if slot.is_none() {
+                    return;
+                }
             }
         }
     }
@@ -1684,6 +1582,7 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         tx.send(&1, None).expect("send");
         let death = rx.death_recipient();
+        let who = SIBinder::downgrade(&rx.sink_binder());
         let (done, watch) = mpsc::channel();
         thread::spawn(move || {
             let first = rx.recv();
@@ -1695,7 +1594,7 @@ mod tests {
             watch.recv_timeout(Duration::from_millis(300)).is_err(),
             "the consumer waits for a second record"
         );
-        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        crate::DeathRecipient::binder_died(&death, &who);
         let (first, second, third, _rx) = watch
             .recv_timeout(Duration::from_secs(5))
             .expect("death must release the consumer");
@@ -1715,7 +1614,7 @@ mod tests {
     fn an_end_record_outranks_a_death_that_followed_it() {
         let (tx, mut rx) = pair::<i32>(512);
         let death = rx.death_recipient();
-        let sink = tx.sink.clone();
+        let sink = rx.sink_binder();
         end(tx).expect("end");
         crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&sink));
         assert!(rx.recv().is_none());
@@ -1727,7 +1626,7 @@ mod tests {
     fn an_end_record_outranks_a_death_noticed_while_it_is_being_read() {
         let (tx, mut rx) = pair::<i32>(512);
         let death = rx.death_recipient();
-        let sink = tx.sink.clone();
+        let sink = rx.sink_binder();
         let shared = rx.shared.clone();
         let reached = Arc::new(AtomicBool::new(false));
         let seen = reached.clone();
@@ -1763,7 +1662,7 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         tx.send(&1, None).expect("send");
         let death = rx.death_recipient();
-        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&rx.sink_binder()));
         assert!(rx.end_status().is_none(), "an item is still in the ring");
         assert_eq!(rx.recv().expect("the item").expect("ok"), 1);
         let ended = rx.recv().expect("the end").expect_err("an error");
@@ -1835,7 +1734,7 @@ mod tests {
         }
         assert_eq!(rx.try_recv().expect("no error"), Some(1));
         let death = rx.death_recipient();
-        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&tx.sink));
+        crate::DeathRecipient::binder_died(&death, &SIBinder::downgrade(&rx.sink_binder()));
         assert_eq!(rx.recv().expect("item").expect("ok"), 2);
         assert_eq!(rx.recv().expect("item").expect("ok"), 3);
         let ended = rx.recv().expect("the end").expect_err("an error");
@@ -2694,5 +2593,28 @@ mod tests {
             assert_eq!(back, status);
             assert_eq!(back.message(), status.message());
         }
+    }
+
+    /// A record whose exception no call may end with still ends the stream, as `BadValue`.
+    #[test]
+    fn an_end_record_with_a_marker_or_unknown_exception_reads_as_bad_value() {
+        for exception in [-127, -128, -129, -256, 7] {
+            let status = end_status(&end_payload(exception, 0, Some("m")));
+            assert_eq!(status.exception_code(), ExceptionCode::TransactionFailed);
+            assert_eq!(
+                status.transaction_error(),
+                StatusCode::BadValue,
+                "{exception}"
+            );
+        }
+    }
+
+    /// The end record's bytes (`contrib/ndk/rsbinder_stream.h`): two `i32` LE, then the message.
+    #[test]
+    fn an_end_record_is_two_le_words_and_the_message() {
+        let mut expected = vec![0xf8, 0xff, 0xff, 0xff, 0x09, 0x00, 0x00, 0x00];
+        expected.extend_from_slice(b"busy");
+        assert_eq!(end_payload(-8, 9, Some("busy")), expected);
+        assert_eq!(end_payload(0, 0, None), [0; 8]);
     }
 }

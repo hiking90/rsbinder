@@ -294,6 +294,31 @@ impl<T: Remotable> Inner<T> {
         Ok(())
     }
 
+    /// After the token, both paths: `BBinder::transact`'s special codes, the stub, the fallbacks.
+    fn dispatch_common(
+        &self,
+        code: TransactionCode,
+        reader: &mut Parcel,
+        reply: &mut Parcel,
+    ) -> Result<()> {
+        match code {
+            PING_TRANSACTION => Ok(()),
+            EXTENSION_TRANSACTION => {
+                let ext = self.extension.read().expect("Extension lock poisoned");
+                SerializeOption::serialize_option(ext.as_ref(), reply)
+            }
+            STOP_RECORDING_TRANSACTION | START_RECORDING_TRANSACTION => {
+                log::error!("recording transactions are not supported");
+                Err(StatusCode::InvalidOperation)
+            }
+            DEBUG_PID_TRANSACTION => reply.write::<i32>(&crate::thread_state::own_pid()),
+            _ => match self.remotable.on_transact(code, reader, reply) {
+                Err(StatusCode::UnknownTransaction) => self.on_transact(code, reader, reply),
+                result => result,
+            },
+        }
+    }
+
     // The following functions can be redefined depending on the service.
     fn on_transact(
         &self,
@@ -404,29 +429,7 @@ impl<T: 'static + Remotable> IBinder for Inner<T> {
         reader: &mut Parcel,
         reply: &mut Parcel,
     ) -> Result<()> {
-        match code {
-            PING_TRANSACTION => Ok(()),
-            EXTENSION_TRANSACTION => {
-                let ext = self.extension.read().expect("Extension lock poisoned");
-                SerializeOption::serialize_option(ext.as_ref(), reply)?;
-                Ok(())
-            }
-            STOP_RECORDING_TRANSACTION | START_RECORDING_TRANSACTION => {
-                log::error!("recording transactions are not supported over RPC");
-                Err(StatusCode::InvalidOperation)
-            }
-            DEBUG_PID_TRANSACTION => {
-                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
-            }
-            _ => match self.remotable.on_transact(code, reader, reply) {
-                Ok(_) => Ok(()),
-                Err(StatusCode::UnknownTransaction) => {
-                    // As `Inner::transact`: fall back for INTERFACE_TRANSACTION etc.
-                    self.on_transact(code, reader, reply)
-                }
-                Err(err) => Err(err),
-            },
-        }
+        self.dispatch_common(code, reader, reply)
     }
 
     fn descriptor(&self) -> &str {
@@ -450,51 +453,13 @@ impl<T: Remotable> Transactable for Inner<T> {
         reply: &mut Parcel,
     ) -> Result<()> {
         reader.set_data_position(0);
-        match code {
-            PING_TRANSACTION => {
-                // Noting to do for PING_TRANSACTION.
-                Ok(())
-            }
-            EXTENSION_TRANSACTION => {
-                let ext = self.extension.read().expect("Extension lock poisoned");
-                SerializeOption::serialize_option(ext.as_ref(), reply)?;
-                Ok(())
-            }
-
-            STOP_RECORDING_TRANSACTION => {
-                log::error!("STOP_RECORDING_TRANSACTION is not supported.");
-                Err(StatusCode::InvalidOperation)
-            }
-
-            START_RECORDING_TRANSACTION => {
-                log::error!("START_RECORDING_TRANSACTION is not supported.");
-                Err(StatusCode::InvalidOperation)
-            }
-
-            DEBUG_PID_TRANSACTION => {
-                reply.write::<i32>(&rustix::process::getpid().as_raw_nonzero().get())
-            }
-
-            _ => {
-                if (FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION).contains(&code)
-                    && !(thread_state::check_interface(reader, T::descriptor())?)
-                {
-                    // Status, never payload (read as success); as AOSP NDK `ABBinder::onTransact`.
-                    return Err(StatusCode::BadType);
-                }
-
-                match self.remotable.on_transact(code, reader, reply) {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        if err == StatusCode::UnknownTransaction {
-                            self.on_transact(code, reader, reply)
-                        } else {
-                            Err(err)
-                        }
-                    }
-                }
-            }
+        if crate::binder::code_takes_token(code)
+            && !(thread_state::check_interface(reader, T::descriptor())?)
+        {
+            // Status, never payload (read as success); as AOSP NDK `ABBinder::onTransact`.
+            return Err(StatusCode::BadType);
         }
+        self.dispatch_common(code, reader, reply)
     }
 }
 
@@ -1222,6 +1187,160 @@ mod rpc_dispatch_tests {
             );
         }
         handle.join().unwrap();
+    }
+
+    /// Special codes carry no token over RPC either (AOSP `getExtension` sends an empty parcel).
+    #[test]
+    fn rpc_special_codes_dispatch_without_an_interface_token() {
+        use crate::binder::RemoteProxy;
+
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let root = Binder::new(Echo);
+        root.set_extension(&Interface::as_binder(&Binder::new(Echo)))
+            .unwrap();
+        server.set_root(Interface::as_binder(&root)).unwrap();
+        let handle = std::thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        {
+            let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+            let root = client.get_root().unwrap();
+            let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
+            let call = |code| {
+                let data = rp.prepare_transact(false).unwrap();
+                assert_eq!(data.data_size(), 0);
+                rp.send(code, &data, 0)
+            };
+            let mut reply = call(EXTENSION_TRANSACTION).unwrap().unwrap();
+            assert!(reply.read::<Option<SIBinder>>().unwrap().is_some());
+            let mut reply = call(DEBUG_PID_TRANSACTION).unwrap().unwrap();
+            assert_eq!(
+                reply.read::<i32>().unwrap(),
+                rustix::process::getpid().as_raw_nonzero().get()
+            );
+            // A custom non-call code: the handler reads its payload from position 0.
+            let mut data = rp.prepare_transact(false).unwrap();
+            data.write(&42i32).unwrap();
+            let mut reply = rp.send(ECHO, &data, 0).unwrap().unwrap();
+            assert_eq!(reply.read::<i32>().unwrap(), 42);
+        }
+        handle.join().unwrap();
+    }
+
+    /// `transact` and `rpc_transact` answer a non-call code alike (`EXTENSION` is checked above).
+    #[test]
+    fn kernel_and_rpc_dispatch_answer_non_call_codes_alike() {
+        let b = Interface::as_binder(&Binder::new(Echo));
+        let t = b.as_transactable().unwrap();
+        for code in [
+            PING_TRANSACTION,
+            INTERFACE_TRANSACTION,
+            DEBUG_PID_TRANSACTION,
+            START_RECORDING_TRANSACTION,
+            STOP_RECORDING_TRANSACTION,
+            SHELL_COMMAND_TRANSACTION,
+            SYSPROPS_TRANSACTION,
+            ECHO,
+            ECHO + 1,
+        ] {
+            let run = |kernel: bool| {
+                let mut reader = Parcel::new();
+                reader.write(&7i32).unwrap();
+                let mut reply = Parcel::new();
+                let result = if kernel {
+                    t.transact(code, &mut reader, &mut reply)
+                } else {
+                    reader.set_data_position(0);
+                    let token = crate::binder::sealed::Token::new();
+                    b.rpc_transact(token, code, &mut reader, &mut reply)
+                };
+                (result, reply.rpc_data_bytes().to_vec())
+            };
+            assert_eq!(run(true), run(false), "{code:#x}");
+        }
+    }
+
+    /// A token-less `DUMP` reaches `on_dump` on both fd shapes: R34 `[idx]`, android-13+ v1/v2.
+    #[test]
+    fn an_rpc_dump_without_a_token_reaches_on_dump() {
+        use crate::rpc::transport::UnixTransport;
+        use crate::rpc::FileDescriptorTransportMode as FdMode;
+        use std::io::Read;
+        use std::os::fd::AsFd;
+
+        for version in [None, Some(1), Some(2)] {
+            let (a, b) = UnixTransport::pair().unwrap();
+            let (server, client) = match version {
+                None => {
+                    let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+                    server.set_supported_fd_modes(&[FdMode::Unix]);
+                    let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+                    (server, client)
+                }
+                Some(v) => {
+                    let accept = std::thread::spawn(move || {
+                        let (t, codec, fd_mode, _, _) =
+                            RpcSession::android13plus_accept_handshake(Box::new(a), v).unwrap();
+                        RpcSession::from_android13plus(t, codec, fd_mode, true).unwrap()
+                    });
+                    let client =
+                        RpcSession::connect_android13plus_fd(Box::new(b), v, FdMode::Unix).unwrap();
+                    (accept.join().unwrap(), client)
+                }
+            };
+            server
+                .set_root(Interface::as_binder(&Binder::new(Svc)))
+                .unwrap();
+            let handle = std::thread::spawn(move || {
+                let _ = server.serve_blocking();
+            });
+            {
+                if version.is_none() {
+                    assert_eq!(
+                        client.negotiate_fd_transport(FdMode::Unix),
+                        Ok(FdMode::Unix)
+                    );
+                }
+                let root = client.get_root().unwrap();
+                let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
+                let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+                let mut data = crate::binder::RemoteProxy::prepare_transact(rp, false).unwrap();
+                crate::file_descriptor::write_raw_fd(&mut data, write_end.as_fd()).unwrap();
+                data.write(&0i32).unwrap();
+                drop(write_end);
+                rp.send(DUMP_TRANSACTION, &data, 0).unwrap();
+                let mut got = [0u8; 6];
+                std::fs::File::from(read_end).read_exact(&mut got).unwrap();
+                assert_eq!(&got, b"dumped", "version {version:?}");
+            }
+            // The serve loop returns when the connection closes.
+            drop(client);
+            handle.join().unwrap();
+        }
+    }
+
+    /// Echoes one `i32` for the non-call code `ECHO`.
+    struct Echo;
+    const ECHO: TransactionCode = LAST_CALL_TRANSACTION + 1;
+    impl Remotable for Echo {
+        fn descriptor() -> &'static str {
+            "x.y.IEcho"
+        }
+        fn on_transact(
+            &self,
+            code: TransactionCode,
+            data: &mut Parcel,
+            reply: &mut Parcel,
+        ) -> Result<()> {
+            if code != ECHO {
+                return Err(StatusCode::UnknownTransaction);
+            }
+            reply.write(&data.read::<i32>()?)
+        }
+        fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+            Ok(())
+        }
     }
 
     /// An RPC `DUMP_TRANSACTION` takes its fd from the session's table (AOSP `readFileDescriptor`).

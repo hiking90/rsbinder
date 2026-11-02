@@ -1241,3 +1241,27 @@ fn a_retry_thread_with_a_watcher_that_never_takes_its_notice_ends_with_the_regis
         "woken by the drop, not its due"
     );
 }
+
+/// A link the next one replaces, and one taken back, each unlink once, a panic kept inside.
+#[test]
+fn a_replaced_or_removed_link_unlinks_once() {
+    let unlinked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let binder = || crate::link::PanickingUnlink::binder(&unlinked);
+    let mut linked = std::collections::BTreeMap::new();
+    let this = std::sync::Weak::new();
+    let mut links = super::ShellLinks {
+        linked: &mut linked,
+        this: &this,
+    };
+    links.link(7, binder()).expect("link");
+    let replaced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        links.link(7, binder()).expect("link again")
+    }));
+    assert!(replaced.is_ok());
+    assert_eq!(unlinked.load(Ordering::SeqCst), 1, "the replaced link");
+    let removed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Links::<super::TopicKey, super::WatcherKey>::unlink(&mut links, 7)
+    }));
+    assert!(removed.is_ok());
+    assert_eq!(unlinked.load(Ordering::SeqCst), 2, "the removed link");
+}

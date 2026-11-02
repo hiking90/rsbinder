@@ -6,11 +6,12 @@
 //! flips the test red until the audit named in the invariant is
 //! performed.
 //!
-//! Eight remain: refuted prose, the one slot un-push, the files a
+//! Nine remain: refuted prose, the one slot un-push, the files a
 //! byte-order primitive may appear in, the method surface of
 //! `CommandStream`, the places a raw fd number becomes an fd, the
 //! public types whose drop ends something, the library threads made by
-//! a call that panics, and the places an async API chooses its thread —
+//! a call that panics, the places an async API chooses its thread, and
+//! the library's death links held as `DeathLink` —
 //! each a closed set, not an enumeration of ways to get it wrong. The call sites of the layer split
 //! are not scanned: L2 is `src/command_stream.rs`'s `CommandStream`, whose
 //! private field leaves the L1 wire codec unreachable from the command
@@ -149,6 +150,21 @@
 //! the two `Reconnecting` refusals. It checks text, not the thread a transaction
 //! leaves from: a thread made with `thread::Builder` that sends a lookup is
 //! not seen.
+//!
+//! # Death links
+//!
+//! A death link the library holds is a `DeathLink`, whose drop unlinks and
+//! drops the binder and the recipient under `catch_unwind` (plan 18 U1). A hand-written unlink
+//! in a `Drop` is where a poisoned lock or a proxy's own drop panicking would
+//! unwind, and an unwind out of a drop during another one aborts.
+//! `death_links_go_through_death_link` finds every `unlink_to_death(` and
+//! `unlink_to_death_arc(` call, as a method (`.`) or a path (`::`), in the
+//! code of `rsbinder` and `rsbinder-topic`, with the test-code mask of the
+//! thread-creation test, fails unless it finds the one in `DeathLink::drop`, and
+//! allows only `death.rs` (the link itself), `binder.rs` (the `_arc`
+//! forwarders), `hub/accessor_16.rs` (an `IBinder` that forwards) and
+//! `bridge.rs`, whose entries hold the remote weakly and so cannot be a
+//! `DeathLink`, which holds it strongly.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -588,6 +604,7 @@ fn types_whose_drop_ends_something_are_must_use() {
     // (crate, file under `src/`, type).
     const MUST_USE: &[(&str, &str, &str)] = &[
         ("rsbinder", "bridge.rs", "Rewrap"),
+        ("rsbinder", "death.rs", "DeathLink"),
         ("rsbinder", "entry/server.rs", "Server"),
         ("rsbinder", "entry/server.rs", "ServerGuard"),
         (
@@ -595,11 +612,14 @@ fn types_whose_drop_ends_something_are_must_use() {
             "hub/accessor_register.rs",
             "AccessorProviderHandle",
         ),
+        // Its `Drop` is `WatchGuard`'s, so the scan below cannot find it.
+        ("rsbinder", "hub/mod.rs", "ServiceWatch"),
         ("rsbinder", "reconnect.rs", "Reconnecting"),
         ("rsbinder", "rpc/server.rs", "RpcServerHandle"),
         ("rsbinder", "rt/tokio_rt.rs", "DeathSignal"),
         ("rsbinder", "stream/mod.rs", "Receiver"),
         ("rsbinder", "stream/mod.rs", "Sink"),
+        ("rsbinder-fmq", "shm/spin.rs", "SpinSlot"),
         ("rsbinder-topic", "named.rs", "NamedSubscriber"),
         ("rsbinder-topic", "publisher.rs", "LoanMut"),
         ("rsbinder-topic", "publisher.rs", "Publisher"),
@@ -763,6 +783,66 @@ fn library_threads_are_made_by_builder() {
         "a library thread is made by a call that panics on failure, or a pinned site moved — \
          use `thread::Builder` and return the error; see this test's doc.\n\
          unpinned: {found:#?}\nmissing: {missing:#?}"
+    );
+}
+
+/// Keeps the library's unlinks behind `DeathLink`; see module doc "Death links".
+#[test]
+fn death_links_go_through_death_link() {
+    const ALLOWED: &[(&str, &str)] = &[
+        ("rsbinder", "death.rs"),
+        ("rsbinder", "binder.rs"),
+        ("rsbinder", "hub/accessor_16.rs"),
+        ("rsbinder", "bridge.rs"),
+    ];
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut found = Vec::new();
+    // `DeathLink::drop`'s own unlink: a scan that no longer sees it sees nothing.
+    let mut pinned = false;
+    for krate in ["rsbinder", "rsbinder-topic"] {
+        let src_root = workspace.join(krate).join("src");
+        if !src_root.is_dir() {
+            eprintln!(
+                "skipping {krate}: sources not reachable at {}",
+                src_root.display()
+            );
+            continue;
+        }
+        visit(&src_root, &mut |path, content| {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                return;
+            }
+            let rel = path.strip_prefix(&src_root).unwrap().to_string_lossy();
+            let rel = rel.replace('\\', "/");
+            let allowed = ALLOWED.iter().any(|&(k, f)| k == krate && f == rel);
+            let lines: Vec<&str> = content.lines().map(code_only).collect();
+            let test = test_module_lines(&lines);
+            for (i, line) in lines.iter().enumerate() {
+                // A method call or a path call (`IBinder::unlink_to_death(&b, w)`), not a `fn`.
+                let unlinks = ["unlink_to_death(", "unlink_to_death_arc("]
+                    .iter()
+                    .flat_map(|word| line.match_indices(word))
+                    .filter(|&(at, _)| line[..at].ends_with(['.', ':']))
+                    .count();
+                if test[i] || unlinks == 0 {
+                    continue;
+                }
+                if krate == "rsbinder"
+                    && rel == "death.rs"
+                    && enclosing_fn(&lines, i + 1).is_some_and(|f| f.starts_with("fn drop("))
+                {
+                    pinned = true;
+                }
+                if !allowed {
+                    found.push(format!("{krate}/src/{rel}:{}", i + 1));
+                }
+            }
+        });
+    }
+    assert!(
+        found.is_empty() && pinned,
+        "an unlink outside `DeathLink`, or `DeathLink::drop`'s unlink moved; hold the link as a \
+         `DeathLink`, see this test's doc:\nunpinned: {found:#?}\npinned found: {pinned}"
     );
 }
 

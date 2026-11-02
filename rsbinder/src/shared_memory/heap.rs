@@ -38,6 +38,11 @@ pub const SEAL_WRITE: u32 = 0x0008;
 /// `F_SEAL_FUTURE_WRITE` (Linux 5.1+).
 pub const SEAL_FUTURE_WRITE: u32 = 0x0010;
 
+/// Whether `seals` (as [`MemoryHeapBase::seals`] reports them) forbid a writable mapping.
+pub(crate) const fn seals_forbid_writing(seals: u32) -> bool {
+    seals & (SEAL_WRITE | SEAL_FUTURE_WRITE) != 0
+}
+
 #[cfg(target_os = "macos")]
 static HEAP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -200,11 +205,8 @@ mod backend {
         }
         match shm::add_seals(fd.as_fd(), seals) {
             Ok(()) => Ok(()),
-            // Pre-5.1 kernel lacks FUTURE_WRITE (EINVAL): apply the rest; `seals()` shows the gap.
-            Err(rsbinder_fmq::Error::Os(errno))
-                if errno.raw() == rustix::io::Errno::INVAL.raw_os_error()
-                    && seals.contains(Seals::FUTURE_WRITE) =>
-            {
+            // Pre-5.1 kernel lacks FUTURE_WRITE: apply the rest; `seals()` shows the gap.
+            Err(e) if shm::seal_unsupported(seals, &e) => {
                 log::warn!("memfd F_SEAL_FUTURE_WRITE unsupported by this kernel; read-only heap is not write-sealed");
                 shm::add_seals(fd.as_fd(), seals.difference(Seals::FUTURE_WRITE))?;
                 Ok(())
@@ -588,7 +590,7 @@ impl MappedHeap {
         if seals & SEAL_SHRINK == 0 {
             return Err(StatusCode::BadValue);
         }
-        if flags & FLAG_READ_ONLY != 0 && seals & (SEAL_WRITE | SEAL_FUTURE_WRITE) == 0 {
+        if flags & FLAG_READ_ONLY != 0 && !seals_forbid_writing(seals) {
             return Err(StatusCode::BadValue);
         }
         Self::from_fd(fd, size, offset, flags)

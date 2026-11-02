@@ -108,8 +108,8 @@
 //!
 //! `register_for_notifications`, `unregister_for_notifications` and
 //! `register_client_callback` hand the caller's callback to a pre-16
-//! service manager through a thin forwarder (`ForwardServiceCallback`,
-//! `ForwardClientCallback`) that returns the original `SIBinder`, instead of
+//! service manager through a thin forwarder (`ForwardCallback`, which
+//! implements both traits) that returns the original `SIBinder`, instead of
 //! reconstructing a typed `Strong` of the per-version trait.
 //!
 //! Each `android_N::IServiceCallback` / `IClientCallback` is generated from
@@ -129,6 +129,7 @@
 //! inbound notifications to the original binder node, never to this
 //! transient local object.
 
+use std::borrow::Borrow;
 use std::sync::{Arc, OnceLock};
 
 /// Common body of `servicemanager_{11..15}`, plus `$extra`; `include!` the AIDL bindings first.
@@ -789,7 +790,7 @@ pub fn default() -> Result<Arc<ServiceManager>> {
         feature = "android_15"
     )
 ))]
-struct ForwardServiceCallback(crate::SIBinder);
+struct ForwardCallback(crate::SIBinder);
 
 #[cfg(all(
     target_os = "android",
@@ -801,13 +802,13 @@ struct ForwardServiceCallback(crate::SIBinder);
         feature = "android_15"
     )
 ))]
-impl crate::Interface for ForwardServiceCallback {
+impl crate::Interface for ForwardCallback {
     fn as_binder(&self) -> crate::SIBinder {
         self.0.clone()
     }
 }
 
-/// Wraps the unified callback as a per-version `Strong<dyn IServiceCallback>` (pre-16 arms).
+/// Wraps a unified callback as the per-version `Strong<dyn android_N::ICallback>` (pre-16 arms).
 #[cfg(all(
     target_os = "android",
     any(
@@ -818,35 +819,22 @@ impl crate::Interface for ForwardServiceCallback {
         feature = "android_15",
     )
 ))]
-macro_rules! wrap_callback {
-    ($modu:ident, $callback:expr) => {
-        crate::Strong::<dyn $modu::IServiceCallback>::new(Box::new(ForwardServiceCallback(
-            $callback.as_binder(),
-        )))
+macro_rules! forward {
+    ($modu:ident::$iface:ident, $callback:expr) => {
+        crate::Strong::<dyn $modu::$iface>::new(Box::new(ForwardCallback($callback.as_binder())))
     };
 }
 
-/// Converts a pre-16 `Vec<android_N::ServiceDebugInfo>` to the unified type (16 returns it).
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15",
-    )
-))]
-macro_rules! collect_debug_info {
-    ($modu:ident, $sm:expr) => {{
-        let result = $modu::get_service_debug_info($sm)?;
-        Ok(result
-            .into_iter()
-            .map(|info| ServiceDebugInfo {
-                name: info.name,
-                debugPid: info.debugPid,
-            })
-            .collect())
-    }};
+/// A plain form's answer: the `try_` form's value, or `T::default()` after logging why not.
+fn or_default_logged<T: Default>(
+    method: &str,
+    arg: &dyn std::fmt::Display,
+    result: std::result::Result<T, Status>,
+) -> T {
+    result.unwrap_or_else(|status| {
+        log::error!("{method}({arg}): {status}");
+        T::default()
+    })
 }
 
 /// `EX_UNSUPPORTED_OPERATION` (AOSP "no such method") naming the first version with `method`.
@@ -862,99 +850,39 @@ fn unsupported(method: &str, since: u32) -> Status {
         .into()
 }
 
-/// Emits the per-version `IServiceCallback` impl for `ForwardServiceCallback` (pre-16).
-macro_rules! forward_service_callback_impl {
+/// Emits `ForwardCallback`'s per-version `IServiceCallback` and `IClientCallback` impls (pre-16).
+macro_rules! forward_callback_impls {
     ($modu:ident, $feat:literal) => {
+        // Both callbacks are unreachable on the serialize-only path (type doc): error, not panic.
         #[cfg(all(target_os = "android", feature = $feat))]
-        impl $modu::IServiceCallback for ForwardServiceCallback {
+        impl $modu::IServiceCallback for ForwardCallback {
             fn r#onRegistration(
                 &self,
                 _name: &str,
                 _binder: &crate::SIBinder,
             ) -> crate::BinderResult<()> {
-                // Unreachable on the serialize-only path (type doc); error rather than panic.
                 Err(crate::StatusCode::UnknownTransaction.into())
             }
         }
-    };
-}
 
-forward_service_callback_impl!(android_11, "android_11");
-forward_service_callback_impl!(android_12, "android_12");
-forward_service_callback_impl!(android_13, "android_13");
-forward_service_callback_impl!(android_14, "android_14");
-forward_service_callback_impl!(android_15, "android_15");
-
-/// `IClientCallback` analogue of [`ForwardServiceCallback`]; same module doc section.
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_11",
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15"
-    )
-))]
-struct ForwardClientCallback(crate::SIBinder);
-
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_11",
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15"
-    )
-))]
-impl crate::Interface for ForwardClientCallback {
-    fn as_binder(&self) -> crate::SIBinder {
-        self.0.clone()
-    }
-}
-
-/// Wraps the unified callback as a per-version `Strong<dyn IClientCallback>` (pre-16 arms).
-#[cfg(all(
-    target_os = "android",
-    any(
-        feature = "android_11",
-        feature = "android_12",
-        feature = "android_13",
-        feature = "android_14",
-        feature = "android_15",
-    )
-))]
-macro_rules! wrap_client_callback {
-    ($modu:ident, $callback:expr) => {
-        crate::Strong::<dyn $modu::IClientCallback>::new(Box::new(ForwardClientCallback(
-            $callback.as_binder(),
-        )))
-    };
-}
-
-/// Emits the per-version `IClientCallback` impl for `ForwardClientCallback` (pre-16).
-macro_rules! forward_client_callback_impl {
-    ($modu:ident, $feat:literal) => {
         #[cfg(all(target_os = "android", feature = $feat))]
-        impl $modu::IClientCallback for ForwardClientCallback {
+        impl $modu::IClientCallback for ForwardCallback {
             fn r#onClients(
                 &self,
                 _registered: &crate::SIBinder,
                 _has_clients: bool,
             ) -> crate::BinderResult<()> {
-                // Unreachable on the serialize-only path (type doc); error rather than panic.
                 Err(crate::StatusCode::UnknownTransaction.into())
             }
         }
     };
 }
 
-forward_client_callback_impl!(android_11, "android_11");
-forward_client_callback_impl!(android_12, "android_12");
-forward_client_callback_impl!(android_13, "android_13");
-forward_client_callback_impl!(android_14, "android_14");
-forward_client_callback_impl!(android_15, "android_15");
+forward_callback_impls!(android_11, "android_11");
+forward_callback_impls!(android_12, "android_12");
+forward_callback_impls!(android_13, "android_13");
+forward_callback_impls!(android_14, "android_14");
+forward_callback_impls!(android_15, "android_15");
 
 impl ServiceManager {
     /// Checks if a service with the given name is available.
@@ -1146,26 +1074,11 @@ impl ServiceManager {
 
     /// Checks if a service with the given name is declared.
     ///
-    /// Note: not supported on Android 10 - always returns false.
+    /// Not supported on Android 10, where it returns false. Any failure is
+    /// logged and returns false; [`try_is_declared`](Self::try_is_declared)
+    /// returns it instead.
     pub fn is_declared(&self, name: &str) -> bool {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("is_declared: not supported on Android 10");
-                false
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::is_declared(sm, name),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::is_declared(sm, name),
-            ServiceManager::Android16(sm) => android_16::is_declared(sm, name),
-        }
+        or_default_logged("is_declared", &name, self.try_is_declared(name))
     }
 
     /// Every declared instance of `iface`.
@@ -1173,27 +1086,11 @@ impl ServiceManager {
     /// Requires the Android 12 protocol or later; earlier ones have no
     /// `getDeclaredInstances`, and report none declared.
     pub fn get_declared_instances(&self, iface: &str) -> Vec<String> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("get_declared_instances: not supported on Android 10");
-                Vec::new()
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(_) => {
-                log::error!("get_declared_instances: not supported on Android 11");
-                Vec::new()
-            }
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::get_declared_instances(sm, iface),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::get_declared_instances(sm, iface),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::get_declared_instances(sm, iface),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::get_declared_instances(sm, iface),
-            ServiceManager::Android16(sm) => android_16::get_declared_instances(sm, iface),
-        }
+        or_default_logged(
+            "get_declared_instances",
+            &iface,
+            self.try_get_declared_instances(iface),
+        )
     }
 
     /// Connection info declared for `name`, if any.
@@ -1201,46 +1098,11 @@ impl ServiceManager {
     /// Requires the Android 13 protocol or later; earlier ones have no
     /// `getConnectionInfo`, and report none.
     pub fn get_connection_info(&self, name: &str) -> Option<ConnectionInfo> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!("get_connection_info: not supported on Android 10");
-                None
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(_) => {
-                log::error!("get_connection_info: not supported on Android 11");
-                None
-            }
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(_) => {
-                log::error!("get_connection_info: not supported on Android 12");
-                None
-            }
-            // Per-version `ConnectionInfo`: rebuild field by field, as for `ServiceDebugInfo`.
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => {
-                android_13::get_connection_info(sm, name).map(|info| ConnectionInfo {
-                    ipAddress: info.ipAddress,
-                    port: info.port,
-                })
-            }
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => {
-                android_14::get_connection_info(sm, name).map(|info| ConnectionInfo {
-                    ipAddress: info.ipAddress,
-                    port: info.port,
-                })
-            }
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => {
-                android_15::get_connection_info(sm, name).map(|info| ConnectionInfo {
-                    ipAddress: info.ipAddress,
-                    port: info.port,
-                })
-            }
-            ServiceManager::Android16(sm) => android_16::get_connection_info(sm, name),
-        }
+        or_default_logged(
+            "get_connection_info",
+            &name,
+            self.try_get_connection_info(name),
+        )
     }
 
     /// Returns a list of all registered services with the specified dump priority.
@@ -1248,21 +1110,11 @@ impl ServiceManager {
     /// This method is version-agnostic and works across all supported Android versions.
     /// On Android 10, uses the iterative wire protocol internally.
     pub fn list_services(&self, dump_priority: i32) -> Vec<String> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(sm) => android_10::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(sm) => android_11::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => android_12::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => android_13::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => android_14::list_services(sm, dump_priority),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => android_15::list_services(sm, dump_priority),
-            ServiceManager::Android16(sm) => android_16::list_services(sm, dump_priority),
-        }
+        or_default_logged(
+            "list_services",
+            &dump_priority,
+            self.try_list_services(dump_priority),
+        )
     }
 
     /// Registers a service with the service manager.
@@ -1320,35 +1172,24 @@ impl ServiceManager {
 
     /// Retrieves debug information about all currently registered services.
     ///
-    /// Note: not supported on Android 10 or Android 11 - returns an error on those versions.
+    /// Not supported on Android 10 or Android 11, where it returns
+    /// [`StatusCode::UnknownTransaction`]. Any other failure is
+    /// [`try_get_service_debug_info`](Self::try_get_service_debug_info)'s
+    /// `Status` flattened to a [`StatusCode`].
     pub fn get_service_debug_info(&self) -> Result<Vec<ServiceDebugInfo>> {
-        match self {
-            #[cfg(all(target_os = "android", feature = "android_10"))]
-            ServiceManager::Android10(_) => {
-                log::error!(
-                    "get_service_debug_info: Unsupported Android SDK version: {}",
-                    crate::get_android_sdk_version()
-                );
-                Err(StatusCode::UnknownTransaction)
-            }
-            #[cfg(all(target_os = "android", feature = "android_11"))]
-            ServiceManager::Android11(_) => {
-                log::error!(
-                    "get_service_debug_info: Unsupported Android SDK version: {}",
-                    crate::get_android_sdk_version()
-                );
-                Err(StatusCode::UnknownTransaction)
-            }
-            #[cfg(all(target_os = "android", feature = "android_12"))]
-            ServiceManager::Android12(sm) => collect_debug_info!(android_12, sm),
-            #[cfg(all(target_os = "android", feature = "android_13"))]
-            ServiceManager::Android13(sm) => collect_debug_info!(android_13, sm),
-            #[cfg(all(target_os = "android", feature = "android_14"))]
-            ServiceManager::Android14(sm) => collect_debug_info!(android_14, sm),
-            #[cfg(all(target_os = "android", feature = "android_15"))]
-            ServiceManager::Android15(sm) => collect_debug_info!(android_15, sm),
-            ServiceManager::Android16(sm) => android_16::get_service_debug_info(sm),
-        }
+        self.try_get_service_debug_info()
+            .map_err(|status| match status.exception_code() {
+                // "No such method", which the flattening `From<Status>` makes `FailedTransaction`.
+                ExceptionCode::UnsupportedOperation => {
+                    #[cfg(target_os = "android")]
+                    log::error!(
+                        "get_service_debug_info: Unsupported Android SDK version: {}",
+                        crate::get_android_sdk_version()
+                    );
+                    StatusCode::UnknownTransaction
+                }
+                _ => status.into(),
+            })
     }
 
     /// Like [`get_service_debug_info`](Self::get_service_debug_info), but
@@ -1427,31 +1268,31 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_11, callback),
+                &forward!(android_11::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_12, callback),
+                &forward!(android_12::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_13, callback),
+                &forward!(android_13::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_14, callback),
+                &forward!(android_14::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
             ServiceManager::Android15(sm) => android_15::IServiceManager::registerForNotifications(
                 sm,
                 name,
-                &wrap_callback!(android_15, callback),
+                &forward!(android_15::IServiceCallback, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::registerForNotifications(sm, name, callback)
@@ -1479,31 +1320,31 @@ impl ServiceManager {
             ServiceManager::Android11(sm) => android_11::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_11, callback),
+                &forward!(android_11::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_12, callback),
+                &forward!(android_12::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_13, callback),
+                &forward!(android_13::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_14, callback),
+                &forward!(android_14::IServiceCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
             ServiceManager::Android15(sm) => android_15::unregister_for_notifications(
                 sm,
                 name,
-                &wrap_callback!(android_15, callback),
+                &forward!(android_15::IServiceCallback, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::unregister_for_notifications(sm, name, callback)
@@ -1539,35 +1380,35 @@ impl ServiceManager {
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_11, callback),
+                &forward!(android_11::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_12"))]
             ServiceManager::Android12(sm) => android_12::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_12, callback),
+                &forward!(android_12::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_13"))]
             ServiceManager::Android13(sm) => android_13::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_13, callback),
+                &forward!(android_13::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_14"))]
             ServiceManager::Android14(sm) => android_14::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_14, callback),
+                &forward!(android_14::IClientCallback, callback),
             ),
             #[cfg(all(target_os = "android", feature = "android_15"))]
             ServiceManager::Android15(sm) => android_15::IServiceManager::registerClientCallback(
                 sm,
                 name,
                 service,
-                &wrap_client_callback!(android_15, callback),
+                &forward!(android_15::IClientCallback, callback),
             ),
             ServiceManager::Android16(sm) => {
                 android_16::IServiceManager::registerClientCallback(sm, name, service, callback)
@@ -1722,14 +1563,13 @@ impl ServiceManager {
     /// # Android 10
     ///
     /// The legacy C service manager has no registration notifications, so the
-    /// event path is unavailable and the wait transparently falls back to ~1s
-    /// polling. The contract is the same (unbounded until the service appears),
-    /// except that the legacy protocol cannot distinguish "not registered" from
-    /// a transport error, so the wait does not give up early there — it keeps
-    /// polling. The per-second pause is a condvar wait on the waiter's
-    /// cancellation state rather than `thread::sleep`, so a dropped
-    /// `wait_for_interface_async` future releases its blocking-pool thread
-    /// at once there too.
+    /// event path is unavailable and the wait is the per-second re-poll alone,
+    /// with the same "still waiting" warnings. The contract is the same
+    /// (unbounded until the service appears), except that the legacy protocol
+    /// cannot distinguish "not registered" from a transport error, so the wait
+    /// does not give up early there — it keeps polling. The per-second pause
+    /// is the same condvar wait, so a dropped `wait_for_interface_async`
+    /// future releases its blocking-pool thread at once there too.
     ///
     /// # Cancellation
     ///
@@ -1752,6 +1592,15 @@ impl ServiceManager {
             .ok()
     }
 
+    /// Calls `on_registered` with each binder registered under `name` until the guard drops.
+    pub(crate) fn watch_borrowed(
+        &self,
+        name: &str,
+        on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+    ) -> std::result::Result<WatchGuard<&Self>, Status> {
+        WatchGuard::register(self, name, on_registered)
+    }
+
     /// `wait_for_service` that `state.cancel()` ends at once; see its rustdoc "Cancellation".
     pub(crate) fn wait_for_service_cancellable(
         &self,
@@ -1768,21 +1617,15 @@ impl ServiceManager {
             return Err(WaitEnd::Cancelled);
         }
 
-        let callback = BnServiceCallback::new_binder(Waiter(state.clone()));
-
-        if let Err(status) = self.register_for_notifications(name, &callback) {
+        let woken = Arc::clone(&state);
+        // Held to the end: every exit unregisters, a panic's too.
+        let _watch = match self.watch_borrowed(name, move |binder| woken.deliver(binder)) {
+            Ok(watch) => Some(watch),
+            // No registration notices on the legacy C protocol: the loop's re-polls find it.
             #[cfg(all(target_os = "android", feature = "android_10"))]
-            if matches!(self, ServiceManager::Android10(_)) {
-                return self.poll_for_service(name, &state);
-            }
+            Err(_) if matches!(self, ServiceManager::Android10(_)) => None,
             // AOSP `waitForService`: a refused registration (bad name, SELinux) ends the wait.
-            return Err(WaitEnd::from_registration(status));
-        }
-        // Always unregister, even on early return / panic (AOSP's `Defer`).
-        let _unregister = UnregisterOnDrop {
-            sm: self,
-            name,
-            callback: &callback,
+            Err(status) => return Err(WaitEnd::from_registration(status)),
         };
 
         let mut waited_secs: u64 = 0;
@@ -1798,7 +1641,7 @@ impl ServiceManager {
                 if let Some(binder) = guard.binder.as_ref() {
                     return Ok(binder.clone());
                 }
-                // The caller gave up. `UnregisterOnDrop` fires on the way out.
+                // The caller gave up. `_watch` unregisters on the way out.
                 if guard.cancelled {
                     return Err(WaitEnd::Cancelled);
                 }
@@ -1824,28 +1667,6 @@ impl ServiceManager {
         match self.wait_for_service(name) {
             Some(binder) => binder.into_interface_checked(),
             None => Err(StatusCode::NameNotFound),
-        }
-    }
-
-    /// Android 10 only: 1s polls until the service appears or the wait is cancelled.
-    #[cfg(all(target_os = "android", feature = "android_10"))]
-    fn poll_for_service(
-        &self,
-        name: &str,
-        state: &WaiterState,
-    ) -> std::result::Result<SIBinder, WaitEnd> {
-        loop {
-            if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
-                return Ok(binder);
-            }
-            let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let (guard, _) = state
-                .cv
-                .wait_timeout_while(guard, std::time::Duration::from_secs(1), |st| !st.cancelled)
-                .unwrap_or_else(|e| e.into_inner());
-            if guard.cancelled {
-                return Err(WaitEnd::Cancelled);
-            }
         }
     }
 }
@@ -1888,7 +1709,8 @@ impl WaitEnd {
     }
 }
 
-/// Shared by [`Waiter`], the blocked waiter and `cancel`: one `cv` for both wake-ups.
+/// Shared by the watch's closure (`deliver`), the blocked waiter and `cancel`: one `cv` for
+/// both wake-ups.
 #[derive(Default)]
 pub(crate) struct WaiterState {
     inner: std::sync::Mutex<WaiterInner>,
@@ -1917,36 +1739,76 @@ impl WaiterState {
             .unwrap_or_else(|e| e.into_inner())
             .cancelled
     }
-}
 
-/// One-shot callback waking the waiter; AOSP `waitForService`'s local `Waiter` class.
-struct Waiter(Arc<WaiterState>);
-
-impl Interface for Waiter {}
-
-impl IServiceCallback for Waiter {
-    fn onRegistration(&self, _name: &str, service: &SIBinder) -> crate::status::BinderResult<()> {
-        let mut guard = self.0.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.binder = Some(service.clone());
+    /// Wakes the wait with `binder`; AOSP `waitForService`'s local `Waiter::onRegistration`.
+    fn deliver(&self, binder: SIBinder) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.binder = Some(binder);
         drop(guard);
         // One waiter per state (its `wait_for_service` call), as AOSP's `mCv.notify_one()`.
-        self.0.cv.notify_one();
+        self.cv.notify_one();
+    }
+}
+
+/// The `IServiceCallback` of one [`WatchGuard`]: hands each registered binder to its closure.
+struct OnRegistration(Box<dyn Fn(SIBinder) + Send + Sync>);
+
+impl Interface for OnRegistration {}
+
+impl IServiceCallback for OnRegistration {
+    fn onRegistration(&self, _name: &str, service: &SIBinder) -> crate::status::BinderResult<()> {
+        (self.0)(service.clone());
         Ok(())
     }
 }
 
-/// Unregisters the wait callback on any exit, as AOSP `waitForService`'s `Defer unregister`.
-struct UnregisterOnDrop<'a> {
-    sm: &'a ServiceManager,
-    name: &'a str,
-    callback: &'a Strong<dyn IServiceCallback>,
+/// A registration callback that drop unregisters, as AOSP `waitForService`'s `Defer unregister`.
+pub(crate) struct WatchGuard<S: Borrow<ServiceManager>> {
+    sm: S,
+    name: String,
+    callback: Strong<dyn IServiceCallback>,
 }
 
-impl Drop for UnregisterOnDrop<'_> {
+impl<S: Borrow<ServiceManager>> WatchGuard<S> {
+    fn register(
+        sm: S,
+        name: &str,
+        on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+    ) -> std::result::Result<Self, Status> {
+        let callback = BnServiceCallback::new_binder(OnRegistration(Box::new(on_registered)));
+        sm.borrow().register_for_notifications(name, &callback)?;
+        Ok(Self {
+            sm,
+            name: name.to_owned(),
+            callback,
+        })
+    }
+}
+
+impl<S: Borrow<ServiceManager>> Drop for WatchGuard<S> {
     fn drop(&mut self) {
+        // A failure leaves a callback whose calls nothing waits for; nothing else to do.
         let _ = self
             .sm
-            .unregister_for_notifications(self.name, self.callback);
+            .borrow()
+            .unregister_for_notifications(&self.name, &self.callback);
+    }
+}
+
+/// A registration callback on the default service manager, from [`watch`].
+///
+/// Dropping it unregisters the callback (`unregisterForNotifications`) on
+/// the service manager it was registered with. A failed unregister is not
+/// reported: the service manager then keeps a callback whose calls reach a
+/// closure nobody holds a watch for, and drops it when this process ends.
+#[must_use = "dropping the watch unregisters its callback at once"]
+pub struct ServiceWatch(WatchGuard<Arc<ServiceManager>>);
+
+impl std::fmt::Debug for ServiceWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceWatch")
+            .field("name", &self.0.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1985,6 +1847,37 @@ pub fn unregister_for_notifications(
     callback: &crate::Strong<dyn IServiceCallback>,
 ) -> BinderResult<()> {
     default()?.unregister_for_notifications(name, callback)
+}
+
+/// Calls `on_registered` with the binder each time the default service
+/// manager registers a service under `name`, until the returned
+/// [`ServiceWatch`] is dropped.
+///
+/// This is [`register_for_notifications`] with a closure for the callback
+/// and the matching [`unregister_for_notifications`] in the guard's `Drop`,
+/// the pairing AOSP `waitForService` keeps with its `Defer`. A name already
+/// registered is reported at once, as the service manager does for every
+/// registration. The closure runs on a binder thread, so it hears nothing
+/// without the thread pool ([`ProcessState::start_thread_pool`]); a panic
+/// in it is caught and logged like any other transaction handler's.
+///
+/// The service manager's refusal keeps its exception, as for
+/// [`ServiceManager::register_for_notifications`]: `EX_SECURITY` for a name
+/// the caller may not find, `EX_ILLEGAL_ARGUMENT` for an invalid name, and
+/// `EX_UNSUPPORTED_OPERATION` on Android 10, whose service manager has no
+/// registration notices. A service manager that cannot be reached is a
+/// [`Status`] carrying [`default`]'s [`StatusCode`].
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
+pub fn watch(
+    name: &str,
+    on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+) -> std::result::Result<ServiceWatch, Status> {
+    Ok(ServiceWatch(WatchGuard::register(
+        default()?,
+        name,
+        on_registered,
+    )?))
 }
 
 /// Convenience function to register a client-presence callback on the default
@@ -2177,6 +2070,51 @@ pub fn try_get_service_debug_info() -> std::result::Result<Vec<ServiceDebugInfo>
 #[inline]
 pub fn get_service_debug_info() -> Result<Vec<ServiceDebugInfo>> {
     default()?.get_service_debug_info()
+}
+
+/// Whether `name` is a service name the Android service manager accepts in
+/// `addService`: 1 to 127 bytes of `[A-Za-z0-9._/-]`.
+///
+/// This is AOSP `ServiceManager.cpp` `isValidServiceName` (android17-release),
+/// which refuses any other name with `EX_ILLEGAL_ARGUMENT`. `rsb_hub` holds
+/// both services and declarations to it, and `rsbinder-topic`'s registry
+/// holds topic names to it, so a caller can check a name before it reaches
+/// any of them. It answers no question about a name's permission or
+/// declaration; the service manager decides those.
+pub fn is_valid_service_name(name: &str) -> bool {
+    let allowed = |c: u8| c.is_ascii_alphanumeric() || b"._/-".contains(&c);
+    (1..=127).contains(&name.len()) && name.bytes().all(allowed)
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::is_valid_service_name;
+
+    /// The AOSP rule: length in bytes, the four punctuation marks, no other byte (multibyte too).
+    #[test]
+    fn a_service_name_is_1_to_127_bytes_of_the_aosp_set() {
+        let mut names: Vec<(String, bool)> = vec![
+            (String::new(), false),
+            ("a".into(), true),
+            ("android.os.IServiceManager/default".into(), true),
+            ("a_b-c.d/E9".into(), true),
+            ("é".into(), false),
+            ("日本".into(), false),
+            ("aé".into(), false),
+            ("a".repeat(126), true),
+            ("a".repeat(127), true),
+            ("a".repeat(128), false),
+            // 125 bytes and a two-byte character: 127 bytes, refused for the character.
+            (format!("{}é", "a".repeat(125)), false),
+        ];
+        names.extend((0..=0xffu32).filter_map(char::from_u32).map(|c| {
+            let ok = c.is_ascii_alphanumeric() || "._/-".contains(c);
+            (format!("a{c}b"), ok)
+        }));
+        for (name, expected) in &names {
+            assert_eq!(is_valid_service_name(name), *expected, "{name:?}");
+        }
+    }
 }
 
 #[cfg(test)]

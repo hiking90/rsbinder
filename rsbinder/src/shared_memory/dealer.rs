@@ -323,10 +323,7 @@ impl Allocation {
     }
 
     fn window(&self, off: usize, len: usize) -> Result<usize> {
-        let end = off.checked_add(len).ok_or(StatusCode::BadValue)?;
-        if end > self.mem.size() {
-            return Err(StatusCode::BadValue);
-        }
+        super::check_range(self.mem.size(), off, len)?;
         Ok(self.mem.offset() + off)
     }
 }

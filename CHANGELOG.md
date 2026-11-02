@@ -58,6 +58,8 @@ accepts both the 0.12.0 bytes and the new ones.
   call is `DeadObject`; the `*_interface` lookups return `Err(DeadObject)`.
 - `hub::default` accepts a context manager that is not an `IServiceManager`
   instead of returning `BadType`.
+- On Android 10, `wait_for_service` looks again a second after its first
+  miss, not at once, and logs "still waiting" every ten seconds.
 
 **Binder objects and process state**
 
@@ -104,6 +106,15 @@ accepts both the 0.12.0 bytes and the new ones.
 - `ProcessState::start_thread_pool` leaves the pool unstarted when its first
   worker cannot be created; a `binder://` `Client` and a kernel `Server`
   return the failure.
+- A kernel proxy lookup fails on a flush only when the driver never took
+  the proxy cache's `BC_INCREFS`: with the driver's error on every thread,
+  or `InvalidOperation` when the flush succeeded without the driver taking
+  it. Any other failed flush, of a `BC_INCREFS` the driver took or of the
+  proxy's `BC_ACQUIRE`, is logged and the proxy is returned (AOSP
+  `incStrongHandle`). 0.12.0 failed the lookup on a failed flush of either
+  command off a binder thread (the driver's error) and of `BC_INCREFS` on
+  one (`DeadObject`). A lookup made from a TLS destructor after the binder
+  thread state's is `InvalidOperation`, where 0.12.0 aborted.
 
 **Calling identity and permissions**
 
@@ -215,6 +226,23 @@ accepts both the 0.12.0 bytes and the new ones.
   join or attach on the session id and the transport kind alone.
 - An `RpcServer` set up with TLS (`setup_*_tls`) refuses every r34 join;
   the r34 founding connection serves as before.
+- An RPC server reads the interface token only before an AIDL call code
+  (`FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION`), as the kernel path
+  does: `EXTENSION_TRANSACTION`, `DEBUG_PID_TRANSACTION`, `DUMP_TRANSACTION`
+  and a custom code outside that range reach the binder at position 0.
+  0.12.0 read a token first and failed a parcel without one.
+- `link_to_death` on an RPC proxy refuses a recipient with no strong
+  reference left with `BadValue`, as a kernel proxy does; 0.12.0 returned
+  `Ok` and never notified it.
+- `send_frame` on `UnixTransport`, `TcpDebugTransport` and
+  `VsockTransport` reports a send deadline that expired before the first
+  byte as `RpcError::Timeout`, not `Io(WouldBlock)`; their `recv_frame`
+  extends its read deadline while the peer takes this end's bytes.
+- Two transport errors carry another code. Fds that arrive with no byte
+  are `RpcError::Truncated` in the android-13+ reader too; 0.12.0 read
+  them as a clean end (`EndOfStream`). A `sendmsg` with fds that takes
+  nothing is `WriteZero` on Apple too; 0.12.0 returned `EndOfStream`
+  there.
 
 **Streams and topics**
 
@@ -297,6 +325,20 @@ accepts both the 0.12.0 bytes and the new ones.
 
 - **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
   has it.
+- **`DeathLink`**: a death notification that unregisters when it drops.
+  `DeathLink::new(&binder, recipient)` links and keeps both strongly; the
+  drop unlinks and drops the binder and the recipient under `catch_unwind`,
+  so a panic there is logged instead of unwinding (an abort when the link
+  drops during another unwind), and an unlink error such as `DeadObject`
+  after the obituary is logged at debug level.
+- **`hub::is_valid_service_name`**: whether a name is one the service
+  manager accepts (AOSP `isValidServiceName`: 1 to 127 bytes of
+  `[A-Za-z0-9._/-]`). `rsb_hub`'s configuration and `rsbinder-topic`'s
+  registry check their names with it.
+- **`impl TryFrom<i32> for ExceptionCode`**: the variant for a wire value,
+  every variant included (the reply-header markers, `TransactionFailed`,
+  `JustError`); any other value is the error. `Deserialize` still reads a
+  value with no variant as `JustError`.
 - **`bridge::Delegating` and a generated `IFooDelegate` trait per
   interface**: a gateway overrides only the methods it changes (typically
   the one that re-wraps a binder argument) and publishes
@@ -406,6 +448,9 @@ accepts both the 0.12.0 bytes and the new ones.
     `Closed::End`, `close_with(&Status)` with a status. `Publisher::new`
     returns `BinderResult` as the other constructors do
     (`EX_ILLEGAL_ARGUMENT` with the failed check for a policy out of range).
+    A receive that ends with `Closed::Corrupted`, and a subscription refused
+    for it, logs once per subscription which check of the topic's memory or
+    pool failed.
   - `Publisher::advertise` and `NamedSubscriber`: a topic found by a service
     manager name, the subscriber reconnecting to whichever publisher holds
     it (`RecvError::Disconnected` between connections). A registration
@@ -526,9 +571,8 @@ accepts both the 0.12.0 bytes and the new ones.
   `rsbinder::fmq::shm`): what the queue is built from, for protocols other
   than FMQ. `create` with `CreateOptions`, `add_seals`, `seals` and `Seals`
   (a memfd and its seals; `add_seals` returns the kernel's error unchanged,
-  so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle);
-  `create_mapped` (create, map writable, then seal, the one order in which
-  the owner keeps a writable mapping under `FUTURE_WRITE`);
+  so `EINVAL` for an unsupported `FUTURE_WRITE` is the caller's to handle;
+  an owner that writes through its own mapping maps it before that seal);
   `Mapping` and `RoMapping` (a shared mapping at any byte offset, read-write
   or read-only, on macOS as well as Linux and Android), and `Mapping::heap`
   (the same over heap memory, for tests and Miri); `futex_wait`,
@@ -611,9 +655,54 @@ accepts both the 0.12.0 bytes and the new ones.
   themselves, where `from_bytes` decodes a copy, and leaves them unchanged.
   A caller that encodes or decodes many values allocates only when its
   buffer grows; `to_bytes` and `from_bytes` are these two on a new buffer.
+- **`hub::watch`**: calls a closure with the binder each time the default
+  service manager registers a service under a name, until the returned
+  **`hub::ServiceWatch`** drops; the drop unregisters the callback. It is
+  `register_for_notifications` with the unregister held by a guard, the
+  pairing `wait_for_service` and `rsbinder-topic`'s service-manager
+  resolver now use.
+- **`rsbinder_fmq::shm::seal_unsupported`**: whether an `add_seals` error
+  means the kernel lacks a seal of the mask (`EINVAL` for a mask with
+  `FUTURE_WRITE`, Linux before 5.1). It reads the answer right only for a
+  memfd the caller created, since a file that takes no seals answers
+  `EINVAL` too.
+- **`rsbinder_fmq::EventFlag::wake_committed_lazy`**: `wake_lazy` on the
+  targets whose code for a libfmq waiter orders it too (x86, x86-64,
+  AArch64, 32-bit ARM, RISC-V 64), `wake` elsewhere; the wake the stream
+  ring sends after each committed record.
+- **`rsbinder_fmq::shm::Deadline::until`**: the futex deadline at an
+  `Instant`, as `Deadline::after` the time left until it.
+- **`rsbinder_fmq::shm::ring_parts`**: the one or two parts of a copy
+  that wraps at a ring's end, handed to a closure that makes the copy
+  with whichever `Bytes`/`RoBytes` method the protocol needs. The FMQ
+  queues and `rsbinder-topic` copy through it.
 
 ### Changed
 
+- **An RPC handler that panics releases what its reply held before the
+  reply.** The partial reply is discarded inside the handler step, so the
+  `DEC_STRONG` of a proxy it held goes out ahead of the `Unknown` reply, the
+  order the session keeps for every other release; it followed the reply.
+  The kernel and RPC handler steps share one function, and a handler panic
+  logs one line on both: `a transaction handler panicked for code N: …`.
+- **Every caught panic logs its message.** The death-link,
+  freeze-notification, reply-path, `Rewrap` and `Reconnecting` catches
+  logged a fixed line; they now append the panic's text.
+- **The frame API of the socket transports follows their raw sends and
+  reads** (see *Migrating*). `UnixTransport`, `TcpDebugTransport`,
+  `VsockTransport` and `TlsTransport` keep the trait's `send_frame` /
+  `recv_frame`, which frame over `send_raw` / `recv_raw`, and every socket
+  send but TLS's goes through one loop, where a send deadline that expires
+  before the frame's first byte is `RpcError::Timeout` and after it
+  `Io(WouldBlock)`, counted from the peer's last progress; `send_frame`
+  on unix, tcp_debug and vsock reported `Io(WouldBlock)` at any position.
+  `recv_frame` keeps its read deadline open while the peer is still taking
+  this end's bytes, as a session's reads already did.
+  `UnixTransport::send_frame_with_fds` waits for room in `poll` on Linux
+  and Android, where it blocked. Every frame reader classifies a short
+  read by one rule: fds that arrive with no byte are a cut frame
+  (`Truncated`) in the android-13+ reader too, where they read as a clean
+  end. A `sendmsg` that takes nothing is `WriteZero` on every send.
 - **Receiving a kernel binder makes no call to the process behind it.**
   Reading a handle from a parcel sends no `INTERFACE_TRANSACTION`; a kernel
   proxy asks for its descriptor when `descriptor()`, `try_descriptor()` or a
@@ -664,6 +753,10 @@ accepts both the 0.12.0 bytes and the new ones.
 - **`rsbinder_fmq::Error::Os` has no `source()`.** Its `Display` already is
   the errno's message, so a reporter that walks the source chain (`anyhow`'s
   `{:#}`, `eyre`, `tracing`) printed it twice.
+- **`wait_for_service` on Android 10** waits in the same loop as on later
+  versions, minus the registration notice: after the first lookup misses,
+  the next comes a second later rather than at once, and a missing service
+  logs the same "still waiting" warning every ten seconds (see *Migrating*).
 
 ### Fixed
 
@@ -768,6 +861,56 @@ accepts both the 0.12.0 bytes and the new ones.
   with `env_remove("NOTIFY_SOCKET")`, so a service `rsb_hub` starts still
   cannot report `rsb_hub`'s unit ready or stopping. A child that other code
   in the process spawns inherits the variable (see *Migrating*).
+- **A `char` array that would reach a recorded object writes no element.**
+  It was refused with `PermissionDenied` only at the element that reached
+  the object, after the elements before it were written and with the
+  position left inside the array; it is now refused before the first
+  element, as every other array is (AOSP `writeInplace`).
+- **A panic while a kernel binder's death is delivered still answers the
+  driver.** A panic in that step (a death recipient's `Drop`, or rsbinder's
+  own lock checks) unwound past `BC_DEAD_BINDER_DONE`, so the driver held
+  the death's clear notification and the pin release behind it. The panic
+  is now caught and logged and the done is queued, as the frozen-binder
+  handshake already did, and on a kernel or RPC proxy the recipients after
+  a panicking one's `Drop` are still notified. A kernel proxy's recipient
+  lock recovers from poison instead of panicking in `link_to_death`,
+  `unlink_to_death` and the obituary, and an obituary whose unlink panics
+  still reaches the recipients.
+- **An RPC proxy dropped by a `thread_local!` destructor no longer aborts
+  the process.** When the destructor ran after the RPC session's own
+  thread-local, the release panicked inside it, which aborts. The release is
+  now sent on a free connection, and a call (two-way or oneway) or a reply
+  made from such a destructor is refused with `InvalidOperation`, as a
+  kernel death or freeze request from one already was.
+- **A panic that escapes an RPC frame's dispatch ends the session.** A
+  panic from user code that a release runs outside the handler, such as the
+  `Drop` of a binder the session lets go when an error reply's parcel
+  drops, unwound the serve thread past the session's end: the session stayed
+  live with no thread reading that connection, so a peer's call on it
+  waited without end. The serve loop now catches it, logs it and ends with
+  `EndReason::Dispatch(StatusCode::Unknown)`, which ends the session as any
+  other loop end does; `serve_blocking` returns instead of unwinding.
+- **A panic in a kernel transaction outside the handler restores the
+  thread's calling identity.** A panic between the dispatch and the reply,
+  such as the `Drop` of a binder the handler had unpublished, left the
+  transaction's calling identity and strict-mode policy on the thread; under
+  a `catch_unwind` of the caller's or tokio's `spawn_blocking`, the thread
+  then answered `get_calling_uid` with that caller and
+  `is_handling_transaction` with `true`. They are now restored on every exit.
+- **A panic in the drop of a panicked handler's reply is caught.** The
+  partial reply of a handler that panicked is discarded under its own
+  `catch_unwind`, kernel and RPC alike, so a `Drop` that panics there no
+  longer unwinds the binder thread or the RPC serve thread.
+- **A kernel binder proxy made from a TLS destructor** (one that runs
+  after the binder thread state's own) fails with `InvalidOperation`
+  instead of aborting the process; a proxy dropped there still sends its
+  decrements, as it did.
+- **A failed flush no longer leaks a kernel reference count.** The proxy
+  cache's `BC_INCREFS` is taken back when the driver never consumed it
+  and counts as sent when it did; a `BC_ACQUIRE` counts as sent once
+  queued, as in AOSP `incStrongHandle` (what a lookup returns: see
+  *Migrating*). Before, either failure left a count the matching decrement
+  never undid.
 
 ### Security
 

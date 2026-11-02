@@ -14,10 +14,11 @@
 //!
 //! The separate frame API ([`send_frame`](RpcTransport::send_frame) /
 //! [`recv_frame`](RpcTransport::recv_frame)), which no session calls,
-//! frames on the transport side. Stream backends
-//! (`unix`, `tcp_debug`) share the length-prefix helpers in this
-//! module; the in-process `mem` backend frames implicitly (one channel
-//! message == one frame).
+//! frames on the transport side. Every stream backend (`unix`,
+//! `tcp_debug`, `vsock`, `tls`) keeps the trait's defaults, which frame on
+//! top of its raw calls, so the frame API has that backend's raw send and
+//! read rules (deadlines, a slow peer); the in-process `mem` backend frames
+//! implicitly (one channel message == one frame).
 //!
 //! The shared stream frame is `u32 little-endian length | <length> body
 //! bytes`, with no magic and no self-sync: the length alone delimits the
@@ -25,12 +26,9 @@
 //! interleave because a connection has one writer at a time: every send,
 //! a `DEC_STRONG` from `RpcProxy::drop` included, goes out on a slot its
 //! thread holds (`session.rs` `ConnGuard`, `exclusive_tid`), so a frame
-//! written in more than one call stays whole. `unix` and `tcp_debug` send
-//! the length and the body as two slices of one `sendmsg`
-//! (`unix::send_frame_vectored`). `tls` and `vsock` coalesce them into one
-//! `write_all` (`write_frame`): over `tls` two writes would let a
-//! `close_notify` from `shutdown` land between them, and `vsock` has no
-//! vectored send path here.
+//! written in more than one call stays whole. The default `send_frame` builds
+//! the length and the body into one buffer for one `send_raw`: over `tls`
+//! two sends would let a `close_notify` from `shutdown` land between them.
 //!
 //! The trait is **synchronous / blocking** (matches android-12 r34's
 //! blocking-thread model). An `async` adapter can be layered *on top*
@@ -47,9 +45,9 @@
 //! body read has lost the position too: `Truncated` if the stream ended,
 //! [`RpcError::DeadlineMidFrame`] if a read deadline cut it.
 //!
-//! `write_all_reporting` is `write_all` that tells a failure which put
-//! nothing on the wire apart from one that stopped part-way; `write_all`
-//! reports the same error either way. A frame that stopped part-way left the
+//! Every send of the socket backends but `tls` is `unix::send_stream`, which
+//! tells a failure that put nothing on the wire apart from one that stopped
+//! part-way. A frame that stopped part-way left the
 //! peer a header it will complete out of whatever arrives next, while a frame
 //! that never started left the stream frame-synchronized. A send deadline
 //! (`SO_SNDTIMEO`) that expires before the first byte is therefore
@@ -66,7 +64,7 @@
 //!
 //! `is_timeout` decides whether an I/O operation failed on a deadline this
 //! end armed: `SO_RCVTIMEO` for the framing readers, `SO_SNDTIMEO` for
-//! `write_all_reporting` and for `tls`'s teardown control flush. On the
+//! `tls`'s teardown control flush. On the
 //! supported platforms both surface as `EAGAIN` (`WouldBlock`), and the
 //! `Read`/`Write` adapters carry `RpcError::Timeout` across the
 //! `RpcError` ⇄ `io::Error` boundary with that same kind, so the framing
@@ -123,18 +121,18 @@
 //!
 //! # Mutation gates
 //!
-//! - `a_send_deadline_is_a_timeout_only_before_the_first_byte`: dropping the
-//!   `sent == 0` guard in `write_all_reporting` makes the second case report
-//!   `Timeout` as well, a frame-synchronized stream the peer was left half a
-//!   frame of.
+//! - `unix::tests::a_send_deadline_is_a_timeout_only_before_the_first_byte`:
+//!   dropping the `sent == 0` guard in `unix::send_stream` makes the cut send
+//!   report `Timeout` as well, in either send mode: a frame-synchronized
+//!   stream the peer was left half a frame of.
 //! - `the_kernels_etimedout_is_a_lost_connection_not_a_deadline`: counting
-//!   `TimedOut` in `is_timeout` makes a send that failed before its
-//!   first byte and a read that consumed nothing report `Timeout`: a serve
-//!   loop with an idle deadline armed reads the kernel's drop as its own
-//!   idle expiry (`Local`, `InSync`).
+//!   `TimedOut` in `is_timeout` makes a read that consumed nothing report
+//!   `Timeout`: a serve loop with an idle deadline armed reads the kernel's
+//!   drop as its own idle expiry (`Local`, `InSync`). A send names `EAGAIN`
+//!   by its errno, so `ETIMEDOUT` there is the transport error either way.
 
 use std::fmt;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 
 use super::{RpcError, RpcResult};
 
@@ -213,7 +211,7 @@ pub trait RpcTransport: Send + Sync {
     /// refuses a declared length above [`MAX_FRAME_LEN`] before
     /// allocating.
     fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        read_frame(&mut RawCalls(self))
+        read_frame_with(|buf| self.recv_raw(buf))
     }
 
     /// The other end's identity, as established by this transport.
@@ -487,9 +485,7 @@ pub trait RpcTransport: Send + Sync {
         } else {
             // A `true` predicate here would advertise FD_PASSING for a send that always fails.
             debug_assert!(!self.supports_fd_passing());
-            Err(RpcError::Protocol(
-                "this transport cannot pass file descriptors (UDS only)",
-            ))
+            Err(cannot_pass_fds())
         }
     }
 
@@ -535,9 +531,7 @@ pub trait RpcTransport: Send + Sync {
             self.send_raw(buf)
         } else {
             debug_assert!(!self.supports_fd_passing());
-            Err(RpcError::Protocol(
-                "this transport cannot pass file descriptors (UDS only)",
-            ))
+            Err(cannot_pass_fds())
         }
     }
 
@@ -609,6 +603,11 @@ pub trait RpcTransport: Send + Sync {
         let _ = drain;
         self.send_raw_with_fds(buf, fds)
     }
+}
+
+/// The refusal of fds by a transport that cannot pass them; `SCM_RIGHTS` is `unix` only.
+pub(crate) fn cannot_pass_fds() -> RpcError {
+    RpcError::Protocol("this transport cannot pass file descriptors (UDS only)")
 }
 
 /// A draining send's read-side failure, kept out of the two "nothing was sent" variants.
@@ -774,37 +773,29 @@ impl fmt::Display for PeerIdentity {
 
 // --- Length-prefix framing shared by stream backends (module doc) ---
 
-/// A transport's `recv_raw` as `Read`, for the default `recv_frame`.
-struct RawCalls<'a, T: RpcTransport + ?Sized>(&'a T);
-
-impl<T: RpcTransport + ?Sized> Read for RawCalls<'_, T> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Kind-preserving, so `read_header`/`read_body` see a deadline as `is_timeout`.
-        self.0.recv_raw(buf).map_err(std::io::Error::from)
-    }
-}
-
-/// `buf` behind its `u32` little-endian length; `FrameTooLarge` past [`MAX_FRAME_LEN`].
-fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
+/// The `u32` little-endian length in front of `buf`; `FrameTooLarge` past [`MAX_FRAME_LEN`].
+pub(crate) fn frame_header(buf: &[u8]) -> RpcResult<[u8; 4]> {
     if buf.len() > MAX_FRAME_LEN {
         return Err(RpcError::FrameTooLarge {
             declared: buf.len(),
             max: MAX_FRAME_LEN,
         });
     }
-    let mut framed = Vec::with_capacity(4 + buf.len());
-    framed.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+    Ok((buf.len() as u32).to_le_bytes())
+}
+
+/// `buf` behind its [`frame_header`], in one buffer.
+fn encode_frame(buf: &[u8]) -> RpcResult<Vec<u8>> {
+    let header = frame_header(buf)?;
+    let mut framed = Vec::with_capacity(header.len() + buf.len());
+    framed.extend_from_slice(&header);
     framed.extend_from_slice(buf);
     Ok(framed)
 }
 
-/// Write one length-prefixed frame to a blocking stream.
-#[cfg(any(
-    test,
-    feature = "rpc-tls",
-    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
-))]
-pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
+/// Write one length-prefixed frame to a blocking stream: what `send_frame` sends, for tests.
+#[cfg(test)]
+pub(crate) fn write_frame<W: std::io::Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     // One buffer, one `write_all`; the slot's single writer keeps the frame whole (module doc).
     let framed = encode_frame(buf)?;
     w.write_all(&framed)?;
@@ -812,41 +803,56 @@ pub(crate) fn write_frame<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
     Ok(())
 }
 
-/// `write_all`, `Timeout` only before the first byte; see module doc "Short reads and writes".
-pub(crate) fn write_all_reporting<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
-    let mut sent = 0;
-    while sent < buf.len() {
-        match w.write(&buf[sent..]) {
-            Ok(0) => return Err(std::io::Error::from(ErrorKind::WriteZero).into()),
-            Ok(n) => sent += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if sent == 0 && is_timeout(&e) => return Err(RpcError::Timeout),
-            Err(e) => return Err(RpcError::from(e)),
-        }
-    }
-    Ok(())
-}
-
-/// `tcp_debug`'s blocking `send_raw` where sends do not wait in `poll` (`unix::WAITING_SENDS`).
-#[cfg(feature = "rpc-tcp-debug")]
-pub(crate) fn write_raw<W: Write>(w: &mut W, buf: &[u8]) -> RpcResult<()> {
-    write_all_reporting(w, buf)?;
-    w.flush()?;
-    Ok(())
-}
-
 /// Stream-backend `recv_raw`: one `read` (`Ok(0)` = EOF), `EINTR` retried, deadline → `Timeout`.
 pub(crate) fn read_raw<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<usize> {
+    read_once(|b| r.read(b), buf)
+}
+
+/// [`read_raw`] over any one-read function, such as a `tls::TlsStream`'s socket read.
+pub(crate) fn read_once(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    buf: &mut [u8],
+) -> RpcResult<usize> {
     loop {
-        return match r.read(buf) {
+        return match read(buf) {
             Ok(n) => Ok(n),
             // EINTR: retry, as `recv_raw_with_fds` and AOSP `interruptableReadFully` do.
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // Deadline → `Timeout`: `read_exact_raw` splits `Timeout`/`DeadlineMidFrame`.
+            // Deadline → `Timeout`: `fill_exact` splits `Timeout`/`DeadlineMidFrame`.
             Err(e) if is_timeout(&e) => Err(RpcError::Timeout),
             Err(e) => Err(RpcError::from(e)),
         };
     }
+}
+
+/// One `poll` of `fd` for `events`, waiting at most `wait` (`None`: no bound); what it reported.
+///
+/// Empty flags when the wait passed. `EINTR` is the caller's to retry, since each caller
+/// recomputes what is left of its own deadline first.
+pub(crate) fn poll_one(
+    fd: std::os::fd::BorrowedFd<'_>,
+    events: rustix::event::PollFlags,
+    wait: Option<std::time::Duration>,
+) -> rustix::io::Result<rustix::event::PollFlags> {
+    use rustix::event::{poll, PollFd, Timespec};
+    let ts = wait.map(|d| Timespec {
+        tv_sec: d.as_secs().try_into().unwrap_or(i64::MAX),
+        tv_nsec: d.subsec_nanos() as _,
+    });
+    let mut fds = [PollFd::from_borrowed_fd(fd, events)];
+    poll(&mut fds, ts.as_ref())?;
+    Ok(fds[0].revents())
+}
+
+/// `SO_NOSIGPIPE` on an Apple socket, which has no `MSG_NOSIGNAL` and on which std sets it only
+/// for sockets std made. XNU refuses it with `EINVAL` once both directions are shut (the peer
+/// closed before the wrap), which is the end of the stream.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn set_nosigpipe(fd: std::os::fd::BorrowedFd<'_>) -> RpcResult<()> {
+    rustix::net::sockopt::set_socket_nosigpipe(fd, true).map_err(|e| match e {
+        rustix::io::Errno::INVAL => RpcError::EndOfStream,
+        e => std::io::Error::from(e).into(),
+    })
 }
 
 /// Bytes `sock` holds that its peer has not taken yet (`SIOCOUTQ`).
@@ -948,8 +954,6 @@ impl ReadDeadline {
         queue: &OutQueue,
         read: impl FnOnce() -> RpcResult<T>,
     ) -> RpcResult<T> {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
-
         let ns = self.limit_ns.load(std::sync::atomic::Ordering::Relaxed);
         let (Some(sock), true) = (sock, ns != 0) else {
             return read();
@@ -970,14 +974,9 @@ impl ReadDeadline {
             } else {
                 left
             };
-            let ts = Timespec {
-                tv_sec: pause.as_secs().try_into().unwrap_or(i64::MAX),
-                tv_nsec: pause.subsec_nanos() as _,
-            };
-            let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::IN)];
-            match poll(&mut fds, Some(&ts)) {
+            match poll_one(sock, rustix::event::PollFlags::IN, Some(pause)) {
                 // Input, the peer's end, or an error: the read returns at once with it.
-                Ok(n) if n > 0 => return read(),
+                Ok(seen) if !seen.is_empty() => return read(),
                 Ok(_) => {
                     if queued > 0 {
                         let now = queue.bytes(sock).unwrap_or(queued);
@@ -994,41 +993,76 @@ impl ReadDeadline {
     }
 }
 
-/// Read exactly `buf.len()` header bytes; see module doc "Short reads and writes".
-fn read_header<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => {
-                return Err(if filled == 0 {
-                    RpcError::EndOfStream
-                } else {
-                    RpcError::Truncated
-                });
+/// What a frame reader makes of [`RpcError::UncleanEndOfStream`] once its frame has begun.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UncleanEnd {
+    /// It stays itself: the AOSP-framing readers (`rpc` module doc "Frame-boundary reads").
+    Keep,
+    /// It becomes `Truncated`: the length-prefix readers (module doc "Short reads and writes").
+    Truncate,
+}
+
+/// Fill `buf` through `read_one`, one read a call with `Ok(0)` for the end of the stream.
+///
+/// The one classification of a short read (module doc "Short reads and writes"). Before the
+/// frame has begun (`started` is false and no byte of `buf` has come), a failure stands as it
+/// is and `Ok(0)` is `EndOfStream`. After, the two that leave a frame boundary are the cut
+/// they now are: `EndOfStream` (and `Ok(0)`) is `Truncated`, `Timeout` is `DeadlineMidFrame`,
+/// and `UncleanEndOfStream` is what `unclean` says. An `Io` error is first read as [`read_raw`]
+/// reads an `io::Error`: `Interrupted` is read again, an armed deadline is `Timeout`, and a
+/// disconnect kind is `EndOfStream`. The `Err` carries the bytes of `buf` that came before it.
+pub(crate) fn fill_exact(
+    buf: &mut [u8],
+    started: bool,
+    unclean: UncleanEnd,
+    mut read_one: impl FnMut(&mut [u8]) -> RpcResult<usize>,
+) -> Result<(), (RpcError, usize)> {
+    let mut got = 0;
+    while got < buf.len() {
+        let e = match read_one(&mut buf[got..]) {
+            Ok(0) => RpcError::EndOfStream,
+            Ok(n) => {
+                got += n;
+                continue;
             }
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            // Nothing consumed: clean Timeout (still frame-synchronized); mid-header: desync.
-            Err(e) if is_timeout(&e) => {
-                return Err(if filled == 0 {
-                    RpcError::Timeout
-                } else {
-                    RpcError::DeadlineMidFrame
-                });
-            }
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof && filled > 0 => {
-                return Err(RpcError::Truncated);
-            }
-            // Past the first byte any disconnect, even one folded to `EndOfStream`, lost position.
-            Err(e) => {
-                return Err(match RpcError::from(e) {
-                    RpcError::EndOfStream if filled > 0 => RpcError::Truncated,
-                    other => other,
-                })
-            }
-        }
+            Err(RpcError::Io(e)) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(RpcError::Io(e)) if is_timeout(&e) => RpcError::Timeout,
+            Err(RpcError::Io(e)) => RpcError::from(e),
+            Err(e) => e,
+        };
+        let cut = match e {
+            e if !started && got == 0 => e,
+            RpcError::EndOfStream => RpcError::Truncated,
+            RpcError::Timeout => RpcError::DeadlineMidFrame,
+            RpcError::UncleanEndOfStream if unclean == UncleanEnd::Truncate => RpcError::Truncated,
+            e => e,
+        };
+        return Err((cut, got));
     }
     Ok(())
+}
+
+/// `read_one` for [`fill_exact`] over a `recvmsg` (`recv`), gathering its fds into `fds`.
+///
+/// At most [`unix::MAX_FDS_PER_FRAME`] fds in all, across every read of the frame. Fds that
+/// came with no byte are a cut frame, never a clean end: the sender's first `sendmsg` carried
+/// them, so a frame had begun.
+pub(crate) fn gathering_fds<'a>(
+    mut recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> + 'a,
+    fds: &'a mut Vec<std::os::fd::OwnedFd>,
+) -> impl FnMut(&mut [u8]) -> RpcResult<usize> + 'a {
+    move |buf| {
+        let (n, mut more) = recv(buf)?;
+        let with_fds = !more.is_empty();
+        fds.append(&mut more);
+        if fds.len() > unix::MAX_FDS_PER_FRAME {
+            return Err(RpcError::Protocol("too many fds in one RPC frame"));
+        }
+        if n == 0 && with_fds {
+            return Err(RpcError::Truncated);
+        }
+        Ok(n)
+    }
 }
 
 /// A deadline this end armed (`WouldBlock`; `TimedOut` is the kernel's); see module doc.
@@ -1063,7 +1097,7 @@ pub(crate) fn socket_peer_closed(
     fd: std::os::fd::BorrowedFd<'_>,
     kind: SocketKind,
 ) -> Option<bool> {
-    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use rustix::event::PollFlags;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let (ask, closed) = {
         let _ = kind;
@@ -1082,15 +1116,8 @@ pub(crate) fn socket_peer_closed(
         #[cfg(not(target_vendor = "apple"))]
         SocketKind::TcpOrVsock => return None,
     };
-    let mut fds = [PollFd::from_borrowed_fd(fd, ask)];
-    let now = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    match poll(&mut fds, Some(&now)) {
-        Ok(_) => Some(fds[0].revents().intersects(closed)),
-        Err(_) => None,
-    }
+    let seen = poll_one(fd, ask, Some(std::time::Duration::ZERO)).ok()?;
+    Some(seen.intersects(closed))
 }
 
 /// `TCP_KEEPIDLE` and `TCP_KEEPINTVL` for `d`, as `RpcTransport::set_liveness` states them.
@@ -1143,43 +1170,29 @@ pub(crate) fn absorb_already_shut(r: std::io::Result<()>) -> RpcResult<()> {
     }
 }
 
-/// Read exactly `buf.len()` body bytes; see module doc "Short reads and writes".
-fn read_body<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => return Err(RpcError::Truncated),
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if is_timeout(&e) => return Err(RpcError::DeadlineMidFrame),
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Err(RpcError::Truncated),
-            // Header consumed: any disconnect, even one folded to `EndOfStream`, is a cut frame.
-            Err(e) => {
-                return Err(match RpcError::from(e) {
-                    RpcError::EndOfStream => RpcError::Truncated,
-                    other => other,
-                })
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Read one length-prefixed frame from a blocking stream.
-pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
+/// One length-prefixed frame through `read_one` (as [`fill_exact`] takes it): the header, the
+/// cap on its length before any allocation, then the body.
+pub(crate) fn read_frame_with(
+    mut read_one: impl FnMut(&mut [u8]) -> RpcResult<usize>,
+) -> RpcResult<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    read_header(r, &mut len_buf)?;
+    fill_exact(&mut len_buf, false, UncleanEnd::Truncate, &mut read_one).map_err(|(e, _)| e)?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_FRAME_LEN {
-        // Reject *before* allocating `len` bytes.
         return Err(RpcError::FrameTooLarge {
             declared: len,
             max: MAX_FRAME_LEN,
         });
     }
     let mut body = vec![0u8; len];
-    read_body(r, &mut body)?;
+    fill_exact(&mut body, true, UncleanEnd::Truncate, &mut read_one).map_err(|(e, _)| e)?;
     Ok(body)
+}
+
+/// Read one length-prefixed frame from a blocking stream: the fuzz entry's and the tests'.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn read_frame<R: Read>(r: &mut R) -> RpcResult<Vec<u8>> {
+    read_frame_with(|buf| read_raw(r, buf))
 }
 
 /// Decode-only entrypoint for the `rpc_frame_decode` fuzz target and
@@ -1196,6 +1209,117 @@ pub fn __fuzz_decode_frame(input: &[u8]) -> RpcResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// One read's outcome, scripted: bytes delivered, or an error.
+    enum Step {
+        Bytes(usize),
+        Fail(fn() -> RpcError),
+    }
+
+    /// The variant's name and the bytes before it, or `Ok`.
+    type Classified = Result<(), (String, usize)>;
+
+    /// `fill_exact` of a 4-byte buffer over `steps`.
+    fn classify(steps: &[Step], started: bool, unclean: UncleanEnd) -> Classified {
+        let mut steps = steps.iter();
+        let mut buf = [0u8; 4];
+        fill_exact(&mut buf, started, unclean, |b| match steps.next() {
+            Some(Step::Bytes(n)) => Ok((*n).min(b.len())),
+            Some(Step::Fail(e)) => Err(e()),
+            None => panic!("read past the script"),
+        })
+        .map_err(|(e, got)| {
+            let name = format!("{e:?}");
+            (name.split(['(', ' ']).next().unwrap_or("").to_owned(), got)
+        })
+    }
+
+    /// Every branch of the one short-read rule, by input and progress (module doc).
+    #[test]
+    fn a_short_read_is_classified_by_whether_the_frame_had_begun() {
+        use std::io::ErrorKind::*;
+        use Step::*;
+        use UncleanEnd::{Keep, Truncate};
+        let end: fn() -> RpcError = || RpcError::EndOfStream;
+        let timeout: fn() -> RpcError = || RpcError::Timeout;
+        let unclean: fn() -> RpcError = || RpcError::UncleanEndOfStream;
+        let protocol: fn() -> RpcError = || RpcError::Protocol("p");
+        let would_block: fn() -> RpcError = || RpcError::Io(WouldBlock.into());
+        let broken_pipe: fn() -> RpcError = || RpcError::Io(BrokenPipe.into());
+        let timed_out: fn() -> RpcError = || RpcError::Io(TimedOut.into());
+        let interrupted: fn() -> RpcError = || RpcError::Io(Interrupted.into());
+        let err = |name: &str, got| Err((name.to_owned(), got));
+        let table: &[(&[Step], bool, UncleanEnd, Classified)] = &[
+            (&[Bytes(0)], false, Keep, err("EndOfStream", 0)),
+            (&[Bytes(0)], true, Keep, err("Truncated", 0)),
+            (&[Bytes(2), Bytes(0)], false, Keep, err("Truncated", 2)),
+            (&[Fail(end)], false, Keep, err("EndOfStream", 0)),
+            (&[Bytes(1), Fail(end)], false, Keep, err("Truncated", 1)),
+            (&[Fail(timeout)], false, Keep, err("Timeout", 0)),
+            (&[Fail(timeout)], true, Keep, err("DeadlineMidFrame", 0)),
+            (
+                &[Bytes(3), Fail(timeout)],
+                false,
+                Keep,
+                err("DeadlineMidFrame", 3),
+            ),
+            (&[Fail(would_block)], false, Keep, err("Timeout", 0)),
+            (&[Fail(would_block)], true, Keep, err("DeadlineMidFrame", 0)),
+            (&[Fail(broken_pipe)], false, Keep, err("EndOfStream", 0)),
+            (&[Fail(broken_pipe)], true, Keep, err("Truncated", 0)),
+            (&[Fail(timed_out)], false, Keep, err("Io", 0)),
+            (&[Bytes(1), Fail(timed_out)], false, Keep, err("Io", 1)),
+            (
+                &[Fail(unclean)],
+                false,
+                Truncate,
+                err("UncleanEndOfStream", 0),
+            ),
+            (&[Fail(unclean)], true, Keep, err("UncleanEndOfStream", 0)),
+            (&[Fail(unclean)], true, Truncate, err("Truncated", 0)),
+            (
+                &[Bytes(2), Fail(unclean)],
+                false,
+                Truncate,
+                err("Truncated", 2),
+            ),
+            (
+                &[Bytes(2), Fail(protocol)],
+                false,
+                Truncate,
+                err("Protocol", 2),
+            ),
+            (&[Fail(interrupted), Bytes(4)], false, Keep, Ok(())),
+            (&[Bytes(1), Bytes(1), Bytes(2)], true, Keep, Ok(())),
+        ];
+        for (i, (steps, started, unclean, expected)) in table.iter().enumerate() {
+            assert_eq!(&classify(steps, *started, *unclean), expected, "row {i}");
+        }
+        // An empty buffer reads nothing, whatever the stream would say.
+        assert!(fill_exact(&mut [], true, Keep, |_| -> RpcResult<usize> {
+            panic!("no read")
+        })
+        .is_ok());
+    }
+
+    /// Fds with no byte are a cut frame; the cap counts every read's fds together.
+    #[test]
+    fn gathered_fds_are_capped_across_reads_and_a_bare_fd_is_a_cut() {
+        let null = || std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let mut fds = Vec::new();
+        let mut read = gathering_fds(|_| Ok((0, vec![null()])), &mut fds);
+        assert!(matches!(read(&mut [0; 4]), Err(RpcError::Truncated)));
+
+        let mut fds = Vec::new();
+        let per_read = unix::MAX_FDS_PER_FRAME / 2 + 1;
+        let mut read = gathering_fds(
+            |b| Ok((b.len(), (0..per_read).map(|_| null()).collect())),
+            &mut fds,
+        );
+        assert!(matches!(read(&mut [0; 1]), Ok(1)));
+        assert!(matches!(read(&mut [0; 1]), Err(RpcError::Protocol(_))));
+    }
 
     #[test]
     fn frame_roundtrip_over_cursor() {
@@ -1282,38 +1406,6 @@ mod tests {
         ));
     }
 
-    /// `Timeout` (stream in step) only while nothing went out; see module doc "Mutation gates".
-    #[test]
-    fn a_send_deadline_is_a_timeout_only_before_the_first_byte() {
-        struct Stall(usize);
-        impl Write for Stall {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                if self.0 == 0 {
-                    return Err(std::io::Error::from(ErrorKind::WouldBlock));
-                }
-                let n = self.0.min(buf.len());
-                self.0 -= n;
-                Ok(n)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        assert!(matches!(
-            write_all_reporting(&mut Stall(0), b"frame"),
-            Err(RpcError::Timeout)
-        ));
-        assert!(
-            matches!(
-                write_all_reporting(&mut Stall(2), b"frame"),
-                Err(RpcError::Io(ref e)) if e.kind() == ErrorKind::WouldBlock
-            ),
-            "a deadline past the first byte left a partial frame on the wire"
-        );
-        assert!(write_all_reporting(&mut Stall(5), b"frame").is_ok());
-    }
-
     /// `tcp_liveness`'s socket options, read back with `getsockopt`.
     #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
     #[test]
@@ -1381,22 +1473,10 @@ mod tests {
                 Err(self.0.into())
             }
         }
-        impl Write for Fails {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(self.0.into())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let lost =
             |r: RpcResult<_>| matches!(r, Err(RpcError::Io(e)) if e.kind() == ErrorKind::TimedOut);
 
         let mut dead = Fails(ErrorKind::TimedOut);
-        assert!(
-            lost(write_all_reporting(&mut dead, b"frame")),
-            "nothing went out, yet the connection is gone"
-        );
         assert!(lost(read_frame(&mut dead).map(drop)));
         assert!(matches!(
             read_frame(&mut Fails(ErrorKind::WouldBlock)),

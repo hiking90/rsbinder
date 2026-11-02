@@ -52,10 +52,8 @@ use std::sync::Arc;
 use crate::error::{Result, StatusCode};
 use crate::file_descriptor;
 use crate::parcel::Parcel;
-use crate::shared_memory::{
-    IMemoryHeap, MappedHeap, MemoryHeapBase, FLAG_READ_ONLY, SEAL_FUTURE_WRITE, SEAL_SHRINK,
-    SEAL_WRITE,
-};
+use crate::shared_memory::heap::seals_forbid_writing;
+use crate::shared_memory::{IMemoryHeap, MappedHeap, MemoryHeapBase, FLAG_READ_ONLY, SEAL_SHRINK};
 
 /// Payloads this long or shorter always go inline; a longer one goes to
 /// shared memory when [`Parcel::write_blob`] can use it (see there).
@@ -217,9 +215,7 @@ impl Parcel {
             let flags = if mutable_copy { 0 } else { FLAG_READ_ONLY };
             let heap = MemoryHeapBase::new_named(data.len(), flags, BLOB_REGION_NAME)?;
             // Pre-5.1 kernels lack the write seal; never tag a writable region immutable.
-            let write_sealed = heap
-                .seals()
-                .is_some_and(|s| s & (SEAL_WRITE | SEAL_FUTURE_WRITE) != 0);
+            let write_sealed = heap.seals().is_some_and(seals_forbid_writing);
             (mutable_copy || write_sealed).then_some(heap)
         } else {
             None
@@ -333,7 +329,7 @@ mod tests {
             || MemoryHeapBase::new_named(4096, FLAG_READ_ONLY, BLOB_REGION_NAME)
                 .ok()
                 .and_then(|h| h.seals())
-                .is_some_and(|s| s & (SEAL_WRITE | SEAL_FUTURE_WRITE) != 0)
+                .is_some_and(seals_forbid_writing)
     }
 
     /// Plan 10-2 AC-2.1: the boundary is the whole decision; pin one byte either side of it.
@@ -402,9 +398,8 @@ mod tests {
             "an immutable blob must not accept a write"
         );
         // The flag is rsbinder bookkeeping; the seal stops a reader that maps the fd itself.
-        assert_ne!(
-            heap.seals().expect("seals") & (SEAL_WRITE | SEAL_FUTURE_WRITE),
-            0,
+        assert!(
+            seals_forbid_writing(heap.seals().expect("seals")),
             "an immutable blob's fd must be write-sealed"
         );
     }

@@ -3107,6 +3107,8 @@ fn rpc_stack_has_no_globals() {
         ("session.rs", "static DRIVING:"),
         // `ARMED_READ`: this thread's live deadline guards, emptied as they drop.
         ("session.rs", "static ARMED_READ:"),
+        // A test's user `thread_local!`, whose destructor runs after `DRIVING`'s.
+        ("ref_accounting_tests.rs", "static LATE:"),
     ];
     fn scan(root: &std::path::Path, dir: &std::path::Path, offenders: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -3271,6 +3273,16 @@ fn rpc_death_recipient_fires_on_session_drop() {
     );
     // The "incoming thread": recorded before the thread starts, so the links below never race it.
     let serve = client.spawn_serve().expect("spawn_serve");
+
+    // As the kernel proxy: a recipient already gone would never fire.
+    let (tx_gone, _rx_gone) = std::sync::mpsc::sync_channel::<()>(1);
+    let strong: Arc<dyn rsbinder::DeathRecipient> = Arc::new(DeathFlag(tx_gone));
+    let gone = Arc::downgrade(&strong);
+    drop(strong);
+    assert_eq!(
+        root.link_to_death(gone),
+        Err(rsbinder::StatusCode::BadValue)
+    );
 
     root.link_to_death(weak_live.clone()).expect("link live");
     root.link_to_death(weak_dead.clone()).expect("link dead");

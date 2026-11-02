@@ -269,6 +269,66 @@ fn copies_at_different_starts_race_as_atomics() {
     });
 }
 
+/// Every copy on a small ring lands at its modular index, in one part or two, the second non-empty.
+#[test]
+fn a_wrapped_copy_lands_where_the_ring_wraps_it() {
+    let capacity = if cfg!(miri) { WORD + 3 } else { 3 * WORD + 5 };
+    let ring = carve(capacity).bytes(0, capacity).unwrap();
+    for offset in 0..capacity {
+        for len in 0..=capacity {
+            ring.store(0, &vec![0u8; capacity]);
+            let src: Vec<u8> = (1..=len as u8).collect();
+            let mut parts = 0;
+            ring_parts(capacity, offset, len, |at, range| {
+                parts += 1;
+                assert!(parts == 1 || !range.is_empty(), "an empty second part");
+                ring.store(at, &src[range]);
+            });
+            assert!(parts <= 2);
+            let mut model = vec![0u8; capacity];
+            for (i, byte) in src.iter().enumerate() {
+                model[(offset + i) % capacity] = *byte;
+            }
+            let mut out = vec![0u8; capacity];
+            ring.load(0, &mut out);
+            assert_eq!(out, model, "offset {offset}, len {len}");
+            let mut back = vec![0u8; len];
+            ring_parts(capacity, offset, len, |at, range| {
+                ring.load(at, &mut back[range])
+            });
+            assert_eq!(back, src, "offset {offset}, len {len}");
+        }
+    }
+}
+
+/// Exists for Miri: copies that wrap race as atomics with a reader's copy that wraps too.
+#[test]
+fn wrapped_copies_race_as_atomics() {
+    let rounds = if cfg!(miri) { 12 } else { 5_000 };
+    let capacity = 2 * WORD;
+    let ring = carve(capacity).bytes(0, capacity).unwrap();
+    std::thread::scope(|s| {
+        let ring = &ring;
+        s.spawn(move || {
+            for i in 0..rounds {
+                let src = [(i % 2) as u8 * 0xaa; WORD + 3];
+                ring_parts(capacity, WORD + 5, src.len(), |at, range| {
+                    ring.store_release(at, &src[range]);
+                });
+            }
+        });
+        s.spawn(move || {
+            let mut out = [0u8; WORD];
+            for _ in 0..rounds {
+                ring_parts(capacity, WORD + 1, out.len(), |at, range| {
+                    ring.load_acquire(at, &mut out[range]);
+                });
+                assert!(out.iter().all(|b| [0, 0xaa].contains(b)), "{out:x?}");
+            }
+        });
+    });
+}
+
 /// A store that covers part of a word keeps what another thread stores to the rest of it.
 #[test]
 fn a_partial_store_keeps_its_neighbours() {

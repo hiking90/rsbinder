@@ -50,7 +50,7 @@
 //! defers via `postTask`; this is the equivalent.
 //!
 //! Callbacks run under `catch_unwind` (`fire_callback`), the same panic
-//! isolation as `ProxyHandle::dispatch_obituary_callbacks`: they run from
+//! isolation as `death::DeathRecipients::dispatch`: they run from
 //! `CallbackDeferGuard::drop`, where a panic escaping during an unwind aborts
 //! the process, and a panic in the first of several queued callbacks would
 //! otherwise discard the rest.
@@ -170,11 +170,7 @@ impl Drop for CallbackDeferGuard {
 /// Run a user callback under `catch_unwind` (runs in `Drop`); module doc "Callback deferral".
 fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
     if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(event))) {
-        let msg = payload
-            .downcast_ref::<&'static str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
+        let msg = crate::error::panic_message(&payload);
         log::error!("ProxyCountCallback panicked for {event:?}: {msg}");
     }
 }

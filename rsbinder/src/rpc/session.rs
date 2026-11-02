@@ -69,8 +69,15 @@
 //! or refcount data (those stay in the per-session `RpcState`), mirroring the kernel path's
 //! thread-local `IPCThreadState`; it is the documented exception in the
 //! `rpc_stack_has_no_globals` gate. It is bound by the borrow-discipline invariant R1
-//! (`thread_state` module doc): every `DRIVING.with` copies its answer out of the closure, and
-//! no borrow is held across the user callback a nested dispatch runs.
+//! (`thread_state` module doc): every access goes through the `stack_*` helpers, whose borrow
+//! ends inside them, and no borrow is held across the user callback a nested dispatch runs.
+//!
+//! A proxy kept in a user `thread_local!` may drop after `DRIVING` is destroyed. The helpers
+//! report that apart from an empty stack, and the rule follows the kernel path's `queue_cmd`
+//! and `send_flushed`: a `DEC_STRONG` is still sent, on a free `Outgoing` slot claimed with
+//! no marker, and a new call or a reply is refused with `InvalidOperation`. Treating the stack as
+//! empty instead would let a nested call made from that destructor pick a slot this thread
+//! already holds and, on its guard's drop, release the outer frame's `exclusive_tid`.
 //!
 //! # Slot pool
 //!
@@ -583,7 +590,11 @@
 //!   ("Slot pool" "Leaving"). It leaves `ended_locally` alone, so the loops it wakes report `NotLocal`.
 //!
 //! A serve loop's end ends the session whichever connection it served: its worker calls
-//! `close` when `SessionEnd::by` is `Local` and `fail_session` otherwise. The death sequence
+//! `close` when `SessionEnd::by` is `Local` and `fail_session` otherwise. A panic that escapes
+//! a frame's dispatch (a handler's own is caught by `binder::run_handler`; this is user code
+//! run by a release, such as a node's `Drop`) is caught in the loop and ends it as
+//! `EndReason::Dispatch(Unknown)`: unwinding past the worker would leave the session live with
+//! no reader on that connection, so a peer's call on it would wait for good. The death sequence
 //! empties the pool, so the other loops stop with what their transport's shutdown gives them,
 //! or with `EndReason::SessionEnded` when `find_conn_pinned` finds their slot gone between
 //! frames; a loop that ends that way touches nothing, because whoever ended the session ran the
@@ -605,6 +616,7 @@ use std::sync::atomic::{
 };
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::{AccessError, LocalKey};
 use std::time::{Duration, Instant};
 
 use super::deadline::PhaseDeadline;
@@ -1362,19 +1374,39 @@ fn gen_rpc_session_id() -> RpcResult<RpcSessionId> {
 
 /// C-2 rule 2 (plan 17): a zero reply, idle or handshake deadline is `BadValue`, never "none".
 pub(crate) fn reject_zero_deadline(timeout: Option<Duration>, setter: &str) -> Result<()> {
-    if timeout.is_some_and(|d| d.is_zero()) {
-        log::error!(
-            "rsbinder RPC: {setter} was given a zero duration, which is not a deadline; pass a \
-             positive duration, or `None` to wait indefinitely on purpose"
-        );
-        return Err(StatusCode::BadValue);
-    }
-    Ok(())
+    super::deadline::refuse_zero(timeout, setter).map_err(StatusCode::from)
 }
 
 thread_local! {
     /// Read deadlines this thread's guards hold, innermost last, by transport ("Reply deadlines").
     static ARMED_READ: RefCell<Vec<(usize, Option<Duration>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `DRIVING` or `ARMED_READ`; helpers end their borrow (R1) and are `Err` during TLS teardown.
+type Stack<T> = &'static LocalKey<RefCell<Vec<T>>>;
+type StackResult<T> = std::result::Result<T, AccessError>;
+
+fn stack_push<T>(key: Stack<T>, entry: T) -> StackResult<()> {
+    key.try_with(|s| s.borrow_mut().push(entry))
+}
+
+/// The value of the innermost entry keyed `k`.
+fn stack_find<K: PartialEq + Copy, V: Copy>(key: Stack<(K, V)>, k: K) -> StackResult<Option<V>> {
+    key.try_with(|s| s.borrow().iter().rev().find(|e| e.0 == k).map(|e| e.1))
+}
+
+fn stack_any<T>(key: Stack<T>, pred: impl FnMut(&T) -> bool) -> StackResult<bool> {
+    key.try_with(|s| s.borrow().iter().any(pred))
+}
+
+/// Remove the innermost entry `pred` matches; a destroyed stack has nothing to remove.
+fn stack_remove_last<T>(key: Stack<T>, mut pred: impl FnMut(&T) -> bool) {
+    let _ = key.try_with(|s| {
+        let mut s = s.borrow_mut();
+        if let Some(i) = s.iter().rposition(&mut pred) {
+            s.remove(i);
+        }
+    });
 }
 
 fn transport_key(t: &dyn RpcTransport) -> usize {
@@ -1383,10 +1415,7 @@ fn transport_key(t: &dyn RpcTransport) -> usize {
 
 /// The read deadline this thread's innermost live guard set on `t`, else `baseline`.
 fn read_deadline_in_effect(t: &dyn RpcTransport, baseline: Option<Duration>) -> Option<Duration> {
-    let key = transport_key(t);
-    // R1: the borrow spans only this scan.
-    ARMED_READ
-        .try_with(|a| a.borrow().iter().rev().find(|e| e.0 == key).map(|e| e.1))
+    stack_find(&ARMED_READ, transport_key(t))
         .ok()
         .flatten()
         .unwrap_or(baseline)
@@ -1402,19 +1431,14 @@ fn push_read_deadline(t: &dyn RpcTransport, d: Option<Duration>) -> RpcResult<bo
             Err(e)
         };
     }
-    let _ = ARMED_READ.try_with(|a| a.borrow_mut().push((transport_key(t), d)));
+    let _ = stack_push(&ARMED_READ, (transport_key(t), d));
     Ok(true)
 }
 
 /// Drop the innermost record for `t` and set `restore` back on it.
 fn pop_read_deadline(t: &dyn RpcTransport, restore: Option<Duration>) {
     let key = transport_key(t);
-    let _ = ARMED_READ.try_with(|a| {
-        let mut a = a.borrow_mut();
-        if let Some(i) = a.iter().rposition(|e| e.0 == key) {
-            a.remove(i);
-        }
-    });
+    stack_remove_last(&ARMED_READ, |e| e.0 == key);
     // Best-effort: Drop cannot surface it, and the next caller re-arms or clears anyway.
     let _ = t.set_read_timeout(restore);
 }
@@ -1464,15 +1488,7 @@ struct HandshakeDeadline<'a> {
 impl<'a> HandshakeDeadline<'a> {
     fn arm(transport: &'a dyn RpcTransport, deadline: Option<Duration>) -> RpcResult<Self> {
         // Sole funnel: the `RpcTransport` trait does not promise to reject `Some(ZERO)`.
-        if deadline.is_some_and(|d| d.is_zero()) {
-            log::error!(
-                "rsbinder RPC: a zero handshake deadline is not a deadline — pass a positive \
-                 duration, or `None` to wait indefinitely on purpose"
-            );
-            return Err(RpcError::Io(std::io::Error::from(
-                std::io::ErrorKind::InvalidInput,
-            )));
-        }
+        super::deadline::refuse_zero(deadline, "a handshake deadline")?;
         let armed = match deadline {
             Some(_) => match transport
                 .set_read_timeout(deadline)
@@ -1667,6 +1683,12 @@ impl Drop for NestedDeadlineGuard<'_> {
 thread_local! {
     /// This thread's `(session, slot)` pins, under R1; see module doc "The `DRIVING` marker".
     static DRIVING: RefCell<Vec<(usize, u64)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A call or reply on a thread whose `DRIVING` is destroyed (kernel `send_flushed`).
+fn refuse_without_driving() -> StatusCode {
+    log::error!("RPC: a call from a thread-local destructor, after `DRIVING` is gone; refused");
+    StatusCode::InvalidOperation
 }
 
 /// AOSP `mOutgoing`/`mIncoming` as a per-slot tag (plan 2-20); module doc "Connection selection".
@@ -1943,12 +1965,7 @@ impl Drop for ConnGuard<'_> {
             return;
         }
         let key = (self.inner as *const _ as usize, self.slot_id);
-        DRIVING.with(|d| {
-            let mut v = d.borrow_mut();
-            if let Some(pos) = v.iter().rposition(|&k| k == key) {
-                v.remove(pos);
-            }
-        });
+        stack_remove_last(&DRIVING, |&k| k == key);
         {
             // `notify_all`: `notify_one` may wake only a waiter pinned to another slot.
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
@@ -2011,13 +2028,7 @@ struct AllowNestedGuard<'a> {
 impl<'a> AllowNestedGuard<'a> {
     /// Arm on this thread's `DRIVING` slot; `None` only if the session ended mid-dispatch.
     fn arm(inner: &'a RpcSessionInner, allow: bool) -> Option<Self> {
-        let sess_ptr = inner as *const RpcSessionInner as usize;
-        let slot_id = DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .rev()
-                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
-        })?;
+        let slot_id = inner.driving_slot().ok().flatten()?;
         let mut st = inner.conn_state.lock().expect("conn_state poisoned");
         let slot = st.slots.iter_mut().find(|s| s.id == slot_id)?;
         let prev = std::mem::replace(&mut slot.allow_nested, allow);
@@ -2291,7 +2302,9 @@ impl RpcSessionInner {
         let mut wait_until: Option<Option<Instant>> = None;
         let tid = current_tid();
         // (1) Reentrant pin, innermost first; a serve-driven slot also needs `allow_nested`.
-        let pinned = self.driving_slot();
+        let Ok(pinned) = self.driving_slot() else {
+            return Err(refuse_without_driving());
+        };
         if let Some(slot_id) = pinned {
             let reusable = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
@@ -2381,44 +2394,35 @@ impl RpcSessionInner {
                 // `None` inside: past what an `Instant` holds, so wait without a deadline.
                 *wait_until.get_or_insert_with(|| Instant::now().checked_add(d))
             });
-            st = match (deadline, at) {
-                (Some(d), Some(at)) => {
-                    let remaining = at.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        log::warn!(
-                            "RPC: no connection slot became available within {d:?} \
-                             (every slot is driven by another thread — a session \
-                             served on one thread and transacted on another needs \
-                             more than one connection); nothing was sent"
-                        );
-                        return Err(StatusCode::WouldBlock);
-                    }
-                    self.slot_cv
-                        .wait_timeout(st, remaining)
-                        .expect("slot_cv poisoned")
-                        .0
+            let waited = crate::signal::wait_until(&self.slot_cv, st, at);
+            st = match waited.expect("slot_cv poisoned") {
+                Ok(st) => st,
+                // Only an `at` passes, and there is one only under a `deadline`.
+                Err(_) => {
+                    log::warn!(
+                        "RPC: no connection slot became available within {:?} \
+                         (every slot is driven by another thread — a session \
+                         served on one thread and transacted on another needs \
+                         more than one connection); nothing was sent",
+                        deadline.unwrap_or_default()
+                    );
+                    return Err(StatusCode::WouldBlock);
                 }
-                _ => self.slot_cv.wait(st).expect("slot_cv poisoned"),
             };
         }
     }
 
-    /// This thread's innermost `DRIVING` slot of this session, if it drives one.
-    fn driving_slot(&self) -> Option<u64> {
-        let sess_ptr = self as *const RpcSessionInner as usize;
-        DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .rev()
-                .find_map(|&(sp, sid)| if sp == sess_ptr { Some(sid) } else { None })
-        })
+    /// This thread's innermost `DRIVING` slot of this session; `Err` once `DRIVING` is destroyed.
+    fn driving_slot(&self) -> StackResult<Option<u64>> {
+        stack_find(&DRIVING, self as *const RpcSessionInner as usize)
     }
 
     /// Hold `slot` for `tid` and push it on `DRIVING`; dropping the guard undoes both.
     fn claim_slot(&self, slot: &mut ConnSlot, tid: Tid) -> ConnGuard<'_> {
         slot.exclusive_tid = Some(tid);
         let sess_ptr = self as *const RpcSessionInner as usize;
-        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot.id)));
+        // Without `DRIVING` only a `DEC_STRONG` gets here, which nests nothing on the slot.
+        let _ = stack_push(&DRIVING, (sess_ptr, slot.id));
         ConnGuard {
             inner: self,
             slot_id: slot.id,
@@ -2430,7 +2434,8 @@ impl RpcSessionInner {
     /// Non-blocking choice of a `DEC_STRONG`'s connection; module doc "Deferred `DEC_STRONG`".
     fn dec_route(&self) -> DecRoute<'_> {
         let tid = current_tid();
-        let pinned = self.driving_slot();
+        // A proxy dropped by a thread-local's destructor: no pin to write on, a free slot will do.
+        let pinned = self.driving_slot().ok().flatten();
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         let mut pending_on = None;
         if let Some(slot_id) = pinned {
@@ -2471,12 +2476,11 @@ impl RpcSessionInner {
             if self.shared.lifecycle.is_torn_down() || st.slots.is_empty() {
                 return None;
             }
-            let free = |s: &ConnSlot| s.exclusive_tid == Some(tid) || s.exclusive_tid.is_none();
-            // `Outgoing` only, like every scan: module doc "Connection selection".
+            // `Outgoing`, unclaimed: `reaper_loop` drops each guard, so no claim is this thread's.
             let pick = st
                 .slots
                 .iter()
-                .position(|s| free(s) && s.role == SlotRole::Outgoing);
+                .position(|s| s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing);
             if let Some(idx) = pick {
                 return Some(self.claim_slot(&mut st.slots[idx], tid));
             }
@@ -2492,12 +2496,10 @@ impl RpcSessionInner {
     fn find_conn_pinned(&self, want_slot_id: u64) -> Result<ConnGuard<'_>> {
         let tid = current_tid();
         let sess_ptr = self as *const RpcSessionInner as usize;
+        let key = (sess_ptr, want_slot_id);
         // Reentrant on the same slot.
-        if DRIVING.with(|d| {
-            d.borrow()
-                .iter()
-                .any(|&(sp, sid)| sp == sess_ptr && sid == want_slot_id)
-        }) {
+        let reentrant = stack_any(&DRIVING, |&k| k == key).map_err(|_| refuse_without_driving())?;
+        if reentrant {
             let transport = {
                 let st = self.conn_state.lock().expect("conn_state poisoned");
                 match st.slots.iter().find(|s| s.id == want_slot_id) {
@@ -3006,17 +3008,15 @@ impl RpcSessionInner {
         let idle = self.shared.serve_read_deadline()?;
         let sess_ptr = self as *const RpcSessionInner as usize;
         let st = self.conn_state.lock().expect("conn_state poisoned");
-        // R1: the borrow spans only this scan, which runs no user code and enters no binder.
-        let serving = DRIVING.with(|d| {
-            d.borrow().iter().any(|&(sp, sid)| {
-                sp == sess_ptr
-                    && st
-                        .slots
-                        .iter()
-                        .any(|s| s.id == sid && s.role == SlotRole::Incoming)
-            })
+        // The scan runs no user code and enters no binder.
+        let serving = stack_any(&DRIVING, |&(sp, sid)| {
+            sp == sess_ptr
+                && st
+                    .slots
+                    .iter()
+                    .any(|s| s.id == sid && s.role == SlotRole::Incoming)
         });
-        serving.then_some(idle)
+        serving.unwrap_or(false).then_some(idle)
     }
 
     /// Whether a loss is noticed as it happens (AOSP `linkToDeath`'s max-incoming-threads test).
@@ -3978,7 +3978,7 @@ impl RpcSessionInner {
         if !oneway {
             // The target receipt, paid just before the `REPLY`; module doc "Deferred `DEC_STRONG`".
             if self.profile.pays_target_before_reply() {
-                if let Some(slot_id) = self.driving_slot() {
+                if let Ok(Some(slot_id)) = self.driving_slot() {
                     self.hold_dec_strong(slot_id, t.address, 1);
                 }
             }
@@ -4045,20 +4045,17 @@ impl RpcSessionInner {
             // AOSP RPC leaves the work source alone; reset it so a handler's `set` cannot leak.
             let _work_source = crate::thread_state::WorkSourceDispatchGuard::enter();
             crate::observe::observed(observed_ctx, || {
-                consume_rpc_interface_token(&mut reader, target.descriptor()).and_then(|()| {
-                    // Unwinding would skip the serve loop's slot cleanup; mirrors the kernel path.
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // AOSP `RpcState` checks no token; the stub does, for call codes (kernel path too).
+                let token = if crate::binder::code_takes_token(code) {
+                    consume_rpc_interface_token(&mut reader, target.descriptor())
+                } else {
+                    Ok(())
+                };
+                // Caught here, so a handler panic is an `Unknown` reply and the session serves on.
+                token.and_then(|()| {
+                    crate::binder::run_handler(code, &mut reply, |reply| {
                         let token = crate::binder::sealed::Token::new();
-                        target.rpc_transact(token, code, &mut reader, &mut reply)
-                    }))
-                    .unwrap_or_else(|payload| {
-                        let msg = payload
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("<non-string panic payload>");
-                        log::error!("RPC on_transact panicked for code {code}: {msg}");
-                        Err(crate::StatusCode::Unknown)
+                        target.rpc_transact(token, code, &mut reader, reply)
                     })
                 })
             })
@@ -4070,12 +4067,12 @@ impl RpcSessionInner {
             if let Err(e) = result {
                 log::error!("oneway RPC transaction failed (dropped): {e:?}");
             }
-            // A oneway reply is never sent: `reply` drops unsent and gives its bumps back.
+            // Never sent: `reply` drops unsent and gives its bumps back (on a panic, already did).
             return Ok(());
         }
         match result {
             Ok(()) => self.send_reply_parcel(&reply),
-            // The error reply discards `reply`, which drops unsent and gives its bumps back.
+            // `reply` then drops unsent and gives its bumps back; a panic's was already dropped.
             Err(e) => self.send_reply(crate::binder::handler_reply_status(e).into(), &[], &[], &[]),
         }
     }
@@ -5078,7 +5075,19 @@ impl RpcSession {
             #[cfg(test)]
             self.inner.shared.run_serve_wait_hook();
             loop {
-                match self.inner.serve_once_on_slot(slot_id) {
+                // An unwind would skip the session end below: module doc "Session end".
+                let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.inner.serve_once_on_slot(slot_id)
+                }));
+                let step = match step {
+                    Ok(step) => step,
+                    Err(payload) => {
+                        let msg = crate::error::panic_message(&payload);
+                        log::error!("RPC: serving slot {slot_id} panicked ({msg}); session ends");
+                        break (EndReason::Dispatch(StatusCode::Unknown), deadline_armed);
+                    }
+                };
+                match step {
                     ServeStep::Continue => {
                         // Lift the admission deadline: later idle waits are unbounded.
                         if first {
@@ -6493,9 +6502,11 @@ mod tests {
     #[test]
     fn zero_handshake_deadline_is_refused_before_it_reaches_a_transport() {
         let (a, _b) = super::super::transport::MemTransport::pair();
-        assert!(
-            HandshakeDeadline::arm(&a, Some(Duration::ZERO)).is_err(),
-            "a zero duration is not a deadline"
+        let refused = HandshakeDeadline::arm(&a, Some(Duration::ZERO)).err();
+        assert_eq!(
+            refused.map(StatusCode::from),
+            Some(StatusCode::BadValue),
+            "a zero duration is not a deadline, and every setter says so alike"
         );
         // The two shapes that are deadlines still arm.
         assert!(HandshakeDeadline::arm(&a, None).is_ok());

@@ -124,6 +124,14 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   without asking for its descriptor, so a context manager that is not an
   `IServiceManager` is accepted and its calls fail as that object answers
   them. 0.12.0 returned `BadType` from `hub::default`.
+- On Android 10, whose service manager sends no registration notice,
+  `wait_for_service` and `wait_for_interface` wait in the loop the later
+  versions use: after the first lookup misses, the next one comes a second
+  later, not at once, and a service still missing logs "still waiting"
+  every ten seconds. 0.12.0 looked again at once and logged one
+  `register_for_notifications: not supported on Android 10` error per
+  wait, but no "still waiting". The answer is the same; only a test that
+  times the second lookup sees it.
 
 ## Binder objects and process state
 
@@ -238,6 +246,28 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `binder://` `Client` and starting a kernel `Server` now return the
   failure as an `Err` (`try_start_thread_pool`, CHANGELOG *Added*) instead
   of succeeding with no pool.
+- **A kernel proxy lookup (`hub` lookups, a parcel's binder read,
+  `ProcessState::strong_proxy_for_handle`) fails on a flush only when the
+  driver never took the proxy cache's `BC_INCREFS`**, and then with the
+  driver's error on every thread. That command is taken back first, so no
+  reference count is left behind. A flush that succeeds without the driver
+  taking it (a pending `return_error` on the thread) fails the lookup with
+  `InvalidOperation`. Any other failed flush, of a `BC_INCREFS` the driver
+  took or of the proxy's `BC_ACQUIRE`, is logged and the lookup returns the
+  proxy, whose drop sends the matching decrement, as AOSP
+  `incStrongHandle` keeps a queued `BC_ACQUIRE`. 0.12.0 failed the lookup
+  on a failed flush of either command: off a binder thread with the
+  driver's error, and on a binder thread (one that joined the thread pool)
+  with `DeadObject` for `BC_INCREFS`, the only one it flushed there; either
+  way it left the command queued or applied with no decrement to match it.
+  Where the flush succeeded without the driver taking `BC_INCREFS`, 0.12.0
+  went on to the lookup's next transaction (a ping or the descriptor
+  query), whose read takes the pending error first: the lookup failed with
+  it (`FailedTransaction`, `DeadObject`), or returned the proxy when that
+  error was the `BR_TRANSACTION_COMPLETE` a failed reply leaves or no
+  transaction was sent (handle 0 on Android 10). A lookup made from a TLS
+  destructor that runs after the binder thread state's own is
+  `InvalidOperation`; 0.12.0 panicked there, which aborts the process.
 
 ## Calling identity and permissions
 
@@ -526,11 +556,48 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   counted in `rejected_unknown_id_count`; the founding connection serves as
   before. Android 12 libbinder has no TLS and an rsbinder r34 client opens
   one connection, so no client of either sends such a join.
+- **An RPC server reads an interface token only before an AIDL call code**
+  (`FIRST_CALL_TRANSACTION..=LAST_CALL_TRANSACTION`), as the kernel path
+  and AOSP `RpcState` do: the generated stub checks the token, not the
+  session. `EXTENSION_TRANSACTION`, `DEBUG_PID_TRANSACTION`,
+  `DUMP_TRANSACTION` and a custom code outside that range reach the binder
+  with the parcel at position 0. 0.12.0 read a token before every code but
+  a two-way `PING` or `INTERFACE`, and failed a parcel without one with
+  `NotEnoughData`; Android 17 libbinder's `getExtension` sends none. A
+  handler of a non-call code whose client writes a token
+  (`prepare_request`, `prepare_transact(true)`) now reads that token as
+  payload: build the parcel with `prepare_transact(false)`. A oneway `PING`
+  or `INTERFACE` succeeds where 0.12.0 logged an error.
+- **`link_to_death` on an RPC proxy refuses a recipient with no strong
+  reference left** with `BadValue`, as a kernel proxy always has: such a
+  recipient could never be notified. 0.12.0 returned `Ok` and dropped it at
+  the obituary. The checks run in the order `InvalidOperation` (a session
+  that would not notice the loss), `DeadObject`, `BadValue`. Keep a strong
+  `Arc` of the recipient for as long as the link should last.
 - An RPC session on the android-13+ wire takes a null binder's stability
   from the low 16 bits of the word, as libbinder 13+ does, and accepts a
   word such as `0x00010000`; 0.12.0 compared all 32 bits with `UNDECLARED`
   and refused it with `BAD_TYPE` (CHANGELOG *Fixed*). A null binder whose
   low 16 bits are not zero is still `BAD_TYPE`.
+- **The frame API of the bundled socket transports follows their raw
+  sends and reads.** `send_frame` on `UnixTransport`, `TcpDebugTransport`
+  and `VsockTransport` is one `send_raw` of the length and the body, so a
+  send deadline that expires before the first byte is `RpcError::Timeout`
+  (the stream is still frame-synchronized) and one after it
+  `Io(WouldBlock)`, each counted from the peer's last progress. 0.12.0
+  reported `Io(WouldBlock)` at any position. Code that matched
+  `Io(WouldBlock)` to detect a stalled `send_frame` also matches `Timeout`.
+  `recv_frame` reads through `recv_raw`, so a peer that is still taking
+  this end's bytes keeps its read deadline from expiring, as it already did
+  for a session. `UnixTransport::send_frame_with_fds` waits for room in
+  `poll` on Linux and Android instead of blocking in `sendmsg`; its deadline
+  follows the same rule. Frames on the wire are unchanged.
+- **Two transport errors carry another code.** Fds that arrive with no
+  byte are `RpcError::Truncated` in the android-13+ reader too, where
+  0.12.0 read them as a clean end (`EndOfStream`). A `sendmsg` with fds
+  that takes nothing is `WriteZero` on Apple too, where 0.12.0 returned
+  `EndOfStream`. Code that matched `EndOfStream` for these cases matches
+  the new codes.
 
 ## Streams and topics
 

@@ -79,6 +79,11 @@ impl TransactionData {
         self.target = ptr.to_ne_bytes();
     }
 
+    /// Entries in the offsets array, which `offsets_size` gives in bytes.
+    pub(crate) fn offsets_count(&self) -> usize {
+        self.offsets_size as usize / std::mem::size_of::<binder_size_t>()
+    }
+
     /// The 64 bytes the driver parses, host-native.
     pub(crate) fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut bytes = [0; Self::SIZE];

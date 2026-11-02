@@ -275,13 +275,7 @@ impl TransactionObserver for Fanout {
         let tags = self
             .observers
             .iter()
-            .map(|observer| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.on_transact(ctx)))
-                    .unwrap_or_else(|payload| {
-                        log_panic("Fanout: TransactionObserver::on_transact", &*payload);
-                        None
-                    })
-            })
+            .map(|observer| guarded_on_transact("Fanout: ", &**observer, ctx))
             .collect();
         Some(Box::new(FanoutTags(tags)))
     }
@@ -300,11 +294,7 @@ impl TransactionObserver for Fanout {
             .into_iter();
         for observer in &self.observers {
             let tag = tags.next().flatten();
-            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                observer.on_reply(ctx, tag, result, elapsed)
-            })) {
-                log_panic("Fanout: TransactionObserver::on_reply", &*payload);
-            }
+            guarded_on_reply("Fanout: ", &**observer, ctx, tag, result, elapsed);
         }
     }
 }
@@ -319,13 +309,40 @@ fn current() -> Option<Arc<dyn TransactionObserver>> {
         .clone()
 }
 
-fn log_panic(which: &str, payload: &(dyn Any + Send)) {
-    let msg = payload
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("<non-string panic payload>");
-    log::error!("{which} panicked: {msg}");
+fn log_panic(which: &str, payload: &Box<dyn Any + Send>) {
+    log::error!("{which} panicked: {}", crate::error::panic_message(payload));
+}
+
+/// `on_transact` with its panic caught: logged with `prefix` before the method, and no tag.
+fn guarded_on_transact(
+    prefix: &str,
+    observer: &dyn TransactionObserver,
+    ctx: &TxnContext<'_>,
+) -> Option<Box<dyn Any>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.on_transact(ctx)))
+        .unwrap_or_else(|payload| {
+            log_panic(
+                &format!("{prefix}TransactionObserver::on_transact"),
+                &payload,
+            );
+            None
+        })
+}
+
+/// `on_reply` with its panic caught and logged as in [`guarded_on_transact`].
+fn guarded_on_reply(
+    prefix: &str,
+    observer: &dyn TransactionObserver,
+    ctx: &TxnContext<'_>,
+    tag: Option<Box<dyn Any>>,
+    result: &Result<()>,
+    elapsed: Duration,
+) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer.on_reply(ctx, tag, result, elapsed)
+    })) {
+        log_panic(&format!("{prefix}TransactionObserver::on_reply"), &payload);
+    }
 }
 
 /// Run `dispatch` between the observer's two calls; `ctx` is built only if an observer is set.
@@ -340,23 +357,15 @@ pub(crate) fn observed<'a>(
     let ctx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(ctx)) {
         Ok(ctx) => ctx,
         Err(payload) => {
-            log_panic("TxnContext (transaction_name/descriptor)", &*payload);
+            log_panic("TxnContext (transaction_name/descriptor)", &payload);
             return dispatch();
         }
     };
-    let tag = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.on_transact(&ctx)))
-        .unwrap_or_else(|payload| {
-            log_panic("TransactionObserver::on_transact", &*payload);
-            None
-        });
+    let tag = guarded_on_transact("", &*observer, &ctx);
     let start = Instant::now();
     let result = dispatch();
     let elapsed = start.elapsed();
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        observer.on_reply(&ctx, tag, &result, elapsed)
-    })) {
-        log_panic("TransactionObserver::on_reply", &*payload);
-    }
+    guarded_on_reply("", &*observer, &ctx, tag, &result, elapsed);
     result
 }
 

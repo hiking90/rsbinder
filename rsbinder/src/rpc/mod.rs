@@ -116,12 +116,11 @@
 //! frame pending") or [`RpcError::Timeout`](crate::rpc::RpcError::Timeout) ("no frame boundary
 //! crossed") is documented to have left the stream at
 //! a frame boundary. Every other read failure lacks that guarantee — including ones that in
-//! fact consumed nothing — and is treated as a lost position. One caller asks through the
-//! crate-private `RpcError::leaves_frame_boundary_intact`: the android-13+ reader, which
-//! promotes a mid-frame case to `Truncated` / `DeadlineMidFrame`. The transports'
-//! length-prefix readers and the serve loop reimplement the same split inline — against the io
-//! error kind and the `RpcError` variants respectively — so a change to the set has to be
-//! made in all three places.
+//! fact consumed nothing — and is treated as a lost position. Every frame reader, the
+//! AOSP-framing ones and the transports' length-prefix ones, fills its buffers through
+//! `transport::fill_exact`, which makes the split in one place: once the frame has begun,
+//! those two become `Truncated` and `DeadlineMidFrame`. The serve loop does not split again;
+//! `recv_end_reason` only says which `EndReason` each resulting variant ends the loop with.
 
 // Every public item of these is re-exported below: one path each, `rpc::*` (plan 17 R-9).
 pub(crate) mod address;
@@ -326,13 +325,6 @@ impl std::error::Error for RpcError {
     }
 }
 
-impl RpcError {
-    /// `EndOfStream` or `Timeout`: a failed read left a frame boundary; see "Frame-boundary reads".
-    pub(crate) fn leaves_frame_boundary_intact(&self) -> bool {
-        matches!(self, RpcError::EndOfStream | RpcError::Timeout)
-    }
-}
-
 impl From<std::io::Error> for RpcError {
     /// Map a clean disconnect to [`RpcError::EndOfStream`]; everything
     /// else stays [`RpcError::Io`]. A truncated *body* is classified by
@@ -357,11 +349,10 @@ impl From<std::io::Error> for RpcError {
 
 impl From<RpcError> for std::io::Error {
     /// Boundary projection back to `std::io::Error` for callers that
-    /// hold an `io::Result<_>` accumulator. Its consumers are the
-    /// adapters that bridge an [`transport::RpcTransport`] to a
-    /// `std::io` `Read`/`Write` — `RawTransportIo`
-    /// (`rpc::wire_android13`, the AOSP raw framing of both profiles) and
-    /// `RawIo` (`rpc::transport::tls`, length-prefixed frames over TLS).
+    /// hold an `io::Result<_>` accumulator. Its consumer is the one
+    /// adapter that bridges an [`transport::RpcTransport`] to a
+    /// `std::io` `Read`/`Write`, `RawTransportIo` (`rpc::wire_android13`,
+    /// the AOSP raw framing and handshake of both profiles).
     ///
     /// `RpcError::Io` hands its payload back as-is, but the reverse
     /// direction folds the disconnect kinds, so an `Io` carrying one of

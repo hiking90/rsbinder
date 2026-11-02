@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 
 use vsock::{VsockAddr, VsockStream};
 
-use super::{read_frame, write_frame, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
 /// A framed transport over a connected vsock stream (Linux).
@@ -98,17 +98,6 @@ impl VsockTransport {
 }
 
 impl RpcTransport for VsockTransport {
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // `&VsockStream: Write` (vsock 0.5+): lock-free duplex, as in `UnixTransport`.
-        let mut w = &self.stream;
-        write_frame(&mut w, buf)
-    }
-
-    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        let mut r = &self.stream;
-        read_frame(&mut r)
-    }
-
     /// Raw, unframed write for the android-13+ profile (the real android
     /// RPC wire has no length prefix).
     /// The trait default refuses raw access, and a
@@ -117,8 +106,7 @@ impl RpcTransport for VsockTransport {
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         use std::os::fd::AsFd;
         // vsock is Linux and Android only, where every send waits in `poll`.
-        let slices = &mut [std::io::IoSlice::new(buf)];
-        super::unix::send_waiting(self.stream.as_fd(), &self.queue, slices, &[], None)
+        super::unix::send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, &[], None)
     }
 
     /// Raw, unframed read: `read_raw`, as `UnixTransport::recv_raw`.
@@ -130,7 +118,6 @@ impl RpcTransport for VsockTransport {
         })
     }
 
-    // No fd passing: `fds` reaches only the trait's refusing default.
     fn send_raw_draining(
         &self,
         buf: &[u8],
@@ -138,16 +125,7 @@ impl RpcTransport for VsockTransport {
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
         use std::os::fd::AsFd;
-        if !fds.is_empty() {
-            return self.send_raw_with_fds(buf, fds);
-        }
-        super::unix::send_waiting(
-            self.stream.as_fd(),
-            &self.queue,
-            &mut [std::io::IoSlice::new(buf)],
-            &[],
-            Some(drain),
-        )
+        super::unix::send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, fds, Some(drain))
     }
 
     fn peer_identity(&self) -> PeerIdentity {

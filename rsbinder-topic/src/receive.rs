@@ -340,7 +340,10 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         match done {
             Ok(()) => Ok(()),
             Err(Unpinned::Lost) => Err(self.lost_loan()),
-            Err(Unpinned::Corrupted(_)) => {
+            Err(Unpinned::Corrupted(what)) => {
+                if !self.corrupted {
+                    log::error!("topic: the topic's pool is corrupted: {what}");
+                }
                 self.corrupted = true;
                 Err(RecvError::Closed(Closed::Corrupted))
             }

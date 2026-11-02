@@ -1799,6 +1799,40 @@ impl Resolver for OneEntry {
     }
 }
 
+/// A resolver with no names, on a host given by the test.
+struct Hosted(SIBinder);
+
+impl Resolver for Hosted {
+    fn advertise(&self, _: &str, _: SIBinder) -> BinderResult<Advertisement> {
+        Ok(Advertisement::none())
+    }
+
+    fn watch(
+        &self,
+        _name: &str,
+        _on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
+    ) -> BinderResult<Watch> {
+        Ok(Watch::new(()))
+    }
+
+    fn host(&self) -> Option<SIBinder> {
+        Some(self.0.clone())
+    }
+}
+
+/// The subscriber's link to the host unlinks once as it drops, and a panic there stays inside.
+#[test]
+fn the_host_link_unlinks_once_as_the_subscriber_drops() {
+    let unlinked = Arc::new(AtomicUsize::new(0));
+    let resolver = Hosted(crate::link::PanickingUnlink::binder(&unlinked));
+    let subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with(NAME, &SubscriberPolicy::default(), &resolver)
+            .unwrap();
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(subscriber)));
+    assert!(dropped.is_ok());
+    assert_eq!(unlinked.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn two_threads_giving_one_name_on_one_host_ask_once_and_leave_its_entry() {
     let host = Publisher::<Bytes>::new(&policy()).unwrap();
@@ -2060,6 +2094,35 @@ fn an_ended_publisher_with_no_binder_after_it_asks_the_lookup() {
     // A publisher not connected to before: read from its oldest record.
     assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
     assert_eq!(names.lookups(), 1);
+}
+
+/// The one notice that comes while a lookup runs connects, though the lookup then panics.
+#[test]
+fn a_notice_during_a_lookup_that_panics_connects() {
+    let names = Names::looking();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    next.publish(&bytes(5)).unwrap();
+    let (panicked, seen) = mpsc::channel();
+    let (given, binder) = (names.clone(), next.as_binder());
+    let calls = AtomicUsize::new(0);
+    names.before_lookup(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            given.give(NAME, binder.clone());
+            panicked.send(()).unwrap();
+            panic!("the test's lookup panics");
+        }
+    });
+    drop(first);
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    seen.recv_timeout(WAIT).expect("the lookup was asked");
+    assert!(subscriber.wait_connected(WAIT), "connected within {WAIT:?}");
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
 }
 
 /// The death of the connection's publisher is an end too.

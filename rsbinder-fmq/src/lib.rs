@@ -192,8 +192,6 @@ mod unsupported_tests {
         use std::sync::atomic::AtomicU32;
         let options = shm::CreateOptions::new("unit");
         assert_eq!(shm::create(4096, &options).err(), Some(Error::Unsupported));
-        let mapped = shm::create_mapped(4096, &options, shm::Seals::SHRINK);
-        assert_eq!(mapped.err(), Some(Error::Unsupported));
         let file = std::fs::File::open("/dev/null").expect("/dev/null");
         let seals = shm::Seals::GROW;
         assert_eq!(shm::add_seals(file.as_fd(), seals), Err(Error::Unsupported));

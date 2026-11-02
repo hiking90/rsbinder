@@ -419,17 +419,7 @@ impl<T: Element> MessageQueue<T> {
             if fresh < read {
                 return Err(Error::Corrupted("read counter moved backwards"));
             }
-            if fresh > write {
-                return Err(Error::Corrupted("read counter ahead of the write counter"));
-            }
-            if write - fresh > state.ring_bytes {
-                return Err(Error::Corrupted("more bytes in flight than the ring holds"));
-            }
-            if fresh % q != 0 {
-                return Err(Error::Corrupted(
-                    "counter not a multiple of the element size",
-                ));
-            }
+            state.check_read(fresh, write)?;
             state.writer_view = Some((fresh, write));
             if !fits(fresh) {
                 return Ok(None);
@@ -541,9 +531,7 @@ impl<T: Element> MessageQueue<T> {
         timeout: Option<Duration>,
     ) -> Result<()> {
         self.flag_ref()?;
-        if items.len() > self.state.capacity {
-            return Err(Error::BadValue("more items than the queue holds"));
-        }
+        // Too many items is `BadValue` from the first try, before any wait.
         self.blocking(notify, timeout, |queue| queue.write(items))
     }
 
@@ -575,9 +563,7 @@ impl<T: Element> MessageQueue<T> {
         timeout: Option<Duration>,
     ) -> Result<()> {
         self.flag_ref()?;
-        if out.len() > self.state.capacity {
-            return Err(Error::BadValue("more items than the queue holds"));
-        }
+        // As in `write_blocking_with`: the first try refuses too many.
         self.blocking(notify, timeout, |queue| queue.read(out))
     }
 
@@ -630,23 +616,33 @@ impl<T: Element> State<T> {
     fn positions(&self) -> Result<(u64, u64)> {
         let write = self.write.load(Ordering::Acquire);
         let read = self.read.load(Ordering::Acquire);
+        self.check_read(read, write)?;
+        // A commit adds at most `ring_bytes`; a counter this high would wrap.
+        if write > u64::MAX - self.ring_bytes {
+            return Err(Error::Corrupted("counter too close to wrapping"));
+        }
+        if write % size_of::<T>() as u64 != 0 {
+            return Err(Error::Corrupted(
+                "counter not a multiple of the element size",
+            ));
+        }
+        Ok((read, write))
+    }
+
+    /// `read` is not past `write`, at most a ring behind, on an element (`positions`, reload).
+    fn check_read(&self, read: u64, write: u64) -> Result<()> {
         if read > write {
             return Err(Error::Corrupted("read counter ahead of the write counter"));
         }
         if write - read > self.ring_bytes {
             return Err(Error::Corrupted("more bytes in flight than the ring holds"));
         }
-        // A commit adds at most `ring_bytes`; a counter this high would wrap.
-        if write > u64::MAX - self.ring_bytes {
-            return Err(Error::Corrupted("counter too close to wrapping"));
-        }
-        let q = size_of::<T>() as u64;
-        if read % q != 0 || write % q != 0 {
+        if read % size_of::<T>() as u64 != 0 {
             return Err(Error::Corrupted(
                 "counter not a multiple of the element size",
             ));
         }
-        Ok((read, write))
+        Ok(())
     }
 
     /// Publish `n` elements at `position`, the write counter `begin_write` loaded; drops the view.
@@ -777,9 +773,7 @@ impl<T: Element> WriteTxn<'_, T> {
     /// [`Error::BadValue`] when `n` exceeds [`len`](Regions::len), and those
     /// of [`commit`](Self::commit).
     pub fn commit_first(self, n: usize) -> Result<()> {
-        if n > self.regions.len() {
-            return Err(Error::BadValue("commit exceeds the elements reserved"));
-        }
+        self.regions.check_prefix(n)?;
         match self.path {
             WritePath::Loaded => self.state.commit_write(self.position, n),
             WritePath::Cached { read } => self.state.commit_write_cached(read, self.position, n),
@@ -842,9 +836,7 @@ impl<T: Element> ReadTxn<'_, T> {
     /// [`Error::BadValue`] when `n` exceeds [`len`](Regions::len), and those
     /// of [`commit`](Self::commit).
     pub fn commit_first(self, n: usize) -> Result<()> {
-        if n > self.regions.len() {
-            return Err(Error::BadValue("commit exceeds the elements reserved"));
-        }
+        self.regions.check_prefix(n)?;
         self.state.commit_read(self.position, n)
     }
 }
@@ -1074,14 +1066,24 @@ impl<T: Element> Regions<'_, T> {
         self.second_len
     }
 
-    /// Where elements `start..start + n` lie: ring bytes before and after the wrap, and how many
-    /// of them come before it.
-    fn split(&self, start: usize, n: usize) -> (usize, usize, usize) {
+    /// `BadValue` when a commit of the first `n` elements would pass the ones covered.
+    fn check_prefix(&self, n: usize) -> Result<()> {
+        if n > self.len() {
+            return Err(Error::BadValue("commit exceeds the elements reserved"));
+        }
+        Ok(())
+    }
+
+    /// `part` on each ring part of elements `start..start + n`, ranges in elements (`ring_parts`).
+    fn parts(&self, start: usize, n: usize, mut part: impl FnMut(usize, std::ops::Range<usize>)) {
         let q = size_of::<T>();
-        let head = self.first_len.saturating_sub(start).min(n);
-        let first = self.first_at + start.min(self.first_len) * q;
-        let second = start.saturating_sub(self.first_len) * q;
-        (first, second, head)
+        let bytes = self.ring.len();
+        // Past a wrap the first part ends at the ring's end, so one subtraction reduces it.
+        let at = self.first_at + start * q;
+        let at = if at >= bytes { at - bytes } else { at };
+        shm::ring_parts(bytes, at, n * q, |at, range| {
+            part(at, range.start / q..range.end / q);
+        });
     }
 
     /// Copy `src` into the elements starting at `start`. `BadValue` when
@@ -1093,20 +1095,13 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("write past the reserved elements"));
         }
-        let (first, second, head) = self.split(start, src.len());
-        let (to_first, to_second) = src.split_at(head);
-        // The part after the wrap is most often empty; a copy of nothing is left out.
-        if self.release {
-            self.ring.store_release(first, to_first);
-            if !to_second.is_empty() {
-                self.ring.store_release(second, to_second);
+        self.parts(start, src.len(), |at, range| {
+            if self.release {
+                self.ring.store_release(at, &src[range]);
+            } else {
+                self.ring.store(at, &src[range]);
             }
-        } else {
-            self.ring.store(first, to_first);
-            if !to_second.is_empty() {
-                self.ring.store(second, to_second);
-            }
-        }
+        });
         Ok(())
     }
 
@@ -1119,12 +1114,9 @@ impl<T: Element> Regions<'_, T> {
         {
             return Err(Error::BadValue("read past the available elements"));
         }
-        let (first, second, head) = self.split(start, dst.len());
-        let (to_first, to_second) = dst.split_at_mut(head);
-        self.ring.load(first, to_first);
-        if !to_second.is_empty() {
-            self.ring.load(second, to_second);
-        }
+        self.parts(start, dst.len(), |at, range| {
+            self.ring.load(at, &mut dst[range]);
+        });
         Ok(())
     }
 }

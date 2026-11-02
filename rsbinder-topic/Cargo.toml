@@ -37,10 +37,11 @@ rsbinder = { version = "0.13.0", path = "../rsbinder", default-features = false,
 # and `poll` (both are features `rsbinder` turns on already). `mm`: `madvise`
 # for a pool on huge pages.
 rustix = { workspace = true, features = ["event", "net", "mm"] }
-# `Notify`: a `recv_async` joins the wait a dropped one left on the blocking pool.
-# `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on.
-tokio = { workspace = true, optional = true, features = ["sync", "net"] }
-# The warning a topic with backpressure gives when it takes a subscription out (plan 15 §6.5).
+# `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on. The `Notify` a
+# `recv_async` joins a left wait with is `rsbinder`'s (`rsbinder/tokio`, which this feature enables).
+tokio = { workspace = true, optional = true, features = ["net"] }
+# The warning a topic with backpressure gives when it takes a subscription out (plan 15 §6.5),
+# and the check a subscriber's corrupted topic memory failed.
 log = { workspace = true }
 
 [build-dependencies]

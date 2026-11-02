@@ -244,7 +244,7 @@ pub struct RpcState {
 
 /// Identity of a local binder's allocation: the data pointer of its trait-object `Arc`.
 fn binder_ptr(b: &SIBinder) -> usize {
-    Arc::as_ptr(b.as_arc()) as *const () as usize
+    b.addr()
 }
 
 impl RpcState {

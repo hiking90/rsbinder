@@ -4,8 +4,7 @@
 use std::fmt;
 use std::os::fd::{BorrowedFd, OwnedFd};
 
-use super::Mapping;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// A set of memfd seals: the `F_SEAL_*` bits of `fcntl(F_ADD_SEALS)` and
 /// `fcntl(F_GET_SEALS)`.
@@ -214,72 +213,15 @@ pub fn create(_size: u64, _options: &CreateOptions<'_>) -> Result<OwnedFd> {
     Err(crate::Error::Unsupported)
 }
 
-/// A new memfd of `size` bytes, this process's writable [`Mapping`] of all
-/// of it, and then `seals`: the three steps in the one order that works
-/// whatever the seals are.
+/// Add `seals` to a memfd (`fcntl(F_ADD_SEALS)`).
 ///
 /// [`Seals::FUTURE_WRITE`] refuses every writable mapping made after it,
-/// the owner's included, so the owner maps first and seals second; the
-/// mapping made before the seal keeps working, and stores through it after
-/// this returns are seen by every peer that maps the fd. Calling [`create`],
-/// [`Mapping::map`] and [`add_seals`] by hand gives the same result when the
-/// calls are made in this order.
+/// the owner's included, so an owner that writes through its own mapping
+/// maps first and seals second; the mapping made before the seal keeps
+/// working, and its stores are seen by every peer that maps the fd.
 ///
 /// `seals` goes on in one `F_ADD_SEALS`, [`Seals::SEAL`] included, so a set
-/// that ends the sealing still gets every other seal in it. The usual sets
-/// are `GROW | SHRINK` (a memfd libfmq or `MemoryHeapBase` makes),
-/// `SHRINK | FUTURE_WRITE` (what [`verify_received`] asks of a memfd before
-/// a peer maps it, with [`CreateOptions::populate`](field@CreateOptions::populate)),
-/// and either of them with `SEAL`.
-///
-/// No fallback is taken for a kernel that does not know a seal: on Linux
-/// before 5.1 a set with `FUTURE_WRITE` fails with `EINVAL` and nothing is
-/// returned. A caller that can do without the seal calls again with
-/// [`Seals::difference`].
-///
-/// # Errors
-///
-/// * [`Error::BadValue`](crate::Error::BadValue) when `seals` contains
-///   [`Seals::WRITE`], before anything is made: the kernel refuses that
-///   seal (`EBUSY`) while the writable mapping this function returns exists.
-///   `FUTURE_WRITE` is the write seal that an owner's mapping survives.
-/// * [`create`]'s errors, then [`Mapping::map`]'s, then [`add_seals`]'s
-///   (`EINVAL` for a seal the kernel does not know), as
-///   [`Error::Os`](crate::Error::Os). The memfd and the mapping made so far
-///   are released.
-/// * [`Error::Unsupported`](crate::Error::Unsupported) off Linux and
-///   Android.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn create_mapped(
-    size: u64,
-    options: &CreateOptions<'_>,
-    seals: Seals,
-) -> Result<(OwnedFd, Mapping)> {
-    use std::os::fd::AsFd;
-    if seals.contains(Seals::WRITE) {
-        return Err(crate::Error::BadValue(
-            "F_SEAL_WRITE cannot be added while the owner's writable mapping exists",
-        ));
-    }
-    let fd = create(size, options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size)?;
-    add_seals(fd.as_fd(), seals)?;
-    Ok((fd, mapping))
-}
-
-/// A new memfd, mapped and sealed.
-/// [`Error::Unsupported`](crate::Error::Unsupported) on this target: memfd
-/// is a Linux facility.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn create_mapped(
-    _size: u64,
-    _options: &CreateOptions<'_>,
-    _seals: Seals,
-) -> Result<(OwnedFd, Mapping)> {
-    Err(crate::Error::Unsupported)
-}
-
-/// Add `seals` to a memfd (`fcntl(F_ADD_SEALS)`).
+/// that ends the sealing still gets every other seal in it.
 ///
 /// # Errors
 ///
@@ -315,6 +257,19 @@ pub fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn add_seals(_fd: BorrowedFd<'_>, _seals: Seals) -> Result<()> {
     Err(crate::Error::Unsupported)
+}
+
+/// Whether `error`, from [`add_seals`] with `seals`, says the kernel does not
+/// know a seal of the mask: `EINVAL` for a mask holding
+/// [`Seals::FUTURE_WRITE`], which Linux before 5.1 lacks, and then none of
+/// the mask was applied.
+///
+/// A file that takes no seals answers `EINVAL` too, so this reads the answer
+/// right only for a memfd the caller created. What follows is the caller's:
+/// refuse, or call [`add_seals`] again with
+/// `seals.difference(Seals::FUTURE_WRITE)`.
+pub fn seal_unsupported(seals: Seals, error: &Error) -> bool {
+    seals.contains(Seals::FUTURE_WRITE) && *error == Error::Os(crate::error::EINVAL)
 }
 
 /// The seals `fd` carries (`fcntl(F_GET_SEALS)`).
@@ -561,49 +516,14 @@ mod tests {
         assert_eq!(byte_at(&reader, 0), 0x5a);
     }
 
+    /// Only `EINVAL` for a mask with `FUTURE_WRITE` reads as a seal the kernel lacks.
     #[test]
-    fn create_mapped_maps_writable_and_then_seals() {
-        let seals = Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL;
-        let options = CreateOptions::new("unit").populate(true);
-        let (fd, owner) = create_mapped(2 * page(), &options, seals).unwrap();
-        assert_eq!(owner.len() as u64, 2 * page());
-        assert_eq!(named_seals(&fd), seals);
-        assert_eq!(verify_received(fd.as_fd()).unwrap(), 2 * page());
-        assert_eq!(
-            Mapping::map(fd.as_fd(), 0, page()).unwrap_err(),
-            os(Errno::PERM)
-        );
-        let reader = whole_ro(RoMapping::map(fd.as_fd(), 0, 2 * page()).unwrap());
-        let last = 2 * page() as usize - 1;
-        whole(owner).store(last, &[0xa5u8]);
-        assert_eq!(byte_at(&reader, last), 0xa5);
-    }
-
-    #[test]
-    fn create_mapped_without_a_write_seal_leaves_new_writable_mappings_allowed() {
-        let options = CreateOptions::new("unit");
-        let (fd, _owner) = create_mapped(page(), &options, Seals::GROW | Seals::SHRINK).unwrap();
-        assert_eq!(named_seals(&fd), Seals::GROW | Seals::SHRINK);
-        Mapping::map(fd.as_fd(), 0, page()).unwrap();
-        add_seals(fd.as_fd(), Seals::SEAL).unwrap();
-    }
-
-    #[test]
-    fn create_mapped_refuses_the_write_seal_and_passes_the_kernels_refusals_on() {
-        let options = CreateOptions::new("unit");
-        assert!(matches!(
-            create_mapped(page(), &options, Seals::SHRINK | Seals::WRITE),
-            Err(Error::BadValue(_))
-        ));
-        let unknown = Seals::from_bits(1 << 30);
-        assert_eq!(
-            create_mapped(page(), &options, unknown).err(),
-            Some(os(Errno::INVAL))
-        );
-        assert!(matches!(
-            create_mapped(0, &options, Seals::SHRINK),
-            Err(Error::BadValue(_))
-        ));
+    fn a_seal_is_unsupported_only_for_einval_on_a_future_write_mask() {
+        let with = Seals::SHRINK | Seals::FUTURE_WRITE;
+        assert!(seal_unsupported(with, &os(Errno::INVAL)));
+        assert!(!seal_unsupported(Seals::SHRINK, &os(Errno::INVAL)));
+        assert!(!seal_unsupported(with, &os(Errno::PERM)));
+        assert!(!seal_unsupported(with, &Error::Unsupported));
     }
 
     #[test]

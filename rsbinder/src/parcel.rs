@@ -88,7 +88,9 @@
 //!   `NotSent`: its `Drop` (and `set_for_rpc(false)`) hands them back through
 //!   `RpcParcelOps::cancel_leaving`, so a parcel written and never sent, or
 //!   refused before the send (`WouldBlock`, `DeadObject`, an encode failure),
-//!   leaks no node and can be sent again as is. The give-back sends nothing to the peer.
+//!   leaks no node and can be sent again as is. The give-back itself sends
+//!   nothing; a proxy release it lets go (one held for this parcel's
+//!   unpaid send) goes out as that proxy's `DEC_STRONG`.
 //! - `send_state` is AOSP `RpcFields::mSendState`. `client_transact` and
 //!   `send_reply_parcel` claim the parcel (`NotSent` → `InFlight`) for one
 //!   send and, on success, mark it `Sent`, which hands `leaving_addrs` to the
@@ -2028,6 +2030,7 @@ impl Parcel {
             .checked_add(padded)
             .filter(|&e| e <= i32::MAX as usize)
             .ok_or(StatusCode::BadValue)?;
+        self.check_object_overlap(end)?;
         self.data.reserve(end.saturating_sub(self.data.len()));
         for c in parcelable {
             self.write(&c.as_i32())?;
@@ -2235,8 +2238,7 @@ impl Parcel {
 
     /// A dup of the fd of the FD object at the cursor; the parcel keeps its own.
     pub(crate) fn read_kernel_fd_dup(&mut self) -> Result<OwnedFd> {
-        self.read_kernel_fd_with(|fd| rustix::io::fcntl_dupfd_cloexec(fd, 0))?
-            .map_err(crate::error::errno_status)
+        self.read_kernel_fd_with(crate::file_descriptor::dup_cloexec)?
     }
 
     /// The fd of this parcel's FD object at `at`: the table's entry, or a `from_ipc_parts` handle.
@@ -2505,8 +2507,7 @@ impl Parcel {
                 flat.acquire()?;
                 if flat.header_type() == BINDER_TYPE_FD {
                     // `off` is uncommitted until the push below, so a failed dup leaves no entry.
-                    let newfd = rustix::io::fcntl_dupfd_cloexec(other.kernel_fd_at(src)?, 0)
-                        .map_err(crate::error::errno_status)?;
+                    let newfd = crate::file_descriptor::dup_cloexec(other.kernel_fd_at(src)?)?;
                     flat.set_handle(std::os::fd::AsRawFd::as_raw_fd(&newfd) as _);
                     flat.set_cookie(1);
                     write_flat_binder(self.data.as_mut_slice(), off, &flat)?;
@@ -2559,8 +2560,7 @@ impl Parcel {
                         .and_then(|idx| usize::try_from(idx).ok())
                         .and_then(|idx| other.rpc.as_ref()?.source_fd(idx))
                         .ok_or(StatusCode::BadValue)?;
-                    let dup = rustix::io::fcntl_dupfd_cloexec(fd, 0)
-                        .map_err(|e| StatusCode::from(std::io::Error::from(e)))?;
+                    let dup = crate::file_descriptor::dup_cloexec(fd)?;
                     fds.push((rel + 4, dup));
                 }
                 Some(_) => {
@@ -3653,6 +3653,39 @@ mod tests {
             still_open(victim),
             "dropping the parcel closed an fd it never owned"
         );
+    }
+
+    /// A char array that would reach an object is refused before any element, as `write_array`.
+    #[test]
+    fn a_char_array_reaching_an_object_writes_no_element() {
+        let pfd = ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+        let mut kernel = Parcel::new();
+        kernel.write(&pfd).unwrap();
+        #[allow(
+            unused_mut,
+            reason = "the rpc case is pushed only with the `rpc` feature"
+        )]
+        let mut cases = vec![("kernel", kernel)];
+        #[cfg(feature = "rpc")]
+        {
+            let mut p = Parcel::new_data_only();
+            p.set_rpc_fd_mode(crate::rpc::FileDescriptorTransportMode::Unix);
+            p.set_rpc_record_fd_positions(true);
+            p.write(&pfd).unwrap();
+            cases.push(("rpc", p));
+        }
+        for (name, mut p) in cases {
+            // `[1][hasComm=0]`, then the fd object at 8: the second element would reach it.
+            let before = p.data.as_slice()[4..8].to_vec();
+            p.set_data_position(0);
+            assert_eq!(
+                p.write_array_char(&[0x41u16, 0x42]),
+                Err(StatusCode::PermissionDenied),
+                "{name}"
+            );
+            assert_eq!(p.data.as_slice()[4..8], before, "{name}");
+            assert_eq!(p.data_position(), 4, "{name}");
+        }
     }
 
     /// AOSP `validateRpcReadData`: no write rewrites a recorded RPC fd index or binder address.

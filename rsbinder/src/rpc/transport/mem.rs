@@ -189,7 +189,7 @@ pub(crate) fn self_identity() -> PeerIdentity {
 
 impl RpcTransport for MemTransport {
     fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // Same cap as `write_frame`, so this test transport passes no frame a real one rejects.
+        // Same cap as the default `send_frame`, so no frame passes here that a socket refuses.
         if buf.len() > super::MAX_FRAME_LEN {
             return Err(RpcError::FrameTooLarge {
                 declared: buf.len(),

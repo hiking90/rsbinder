@@ -18,11 +18,12 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::fd::BorrowedFd;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use rsbinder::__sync::Signal;
 use rsbinder::{
-    BinderResult, DeathRecipient, ExceptionCode, SIBinder, Status, StatusCode, WIBinder,
+    BinderResult, DeathLink, DeathRecipient, ExceptionCode, SIBinder, Status, StatusCode, WIBinder,
 };
 
 use crate::aidl::ITopic::{ERROR_CLOSED, ERROR_VERSION};
@@ -190,8 +191,8 @@ pub struct NamedSubscriber<T: Payload, M: Trust = Untrusted> {
     /// What the connections that ended counted.
     past: SubscriberStats,
     _watch: Watch,
-    /// The death link to the watch's host, when it has one.
-    _host: Option<HostLink>,
+    /// The death link to the watch's host, when it has one; unlinked as the subscriber drops.
+    _host: Option<DeathLink>,
 }
 
 /// Marks the name layer dropped when the subscriber drops: a connection thread then ends.
@@ -207,19 +208,6 @@ impl<T: Payload> Drop for Leave<T> {
         // A connection thread asleep before a retry looks at `dropped` and ends.
         self.0.signal();
         drop(ready);
-    }
-}
-
-/// Unlinks from the watch's host as the subscriber drops.
-struct HostLink {
-    host: SIBinder,
-    death: Arc<HostDeath>,
-}
-
-impl Drop for HostLink {
-    fn drop(&mut self) {
-        // A host that died has no link left to take back.
-        let _ = self.host.unlink_to_death_arc(&self.death);
     }
 }
 
@@ -329,9 +317,7 @@ struct Named<T: Payload> {
     policy: SubscriberPolicy,
     state: Mutex<State<T>>,
     /// Each change of `state` is signalled to every kind of wait: a thread's, a future's, a poll's.
-    changed: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    changed: Signal,
     /// With [`Wake::Fd`]: the fds handed out, which hold the connection's.
     fds: Option<NamedFds>,
 }
@@ -463,10 +449,10 @@ fn refusal(status: &Status) -> Refusal {
 impl<T: Payload + 'static> NamedSubscriber<T> {
     /// Subscribe to the topic the service manager gives `name` to, now or later.
     ///
-    /// Returns once the name is watched (`rsbinder::hub::register_for_notifications`), without
-    /// waiting for a publisher. Fails when the watch does: a name the service manager refuses,
-    /// or Android 10's service manager, which has no registration notices. `policy` is used for
-    /// every connection, but for where each connection after the first starts (see the type's
+    /// Returns once the name is watched (`rsbinder::hub::watch`), without waiting for a
+    /// publisher. Fails when the watch does: a name the service manager refuses, or Android
+    /// 10's service manager, which has no registration notices. `policy` is used for every
+    /// connection, but for where each connection after the first starts (see the type's
     /// documentation).
     pub fn subscribe(name: &str, policy: &SubscriberPolicy) -> BinderResult<Self> {
         Self::subscribe_with(name, policy, &ServiceManager)
@@ -486,9 +472,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         let named = Arc::new(Named {
             policy: policy.clone(),
             state: Mutex::new(State::new()),
-            changed: Condvar::new(),
-            #[cfg(feature = "tokio")]
-            notify: tokio::sync::Notify::new(),
+            changed: Signal::default(),
             fds,
         });
         let weak = Arc::downgrade(&named);
@@ -744,16 +728,10 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
             if state.closed.is_some() {
                 return false;
             }
-            state = match deadline {
-                None => self.named.changed.wait(state).expect("lock poisoned"),
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return false;
-                    }
-                    let waited = self.named.changed.wait_timeout(state, deadline - now);
-                    waited.expect("lock poisoned").0
-                }
+            let waited = self.named.changed.wait_until(state, deadline);
+            state = match waited.expect("lock poisoned") {
+                Ok(state) => state,
+                Err(_) => return false,
             };
         }
     }
@@ -789,16 +767,13 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
             if state.take_interrupt() {
                 return Err(RecvError::Cancelled);
             }
-            match deadline {
-                None => drop(named.changed.wait(state).expect("lock poisoned")),
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(RecvError::Timeout);
-                    }
-                    let waited = named.changed.wait_timeout(state, deadline - now);
-                    drop(waited.expect("lock poisoned"));
-                }
+            if named
+                .changed
+                .wait_until(state, deadline)
+                .expect("lock poisoned")
+                .is_err()
+            {
+                return Err(RecvError::Timeout);
             }
         }
     }
@@ -818,7 +793,7 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         loop {
             let named = self.named.clone();
             // Made before the look: a `Notified` gets `notify_waiters` from its creation on.
-            let notified = named.notify.notified();
+            let notified = named.changed.notified();
             // Decided before any await: the lock, and the type that holds it, end here.
             let connected = match self.step(named.lock(), false, look) {
                 Step::Done(received) => return received,
@@ -1330,9 +1305,7 @@ impl<T: Payload> Named<T> {
 
     /// Tell every wait that `state` changed; called after the change, with the lock released.
     fn signal(&self) {
-        Condvar::notify_all(&self.changed);
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.changed.wake_all();
         if let Some(fds) = &self.fds {
             fds.poke();
         }
@@ -1352,15 +1325,12 @@ impl<T: Payload> Named<T> {
 
 impl<T: Payload + 'static> Named<T> {
     /// Link to the death of the watch's host; one already dead closes the subscriber now.
-    fn link_host(self: &Arc<Self>, host: &SIBinder) -> Option<HostLink> {
+    fn link_host(self: &Arc<Self>, host: &SIBinder) -> Option<DeathLink> {
         let death = Arc::new(HostDeath {
             named: Arc::downgrade(self) as Weak<dyn ResolverDeath>,
         });
-        match host.link_to_death_arc(&death) {
-            Ok(()) => Some(HostLink {
-                host: host.clone(),
-                death,
-            }),
+        match DeathLink::new(host, death) {
+            Ok(link) => Some(link),
             Err(StatusCode::DeadObject) => {
                 self.resolver_died();
                 None
@@ -1416,7 +1386,8 @@ impl<T: Payload + 'static> Named<T> {
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-connect".into())
             .spawn(move || named.run(begin, after));
-        if spawned.is_err() {
+        if let Err(error) = spawned {
+            log::warn!("topic: no thread to connect to the name's publisher: {error}");
             // The next registration of the name tries again.
             self.lock().connecting = false;
         }
@@ -1424,6 +1395,7 @@ impl<T: Payload + 'static> Named<T> {
 
     /// The connection thread: subscribe from `begin` after `after`, retry, move to a newer binder.
     fn run(self: Arc<Self>, begin: Begin, after: Duration) {
+        let _unwinding = Connecting(&self);
         // Whether `binder` is the lookup's answer: its refusal asks no more.
         let (mut binder, mut looked) = match begin {
             Begin::At(binder) => (binder, false),
@@ -1537,12 +1509,14 @@ impl<T: Payload + 'static> Named<T> {
         until: Instant,
     ) -> MutexGuard<'s, State<T>> {
         while !state.dropped && state.closed.is_none() && state.latest.as_ref() == Some(binder) {
-            let now = Instant::now();
-            if now >= until {
-                break;
-            }
-            let waited = self.changed.wait_timeout(state, until - now);
-            state = waited.expect("lock poisoned").0;
+            state = match self
+                .changed
+                .wait_until(state, Some(until))
+                .expect("lock poisoned")
+            {
+                Ok(state) => state,
+                Err(state) => return state,
+            };
         }
         state
     }
@@ -1575,7 +1549,15 @@ impl<T: Payload + 'static> Named<T> {
             // Counted, not compared: a notice of the binder `latest` already holds is a notice too.
             let before = state.registrations;
             drop(state);
-            let found = lookup().ok().flatten();
+            // Caught here, a panic leaves the notices counted below to connect, as an `Err` does.
+            let found = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lookup())) {
+                Ok(found) => found.ok().flatten(),
+                Err(payload) => {
+                    let panic = rsbinder::__panic_message(&payload);
+                    log::error!("topic: the name's lookup panicked ({panic}); taken as no binder");
+                    None
+                }
+            };
             state = self.lock();
             if state.dropped || state.closed.is_some() {
                 break None;
@@ -1596,6 +1578,21 @@ impl<T: Payload + 'static> Named<T> {
         };
         state.connecting = next.is_some();
         next
+    }
+}
+
+/// Clears `connecting` when the connection thread unwinds (a poisoned lock, a request's panic).
+struct Connecting<'n, T: Payload>(&'n Named<T>);
+
+impl<T: Payload> Drop for Connecting<'_, T> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.connecting = false;
+        drop(state);
+        self.0.signal();
     }
 }
 

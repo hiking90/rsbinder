@@ -23,7 +23,7 @@ use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use rsbinder::fmq::shm::spin::{spin_until, SpinGauge};
+use rsbinder::fmq::shm::spin::SpinGauge;
 use rsbinder::fmq::Descriptor;
 use rsbinder::{
     BinderResult, Interface, ParcelFileDescriptor, SIBinder, Status, StatusCode, Strong,
@@ -38,7 +38,7 @@ use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::{refuse, status_of, Asking, Token};
 use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET, VERSION};
-use crate::link::{Dead, DeathLink};
+use crate::link::{link_death, Dead};
 use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
@@ -170,7 +170,7 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     /// The token the publisher links to; alive as long as the subscription.
     _token: SIBinder,
     /// On the publisher's binder; `None` when the publisher is in this process.
-    _death: Option<DeathLink<Died>>,
+    _death: Option<rsbinder::DeathLink>,
     /// Set by the death notice of the publisher's binder, which `DIED` alone does not tell.
     dead: Arc<Dead>,
     /// A look read the topic's end record: the publisher refuses every later subscription.
@@ -246,7 +246,7 @@ impl<T: Payload> Subscriber<T> {
             local: local.clone(),
             dead: dead.clone(),
         };
-        let death = DeathLink::new(topic, died)?;
+        let death = link_death(topic, died)?;
         let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         // `Wake::Fd`: a pair of this side's own; the publisher and this process send, it polls.
         let (fd_wake, sent) = match policy.wake {
@@ -299,7 +299,10 @@ impl<T: Payload> Subscriber<T> {
             Start::Last => ring::Start::Last,
             Start::Oldest => ring::Start::Oldest,
         };
-        let reader = Reader::attach(memory, start).map_err(|_| StatusCode::BadValue)?;
+        let reader = Reader::attach(memory, start).map_err(|ring::Corrupted(what)| {
+            log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
+            StatusCode::BadValue
+        })?;
         Ok(Self {
             _abandon: Abandon {
                 local: local.clone(),
@@ -690,11 +693,10 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     /// Look at the ring for a spin's budget; whether a record or a bit in `stop` turned up.
     fn spun(&self, deadline: Option<&Until>) -> bool {
-        let budget = self
+        let futex = deadline.and_then(|until| until.futex.as_ref());
+        let look = self
             .spin
-            .budget(deadline.and_then(|until| until.futex.as_ref()));
-        let (look, spun) = spin_until(budget, || self.reader.pending() || self.local.stopped());
-        self.spin.spun(spun, look);
+            .look(futex, || self.reader.pending() || self.local.stopped());
         look.is_found()
     }
 

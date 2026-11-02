@@ -44,6 +44,15 @@
 //!   the release goes at once, on android-13+ with the server's receipt before its next reply.
 //! - `t12_a_proxy_in_a_v2_reply_waits_for_its_receipt`: a server's proxy returned in a v2
 //!   reply is released only after the raw caller pays that receipt.
+//! - `t13_a_twoway_handler_panic_is_unknown_and_the_session_serves_on`,
+//!   `t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on`: a handler panic is
+//!   contained on every wire; the twoway caller reads `Unknown`, the oneway is dropped.
+//! - `t15_a_panicking_handlers_reply_is_released_before_the_reply`: the reply a panicking
+//!   handler wrote is dropped before the `REPLY`, and with it the release of a proxy in it.
+//! - `t16_a_panicking_drop_of_the_discarded_reply_is_contained`: that drop's own panic (a
+//!   released node's `Drop`) is caught too, and the session keeps serving.
+//! - `t17_a_panic_escaping_a_frame_ends_the_session`: the same `Drop` after an `Err` reply,
+//!   outside any handler guard, ends the serve loop as `Dispatch(Unknown)` and the session.
 //!
 //! # Mutation gates
 //!
@@ -99,6 +108,14 @@ const TX_HOLDER: TransactionCode = FIRST_CALL_TRANSACTION + 3;
 const TX_KEEP: TransactionCode = FIRST_CALL_TRANSACTION + 4;
 /// Oneway: `Option<SIBinder>` in, dropped.
 const TX_TAKE: TransactionCode = FIRST_CALL_TRANSACTION + 5;
+/// Panics, twoway or oneway.
+const TX_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 6;
+/// `Option<SIBinder>` in, written into the reply, then a panic.
+const TX_ECHO_THEN_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 7;
+/// A fresh binder whose drop panics, written into the reply, then a panic.
+const TX_BOMB_THEN_PANIC: TransactionCode = FIRST_CALL_TRANSACTION + 8;
+/// The same binder in the reply, then `Err(BadValue)`: the reply drops after the `REPLY`.
+const TX_BOMB_THEN_ERR: TransactionCode = FIRST_CALL_TRANSACTION + 9;
 
 #[derive(Default)]
 struct Acct {
@@ -154,11 +171,45 @@ impl Remotable for Acct {
                 let _b: Option<SIBinder> = reader.read()?;
                 Ok(())
             }
+            TX_PANIC => panic!("TX_PANIC"),
+            TX_ECHO_THEN_PANIC => {
+                let b: Option<SIBinder> = reader.read()?;
+                reply.write(&b)?;
+                panic!("TX_ECHO_THEN_PANIC")
+            }
+            TX_BOMB_THEN_PANIC => {
+                reply.write(&Interface::as_binder(&Binder::new(Bomb)))?;
+                panic!("TX_BOMB_THEN_PANIC")
+            }
+            TX_BOMB_THEN_ERR => {
+                reply.write(&Interface::as_binder(&Binder::new(Bomb)))?;
+                Err(StatusCode::BadValue)
+            }
             _ => Err(StatusCode::UnknownTransaction),
         }
     }
     fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A binder whose last drop panics.
+struct Bomb;
+impl Interface for Bomb {}
+impl Remotable for Bomb {
+    fn descriptor() -> &'static str {
+        CARRIER
+    }
+    fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+        Err(StatusCode::UnknownTransaction)
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("Bomb dropped");
     }
 }
 
@@ -919,4 +970,195 @@ fn t11_the_release_waits_on_the_wires_that_count_targets() {
         assert!(released(Duration::from_secs(5)), "{wire:?}: never released");
         assert_eq!(dec_received(&p.server, &addr), (1, 1), "{wire:?}");
     }
+}
+
+/// T13: a twoway handler panic is an `Unknown` reply, and the session keeps serving.
+#[test]
+fn t13_a_twoway_handler_panic_is_unknown_and_the_session_serves_on() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let p = Pair::new(wire);
+        assert_eq!(
+            p.call(TX_PANIC, None).map(drop),
+            Err(StatusCode::Unknown),
+            "{wire:?}"
+        );
+        p.call(TX_ECHO, None).expect("the next call");
+    }
+}
+
+/// T14: a oneway handler panic drops the call, and the session keeps serving.
+#[test]
+fn t14_a_oneway_handler_panic_is_dropped_and_the_session_serves_on() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let p = Pair::new(wire);
+        let d = rpc_of(p.root()).request_parcel(DESC).expect("request");
+        assert!(rpc_of(p.root())
+            .send(TX_PANIC, &d, FLAG_ONEWAY)
+            .expect("oneway")
+            .is_none());
+        p.call(TX_ECHO, None).expect("the call after it");
+    }
+}
+
+/// T15: a proxy in a panicked handler's reply is released before the `REPLY` (`session.rs` doc).
+#[test]
+fn t15_a_panicking_handlers_reply_is_released_before_the_reply() {
+    for version in [1, PROTOCOL_V2] {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let server = session(a, AddressSpace::Acceptor, Wire::V(version));
+        server.set_root(local()).expect("set_root");
+        let s = server.clone();
+        let serve = std::thread::spawn(move || s.serve_blocking());
+        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut raw = RawClient {
+            stream: b,
+            codec: Android13PlusCodec::with_version(version).unwrap(),
+        };
+        let (root_reply, _) = raw.call(WireTransaction {
+            code: SpecialTransaction::GetRoot.code(),
+            ..Default::default()
+        });
+        let root = Android13PlusCodec::decode_addr(&root_reply.data, 4).expect("root address");
+        let mut ctr = 0u64;
+        let mine = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
+
+        let mut token = Parcel::new();
+        write_rpc_interface_token(&mut token, DESC).unwrap();
+        let mut data = token.rpc_data_bytes().to_vec();
+        let at = data.len() as u32;
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&Android13PlusCodec::encode_addr(&mine));
+        data.extend_from_slice(&0i32.to_le_bytes());
+        let object_positions = if version >= PROTOCOL_V2 {
+            vec![at]
+        } else {
+            vec![]
+        };
+        let (reply, decs) = raw.call(WireTransaction {
+            address: root,
+            code: TX_ECHO_THEN_PANIC,
+            data,
+            object_positions,
+            ..Default::default()
+        });
+        assert_eq!(reply.status, i32::from(StatusCode::Unknown), "v{version}");
+        assert!(
+            decs.contains(&(mine, 1)),
+            "v{version}: the proxy in the discarded reply is released before the REPLY: {decs:?}"
+        );
+        let (_, decs) = raw.call(WireTransaction {
+            address: root,
+            code: PING_TRANSACTION,
+            ..Default::default()
+        });
+        assert!(
+            decs.iter().all(|(a, _)| *a != mine),
+            "v{version}: released once: {decs:?}"
+        );
+
+        drop(raw);
+        let _ = serve.join();
+    }
+}
+
+/// T16: a panic dropping a panicked handler's reply is caught: `Unknown`, and the session serves.
+#[test]
+fn t16_a_panicking_drop_of_the_discarded_reply_is_contained() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let p = Pair::new(wire);
+        assert_eq!(
+            p.call(TX_BOMB_THEN_PANIC, None).map(drop),
+            Err(StatusCode::Unknown),
+            "{wire:?}"
+        );
+        p.call(TX_ECHO, None).expect("the next call");
+        assert_eq!(
+            p.server.local_node_count(),
+            1,
+            "{wire:?}: the bomb's node went"
+        );
+    }
+}
+
+/// T17: a panic escaping a frame's dispatch ends the session, `Dispatch(Unknown)` ("Session end").
+#[test]
+fn t17_a_panic_escaping_a_frame_ends_the_session() {
+    for wire in [Wire::R34, Wire::V(1), Wire::V(2)] {
+        let mut p = Pair::new(wire);
+        assert_eq!(
+            p.call(TX_BOMB_THEN_ERR, None).map(drop),
+            Err(StatusCode::BadValue),
+            "{wire:?}: the reply went out before the drop"
+        );
+        let serve = p.serve.take().expect("serve loop");
+        let end = serve.join().expect("the serve loop returns, not unwinds");
+        assert_eq!(
+            end.reason,
+            EndReason::Dispatch(StatusCode::Unknown),
+            "{wire:?}"
+        );
+        assert!(p.server.is_ended(), "{wire:?}");
+        assert_eq!(
+            p.call(TX_ECHO, None).map(drop),
+            Err(StatusCode::DeadObject),
+            "{wire:?}"
+        );
+    }
+}
+
+/// After `DRIVING` is destroyed a dropped proxy is released, a call refused (child: a bug aborts).
+#[test]
+// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(target_arch = "s390x")
+))]
+fn a_proxy_dropped_after_driving_is_destroyed_is_released() {
+    crate::tests::in_child_process(
+        "rpc::session::ref_accounting_tests::a_proxy_dropped_after_driving_is_destroyed_is_released",
+        || {
+            /// Run as this thread's locals are destroyed: `DRIVING`'s first, as it was made last.
+            struct Late {
+                made: Option<SIBinder>,
+                root: SIBinder,
+                told: std::sync::mpsc::Sender<(bool, Result<()>)>,
+            }
+            impl Drop for Late {
+                fn drop(&mut self) {
+                    let gone = DRIVING.try_with(|_| ()).is_err();
+                    let call = self.root.ping_binder();
+                    drop(self.made.take());
+                    let _ = self.told.send((gone, call));
+                }
+            }
+            thread_local! {
+                static LATE: std::cell::RefCell<Option<Late>> = const { std::cell::RefCell::new(None) };
+            }
+
+            let p = Pair::new(Wire::R34);
+            let made: SIBinder = p.call(TX_MAKE, None).expect("make").read().expect("binder");
+            let addr = rpc_of(&made).address();
+            let (told, heard) = std::sync::mpsc::channel();
+            let (root, client) = (p.root().clone(), p.client.clone());
+            std::thread::spawn(move || {
+                LATE.with(|l| {
+                    *l.borrow_mut() = Some(Late {
+                        made: Some(made),
+                        root,
+                        told,
+                    })
+                });
+                // Registers `DRIVING`'s destructor after `LATE`'s, so it runs first.
+                assert_eq!(client.inner.driving_slot(), Ok(None));
+            })
+            .join()
+            .expect("thread");
+            let (gone, call) = heard.recv_timeout(Duration::from_secs(10)).expect("told");
+            assert!(gone, "`DRIVING` outlived `LATE`: the test's premise");
+            assert_eq!(call, Err(StatusCode::InvalidOperation));
+            // r34 counts no targets, so the release went out at once; the ping is read after it.
+            p.root().ping_binder().expect("ping");
+            assert_eq!(dec_received(&p.server, &addr), (1, 1));
+        },
+    );
 }

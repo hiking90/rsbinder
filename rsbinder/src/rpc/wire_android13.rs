@@ -116,7 +116,7 @@
 //! `interruptableWriteFully`/`ReadFully` of iovecs, no framing). android-12
 //! frames its messages the same way. This is distinct from the
 //! `RpcTransport::send_frame` framing, which prepends a `u32` length
-//! (`transport::write_frame`) — that prefix is an rsbinder-ism a real
+//! (the trait's default) — that prefix is an rsbinder-ism a real
 //! android peer neither writes nor expects, and no `RpcSession` uses it.
 //!
 //! The `*_aosp_message*` and handshake helpers operate directly on a byte
@@ -140,13 +140,14 @@
 //! across N `recvmsg`s of 64 fds each would collect 64·N fds and walk the
 //! process toward `RLIMIT_NOFILE`.
 //!
-//! A failed read is classified by `progress`, the amount the caller counts
-//! as already arrived (one call's bytes for `read_exact_into`, the whole
-//! message for the fd reader): at zero, a clean close or an elapsed
-//! deadline stands as itself; above zero the stream position is lost —
+//! A failed read is classified by `transport::fill_exact`, the one rule for
+//! every reader, by whether the message had begun (a byte of this read, or
+//! the header before the body): before, a clean close or an elapsed
+//! deadline stands as itself; after, the stream position is lost —
 //! `Truncated` if the stream ended, `DeadlineMidFrame` if a read deadline
 //! of this end's cut it (the kernel's `ETIMEDOUT` is a lost connection, not
-//! a deadline; see `transport::is_timeout`).
+//! a deadline; see `transport::is_timeout`). An unclean end stays itself
+//! here (`UncleanEnd::Keep`). Fds that arrive with no byte are a cut message.
 //!
 //! ## Address projection
 //!
@@ -220,7 +221,7 @@
 use std::io::{Read, Write};
 
 use super::address::RpcAddress;
-use super::transport::MAX_FRAME_LEN;
+use super::transport::{fill_exact, gathering_fds, read_raw, UncleanEnd, MAX_FRAME_LEN};
 use super::wire::{
     encode_header, header_body_size, split_frame, WireCodec, WireMessage, WireReply, WireReplyRef,
     WireTransaction, WireTransactionRef, WIRE_HEADER_LEN,
@@ -780,19 +781,6 @@ fn map_io(e: std::io::Error) -> RpcError {
     RpcError::from(e)
 }
 
-/// Classifies a failed read by the caller's `progress`; see module doc "Raw framing".
-fn classify_short_read(e: RpcError, progress: usize) -> RpcError {
-    if progress > 0 && e.leaves_frame_boundary_intact() {
-        if matches!(e, RpcError::Timeout) {
-            RpcError::DeadlineMidFrame
-        } else {
-            RpcError::Truncated
-        }
-    } else {
-        e
-    }
-}
-
 /// Reads exactly `n` bytes: `EndOfStream` before any byte, `Truncated` after partial progress.
 fn read_exact_raw<R: Read>(r: &mut R, n: usize) -> RpcResult<Vec<u8>> {
     let mut buf = vec![0u8; n];
@@ -807,22 +795,7 @@ fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> RpcResult<()> {
 
 /// `read_exact_into` whose failure also carries how many bytes arrived before it.
 fn read_exact_into_counted<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), (RpcError, usize)> {
-    let n = buf.len();
-    let mut got = 0;
-    while got < n {
-        match r.read(&mut buf[got..]) {
-            Ok(0) => return Err((classify_short_read(RpcError::EndOfStream, got), got)),
-            Ok(k) => got += k,
-            // A signal interrupted the read; retry like every other reader.
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // Deadline (`WouldBlock`, raw or via `RawTransportIo`) → `Timeout`, not `Io`.
-            Err(ref e) if super::transport::is_timeout(e) => {
-                return Err((classify_short_read(RpcError::Timeout, got), got))
-            }
-            Err(e) => return Err((classify_short_read(map_io(e), got), got)),
-        }
-    }
-    Ok(())
+    fill_exact(buf, false, UncleanEnd::Keep, |b| read_raw(r, b))
 }
 
 /// Write one message **AOSP-faithfully**: `msg` is the codec output
@@ -863,18 +836,29 @@ pub(crate) fn read_aosp_message_gated<R: Read>(
     r: &mut R,
     gate: impl FnOnce(&[u8]) -> RpcResult<()>,
 ) -> RpcResult<Vec<u8>> {
+    read_aosp_message_with(|b| read_raw(r, b), gate)
+}
+
+/// One `[header | body]` through `read_one`: header, `gate`, body cap before allocating, body.
+fn read_aosp_message_with(
+    mut read_one: impl FnMut(&mut [u8]) -> RpcResult<usize>,
+    gate: impl FnOnce(&[u8]) -> RpcResult<()>,
+) -> RpcResult<Vec<u8>> {
     let mut header = [0u8; WIRE_HEADER_LEN];
-    read_exact_into(r, &mut header)?;
+    fill_exact(&mut header, false, UncleanEnd::Keep, &mut read_one).map_err(|(e, _)| e)?;
     gate(&header)?;
     let body_size = header_body_size(&header)?;
     // One allocation for header + body (module doc "Raw framing").
     let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
     out[..WIRE_HEADER_LEN].copy_from_slice(&header);
-    if body_size > 0 {
-        // The header counts as progress: an EOF or deadline here is mid-message.
-        read_exact_into(r, &mut out[WIRE_HEADER_LEN..])
-            .map_err(|e| classify_short_read(e, WIRE_HEADER_LEN))?;
-    }
+    // The header counts as progress: an end or deadline here is mid-message.
+    fill_exact(
+        &mut out[WIRE_HEADER_LEN..],
+        true,
+        UncleanEnd::Keep,
+        read_one,
+    )
+    .map_err(|(e, _)| e)?;
     Ok(out)
 }
 
@@ -920,45 +904,12 @@ pub fn write_aosp_message_with_fds(
 /// (`RpcTransport::recv_raw_with_fds`).
 /// `gate` may refuse the header before any body byte is read.
 pub fn read_aosp_message_with_fds(
-    mut recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)>,
+    recv: impl FnMut(&mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)>,
     gate: impl FnOnce(&[u8]) -> RpcResult<()>,
 ) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-    let mut total_read = 0usize;
-    // `total_read` spans header + body, so `classify_short_read` sees mid-message cuts.
-    let mut fill = |dst: &mut [u8]| -> RpcResult<()> {
-        let mut got = 0;
-        while got < dst.len() {
-            let (n, mut more) = match recv(&mut dst[got..]) {
-                Ok(v) => v,
-                Err(e) => return Err(classify_short_read(e, total_read)),
-            };
-            fds.append(&mut more);
-            // Per-message cap across all `recvmsg`s (module doc "Raw framing").
-            if fds.len() > super::transport::unix::MAX_FDS_PER_FRAME {
-                return Err(RpcError::Protocol(
-                    "RPC message exceeded MAX_FDS_PER_FRAME (ancillary fd budget)",
-                ));
-            }
-            if n == 0 {
-                return Err(classify_short_read(RpcError::EndOfStream, total_read));
-            }
-            got += n;
-            total_read += n;
-        }
-        Ok(())
-    };
-
-    let mut header = [0u8; WIRE_HEADER_LEN];
-    fill(&mut header)?;
-    gate(&header)?;
-    let body_size = header_body_size(&header)?;
-    // One allocation for header + body (module doc "Raw framing").
-    let mut out = vec![0u8; WIRE_HEADER_LEN + body_size];
-    out[..WIRE_HEADER_LEN].copy_from_slice(&header);
-    if body_size > 0 {
-        fill(&mut out[WIRE_HEADER_LEN..])?;
-    }
+    // The fd cap spans every `recvmsg` of the message (module doc "Raw framing").
+    let out = read_aosp_message_with(gathering_fds(recv, &mut fds), gate)?;
     Ok((out, fds))
 }
 

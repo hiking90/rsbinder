@@ -341,8 +341,7 @@ impl RawAccepted {
                     RawAccepted::Unix(s) => s.as_fd(),
                     RawAccepted::Tcp(s) => s.as_fd(),
                 };
-                rustix::net::sockopt::set_socket_nosigpipe(fd, true)
-                    .map_err(std::io::Error::from)?;
+                super::transport::set_nosigpipe(fd)?;
             }
             let stream: Box<dyn TlsStream> = match self {
                 RawAccepted::Unix(s) => Box::new(s),

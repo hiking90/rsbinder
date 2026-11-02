@@ -101,6 +101,11 @@ const fn b_pack_chars(c1: char, c2: char, c3: char, c4: char) -> u32 {
 pub const FIRST_CALL_TRANSACTION: u32 = 0x00000001;
 pub const LAST_CALL_TRANSACTION: u32 = 0x00ffffff;
 
+/// Whether a transaction with `code` starts with an interface token (AIDL call codes only).
+pub(crate) const fn code_takes_token(code: TransactionCode) -> bool {
+    FIRST_CALL_TRANSACTION <= code && code <= LAST_CALL_TRANSACTION
+}
+
 pub const PING_TRANSACTION: u32 = b_pack_chars('_', 'P', 'N', 'G');
 pub const DUMP_TRANSACTION: u32 = b_pack_chars('_', 'D', 'M', 'P');
 pub const SHELL_COMMAND_TRANSACTION: u32 = b_pack_chars('_', 'C', 'M', 'D');
@@ -342,6 +347,10 @@ pub trait IBinder: Any + Send + Sync {
     /// caller must keep its own strong `Arc` to the recipient alive for the
     /// duration of the link — otherwise the notification silently never fires.
     ///
+    /// A remote binder returns [`StatusCode::DeadObject`] once its death has
+    /// been delivered, and [`StatusCode::BadValue`] for a `recipient` with no
+    /// strong reference left, which could never fire.
+    ///
     /// Over the RPC transport, death is detected as a dropped session
     /// connection rather than a kernel `BR_DEAD_BINDER`, and the link is
     /// refused with `InvalidOperation` unless this side's session notices a
@@ -563,9 +572,11 @@ pub trait IBinder: Any + Send + Sync {
     /// `Transactable::transact` → `thread_state::check_interface`
     /// path. `check_interface` reads the kernel transaction header and
     /// mutates `THREAD_STATE` (strict-mode / work-source) — both
-    /// meaningless for RPC and forbidden to touch. The adapter has
-    /// already consumed + validated the RPC interface token, so this
-    /// just dispatches `code` to the generated, transport-neutral
+    /// meaningless for RPC and forbidden to touch. For an AIDL call code
+    /// the adapter has already consumed and validated the RPC interface
+    /// token (a special code such as `PING_TRANSACTION` carries none), so
+    /// this dispatches `code` as the kernel path does after its token
+    /// check, down to the generated, transport-neutral
     /// `Remotable::on_transact`. Native binders override it; the
     /// default is "not an RPC dispatch target".
     ///
@@ -764,6 +775,18 @@ pub(crate) fn read_interface_reply(reply: Option<Parcel>) -> Result<String> {
     Ok(interface.unwrap_or_default())
 }
 
+/// A proxy's `descriptor()`: its `try_descriptor` answer, or `""` after logging which proxy
+/// (`who`) could not say.
+pub(crate) fn descriptor_or_empty<'a>(
+    answer: Result<&'a str>,
+    who: std::fmt::Arguments<'_>,
+) -> &'a str {
+    answer.unwrap_or_else(|err| {
+        log::warn!("interface descriptor of {who} unavailable: {err:?}");
+        ""
+    })
+}
+
 /// `Debug`'s descriptor, never a transaction (AOSP `BPBINDER_BEST_DESCRIPTOR_LOCKED`).
 fn descriptor_for_debug(binder: &dyn IBinder) -> &str {
     binder.cached_descriptor().unwrap_or("(not cached)")
@@ -871,8 +894,9 @@ pub fn __transaction_name(
 /// # Panic safety
 ///
 /// `transact` is invoked from the binder worker thread that processes
-/// incoming `BR_TRANSACTION` from the kernel. rsbinder catches panics
-/// from `transact` and converts them to `Err(StatusCode::Unknown)`, so:
+/// incoming `BR_TRANSACTION` from the kernel; an RPC server runs its
+/// handler under the same guard. rsbinder catches panics from the
+/// handler and converts them to `Err(StatusCode::Unknown)`, so:
 ///
 /// - A panic in `transact` does **not** terminate the binder worker
 ///   thread; subsequent transactions on the same thread continue to be
@@ -881,9 +905,11 @@ pub fn __transaction_name(
 ///   error reply (`StatusCode::Unknown`) instead of hanging on a never-
 ///   sent `BR_REPLY`. Any partially-written reply parcel is discarded
 ///   before the error is returned, so the client does not misparse
-///   half-formed data.
+///   half-formed data. The discarded reply drops then, before the error
+///   reply is sent, and a panic from that drop (a `Drop` of a binder the
+///   reply held last) is caught and logged too.
 /// - For oneway calls, the panic is logged and the transaction is
-///   dropped (matching the existing oneway `Err` path).
+///   dropped, as a oneway `Err` is.
 ///
 /// rsbinder does **not** repair the panicking transactable's own
 /// internal state across the unwind boundary — implementations should
@@ -938,6 +964,32 @@ pub(crate) fn handler_reply_status(err: StatusCode) -> StatusCode {
         }
         other => other,
     }
+}
+
+/// Run a handler on `reply`, kernel or RPC; a panic is logged, discards `reply`, and is `Unknown`.
+///
+/// See [`Transactable`] "Panic safety". The discarded reply drops here, before the caller
+/// frees the request and sends the reply, as a handler's `Err` reply drops after it. Its
+/// drop runs user code (a released node, a proxy's release), so it is caught as well.
+pub(crate) fn run_handler(
+    code: TransactionCode,
+    reply: &mut Parcel,
+    handler: impl FnOnce(&mut Parcel) -> Result<()>,
+) -> Result<()> {
+    let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(reply))) {
+        Ok(result) => return result,
+        Err(payload) => payload,
+    };
+    let msg = panic_message(&payload);
+    log::error!("a transaction handler panicked for code {code}: {msg}");
+    let partial = std::mem::replace(reply, Parcel::with_capacity(0));
+    if let Err(payload) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(partial)))
+    {
+        let msg = panic_message(&payload);
+        log::error!("dropping the reply of a panicked handler panicked for code {code}: {msg}");
+    }
+    Err(StatusCode::Unknown)
 }
 
 /// Implemented by sync interfaces to specify what the associated async interface is.
@@ -1351,6 +1403,26 @@ impl SIBinder {
     /// remote's interface checked first.
     pub fn into_interface<I: FromIBinder + Interface + ?Sized>(self) -> Result<Strong<I>> {
         FromIBinder::try_from(self)
+    }
+
+    /// The data address of the binder's allocation, its identity as a map key: not the
+    /// trait-object pointer, whose vtable half may differ between two `Arc`s of one binder.
+    /// It names that binder only while something keeps the allocation alive.
+    pub(crate) fn addr(&self) -> usize {
+        Arc::as_ptr(self.as_arc()) as *const () as usize
+    }
+
+    /// `BadType` when this binder's descriptor is known without a transaction and is not
+    /// `expected`; `Ok` when it matches or is not known, which nothing here asks (plan 16 D6).
+    /// `what` names the caller in the log.
+    pub(crate) fn refuse_known_other(&self, expected: &str, what: &str) -> Result<()> {
+        match self.cached_descriptor() {
+            Some(actual) if actual != expected => {
+                log::error!("{what}: not an {expected}: {actual:?}");
+                Err(StatusCode::BadType)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// [`into_interface`](Self::into_interface) that also asks a remote
@@ -2064,6 +2136,24 @@ mod tests {
         // ...but neither upgrades.
         assert!(matches!(weak1.upgrade(), Err(StatusCode::DeadObject)));
         assert!(matches!(weak2.upgrade(), Err(StatusCode::DeadObject)));
+    }
+
+    #[test]
+    fn only_call_codes_take_a_token() {
+        assert!(!code_takes_token(0));
+        assert!(code_takes_token(FIRST_CALL_TRANSACTION));
+        assert!(code_takes_token(LAST_CALL_TRANSACTION));
+        assert!(!code_takes_token(LAST_CALL_TRANSACTION + 1));
+        for code in [
+            PING_TRANSACTION,
+            DUMP_TRANSACTION,
+            SHELL_COMMAND_TRANSACTION,
+            INTERFACE_TRANSACTION,
+            EXTENSION_TRANSACTION,
+            DEBUG_PID_TRANSACTION,
+        ] {
+            assert!(!code_takes_token(code), "{code:#x}");
+        }
     }
 
     #[test]

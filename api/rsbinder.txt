@@ -2142,6 +2142,16 @@ impl core::marker::Unpin for rsbinder::hub::android_16::android::os::ServiceDebu
 impl core::marker::UnsafeUnpin for rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo
+pub struct rsbinder::hub::ServiceWatch(_)
+impl core::fmt::Debug for rsbinder::hub::ServiceWatch
+pub fn rsbinder::hub::ServiceWatch::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::hub::ServiceWatch
+impl core::marker::Send for rsbinder::hub::ServiceWatch
+impl core::marker::Sync for rsbinder::hub::ServiceWatch
+impl core::marker::Unpin for rsbinder::hub::ServiceWatch
+impl core::marker::UnsafeUnpin for rsbinder::hub::ServiceWatch
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::hub::ServiceWatch
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::hub::ServiceWatch
 pub const rsbinder::hub::DUMP_FLAG_PRIORITY_ALL: i32
 pub const rsbinder::hub::DUMP_FLAG_PRIORITY_CRITICAL: i32
 pub const rsbinder::hub::DUMP_FLAG_PRIORITY_DEFAULT: i32
@@ -2206,6 +2216,7 @@ pub fn rsbinder::hub::get_connection_info(&str) -> core::option::Option<rsbinder
 pub fn rsbinder::hub::get_declared_instances(&str) -> alloc::vec::Vec<alloc::string::String>
 pub fn rsbinder::hub::get_service_debug_info() -> rsbinder::Result<alloc::vec::Vec<rsbinder::hub::android_16::android::os::ServiceDebugInfo::ServiceDebugInfo>>
 pub fn rsbinder::hub::is_declared(&str) -> bool
+pub fn rsbinder::hub::is_valid_service_name(&str) -> bool
 pub fn rsbinder::hub::list_services(i32) -> alloc::vec::Vec<alloc::string::String>
 pub fn rsbinder::hub::register_client_callback(&str, &rsbinder::SIBinder, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IClientCallback::IClientCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::register_for_notifications(&str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
@@ -2220,6 +2231,7 @@ pub fn rsbinder::hub::try_unregister_service(&str, &rsbinder::SIBinder) -> rsbin
 pub fn rsbinder::hub::unregister_for_notifications(&str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::wait_for_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::wait_for_service(&str) -> core::option::Option<rsbinder::SIBinder>
+pub fn rsbinder::hub::watch(&str, impl core::ops::function::Fn(rsbinder::SIBinder) + core::marker::Send + core::marker::Sync + 'static) -> core::result::Result<rsbinder::hub::ServiceWatch, rsbinder::Status>
 pub mod rsbinder::lazy_service
 pub struct rsbinder::lazy_service::LazyServiceRegistrar
 impl rsbinder::lazy_service::LazyServiceRegistrar
@@ -3405,6 +3417,9 @@ impl core::convert::From<rsbinder::ExceptionCode> for rsbinder::StatusCode
 pub fn rsbinder::StatusCode::from(rsbinder::ExceptionCode) -> Self
 impl core::convert::From<rsbinder::StatusCode> for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::from(rsbinder::StatusCode) -> Self
+impl core::convert::TryFrom<i32> for rsbinder::ExceptionCode
+pub type rsbinder::ExceptionCode::Error = i32
+pub fn rsbinder::ExceptionCode::try_from(i32) -> core::result::Result<Self, i32>
 impl core::fmt::Debug for rsbinder::ExceptionCode
 pub fn rsbinder::ExceptionCode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::fmt::Display for rsbinder::ExceptionCode
@@ -3749,14 +3764,26 @@ impl core::marker::Unpin for rsbinder::ClientOptions
 impl core::marker::UnsafeUnpin for rsbinder::ClientOptions
 impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::ClientOptions
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::ClientOptions
+pub struct rsbinder::DeathLink
+impl rsbinder::DeathLink
+pub fn rsbinder::DeathLink::new(&rsbinder::SIBinder, alloc::sync::Arc<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<Self>
+impl core::fmt::Debug for rsbinder::DeathLink
+pub fn rsbinder::DeathLink::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for rsbinder::DeathLink
+pub fn rsbinder::DeathLink::drop(&mut self)
+impl core::marker::Freeze for rsbinder::DeathLink
+impl core::marker::Send for rsbinder::DeathLink
+impl core::marker::Sync for rsbinder::DeathLink
+impl core::marker::Unpin for rsbinder::DeathLink
+impl core::marker::UnsafeUnpin for rsbinder::DeathLink
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::DeathLink
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::DeathLink
 pub struct rsbinder::DeathSignal
 impl core::fmt::Debug for rsbinder::DeathSignal
 pub fn rsbinder::DeathSignal::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::future::future::Future for rsbinder::DeathSignal
 pub type rsbinder::DeathSignal::Output = ()
 pub fn rsbinder::DeathSignal::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<()>
-impl core::ops::drop::Drop for rsbinder::DeathSignal
-pub fn rsbinder::DeathSignal::drop(&mut self)
 impl core::marker::Freeze for rsbinder::DeathSignal
 impl core::marker::Send for rsbinder::DeathSignal
 impl core::marker::Sync for rsbinder::DeathSignal

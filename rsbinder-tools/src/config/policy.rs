@@ -124,7 +124,7 @@ impl Subjects {
 /// A pattern of service names (`[[rule]]`) or of topic names (`[[topic]]`).
 ///
 /// Only a trailing `*` is supported. Both kinds of name are restricted to
-/// `[A-Za-z0-9._/-]` (`is_valid_service_name`, and the topic registry's copy of it), so a
+/// `[A-Za-z0-9._/-]` (`rsbinder::hub::is_valid_service_name`, which the topic registry calls), so a
 /// general glob engine would buy nothing over a matcher small enough to
 /// audit by eye — and an auditable matcher is the point in a file whose
 /// job is to deny things.

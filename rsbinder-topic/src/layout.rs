@@ -107,7 +107,9 @@ use rsbinder::fmq::shm::{
     self, Bytes, Carve, CreateOptions, Lendable, Mapping, RoBytes, RoCarve, RoLendable, RoMapping,
     RoWord32, RoWord64, Seals, Word, Words,
 };
-use rsbinder::fmq::{Descriptor, Errno, Error, Flavor, Grantor, Result};
+#[cfg(test)]
+use rsbinder::fmq::Errno;
+use rsbinder::fmq::{Descriptor, Error, Flavor, Grantor, Result};
 
 use crate::pool::{GenerationLoads, Generations, LendError, LentSlot, Pin, Pins, Slots};
 use crate::ring::{Loads, Stores};
@@ -207,14 +209,13 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// The errno a kernel answers for a seal it does not know.
-const EINVAL: Errno = Errno::from_raw(rustix::io::Errno::INVAL.raw_os_error());
-
 /// Add `seals` to `fd`: `shm::add_seals`, behind the switch above.
 fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
     #[cfg(test)]
     if seals.contains(Seals::FUTURE_WRITE) && NO_FUTURE_WRITE.get() {
-        return Err(Error::Os(EINVAL));
+        // The errno a kernel answers for a seal it does not know.
+        let einval = Errno::from_raw(rustix::io::Errno::INVAL.raw_os_error());
+        return Err(Error::Os(einval));
     }
     shm::add_seals(fd, seals)
 }
@@ -223,20 +224,46 @@ fn add_seals(fd: BorrowedFd<'_>, seals: Seals) -> Result<()> {
 fn seal(fd: BorrowedFd<'_>) -> Result<()> {
     let seals = Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE | Seals::SEAL;
     match add_seals(fd, seals) {
-        // The kernel applies none of a mask that holds a seal it does not know.
-        Err(Error::Os(EINVAL)) => Err(Error::Unsupported),
+        Err(e) if shm::seal_unsupported(seals, &e) => Err(Error::Unsupported),
         other => other,
     }
 }
 
-/// The start of a ring copy and the bytes of it that precede the ring's end.
-fn split(capacity: usize, position: u64, len: usize) -> (usize, usize) {
+/// A memfd laid out by `fill` through a writable mapping, then sealed, which refuses later ones.
+fn make<T>(
+    name: &str,
+    size: u64,
+    populate: bool,
+    fill: impl FnOnce(Mapping) -> Result<T>,
+) -> Result<(OwnedFd, T)> {
+    let fd = shm::create(size, &CreateOptions::new(name).populate(populate))?;
+    let laid = fill(Mapping::map(fd.as_fd(), 0, size)?)?;
+    seal(fd.as_fd())?;
+    Ok((fd, laid))
+}
+
+/// Map a peer's fd read-only once it passes [`shm::verify_received`] and `sized` (its size).
+fn received<R>(fd: BorrowedFd<'_>, sized: impl FnOnce(u64) -> Result<R>) -> Result<(R, RoCarve)> {
+    let size = shm::verify_received(fd)?;
+    let judged = sized(size)?;
+    Ok((judged, RoMapping::map(fd, 0, size)?.carve()))
+}
+
+/// `BadValue(what)` unless the word at `offset` holds `want`.
+fn expect_word(carve: &mut RoCarve, offset: usize, want: u32, what: &'static str) -> Result<()> {
+    if carve.word32(offset)?.load() != want {
+        return Err(Error::BadValue(what));
+    }
+    Ok(())
+}
+
+/// The ring byte a copy at `position` starts at, once the copy passes the format's checks.
+fn ring_offset(capacity: usize, position: u64, len: usize) -> usize {
     assert!(
         position % 8 == 0 && len % 8 == 0 && len <= capacity,
         "a ring copy off the 8-byte grid or longer than the ring"
     );
-    let offset = (position % capacity as u64) as usize;
-    (offset, len.min(capacity - offset))
+    (position % capacity as u64) as usize
 }
 
 /// Topic memory as its one writer reaches it: the words of the header and the ring, as pieces.
@@ -319,10 +346,11 @@ impl Stores for Stored {
     }
 
     fn store_ring(&self, position: u64, src: &[u8]) {
-        let (offset, first) = split(self.ring.len(), position, src.len());
-        let (head, wrapped) = src.split_at(first);
-        self.ring.store_release(offset, head);
-        self.ring.store_release(0, wrapped);
+        let capacity = self.ring.len();
+        let offset = ring_offset(capacity, position, src.len());
+        shm::ring_parts(capacity, offset, src.len(), |at, range| {
+            self.ring.store_release(at, &src[range]);
+        });
     }
 }
 
@@ -401,16 +429,19 @@ impl Loads for Loaded {
     }
 
     fn load_ring(&self, position: u64, dst: &mut [u8]) {
-        let (offset, first) = split(self.ring.len(), position, dst.len());
-        let (head, wrapped) = dst.split_at_mut(first);
-        self.ring.load(offset, head);
-        self.ring.load(0, wrapped);
+        let capacity = self.ring.len();
+        let offset = ring_offset(capacity, position, dst.len());
+        shm::ring_parts(capacity, offset, dst.len(), |at, range| {
+            self.ring.load(at, &mut dst[range]);
+        });
     }
 
     fn load_ring_extend(&self, position: u64, len: usize, dst: &mut Vec<u8>) {
-        let (offset, first) = split(self.ring.len(), position, len);
-        self.ring.load_extend(offset, first, dst);
-        self.ring.load_extend(0, len - first, dst);
+        let capacity = self.ring.len();
+        let offset = ring_offset(capacity, position, len);
+        shm::ring_parts(capacity, offset, len, |at, range| {
+            self.ring.load_extend(at, range.len(), dst);
+        });
     }
 
     fn fence(&self) {
@@ -443,27 +474,25 @@ pub(crate) fn create_topic(ring_bytes: usize) -> Result<(OwnedFd, Stored)> {
     check_target()?;
     let capacity = ring_capacity(ring_bytes)?;
     let size = (topic::RING + capacity) as u64;
-    let options = CreateOptions::new("rsbinder-topic").populate(true);
-    let fd = shm::create(size, &options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size)?;
-    let stored = Stored::carve(mapping.carve(), capacity)?;
-    stored.mark();
-    // After the mapping: `FUTURE_WRITE` refuses every writable mapping made from here on.
-    seal(fd.as_fd())?;
-    Ok((fd, stored))
+    make("rsbinder-topic", size, true, |mapping| {
+        let stored = Stored::carve(mapping.carve(), capacity)?;
+        stored.mark();
+        Ok(stored)
+    })
 }
 
 /// Map topic memory a publisher sent, read-only, once the fd, its size and its marks pass.
 pub(crate) fn map_topic(fd: BorrowedFd<'_>, max_ring: usize) -> Result<Loaded> {
     check_target()?;
-    let size = shm::verify_received(fd)?;
-    let capacity = usize::try_from(size)
-        .ok()
-        .and_then(|size| size.checked_sub(topic::RING))
-        .filter(|ring| ring % 8 == 0 && (MIN_RING..=MAX_RING.min(max_ring)).contains(ring))
-        .ok_or(Error::BadValue("topic memory of a size outside the bounds"))?;
+    let (capacity, carve) = received(fd, |size| {
+        usize::try_from(size)
+            .ok()
+            .and_then(|size| size.checked_sub(topic::RING))
+            .filter(|ring| ring % 8 == 0 && (MIN_RING..=MAX_RING.min(max_ring)).contains(ring))
+            .ok_or(Error::BadValue("topic memory of a size outside the bounds"))
+    })?;
     // The pieces share the mapping, so a `Seq` taken from the view outlives a dropped reader.
-    let loaded = Loaded::carve(RoMapping::map(fd, 0, size)?.carve(), capacity)?;
+    let loaded = Loaded::carve(carve, capacity)?;
     loaded.marked()?;
     Ok(loaded)
 }
@@ -515,25 +544,27 @@ impl ControlPage {
     /// The errors are [`create_topic`]'s.
     pub(crate) fn create(pins: u32) -> Result<(OwnedFd, Self)> {
         check_target()?;
-        let size = control_size(pins);
-        let options = CreateOptions::new("rsbinder-topic-control").populate(true);
-        let fd = shm::create(size, &options)?;
-        let mut carve = Mapping::map(fd.as_fd(), 0, size)?.carve();
-        carve
-            .word32(control::MAGIC)?
-            .store(CONTROL_MAGIC, Ordering::Relaxed);
-        carve
-            .word32(control::VERSION)?
-            .store(VERSION, Ordering::Relaxed);
-        carve.word32(control::PINS)?.store(pins, Ordering::Relaxed);
-        let page = Self {
-            state: carve.word32(control::STATE)?,
-            read: carve.word64(control::READ)?,
-            lost: carve.word64(control::LOST)?,
-            pins: carve.words32(control::PIN as usize, pins as usize)?,
-        };
-        seal(fd.as_fd())?;
-        Ok((fd, page))
+        make(
+            "rsbinder-topic-control",
+            control_size(pins),
+            true,
+            |mapping| {
+                let mut carve = mapping.carve();
+                carve
+                    .word32(control::MAGIC)?
+                    .store(CONTROL_MAGIC, Ordering::Relaxed);
+                carve
+                    .word32(control::VERSION)?
+                    .store(VERSION, Ordering::Relaxed);
+                carve.word32(control::PINS)?.store(pins, Ordering::Relaxed);
+                Ok(Self {
+                    state: carve.word32(control::STATE)?,
+                    read: carve.word64(control::READ)?,
+                    lost: carve.word64(control::LOST)?,
+                    pins: carve.words32(control::PIN as usize, pins as usize)?,
+                })
+            },
+        )
     }
 
     /// The [`WAITING`] and [`CLOSED`] bits and the `seq` a wait sleeps on. Changed by RMWs alone.
@@ -580,20 +611,16 @@ impl ControlView {
     /// Map a control page a subscriber sent, after checking the fd, its size and what it holds.
     pub(crate) fn map(fd: BorrowedFd<'_>, pins: u32) -> Result<Self> {
         check_target()?;
-        let size = shm::verify_received(fd)?;
-        if size != control_size(pins) {
-            return Err(Error::BadValue("control page of another size"));
-        }
-        let mut carve = RoMapping::map(fd, 0, size)?.carve();
-        if carve.word32(control::MAGIC)?.load() != CONTROL_MAGIC {
-            return Err(Error::BadValue("received memfd is not a control page"));
-        }
-        if carve.word32(control::VERSION)?.load() != VERSION {
-            return Err(Error::BadValue("control page of another layout version"));
-        }
-        if carve.word32(control::PINS)?.load() != pins {
-            return Err(Error::BadValue("control page with another pin count"));
-        }
+        let other_size = Error::BadValue("control page of another size");
+        let ((), mut carve) = received(fd, |size| {
+            (size == control_size(pins)).then_some(()).ok_or(other_size)
+        })?;
+        let not_control = "received memfd is not a control page";
+        expect_word(&mut carve, control::MAGIC, CONTROL_MAGIC, not_control)?;
+        let version = "control page of another layout version";
+        expect_word(&mut carve, control::VERSION, VERSION, version)?;
+        let pin_count = "control page with another pin count";
+        expect_word(&mut carve, control::PINS, pins, pin_count)?;
         Ok(Self {
             state: carve.word32(control::STATE)?,
             read: carve.word64(control::READ)?,
@@ -762,34 +789,31 @@ pub(crate) fn create_pool(
     let size =
         pool_size(slots, slot_bytes).ok_or(Error::BadValue("pool of a size outside the bounds"))?;
     // Huge pages come with the first write through a mapping advised so, not with `pwrite`.
-    let options = CreateOptions::new("rsbinder-topic-pool").populate(!huge);
-    let fd = shm::create(size, &options)?;
-    let mapping = Mapping::map(fd.as_fd(), 0, size)?;
-    if huge {
-        mapping.populate_huge_pages();
-    }
-    let mut carve = mapping.carve();
-    carve
-        .word32(pool::MAGIC)?
-        .store(POOL_MAGIC, Ordering::Relaxed);
-    carve
-        .word32(pool::VERSION)?
-        .store(VERSION, Ordering::Relaxed);
-    carve.word32(pool::SLOTS)?.store(slots, Ordering::Relaxed);
-    carve
-        .word32(pool::SLOT_BYTES)?
-        .store(slot_bytes, Ordering::Relaxed);
-    let stored = StoredPool {
-        generations: carve.words64(pool::GENERATIONS, slots as usize)?,
-        area: carve.lendable(
-            slot_area(slots) as usize,
-            slots as usize * slot_bytes as usize,
-        )?,
-        slots,
-        slot_bytes,
-    };
-    seal(fd.as_fd())?;
-    Ok((fd, stored))
+    make("rsbinder-topic-pool", size, !huge, |mapping| {
+        if huge {
+            mapping.populate_huge_pages();
+        }
+        let mut carve = mapping.carve();
+        carve
+            .word32(pool::MAGIC)?
+            .store(POOL_MAGIC, Ordering::Relaxed);
+        carve
+            .word32(pool::VERSION)?
+            .store(VERSION, Ordering::Relaxed);
+        carve.word32(pool::SLOTS)?.store(slots, Ordering::Relaxed);
+        carve
+            .word32(pool::SLOT_BYTES)?
+            .store(slot_bytes, Ordering::Relaxed);
+        Ok(StoredPool {
+            generations: carve.words64(pool::GENERATIONS, slots as usize)?,
+            area: carve.lendable(
+                slot_area(slots) as usize,
+                slots as usize * slot_bytes as usize,
+            )?,
+            slots,
+            slot_bytes,
+        })
+    })
 }
 
 /// Map pool memory a publisher sent, read-only, once the fd, its size and its marks pass: the
@@ -804,26 +828,17 @@ pub(crate) fn map_pool(
     let expected = pool_size(slots, slot_bytes)
         .filter(|&size| size <= max_pool as u64)
         .ok_or(Error::BadValue("pool memory of a size outside the bounds"))?;
-    let size = shm::verify_received(fd)?;
-    if size != expected {
-        return Err(Error::BadValue(
-            "pool memory of another size than its slots",
-        ));
-    }
-    let mut carve = RoMapping::map(fd, 0, size)?.carve();
-    if carve.word32(pool::MAGIC)?.load() != POOL_MAGIC {
-        return Err(Error::BadValue("received memfd is not pool memory"));
-    }
-    if carve.word32(pool::VERSION)?.load() != VERSION {
-        return Err(Error::BadValue("pool memory of another layout version"));
-    }
-    if carve.word32(pool::SLOTS)?.load() != slots
-        || carve.word32(pool::SLOT_BYTES)?.load() != slot_bytes
-    {
-        return Err(Error::BadValue(
-            "pool memory with other slots than its endpoint",
-        ));
-    }
+    let other_size = Error::BadValue("pool memory of another size than its slots");
+    let ((), mut carve) = received(fd, |size| {
+        (size == expected).then_some(()).ok_or(other_size)
+    })?;
+    let not_pool = "received memfd is not pool memory";
+    expect_word(&mut carve, pool::MAGIC, POOL_MAGIC, not_pool)?;
+    let version = "pool memory of another layout version";
+    expect_word(&mut carve, pool::VERSION, VERSION, version)?;
+    let other_slots = "pool memory with other slots than its endpoint";
+    expect_word(&mut carve, pool::SLOTS, slots, other_slots)?;
+    expect_word(&mut carve, pool::SLOT_BYTES, slot_bytes, other_slots)?;
     Ok(LoadedPool {
         generations: carve.words64(pool::GENERATIONS, slots as usize)?,
         area: carve.lendable(

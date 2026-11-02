@@ -13,8 +13,7 @@
 //!
 //! | Need | Item |
 //! |---|---|
-//! | Make the memory | [`create`] (a memfd), [`add_seals`], [`seals`], [`Seals`] |
-//! | Make it, map it writable and seal it, in that order | [`create_mapped`] |
+//! | Make the memory | [`create`] (a memfd), [`add_seals`], [`seal_unsupported`], [`seals`], [`Seals`] |
 //! | Map it | [`Mapping`], [`RoMapping`], and [`Mapping::heap`] for tests |
 //! | Split it by its layout | [`Carve`], [`RoCarve`] |
 //! | Load and store a word, an array of words | [`Word`], [`Words`] |
@@ -101,9 +100,12 @@ pub(crate) use element::bytes_of_mut;
 pub use element::Element;
 pub use futex::{futex_wait, futex_wake, Deadline};
 pub use mapping::{Mapping, RoMapping};
-pub use memfd::{add_seals, create, create_mapped, seals, verify_received, CreateOptions, Seals};
+pub use memfd::{
+    add_seals, create, seal_unsupported, seals, verify_received, CreateOptions, Seals,
+};
 pub use piece::{
-    AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType, Words,
+    ring_parts, AtomicU64, Bytes, Carve, Lendable, RoBytes, RoCarve, RoLendable, Word, WordType,
+    Words,
 };
 // A glob: `RoWord64` is there only on the architectures `word.rs` names.
 pub use word::*;

@@ -335,8 +335,9 @@ use std::sync::{self, Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::death::{DeathCmd, DeathRegistry};
-use crate::freeze::{ClearDone, FreezeCmd, FreezeRegistry};
+use crate::death::DeathRegistry;
+use crate::freeze::FreezeRegistry;
+use crate::notification::{ClearDone, NotifyCmd, Registrations};
 use crate::{binder::*, error::*, proxy::*, sys::binder, thread_state};
 
 /// A handle's shared `BC_INCREFS`; `Drop` write-locks `handle_to_proxy`, so never drop under it.
@@ -420,10 +421,7 @@ impl Drop for HandlePin {
             return;
         };
         {
-            let mut handle_to_proxy = this
-                .handle_to_proxy
-                .write()
-                .expect("Handle to proxy lock poisoned");
+            let mut handle_to_proxy = this.proxies_mut();
             expunge_locked(&mut handle_to_proxy, self.handle, self);
         }
         let count = {
@@ -593,6 +591,22 @@ impl PinLedger {
     }
 }
 
+/// A pid the freeze ioctls take: positive, else `BadValue` before any ioctl.
+fn positive_pid(pid: i32) -> Result<u32> {
+    u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or(StatusCode::BadValue)
+}
+
+/// `BINDER_SET_MAX_THREADS`, its failure logged.
+fn set_max_threads_ioctl(driver: &File, max_threads: u32) -> Result<()> {
+    binder::set_max_threads(driver, max_threads).map_err(|e| {
+        log::error!("Binder ioctl to set max threads failed: {e}");
+        errno_status(e)
+    })
+}
+
 /// `BC_DECREFS` for `count` pins; call with no lock held (module doc "Proxy cache entry").
 fn release_pins(handle: u32, count: u32) {
     for _ in 0..count {
@@ -644,6 +658,13 @@ pub(crate) struct PublishedNative {
     pub(crate) kernel_refs: u32,
     /// Dedup hits whose `incref_publish` is pending; removal needs 0 (module doc).
     pub(crate) pending_reservations: u32,
+}
+
+impl PublishedNative {
+    /// No parcel object, kernel ref or pending reservation holds the entry: it may go.
+    fn unreferenced(&self) -> bool {
+        self.publish_count == 0 && self.kernel_refs == 0 && self.pending_reservations == 0
+    }
 }
 
 /// How this process treats **blocking** (non-oneway) outgoing binder
@@ -1083,13 +1104,7 @@ impl ProcessState {
     /// The cached or new proxy for `handle`; its stability is the caller's to fill.
     pub(crate) fn proxy_for_handle(&self, handle: u32) -> Result<Arc<ProxyHandle>> {
         // Read-lock fast path: pure Arc::clone, no kernel command.
-        if let Some(arc) = self
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
-            .get(&handle)
-            .and_then(|e| e.weak.upgrade())
-        {
+        if let Some(arc) = self.proxies().get(&handle).and_then(|e| e.weak.upgrade()) {
             return Ok(arc);
         }
 
@@ -1109,10 +1124,7 @@ impl ProcessState {
     /// P1, under the write lock: decide the sub-case; case (a) pins (`BC_INCREFS` + flush).
     fn slow_path_p1(&self, handle: u32) -> Result<SlowPathDecision> {
         // Write lock though P1 only reads: it serializes the BC_INCREFS issue point.
-        let handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
+        let handle_to_proxy = self.proxies_mut();
 
         if let Some(entry) = handle_to_proxy.get(&handle) {
             // Case (c): another thread inserted/upgraded since the read-fast-path miss.
@@ -1127,13 +1139,10 @@ impl ProcessState {
         }
 
         // Case (a): pin under the lock; see module doc "Proxy cache slow path" for why.
-        thread_state::inc_weak_handle(handle)?;
-        if let Err(err) = thread_state::flush_commands() {
-            log::warn!(
-                "BC_INCREFS for handle {handle} failed at flush: {err:?}; \
-                 handle is no longer valid in the kernel"
-            );
-            return Err(StatusCode::DeadObject);
+        if let Err(err) = thread_state::send_weak_pin(handle) {
+            // Never sent, so no pin is owed; a failed flush the driver consumed counts as sent.
+            log::warn!("BC_INCREFS for handle {handle} was not sent: {err:?}");
+            return Err(err);
         }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         Ok(SlowPathDecision::NeedIpc(SlowPathPlan::CaseA {
@@ -1166,10 +1175,7 @@ impl ProcessState {
         let _proxy_count_defer = crate::proxy_count::CallbackDeferGuard::new();
         // Declared before the guard (and `ready` is a parameter) so every pin drops after the lock.
         let entry_pin: Option<Arc<HandlePin>>;
-        let mut handle_to_proxy = self
-            .handle_to_proxy
-            .write()
-            .expect("Handle to proxy lock poisoned");
+        let mut handle_to_proxy = self.proxies_mut();
 
         let entry = handle_to_proxy.get(&handle);
         // Re-check (c): a concurrent slow path completed during our P2; ours is redundant.
@@ -1194,9 +1200,7 @@ impl ProcessState {
         // Pin compared before upgrading, so no other pin's proxy is upgraded and dropped here.
         Self::instance()
             .get()?
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
+            .proxies()
             .get(&pin.handle())
             .filter(|entry| std::ptr::eq(entry.pin.as_ptr(), Arc::as_ptr(pin)))
             .and_then(|entry| entry.weak.upgrade())
@@ -1206,12 +1210,7 @@ impl ProcessState {
     #[cfg(test)]
     pub(crate) fn cache_generation_for(&self, handle: u32) -> Option<u64> {
         // The upgraded pin drops after the lock (module doc "Proxy cache entry").
-        let pin = self
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned")
-            .get(&handle)
-            .and_then(|e| e.pin.upgrade());
+        let pin = self.proxies().get(&handle).and_then(|e| e.pin.upgrade());
         pin.map(|pin| pin.generation())
     }
 
@@ -1219,10 +1218,7 @@ impl ProcessState {
     pub(crate) fn send_obituary_for_handle(&self, handle: u32) -> Result<()> {
         // Upgrade and remove under one lock: a P3 commit in between would lose its obituary.
         let removed = {
-            let mut handle_to_proxy = self
-                .handle_to_proxy
-                .write()
-                .expect("Handle to proxy lock poisoned");
+            let mut handle_to_proxy = self.proxies_mut();
             // Recipients live only on a live proxy; the pin stays with its holders (module doc).
             handle_to_proxy
                 .remove(&handle)
@@ -1252,6 +1248,32 @@ impl ProcessState {
         thread_state::flush_commands()
     }
 
+    /// The proxy cache, read; module doc "Proxy cache slow path" says when a write is needed.
+    fn proxies(&self) -> sync::RwLockReadGuard<'_, HashMap<u32, CacheEntry>> {
+        self.handle_to_proxy
+            .read()
+            .expect("Handle to proxy lock poisoned")
+    }
+
+    fn proxies_mut(&self) -> sync::RwLockWriteGuard<'_, HashMap<u32, CacheEntry>> {
+        self.handle_to_proxy
+            .write()
+            .expect("Handle to proxy lock poisoned")
+    }
+
+    /// The published natives, read: the `BR_TRANSACTION` lookup's side.
+    fn natives(&self) -> sync::RwLockReadGuard<'_, HashMap<u64, PublishedNative>> {
+        self.published_natives
+            .read()
+            .expect("Published natives lock poisoned")
+    }
+
+    fn natives_mut(&self) -> sync::RwLockWriteGuard<'_, HashMap<u64, PublishedNative>> {
+        self.published_natives
+            .write()
+            .expect("Published natives lock poisoned")
+    }
+
     fn pin_ledger_lock(&self) -> sync::MutexGuard<'_, PinLedger> {
         self.pin_ledger.lock().expect("Pin ledger lock poisoned")
     }
@@ -1265,31 +1287,46 @@ impl ProcessState {
 
     /// `BR_CLEAR_DEATH_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
     pub(crate) fn death_clear_done(&self, handle: u32) {
-        {
-            let mut registry = self.death_lock();
-            // A link made during the clear asked for this request (module doc "Death links").
-            if registry.clear_done(handle) == ClearDone::Rerequest {
-                if let Err(err) = thread_state::send_death_request(handle) {
-                    registry.abort_request(handle);
-                    log::error!(
-                        "BC_REQUEST_DEATH_NOTIFICATION for handle {handle} failed: {err:?}; \
-                         its recipients will not hear of its death"
-                    );
-                }
+        // A link made during the clear asked for this request (module doc "Death links").
+        self.finish_clear(
+            self.death_lock(),
+            handle,
+            ClearKind::Death,
+            thread_state::send_death_request,
+            "its recipients will not hear of its death",
+        );
+    }
+
+    /// A clear-done: the deferred request flushed under the lock (or forgotten), then the pins.
+    fn finish_clear<R: Registrations>(
+        &self,
+        mut registry: sync::MutexGuard<'_, R>,
+        handle: u32,
+        kind: ClearKind,
+        request: fn(u32) -> Result<()>,
+        lost: &str,
+    ) {
+        if registry.clear_done(handle) == ClearDone::Rerequest {
+            if let Err(err) = request(handle) {
+                registry.abort_request(handle);
+                log::error!("{kind:?} re-request for handle {handle} failed: {err:?}; {lost}");
             }
         }
-        let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Death);
+        drop(registry);
+        // The ledger warns for a done with no clear in flight, of either kind.
+        let count = self.pin_ledger_lock().clear_done(handle, kind);
         release_pins(handle, count);
     }
 
     fn death_lock(&self) -> sync::MutexGuard<'_, DeathRegistry> {
+        // Not recovered: a panic before `abort_request` leaves a slot no kernel request backs.
         self.death.lock().expect("Death registry lock poisoned")
     }
 
     /// `owner`'s recipient list became non-empty; `Err` means nothing was registered.
     pub(crate) fn link_death(&self, handle: u32, owner: usize) -> Result<()> {
         let mut registry = self.death_lock();
-        if registry.link(handle, owner) == Some(DeathCmd::Request) {
+        if registry.link(handle, owner) == Some(NotifyCmd::Request) {
             // Flushed under the lock: a clear written after it must not overtake it.
             thread_state::send_death_request(handle)
                 .inspect_err(|_| registry.abort_request(handle))?;
@@ -1301,7 +1338,7 @@ impl ProcessState {
     pub(crate) fn unlink_death(&self, handle: u32, owner: usize) -> Result<()> {
         let mut registry = self.death_lock();
         match registry.unlink(handle, owner) {
-            Some(DeathCmd::Clear) => thread_state::clear_death_notification(handle),
+            Some(NotifyCmd::Clear) => thread_state::clear_death_notification(handle),
             _ => Ok(()),
         }
     }
@@ -1335,7 +1372,7 @@ impl ProcessState {
     ) -> Result<()> {
         {
             let mut registry = self.freeze_lock();
-            if registry.add(handle, owner, proxy, callback) == Some(FreezeCmd::Request) {
+            if registry.add(handle, owner, proxy, callback) == Some(NotifyCmd::Request) {
                 self.request_freeze_locked(&mut registry, handle)?;
             }
         }
@@ -1361,7 +1398,7 @@ impl ProcessState {
         callback: &sync::Weak<dyn FrozenStateChangeCallback>,
     ) -> Result<()> {
         let mut registry = self.freeze_lock();
-        if registry.remove(handle, owner, callback)? == Some(FreezeCmd::Clear) {
+        if registry.remove(handle, owner, callback)? == Some(NotifyCmd::Clear) {
             Self::write_freeze_clear(handle);
             // AOSP flushes eagerly (`RELEASE_LIBBINDER_FREEZE_USE_FLUSH_EAGERLY`).
             if let Err(err) = thread_state::flush_commands_if_alive() {
@@ -1375,7 +1412,7 @@ impl ProcessState {
 
     /// `ProxyHandle::drop` of a proxy that registered callbacks; on a looper the clear waits.
     pub(crate) fn drop_frozen_owner(&self, handle: u32, owner: usize) {
-        if self.freeze_lock().drop_owner(handle, owner) == Some(FreezeCmd::Clear) {
+        if self.freeze_lock().drop_owner(handle, owner) == Some(NotifyCmd::Clear) {
             Self::write_freeze_clear(handle);
         }
     }
@@ -1396,25 +1433,14 @@ impl ProcessState {
 
     /// `BR_CLEAR_FREEZE_NOTIFICATION_DONE`; R1: call with no `THREAD_STATE` borrow held.
     pub(crate) fn freeze_clear_done(&self, handle: u32) {
-        let outcome = {
-            let mut registry = self.freeze_lock();
-            let outcome = registry.clear_done(handle);
-            // AOSP re-requests here too (`onFrozenStateChangeListenerRemoved`).
-            if outcome == ClearDone::Rerequest {
-                if let Err(err) = self.request_freeze_locked(&mut registry, handle) {
-                    log::error!(
-                        "BC_REQUEST_FREEZE_NOTIFICATION for handle {handle} failed: {err:?}; \
-                         its callbacks are dropped"
-                    );
-                }
-            }
-            outcome
-        };
-        if outcome == ClearDone::Unexpected {
-            log::warn!("BR_CLEAR_FREEZE_NOTIFICATION_DONE for handle {handle} with no clear");
-        }
-        let count = self.pin_ledger_lock().clear_done(handle, ClearKind::Freeze);
-        release_pins(handle, count);
+        // AOSP re-requests here too (`onFrozenStateChangeListenerRemoved`).
+        self.finish_clear(
+            self.freeze_lock(),
+            handle,
+            ClearKind::Freeze,
+            thread_state::send_freeze_request,
+            "its callbacks are dropped",
+        );
     }
 
     /// Runs `handle`'s undelivered callbacks, one thread at a time; see `freeze` module doc.
@@ -1438,11 +1464,7 @@ impl ProcessState {
                         callback.on_state_changed(&who, state);
                     }));
                     if let Err(payload) = result {
-                        let msg = payload
-                            .downcast_ref::<&'static str>()
-                            .copied()
-                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                            .unwrap_or("<non-string panic payload>");
+                        let msg = crate::error::panic_message(&payload);
                         log::error!(
                             "FrozenStateChangeCallback panicked for handle {handle:X}: {msg}"
                         );
@@ -1522,12 +1544,8 @@ impl ProcessState {
     }
 
     fn set_frozen(&self, pid: i32, enable: bool, timeout: Duration) -> Result<()> {
-        let pid = u32::try_from(pid)
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or(StatusCode::BadValue)?;
         let info = binder::binder_freeze_info {
-            pid,
+            pid: positive_pid(pid)?,
             enable: enable.into(),
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
         };
@@ -1545,12 +1563,8 @@ impl ProcessState {
     ///   which SELinux grants this ioctl alone, as for
     ///   [`freeze`](Self::freeze).
     pub fn process_freeze_info(&self, pid: i32) -> Result<ProcessFreezeInfo> {
-        let pid = u32::try_from(pid)
-            .ok()
-            .filter(|pid| *pid > 0)
-            .ok_or(StatusCode::BadValue)?;
         let mut info = binder::binder_frozen_status_info {
-            pid,
+            pid: positive_pid(pid)?,
             sync_recv: 0,
             async_recv: 0,
         };
@@ -1565,10 +1579,7 @@ impl ProcessState {
     /// Publish a native (dedup by `Arc::ptr_eq`) and return its id; see module doc.
     pub(crate) fn publish_native(&self, arc: Arc<dyn IBinder>) -> u64 {
         // One write lock for dedup + insert: a read-then-write split would duplicate entries.
-        let mut map = self
-            .published_natives
-            .write()
-            .expect("Published natives lock poisoned");
+        let mut map = self.natives_mut();
         for (existing_id, entry) in map.iter_mut() {
             if Arc::ptr_eq(entry.binder_pin.as_arc(), &arc) {
                 // Hold the entry until the matching `acquire`; a wrap to 0 would defeat that.
@@ -1591,10 +1602,7 @@ impl ProcessState {
 
     /// `acquire` arm for `BINDER_TYPE_BINDER`; `false` (a caller bug) for an unknown id.
     pub(crate) fn incref_publish(&self, id: u64) -> bool {
-        let mut map = self
-            .published_natives
-            .write()
-            .expect("Published natives lock poisoned");
+        let mut map = self.natives_mut();
         match map.get_mut(&id) {
             Some(entry) => {
                 entry.publish_count += 1;
@@ -1609,10 +1617,7 @@ impl ProcessState {
     /// `release` arm for `BINDER_TYPE_BINDER`; removes the entry at zero, `false` if unknown.
     pub(crate) fn decref_publish(&self, id: u64) -> bool {
         let trigger_remove = {
-            let mut map = self
-                .published_natives
-                .write()
-                .expect("Published natives lock poisoned");
+            let mut map = self.natives_mut();
             match map.get_mut(&id) {
                 Some(entry) => {
                     // Release builds clamp an unpaired release; debug builds assert on it.
@@ -1623,9 +1628,7 @@ impl ProcessState {
                          FlatBinderObject::release pairing)"
                     );
                     entry.publish_count = entry.publish_count.saturating_sub(1);
-                    entry.publish_count == 0
-                        && entry.kernel_refs == 0
-                        && entry.pending_reservations == 0
+                    entry.unreferenced()
                 }
                 None => return false,
             }
@@ -1638,10 +1641,7 @@ impl ProcessState {
 
     /// `BR_INCREFS`/`BR_ACQUIRE`/`BR_ATTEMPT_ACQUIRE`: bump `kernel_refs`; `None` if unknown.
     pub(crate) fn ref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
-        let mut map = self
-            .published_natives
-            .write()
-            .expect("Published natives lock poisoned");
+        let mut map = self.natives_mut();
         let entry = map.get_mut(&id)?;
         entry.kernel_refs += 1;
         Some(Arc::clone(entry.binder_pin.as_arc()))
@@ -1650,18 +1650,11 @@ impl ProcessState {
     /// Deferred `BR_RELEASE`/`BR_DECREFS`: decrement `kernel_refs`, removing the entry at zero.
     pub(crate) fn deref_native_kernel(&self, id: u64) -> Option<Arc<dyn IBinder>> {
         let (arc, trigger_remove) = {
-            let mut map = self
-                .published_natives
-                .write()
-                .expect("Published natives lock poisoned");
+            let mut map = self.natives_mut();
             let entry = map.get_mut(&id)?;
             // Clamps a BR_DECREFS-before-BR_INCREFS race; see module doc "`kernel_refs` drift".
             entry.kernel_refs = entry.kernel_refs.saturating_sub(1);
-            let arc = Arc::clone(entry.binder_pin.as_arc());
-            let trigger = entry.publish_count == 0
-                && entry.kernel_refs == 0
-                && entry.pending_reservations == 0;
-            (arc, trigger)
+            (Arc::clone(entry.binder_pin.as_arc()), entry.unreferenced())
         };
         if trigger_remove {
             self.remove_entry_if_zero(id);
@@ -1671,25 +1664,18 @@ impl ProcessState {
 
     /// Read-only lookup for `BR_TRANSACTION` and a round-trip `BINDER_TYPE_BINDER` read.
     pub(crate) fn lookup_native(&self, id: u64) -> Option<Arc<dyn IBinder>> {
-        let map = self
-            .published_natives
-            .read()
-            .expect("Published natives lock poisoned");
+        let map = self.natives();
         map.get(&id).map(|e| Arc::clone(e.binder_pin.as_arc()))
     }
 
     /// Removal phase 2: re-check the counters, remove, drop unlocked; see module doc.
     fn remove_entry_if_zero(&self, id: u64) {
         let entry = {
-            let mut map = self
-                .published_natives
-                .write()
-                .expect("Published natives lock poisoned");
+            let mut map = self.natives_mut();
             let Entry::Occupied(slot) = map.entry(id) else {
                 return;
             };
-            let e = slot.get();
-            if e.publish_count != 0 || e.kernel_refs != 0 || e.pending_reservations != 0 {
+            if !slot.get().unreferenced() {
                 return;
             }
             slot.remove()
@@ -1759,10 +1745,7 @@ impl ProcessState {
             );
             return Err(StatusCode::InvalidOperation);
         }
-        binder::set_max_threads(&self.driver, max_threads).map_err(|e| {
-            log::error!("Binder ioctl to set max threads failed: {e}");
-            errno_status(e)
-        })?;
+        set_max_threads_ioctl(&self.driver, max_threads)?;
         self.max_threads.store(max_threads, Ordering::Release);
         Self::log_max_threads(max_threads);
         Ok(())
@@ -1966,10 +1949,7 @@ fn open_driver(driver: &Path, max_threads: u32) -> Result<File> {
         return Err(StatusCode::NoInit);
     }
 
-    binder::set_max_threads(&fd, max_threads).map_err(|e| {
-        log::error!("Binder ioctl to set max threads failed: {e}");
-        errno_status(e)
-    })?;
+    set_max_threads_ioctl(&fd, max_threads)?;
     log::info!("Binder driver max threads set to {max_threads}");
 
     let enable = DEFAULT_ENABLE_ONEWAY_SPAM_DETECTION;
@@ -2241,10 +2221,7 @@ mod tests {
             );
         }
         // Exactly one cache entry for this handle.
-        let map = ProcessState::as_self()
-            .handle_to_proxy
-            .read()
-            .expect("Handle to proxy lock poisoned");
+        let map = ProcessState::as_self().proxies();
         assert!(
             map.contains_key(&0),
             "case (a) winner must have installed an entry for handle 0"

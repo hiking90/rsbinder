@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use rsbinder::{DeathRecipient, SIBinder, Strong, WIBinder};
+use rsbinder::{DeathLink, DeathRecipient, SIBinder, Strong, WIBinder};
 
 use crate::aidl::ISubscription::ISubscription;
 use crate::backpressure::Readers;
@@ -17,31 +17,52 @@ use crate::pool::{self, Pins};
 use crate::wake::{send_wake, Sent};
 use crate::SubscriberInfo;
 
-/// A death notification registered on a proxy, removed on drop.
-pub(crate) struct DeathLink<R: DeathRecipient + 'static> {
-    binder: SIBinder,
-    recipient: Arc<R>,
+/// Link `recipient` to `binder`'s death, removed when the link drops; `None` for a binder of
+/// this process, which has none.
+pub(crate) fn link_death(
+    binder: &SIBinder,
+    recipient: impl DeathRecipient + 'static,
+) -> rsbinder::Result<Option<DeathLink>> {
+    if binder.as_proxy().is_none() {
+        return Ok(None);
+    }
+    DeathLink::new(binder, Arc::new(recipient)).map(Some)
 }
 
-impl<R: DeathRecipient + 'static> DeathLink<R> {
-    /// Link `recipient` to `binder`'s death; `None` for a binder of this process, which has none.
-    pub(crate) fn new(binder: &SIBinder, recipient: R) -> rsbinder::Result<Option<Self>> {
-        if binder.as_proxy().is_none() {
-            return Ok(None);
-        }
-        let recipient = Arc::new(recipient);
-        binder.link_to_death_arc(&recipient)?;
-        Ok(Some(Self {
-            binder: binder.clone(),
-            recipient,
-        }))
+/// A remote binder for tests that links, and whose unlink is counted and panics.
+#[cfg(test)]
+pub(crate) struct PanickingUnlink(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl PanickingUnlink {
+    pub(crate) fn binder(unlinked: &Arc<std::sync::atomic::AtomicUsize>) -> SIBinder {
+        SIBinder::new(Arc::new(Self(unlinked.clone()))).expect("binder")
     }
 }
 
-impl<R: DeathRecipient + 'static> Drop for DeathLink<R> {
-    fn drop(&mut self) {
-        // After the death it is gone already; nothing else can fail here.
-        let _ = self.binder.unlink_to_death_arc(&self.recipient);
+#[cfg(test)]
+impl rsbinder::IBinder for PanickingUnlink {
+    fn link_to_death(&self, _: Weak<dyn DeathRecipient>) -> rsbinder::Result<()> {
+        Ok(())
+    }
+    fn unlink_to_death(&self, _: Weak<dyn DeathRecipient>) -> rsbinder::Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("the unlink panics");
+    }
+    fn ping_binder(&self) -> rsbinder::Result<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_transactable(&self) -> Option<&dyn rsbinder::Transactable> {
+        None
+    }
+    fn descriptor(&self) -> &str {
+        "rsbinder.test.IRemote"
+    }
+    fn is_remote(&self) -> bool {
+        true
     }
 }
 
@@ -101,7 +122,7 @@ pub(crate) struct Link {
     subscription: Strong<dyn ISubscription>,
     /// Taken out by a wait for room (plan 15 §6.5): no longer waited for, its pin still kept.
     evicted: AtomicBool,
-    _death: Option<DeathLink<Watch>>,
+    _death: Option<DeathLink>,
 }
 
 /// How a link wants waking after a commit.
@@ -132,7 +153,7 @@ impl Link {
             control,
             uid,
             pid,
-            _death: DeathLink::new(token, watch)?,
+            _death: link_death(token, watch)?,
             dead,
             // No `state` with `WAITING` raised is zero.
             woken: AtomicU32::new(0),

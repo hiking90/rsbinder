@@ -147,6 +147,10 @@ pub enum EndReason {
     /// a lost connection, so the loop records it here as `DeadObject`.
     Frame(StatusCode),
     /// Dispatching a frame failed — the handler, or writing its reply.
+    /// `Dispatch(Unknown)` is also a panic that escaped the dispatch: not
+    /// the handler's own, which is replied as `Unknown` and leaves the
+    /// session serving, but one from user code a release ran, such as
+    /// the `Drop` of a binder the session let go.
     Dispatch(StatusCode),
 }
 

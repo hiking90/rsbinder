@@ -156,7 +156,7 @@ impl Until {
     pub(crate) fn new(at: Instant) -> Self {
         Self {
             at,
-            futex: Deadline::after(at.saturating_duration_since(Instant::now())),
+            futex: Deadline::until(at),
         }
     }
 }
@@ -693,10 +693,12 @@ pub(crate) use pool::{on_pool, Leftover};
 /// A wait handed to the blocking pool, and the record of it the next wait joins.
 #[cfg(feature = "tokio")]
 mod pool {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::Arc;
+    #[cfg(test)]
+    use std::sync::Mutex;
     use std::time::Instant;
 
+    use rsbinder::__sync::PoolGate;
     use rsbinder::StatusCode;
 
     use super::{serve, GiveBack, Hand, Handed, Local, Parts, Settle};
@@ -704,41 +706,28 @@ mod pool {
     /// Whether a wait handed to the pool has not ended: while its future lives, or while a pool
     /// thread runs it. At most one, which the next wait joins first.
     ///
-    /// `busy` is raised by `on_pool` and lowered by `settle`, which the wait runs as it goes
-    /// (`Handed`'s drop). Only the subscriber's own receive raises it, and only once no wait is
-    /// out, so a `settle` never races a raise. `settle` lowers it while holding `idle_lock`, the
-    /// mutex `join` holds from its look at `busy` until `Condvar::wait` releases it, so a `join`
-    /// that saw it up is on the condvar before `settle` lowers it and gets the `notify_all`.
+    /// The gate is raised by `on_pool` and lowered by `settle`, which the wait runs as it goes
+    /// (`Handed`'s drop); `PoolGate` says why a join cannot sleep through it. Only the
+    /// subscriber's own receive raises it, and only once no wait is out. A gate seen down after
+    /// a wait went to the pool is `settle`'s store, which a wait a pool thread ran makes after
+    /// it lowered `parked` and `WAITING` and took its `ABANDON`, so a wait that begins after it
+    /// is their one owner. A wait taken back before it ran armed nothing.
     #[derive(Default)]
     pub(crate) struct Leftover {
-        busy: AtomicBool,
-        idle_lock: Mutex<()>,
-        idle: Condvar,
-        notify: tokio::sync::Notify,
+        gate: PoolGate<()>,
         /// A test's step as a receive begins to join, after the look before it.
         #[cfg(test)]
         pub(crate) before_join: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-        /// A test's step in a join that saw a wait out, before it sleeps on `idle`.
-        #[cfg(test)]
-        in_join: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl Leftover {
-        fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
-            self.idle_lock.lock().unwrap_or_else(|e| e.into_inner())
-        }
-
-        /// Whether a wait is out. A `false` after a wait went to the pool is `settle`'s store,
-        /// which a wait a pool thread ran makes after it lowered `parked` and `WAITING` and took
-        /// its `ABANDON`: the `Acquire` pairs with that `Release`, so a wait that begins after it
-        /// is their one owner. A wait taken back before it ran armed nothing.
+        /// Whether a wait is out.
         pub(crate) fn busy(&self) -> bool {
-            self.busy.load(Ordering::Acquire)
+            self.gate.busy()
         }
 
-        /// No lock: no wait is out, so no `settle` and no `join` runs meanwhile.
         fn begin(&self) {
-            self.busy.store(true, Ordering::Relaxed);
+            self.gate.begin();
         }
 
         /// Block until no wait is out; `false` if `deadline` passes first.
@@ -747,49 +736,17 @@ mod pool {
             if let Some(step) = self.before_join.lock().expect("lock").as_ref() {
                 step();
             }
-            let mut idle = self.lock();
-            while self.busy() {
-                #[cfg(test)]
-                if let Some(step) = self.in_join.lock().expect("lock").as_ref() {
-                    step();
-                }
-                let Some(deadline) = deadline else {
-                    idle = self.idle.wait(idle).unwrap_or_else(|e| e.into_inner());
-                    continue;
-                };
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return false;
-                }
-                idle = self
-                    .idle
-                    .wait_timeout(idle, left)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
-            }
-            true
+            self.gate.join(deadline)
         }
 
         pub(crate) async fn join_async(&self) {
-            loop {
-                // Made before the check: a `Notified` gets `notify_waiters` from its creation on.
-                let notified = self.notify.notified();
-                if !self.busy() {
-                    return;
-                }
-                notified.await;
-            }
+            self.gate.join_async().await;
         }
     }
 
     impl Settle for Leftover {
         fn settle(&self) {
-            {
-                let _idle = self.lock();
-                self.busy.store(false, Ordering::Release);
-            }
-            self.idle.notify_all();
-            self.notify.notify_waiters();
+            self.gate.settle(|()| ());
         }
     }
 
@@ -816,46 +773,6 @@ mod pool {
         .await;
         give_back.armed = false;
         ran
-    }
-
-    #[cfg(all(test, not(loom)))]
-    mod tests {
-        use std::sync::{mpsc, Arc, Mutex};
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        use super::{Leftover, Settle};
-
-        /// A wait that ends after a join saw it out, before the join sleeps, wakes that join.
-        #[test]
-        fn a_wait_that_ends_as_a_join_goes_to_sleep_wakes_the_join() {
-            let left = Arc::new(Leftover::default());
-            left.begin();
-            let (at_join, joining) = mpsc::channel();
-            let (ended, settled) = mpsc::channel::<()>();
-            let hold = Mutex::new(Some((at_join, settled)));
-            *left.in_join.lock().unwrap() = Some(Box::new(move || {
-                if let Some((at_join, settled)) = hold.lock().unwrap().take() {
-                    at_join.send(()).unwrap();
-                    // A `settle` that takes the join's lock cannot end before the join sleeps.
-                    let _ = settled.recv_timeout(Duration::from_millis(500));
-                }
-            }));
-            let receiving = {
-                let left = left.clone();
-                thread::spawn(move || {
-                    let started = Instant::now();
-                    let joined = left.join(Some(started + Duration::from_secs(5)));
-                    (joined, started.elapsed())
-                })
-            };
-            joining.recv().unwrap();
-            left.settle();
-            let _ = ended.send(());
-            let (joined, took) = receiving.join().unwrap();
-            assert!(joined);
-            assert!(took < Duration::from_secs(3), "missed the wake: {took:?}");
-        }
     }
 }
 

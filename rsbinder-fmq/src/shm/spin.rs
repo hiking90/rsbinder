@@ -77,14 +77,21 @@ pub fn spin_budget(deadline: Option<&Deadline>) -> Duration {
     }
 }
 
-/// One of this process's concurrent looks: a look pays only while its peer runs, so half the cores.
-struct SpinSlot;
+/// One of this process's concurrent looks, held while it lasts: a look pays only while its peer
+/// runs, so at most half the cores' worth of threads look at once.
+///
+/// [`spin_until`] takes one past its first round. A look of its own shape, such as one that
+/// reads a counter less often than every turn, takes one at the same point, so that it counts
+/// against the same limit.
+#[must_use = "the slot is given back when it drops"]
+pub struct SpinSlot(());
 
 static SPINNERS: AtomicUsize = AtomicUsize::new(0);
 
 impl SpinSlot {
+    /// A slot, or `None` when the process already has its share of threads looking.
     #[inline]
-    fn take() -> Option<SpinSlot> {
+    pub fn take() -> Option<SpinSlot> {
         static MAX: OnceLock<usize> = OnceLock::new();
         let max = *MAX.get_or_init(|| {
             std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
@@ -93,7 +100,7 @@ impl SpinSlot {
             SPINNERS.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
-        Some(SpinSlot)
+        Some(SpinSlot(()))
     }
 }
 
@@ -155,14 +162,12 @@ pub fn spin_until(budget: Duration, mut done: impl FnMut() -> bool) -> (Look, Du
 /// One gauge per side and channel. Each wait goes:
 ///
 /// ```
-/// # use rsbinder_fmq::shm::spin::{spin_until, Look, SpinGauge};
+/// # use rsbinder_fmq::shm::spin::{Look, SpinGauge};
 /// # use std::time::Instant;
 /// # let gauge = SpinGauge::default();
 /// # let ready = || true;
 /// # let park = || ();
-/// let budget = gauge.budget(None);
-/// let (look, spun) = spin_until(budget, ready);
-/// gauge.spun(spun, look);
+/// let look = gauge.look(None, ready);
 /// if look == Look::Empty {
 ///     let parked_at = Instant::now();
 ///     park();
@@ -195,6 +200,15 @@ impl SpinGauge {
         spin_budget(deadline)
     }
 
+    /// One look for a wait that ends at `deadline`: [`budget`](Self::budget), [`spin_until`]
+    /// on `done`, then [`spun`](Self::spun) with what it came up with.
+    #[inline]
+    pub fn look(&self, deadline: Option<&Deadline>, done: impl FnMut() -> bool) -> Look {
+        let (look, spun) = spin_until(self.budget(deadline), done);
+        self.spun(spun, look);
+        look
+    }
+
     /// Whether looking is off: the last 64 full looks found nothing.
     #[inline]
     pub fn is_off(&self) -> bool {
@@ -222,8 +236,12 @@ impl SpinGauge {
     ///
     /// Turns the look back on when the gauge is off, this wait parked without looking, and the
     /// wake came within [`SPIN`]. After a full look, a quick wake is that look's miss and
-    /// changes nothing. Leave out a park that did not sleep — one whose wake was already
-    /// pending — as it says nothing about how soon the peer writes.
+    /// changes nothing.
+    ///
+    /// Leave out a park that did not sleep because a wake was pending from before the wait,
+    /// such as a bit an earlier lazy wake left up: it says nothing about how soon the peer
+    /// writes. A park that returns at once because the peer changed the word after the look
+    /// does count; it is the quick wake a look would have caught.
     #[inline]
     pub fn parked(&self, took: Duration) {
         if self.is_off() && self.skipped.load(Ordering::Relaxed) > 0 && took < SPIN {

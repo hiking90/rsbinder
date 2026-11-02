@@ -124,7 +124,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, Connection, ServerConnection};
 use sha2::{Digest, Sha256};
 
-use super::{read_frame, write_frame, CertId, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
+use super::{CertId, OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::{RpcError, RpcResult};
 
 /// Ciphertext read chunk: one TLS record is ≤ 16 KiB, so a read takes about one record.
@@ -182,15 +182,8 @@ impl WriteLock {
         let deadline = std::time::Instant::now() + wait;
         let mut busy = self.busy.lock().expect("tls wlock poisoned");
         while *busy {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            let (guard, _) = self
-                .freed
-                .wait_timeout(busy, deadline - now)
-                .expect("tls wlock poisoned");
-            busy = guard;
+            let waited = crate::signal::wait_until(&self.freed, busy, Some(deadline));
+            busy = waited.expect("tls wlock poisoned").ok()?;
         }
         *busy = true;
         Some(WriteGuard(self))
@@ -466,8 +459,15 @@ fn drive_handshake_within(
     let Some(d) = deadline else {
         return drive_handshake(conn, stream);
     };
-    stream.set_read_timeout(Some(d))?;
-    stream.set_write_timeout(Some(d))?;
+    let armed = stream
+        .set_read_timeout(Some(d))
+        .and_then(|()| stream.set_write_timeout(Some(d)));
+    match armed {
+        Ok(()) => {}
+        // As `HandshakeDeadline::arm`: XNU refuses it on a shut socket, whose reads end at EOF.
+        Err(_) if stream.peer_closed() == Some(true) => return drive_handshake(conn, stream),
+        Err(e) => return Err(e.into()),
+    }
     // Each wait above; the whole handshake here, against a peer that sends a byte at a time.
     let mut whole = crate::rpc::deadline::PhaseDeadline::arm_with(Some(d), || {
         stream.socket().and_then(super::socket_shutdown_handle)
@@ -537,11 +537,7 @@ fn linger_for_alert(conn: &mut Connection, stream: &dyn TlsStream) {
 
 /// `BadValue` (via `EINVAL`) for a zero handshake deadline, which bounds nothing.
 fn refuse_zero_handshake_timeout(d: Duration, what: &str) -> RpcResult<()> {
-    if d.is_zero() {
-        log::error!("{what}: a zero handshake_timeout is refused; pass a nonzero bound");
-        return Err(RpcError::Io(std::io::Error::from(rustix::io::Errno::INVAL)));
-    }
-    Ok(())
+    crate::rpc::deadline::refuse_zero(Some(d), what)
 }
 
 impl std::fmt::Debug for TlsTransport {
@@ -849,7 +845,7 @@ impl TlsTransport {
 
     /// Plaintext or the peer's end is ready for `drain`; takes in what the socket holds, unblocked.
     fn input_waiting(&self, sock: std::os::fd::BorrowedFd<'_>) -> RpcResult<bool> {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        use rustix::event::PollFlags;
         loop {
             {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
@@ -867,13 +863,8 @@ impl TlsTransport {
                 self.pump_incoming()?;
                 continue;
             }
-            let mut fds = [PollFd::from_borrowed_fd(sock, PollFlags::IN)];
-            let now = Timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            match poll(&mut fds, Some(&now)) {
-                Ok(_) if fds[0].revents().contains(PollFlags::IN) => {}
+            match super::poll_one(sock, PollFlags::IN, Some(Duration::ZERO)) {
+                Ok(seen) if seen.contains(PollFlags::IN) => {}
                 // Nothing to read; an error flag alone is the next send's to report.
                 Ok(_) => return Ok(false),
                 Err(rustix::io::Errno::INTR) => continue,
@@ -913,18 +904,9 @@ impl TlsTransport {
             return Ok(true);
         }
         let mut tmp = [0u8; TLS_READ_CHUNK];
-        let k = self
-            .reads
-            .read(self.stream.socket(), &self.queue, || loop {
-                match self.stream.read(&mut tmp) {
-                    Ok(k) => return Ok(k),
-                    // EINTR: retry the interrupted blocking read.
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    // Deadline → `Timeout`, as plain sockets (the `DeadlineMidFrame` split).
-                    Err(e) if super::is_timeout(&e) => return Err(RpcError::Timeout),
-                    Err(e) => return Err(e.into()),
-                }
-            })?;
+        let k = self.reads.read(self.stream.socket(), &self.queue, || {
+            super::read_once(|b| self.stream.read(b), &mut tmp)
+        })?;
         let mut c = self.conn.lock().expect("tls conn poisoned");
         if k == 0 {
             let mut eof: &[u8] = &[];
@@ -954,15 +936,6 @@ impl TlsTransport {
 }
 
 impl RpcTransport for TlsTransport {
-    fn send_frame(&self, buf: &[u8]) -> RpcResult<()> {
-        // R34 framing over a `Write` adapter: bytes identical to every other stream backend.
-        write_frame(&mut RawIo(self), buf)
-    }
-
-    fn recv_frame(&self) -> RpcResult<Vec<u8>> {
-        read_frame(&mut RawIo(self))
-    }
-
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         let sock = self.stream.socket().filter(|_| super::unix::WAITING_SENDS);
         self.send_records(buf, sock, None)
@@ -1082,36 +1055,5 @@ impl RpcTransport for TlsTransport {
         let cut = super::absorb_already_shut(self.stream.shutdown_stream());
         drop(held);
         cut
-    }
-}
-
-/// R34 framing over raw TLS I/O, so [`write_frame`]/[`read_frame`] emit identical bytes.
-struct RawIo<'a>(&'a TlsTransport);
-impl Read for RawIo<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self.0.recv_raw(buf) {
-            Ok(n) => Ok(n),
-            // Keep the io kind so `read_header` handles timeouts and clean close as R34 does.
-            Err(RpcError::Io(e)) => Err(e),
-            // `EAGAIN`'s kind, so `read_header`'s `is_timeout` fires (`DeadlineMidFrame` split).
-            Err(RpcError::Timeout) => Err(std::io::ErrorKind::WouldBlock.into()),
-            Err(RpcError::EndOfStream) => Ok(0),
-            // Carried as the payload so `From<io::Error>` hands it back past `read_header`.
-            Err(e @ RpcError::UncleanEndOfStream) => Err(std::io::Error::from(e)),
-            Err(e) => Err(std::io::Error::other(e.to_string())),
-        }
-    }
-}
-impl Write for RawIo<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        // Kind-preserving: a closed-peer write must reach `write_frame` as `EndOfStream`.
-        self.0.send_raw(buf).map_err(std::io::Error::from)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(()) // send_raw already flushes the socket
     }
 }

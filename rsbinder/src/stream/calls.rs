@@ -9,13 +9,14 @@ use std::collections::VecDeque;
 use std::marker::PhantomData;
 #[cfg(feature = "tokio")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::binder::{FromIBinder, Interface, Strong};
 use crate::error::{Result, StatusCode};
 use crate::parcel::Parcel;
 use crate::parcelable::{Deserialize, Serialize};
+use crate::signal::{PoolGate, Signal};
 use crate::status::{BinderResult, ExceptionCode, Status};
 use crate::SIBinder;
 
@@ -25,43 +26,39 @@ use super::generated::rsbinder::stream::IStreamSource::{
 };
 #[cfg(feature = "tokio")]
 use super::pool::on_pool;
+#[cfg(feature = "tokio")]
+use super::EndDecision;
 use super::{
-    status_from_fields, truncated_terminator, unlink_death, watch_death, Ping, PingPolicy,
-    ReceiverPolicy, SinkPolicy,
+    end_decision, status_from_fields, watch_death, Book, Ping, PingPolicy, ReceiverPolicy,
+    SinkPolicy,
 };
 
 // ---- Pinging a quiet peer (plan 2-24 D9) ----
 
-/// Wait on `cv` while `blocked` until `deadline` or `ping.every`; the ping goes out unlocked.
+/// Wait on `signal` while `blocked` until `deadline` or `ping.every`; the ping goes out unlocked.
 fn park<S>(
     mutex: &Mutex<S>,
-    cv: &Condvar,
+    signal: &Signal,
     blocked: impl Fn(&S) -> bool,
     deadline: Option<Instant>,
     ping: Option<&Ping>,
 ) {
-    let quiet_until = ping.and_then(|ping| Instant::now().checked_add(ping.every));
-    // A caller's deadline that comes first ends the wait without a ping.
-    let pings = quiet_until.is_some_and(|quiet| deadline.is_none_or(|d| quiet <= d));
-    let wake_at = if pings { quiet_until } else { deadline };
+    let (wake_at, pings) = Ping::wake_at(ping, deadline);
     let mut state = mutex.lock().unwrap_or_else(|e| e.into_inner());
     while blocked(&state) {
-        let Some(at) = wake_at else {
-            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
-            continue;
-        };
-        let left = at.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            drop(state);
-            if let Some(ping) = ping.filter(|_| pings) {
-                ping.send();
+        state = match signal
+            .wait_until(state, wake_at)
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            Ok(state) => state,
+            Err(state) => {
+                drop(state);
+                if let Some(ping) = ping.filter(|_| pings) {
+                    ping.send();
+                }
+                return;
             }
-            return;
-        }
-        state = cv
-            .wait_timeout(state, left)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
+        };
     }
 }
 
@@ -70,16 +67,16 @@ fn park<S>(
 struct Abandon<'a, S> {
     gone: Arc<AtomicBool>,
     mutex: &'a Mutex<S>,
-    cv: &'a Condvar,
+    signal: &'a Signal,
 }
 
 #[cfg(feature = "tokio")]
 impl<'a, S> Abandon<'a, S> {
-    fn new(mutex: &'a Mutex<S>, cv: &'a Condvar) -> Self {
+    fn new(mutex: &'a Mutex<S>, signal: &'a Signal) -> Self {
         Abandon {
             gone: Arc::default(),
             mutex,
-            cv,
+            signal,
         }
     }
 
@@ -95,7 +92,8 @@ impl<S> Drop for Abandon<'_, S> {
         self.gone.store(true, Ordering::Release);
         // Locked once, so the store cannot fall between the wait's check and its sleep.
         drop(self.mutex.lock().unwrap_or_else(|e| e.into_inner()));
-        self.cv.notify_all();
+        // Threads only: the future holds a `Notified` across this drop and must not wake from it.
+        self.signal.wake_threads();
     }
 }
 
@@ -118,10 +116,7 @@ struct CreditState {
 pub(super) struct Credit {
     state: Mutex<CreditState>,
     /// Woken by a grant, a cancel and the consumer's death.
-    wake: Condvar,
-    /// The same three, for a producer suspended in `wait_credit_async`.
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    wake: Signal,
 }
 
 impl Credit {
@@ -163,9 +158,7 @@ impl Credit {
     }
 
     fn wake_all(&self) {
-        self.wake.notify_all();
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.wake.wake_all();
     }
 
     /// One step of taking a credit: `None` if the caller has to wait.
@@ -249,7 +242,7 @@ impl Credit {
     ) -> Result<()> {
         loop {
             // Created first: a `Notified` sees every `notify_waiters` from its creation on.
-            let notified = self.notify.notified();
+            let notified = self.wake.notified();
             if let Some(answer) = Self::poll_credit(&mut self.lock()) {
                 return answer;
             }
@@ -325,12 +318,7 @@ fn resolve_peer<I>(binder: &SIBinder, expected: &str, what: &str) -> Result<Peer
 where
     I: FromIBinder + ?Sized,
 {
-    if let Some(actual) = binder.cached_descriptor() {
-        if actual != expected {
-            log::error!("{what}: not an {expected}: {actual:?}");
-            return Err(StatusCode::BadType);
-        }
-    }
+    binder.refuse_known_other(expected, what)?;
     let typed = FromIBinder::try_from(binder.clone()).map_err(|e| {
         log::error!("{what}: not an {expected}: {e:?}");
         StatusCode::BadType
@@ -340,30 +328,16 @@ where
 
 // ---- Producer ----
 
-#[derive(Default)]
-struct LedgerState {
-    /// Items that left the pending batch and never arrived; only the terminator can report them.
-    lost: i32,
-    /// A send that failed with nobody told yet; the next call returns it.
-    unreported: Option<StatusCode>,
-    /// A batch is on its way; nothing may be sent past it, or it would arrive out of order.
-    in_transit: bool,
-    /// A failed send's delivery is unknown, so remaining credit is too; nothing more is sent.
-    broken: Option<StatusCode>,
-}
-
 /// Batch outcomes, written by the pool task: dropping a `*_async` future detaches, not cancels it.
 #[derive(Default)]
 struct Ledger {
-    state: Mutex<LedgerState>,
-    idle: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    /// Up while a batch is on its way; nothing may be sent past it, lest it arrive out of order.
+    gate: PoolGate<Book>,
 }
 
 impl Ledger {
-    fn lock(&self) -> std::sync::MutexGuard<'_, LedgerState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.gate.lock()
     }
 
     fn lost(&self) -> i32 {
@@ -371,8 +345,7 @@ impl Ledger {
     }
 
     fn add_lost(&self, count: i32) {
-        let mut state = self.lock();
-        state.lost = state.lost.saturating_add(count);
+        self.lock().add_lost(count);
     }
 
     fn take_unreported(&self) -> Option<StatusCode> {
@@ -385,22 +358,12 @@ impl Ledger {
 
     /// Block until no batch is in transit.
     fn wait_idle(&self) {
-        let mut state = self.lock();
-        while state.in_transit {
-            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
+        self.gate.join(None);
     }
 
     #[cfg(feature = "tokio")]
     async fn idle_async(&self) {
-        loop {
-            // Created before the check, as in `wait_credit_async`.
-            let notified = self.notify.notified();
-            if !self.lock().in_transit {
-                return;
-            }
-            notified.await;
-        }
+        self.gate.join_async().await;
     }
 }
 
@@ -438,7 +401,7 @@ struct BatchInTransit {
 impl BatchInTransit {
     /// The caller has taken one credit for `count` items.
     fn new(credit: Arc<Credit>, ledger: Arc<Ledger>, count: i32) -> Self {
-        ledger.lock().in_transit = true;
+        ledger.gate.begin();
         BatchInTransit {
             credit,
             ledger,
@@ -472,22 +435,14 @@ impl Drop for BatchInTransit {
             // The consumer never grants this credit back; the items are counted lost, not resent.
             self.credit.grant(1);
         }
-        {
-            let mut state = self.ledger.lock();
+        // One critical section with the gate's lowering: a waiter that sees it down sees this.
+        self.ledger.gate.settle(|book| {
             if let Some(e) = failure {
-                state.lost = state.lost.saturating_add(self.count);
-                state.unreported = Some(e);
+                book.add_lost(self.count);
                 // Delivery unknown: the credit can neither be given back nor kept safely.
-                if !not_delivered {
-                    state.broken = Some(e);
-                }
+                book.record_failure(e, !not_delivered);
             }
-            // Same critical section: a waiter that sees the batch gone sees its outcome.
-            state.in_transit = false;
-        }
-        self.ledger.idle.notify_all();
-        #[cfg(feature = "tokio")]
-        self.ledger.notify.notify_waiters();
+        });
     }
 }
 
@@ -548,11 +503,11 @@ pub(super) struct Producer<T: ?Sized> {
     ledger: Arc<Ledger>,
     /// Lives as long as the producer; the consumer got its own reference in `onStart`.
     _source: SIBinder,
-    /// The consumer's sink, kept for the unlink in `Drop` and pinged by a quiet credit wait.
+    /// The consumer's sink, pinged by a quiet credit wait.
     sink: SIBinder,
     ping: PingPolicy,
-    /// Holds the death link on the sink; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The death link on the sink; `None` for a local sink.
+    death: Option<crate::DeathLink>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -578,8 +533,8 @@ impl<T: Serialize + ?Sized> Producer<T> {
         let death = watch_death(sink, SinkDeath(credit.clone()))?;
         // First, so the consumer knows where to grant and whom to watch before any batch lands.
         if let Err(e) = peer.on_start(&source, declared) {
-            // No producer is built, so nothing else will undo the link.
-            unlink_death(sink, &death);
+            // Unlinked before the error returns.
+            drop(death);
             return Err(e);
         }
         Ok(Producer {
@@ -615,9 +570,9 @@ impl<T: Serialize + ?Sized> Producer<T> {
         self.send_with_credit()
     }
 
-    /// The error that broke the stream, if one has: see `LedgerState::broken`.
+    /// The error that broke the stream, if one has: a send whose delivery is unknown breaks it.
     fn usable(&self) -> Result<()> {
-        self.ledger.broken().map_or(Ok(()), Err)
+        self.ledger.lock().usable()
     }
 
     /// Queue one item; `true` when the batch has reached its threshold and should go out.
@@ -675,8 +630,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
 
     /// The last batch's failure, reported once; a broken stream reports it on every call.
     fn reported(&self) -> Result<()> {
-        let unreported = self.ledger.take_unreported();
-        unreported.or(self.ledger.broken()).map_or(Ok(()), Err)
+        self.ledger.lock().reported()
     }
 
     pub(super) fn terminate(
@@ -699,39 +653,15 @@ impl<T: Serialize + ?Sized> Producer<T> {
             }
             (Ok(()), stale) => stale,
         };
-        match failed {
-            // Nobody is left to tell.
-            Some(StatusCode::DeadObject) => Err(StatusCode::DeadObject),
-            // After a cancel no loss or flush failure is reported: the consumer asked for no more.
-            _ if self.credit.is_canceled() => {
-                self.peer.on_end(exception, service_specific, message)
-            }
-            // The consumer still blocks in `recv`: end it anyway, report the earlier flush error.
-            Some(e) => {
-                if let Err(end) = self.send_terminator(exception, service_specific, message) {
-                    log::warn!("stream: the terminator could not be delivered: {end:?}");
-                }
-                Err(e)
-            }
-            // Caller's terminator, unless an earlier send lost items, which nothing else reports.
-            None => self.send_terminator(exception, service_specific, message),
-        }
-    }
-
-    /// The caller's terminator, or the one saying items went missing when any did.
-    fn send_terminator(
-        &self,
-        exception: i32,
-        service_specific: i32,
-        message: Option<&str>,
-    ) -> Result<()> {
-        match truncated_terminator(exception, self.ledger.lost()) {
+        let canceled = self.credit.is_canceled();
+        let decision = end_decision(failed, false, canceled, self.ledger.lost(), exception);
+        decision.send(|truncated| match truncated {
             Some(truncated) => {
                 self.peer
-                    .on_end(ExceptionCode::IllegalState as i32, 0, Some(&truncated))
+                    .on_end(ExceptionCode::IllegalState as i32, 0, Some(truncated))
             }
             None => self.peer.on_end(exception, service_specific, message),
-        }
+        })
     }
 
     /// The item is encoded now; the returned future sends the batch if it is full.
@@ -829,20 +759,17 @@ impl<T: Serialize + ?Sized> Producer<T> {
             }
             (Ok(()), stale) => stale,
         };
-        // As in `terminate`: only a dead consumer leaves nobody to send the terminator to.
-        if let Some(StatusCode::DeadObject) = failed {
+        // As in `terminate`; the end goes out from the pool, so the decision is taken apart here.
+        let canceled = self.credit.is_canceled();
+        let decision = end_decision(failed, false, canceled, self.ledger.lost(), exception);
+        let EndDecision::Send { truncated, failed } = decision else {
             self.ended = true;
             return Err(StatusCode::DeadObject);
-        }
-        let canceled = self.credit.is_canceled();
-        // As in `terminate`: cancel keeps the caller's end; losses are reported here or nowhere.
-        let (exception, service_specific, message) =
-            match truncated_terminator(exception, self.ledger.lost()) {
-                Some(truncated) if !canceled => {
-                    (ExceptionCode::IllegalState as i32, 0, Some(truncated))
-                }
-                _ => (exception, service_specific, message),
-            };
+        };
+        let (exception, service_specific, message) = match truncated {
+            Some(truncated) => (ExceptionCode::IllegalState as i32, 0, Some(truncated)),
+            None => (exception, service_specific, message),
+        };
         let outcome = Arc::new(std::sync::OnceLock::new());
         let terminator = TerminatorInTransit {
             peer: self.peer.clone(),
@@ -862,10 +789,8 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // The token's answer first: if the pool never ran it, its `Drop` still sent the end.
         let sent = outcome.get().copied();
         let ended = sent.unwrap_or(pooled);
-        match failed {
-            Some(e) if !canceled => Err(e),
-            _ => ended,
-        }
+        // `deliver` logged a failed send; an earlier failure is the answer, as in `send`.
+        failed.map_or(ended, Err)
     }
 
     /// Batches this producer may still send without waiting.
@@ -925,9 +850,8 @@ impl<T: ?Sized> Producer<T> {
 impl<T: ?Sized> Drop for Producer<T> {
     /// Deliver what is queued and end the stream without waiting for credit.
     fn drop(&mut self) {
-        // Unlink regardless: a dropped recipient leaves a dead `Weak` in the sink's list for good.
-        let death = self.death.take();
-        unlink_death(&self.sink, &death);
+        // Unlinked first, before the batch and the terminator go out.
+        drop(self.death.take());
         if self.ended {
             return;
         }
@@ -983,10 +907,10 @@ struct StreamState {
     end: Option<Status>,
     /// Where to grant and cancel; `None` until `onStart` arrives.
     source: Option<Arc<Peer<dyn IStreamSource>>>,
-    /// The same binder, kept for the unlink in the consumer's `Drop`.
+    /// The same binder, compared by a later `onStart` and pinged by a quiet wait.
     source_binder: Option<SIBinder>,
-    /// Holds the death link on the source; the binder keeps only a `Weak`.
-    death: Option<Arc<dyn crate::DeathRecipient>>,
+    /// The death link on the source; `None` until `onStart`, or for a local source.
+    death: Option<crate::DeathLink>,
     /// The consumer wants no more; an `onStart` arriving after this is cancelled on the spot.
     canceled: bool,
     /// The receiver is gone, so nothing will drain a batch again.
@@ -1041,9 +965,7 @@ impl StreamState {
 
 pub(super) struct Stream {
     state: Mutex<StreamState>,
-    arrived: Condvar,
-    #[cfg(feature = "tokio")]
-    notify: tokio::sync::Notify,
+    arrived: Signal,
     /// The widest opening window this consumer takes from a producer.
     max_opening: u32,
 }
@@ -1052,9 +974,7 @@ impl Stream {
     fn new(max_opening: u32) -> Self {
         Stream {
             state: Mutex::default(),
-            arrived: Condvar::new(),
-            #[cfg(feature = "tokio")]
-            notify: tokio::sync::Notify::new(),
+            arrived: Signal::default(),
             max_opening,
         }
     }
@@ -1064,9 +984,7 @@ impl Stream {
     }
 
     fn wake(&self) {
-        self.arrived.notify_all();
-        #[cfg(feature = "tokio")]
-        self.notify.notify_waiters();
+        self.arrived.wake_all();
     }
 
     /// End the stream with `status` unless something already has.
@@ -1234,7 +1152,7 @@ impl IStreamSink for SinkObject {
             return Ok(());
         };
         // Linked before taking the lock: no binder call under it.
-        let death = match watch_death(source, SourceDeath(Arc::downgrade(&self.0))) {
+        let mut death = match watch_death(source, SourceDeath(Arc::downgrade(&self.0))) {
             Ok(death) => death,
             Err(code) => {
                 if self.0.refuse_start(source, Status::from(code)) {
@@ -1256,7 +1174,7 @@ impl IStreamSink for SinkObject {
                 if kept {
                     state.source = Some(peer.clone());
                     state.source_binder = Some(source.clone());
-                    state.death = death.clone();
+                    state.death = death.take();
                     state.declared = window;
                 }
                 cancel_now = state.canceled;
@@ -1266,10 +1184,8 @@ impl IStreamSink for SinkObject {
             // A wait begun before now had nobody to ping; woken, it looks the source up.
             self.0.wake();
         }
-        if !kept {
-            // Nothing owns this link now; dropping the recipient would only make it inert.
-            unlink_death(source, &death);
-        }
+        // Not kept: nothing owns this link, so it unlinks here, before the cancel below.
+        drop(death);
         if cancel_now {
             // The consumer gave up before the producer got this far.
             let _ = peer.cancel();
@@ -1451,7 +1367,7 @@ impl<T: Deserialize> Consumer<T> {
         let stream = self.stream.clone();
         loop {
             // Created before looking, so a batch landing before the await is not missed.
-            let notified = stream.notify.notified();
+            let notified = stream.arrived.notified();
             if let Some(done) = self.advance_async().await {
                 return done;
             }
@@ -1683,7 +1599,7 @@ impl<T> Consumer<T> {
 
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
-        let (source, binder, death) = {
+        let (source, _source_binder, death) = {
             let mut state = self.stream.lock();
             state.canceled = true;
             state.closed = true;
@@ -1694,10 +1610,8 @@ impl<T> Drop for Consumer<T> {
                 state.death.take(),
             )
         };
-        if let Some(binder) = binder {
-            // Dropping the recipient only makes the link inert; the source's list never shrinks.
-            unlink_death(&binder, &death);
-        }
+        // Unlinked out of the lock, before the cancel.
+        drop(death);
         if let Some(source) = source {
             // Nothing else tells a producer parked on `wait_credit` that nobody reads any more.
             let _ = source.cancel();
@@ -1922,7 +1836,7 @@ mod tests {
             assert!(credit.try_credit());
             let mut batch = BatchInTransit::new(credit.clone(), ledger.clone(), 3);
             batch.bytes = vec![0; 12];
-            assert!(ledger.lock().in_transit, "{way:?}");
+            assert!(ledger.gate.busy(), "{way:?}");
 
             match way {
                 Way::Accepted => batch.send(&peer),
@@ -1946,7 +1860,7 @@ mod tests {
 
             let delivered = matches!(way, Way::Accepted);
             let unknown = matches!(way, Way::FailedWithoutSayingWhich | Way::UnwoundInTheCall);
-            assert!(!ledger.lock().in_transit, "{way:?}: nothing may wait on it");
+            assert!(!ledger.gate.busy(), "{way:?}: nothing may wait on it");
             assert_eq!(
                 credit.lock().available,
                 u64::from(!delivered && !unknown),
@@ -3034,8 +2948,8 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[test]
     fn an_abandon_dropped_while_its_wait_sleeps_ends_the_wait() {
-        let (mutex, cv) = (Mutex::new(()), Condvar::new());
-        let abandon = Abandon::new(&mutex, &cv);
+        let (mutex, signal) = (Mutex::new(()), Signal::default());
+        let abandon = Abandon::new(&mutex, &signal);
         let gone = abandon.gone();
         let (asleep_tx, asleep) = mpsc::channel();
         thread::scope(|scope| {
@@ -3051,7 +2965,7 @@ mod tests {
                 };
                 park(
                     &mutex,
-                    &cv,
+                    &signal,
                     blocked,
                     Some(started + Duration::from_secs(5)),
                     None,
@@ -3068,6 +2982,63 @@ mod tests {
                 "the abandoned wait slept on: {slept:?}"
             );
         });
+    }
+
+    /// A pinged wait with no pool waits for a change, not spins: `Abandon` wakes threads only.
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
+    #[test]
+    fn a_consumer_whose_pool_is_gone_waits_unpinged_rather_than_spin() {
+        use crate::rpc::transport::MemTransport;
+        use crate::rpc::{AddressSpace, RpcSession};
+
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let source = BnStreamSource::new_binder(RefusingSource(Arc::default())).as_binder();
+        server.set_root(source).unwrap();
+        let serving = thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+        // A reply deadline gives the source a ping interval, which sends a quiet wait to the pool.
+        client
+            .set_reply_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let remote_source = client.get_root().unwrap();
+
+        let (rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(4, 4));
+        let sink: Strong<dyn IStreamSink> =
+            FromIBinder::try_from(sink_binder).expect("the consumer's own sink");
+        let local_source = BnStreamSource::new_binder(RefusingSource(Arc::default())).as_binder();
+        sink.r#onStart(&local_source, 4).expect("onStart");
+        // Only the ping target is remote: a death link on it would need incoming connections.
+        rx.stream.lock().source_binder = Some(remote_source);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+
+        let (done, watch) = mpsc::channel();
+        thread::spawn(move || {
+            let _entered = handle.enter();
+            let mut rx = rx;
+            let pending = {
+                let recv = std::pin::pin!(rx.recv_async());
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                std::future::Future::poll(recv, &mut cx).is_pending()
+            };
+            // Sent back alive: dropping the consumer cancels too.
+            let _ = done.send((pending, rx));
+        });
+        let (pending, rx) = watch
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the receive spun: its first poll never returned");
+        assert!(pending, "nothing arrived, so the receive waits");
+        drop(rx);
+        client.close_session();
+        serving.join().unwrap();
     }
 
     /// Plan 16 D6: a peer of unknown interface is cast unasked; a known other one is refused.

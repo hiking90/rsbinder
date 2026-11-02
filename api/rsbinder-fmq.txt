@@ -64,6 +64,7 @@ impl<'a> core::panic::unwind_safe::UnwindSafe for rsbinder_fmq::shm::CreateOptio
 pub struct rsbinder_fmq::shm::Deadline(_)
 impl rsbinder_fmq::shm::Deadline
 pub fn rsbinder_fmq::shm::Deadline::after(core::time::Duration) -> core::option::Option<Self>
+pub fn rsbinder_fmq::shm::Deadline::until(std::time::Instant) -> core::option::Option<Self>
 impl core::clone::Clone for rsbinder_fmq::shm::Deadline
 pub fn rsbinder_fmq::shm::Deadline::clone(&self) -> rsbinder_fmq::shm::Deadline
 impl core::fmt::Debug for rsbinder_fmq::shm::Deadline
@@ -309,11 +310,12 @@ pub fn rsbinder_fmq::shm::add_seals(std::os::fd::owned::BorrowedFd<'_>, rsbinder
 pub fn rsbinder_fmq::shm::ashmem_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
 pub fn rsbinder_fmq::shm::ashmem_write_protected(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<bool>
 pub fn rsbinder_fmq::shm::create(u64, &rsbinder_fmq::shm::CreateOptions<'_>) -> rsbinder_fmq::Result<std::os::fd::owned::OwnedFd>
-pub fn rsbinder_fmq::shm::create_mapped(u64, &rsbinder_fmq::shm::CreateOptions<'_>, rsbinder_fmq::shm::Seals) -> rsbinder_fmq::Result<(std::os::fd::owned::OwnedFd, rsbinder_fmq::shm::Mapping)>
 pub fn rsbinder_fmq::shm::futex_wait(&core::sync::atomic::AtomicU32, u32, core::num::nonzero::NonZeroU32, core::option::Option<&rsbinder_fmq::shm::Deadline>) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::shm::futex_wake(&core::sync::atomic::AtomicU32, core::num::nonzero::NonZeroU32) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::shm::is_ashmem_fd(std::os::fd::owned::BorrowedFd<'_>) -> bool
 pub fn rsbinder_fmq::shm::region_size(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
+pub fn rsbinder_fmq::shm::ring_parts(usize, usize, usize, impl core::ops::function::FnMut(usize, core::ops::range::Range<usize>))
+pub fn rsbinder_fmq::shm::seal_unsupported(rsbinder_fmq::shm::Seals, &rsbinder_fmq::Error) -> bool
 pub fn rsbinder_fmq::shm::seals(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<rsbinder_fmq::shm::Seals>
 pub fn rsbinder_fmq::shm::shrink_sealed(std::os::fd::owned::BorrowedFd<'_>) -> bool
 pub fn rsbinder_fmq::shm::verify_received(std::os::fd::owned::BorrowedFd<'_>) -> rsbinder_fmq::Result<u64>
@@ -517,6 +519,7 @@ impl rsbinder_fmq::EventFlag
 pub fn rsbinder_fmq::EventFlag::peek(&self) -> u32
 pub fn rsbinder_fmq::EventFlag::wait(&self, u32, core::option::Option<core::time::Duration>) -> rsbinder_fmq::Result<u32>
 pub fn rsbinder_fmq::EventFlag::wake(&self, u32) -> rsbinder_fmq::Result<()>
+pub fn rsbinder_fmq::EventFlag::wake_committed_lazy(&self, u32) -> rsbinder_fmq::Result<()>
 pub fn rsbinder_fmq::EventFlag::wake_lazy(&self, u32) -> rsbinder_fmq::Result<()>
 impl core::clone::Clone for rsbinder_fmq::EventFlag
 pub fn rsbinder_fmq::EventFlag::clone(&self) -> rsbinder_fmq::EventFlag
