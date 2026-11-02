@@ -211,11 +211,11 @@
 //!   fresh borrow and, if one is still out, logs instead of panicking, which
 //!   during an unwind would abort. A panic from the reply flush/await —
 //!   `talk_with_driver` or a nested dispatch; OOM aborts and is not
-//!   catchable — is caught rather than
-//!   unwinding the worker loop (as `binder::run_handler` does; a dropped
-//!   reply reaches a sync caller as `BR_DEAD_REPLY`). The `unflushed_mark` is
-//!   taken outside `catch_unwind` so the panic arm can rewind to it too. That
-//!   arm rewinds only this transaction's bytes: truncating the whole
+//!   catchable — is caught rather than unwinding the worker loop (as
+//!   `binder::run_handler` does; a dropped reply reaches a sync caller as
+//!   `BR_DEAD_REPLY`). The `unflushed_mark` is taken outside `catch_unwind`
+//!   so the panic arm can rewind to it too. That arm rewinds only this
+//!   transaction's bytes: truncating the whole
 //!   `out_parcel` would also drop a `BC_FREE_BUFFER` queued earlier by a
 //!   nested call — which `flush_if_needed` never flushes on a looper thread —
 //!   and the kernel would never reclaim that transaction buffer. It does not
@@ -961,7 +961,7 @@ impl ThreadState {
         (self.out_flush_epoch, self.out_parcel.data_size())
     }
 
-    /// Drops the bytes queued since `mark` unless they went out; `None` if none (module doc).
+    /// Drops the bytes queued since `mark`: their length, or `None` if none or they went out.
     fn rewind_to(&mut self, mark: (u64, usize)) -> Option<usize> {
         let (epoch, len) = mark;
         let queued = self.out_parcel.data_size();

@@ -67,11 +67,10 @@ use crate::notification::{ClearDone, Kernel, NotifyCmd, Registrations};
 /// The drop never panics past itself: the unlink, the binder's drop and the
 /// recipient's drop run under `catch_unwind`, so a panic there (a poisoned lock
 /// inside rsbinder, or the last reference to a proxy or recipient whose own
-/// drop panics) is logged at error
-/// level instead of unwinding, which would abort the process if the link were
-/// dropped during another unwind. An unlink that returns an error is logged at
-/// debug level: [`StatusCode::DeadObject`] is what an unlink returns after
-/// the binder's death was delivered.
+/// drop panics) is logged at error level instead of unwinding, which would
+/// abort the process if the link were dropped during another unwind. An unlink
+/// that returns an error is logged at debug level: [`StatusCode::DeadObject`]
+/// is what an unlink returns after the binder's death was delivered.
 ///
 /// A recipient linked to the same binder twice is notified twice; each link
 /// removes one registration when it drops (see `unlink_to_death`).

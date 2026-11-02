@@ -918,7 +918,7 @@ enum EndDecision {
     },
 }
 
-/// How `end`/`end_async` ends a stream after `failed`, with `lost` items and `exception` ending.
+/// How `end`/`end_async` ends a stream: after `failed`, with `lost` items, ending with `exception`.
 fn end_decision(
     failed: Option<StatusCode>,
     dead: bool,

@@ -113,7 +113,7 @@ accepts both the 0.12.0 bytes and the new ones.
   proxy's `BC_ACQUIRE`, is logged and the proxy is returned (AOSP
   `incStrongHandle`). 0.12.0 failed the lookup on a failed flush of either
   command off a binder thread (the driver's error) and of `BC_INCREFS` on
-  one (`DeadObject`). One made from a TLS destructor after the binder
+  one (`DeadObject`). A lookup made from a TLS destructor after the binder
   thread state's is `InvalidOperation`, where 0.12.0 aborted.
 
 **Calling identity and permissions**

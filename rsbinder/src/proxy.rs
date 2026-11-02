@@ -12,12 +12,13 @@
 //! `ProxyHandle` follows C++ `BpBinder` (`BpBinder.cpp`) for the recipient
 //! list and the obituary:
 //!
-//! - `link_to_death` and `unlink_to_death` take the `recipients` lock
-//!   before reading `obituary_sent`, as `BpBinder::linkToDeath` /
-//!   `unlinkToDeath` read `mObitsSent` inside `AutoMutex _l(mLock)`. Checking
-//!   the flag outside the lock would leave a window where `send_obituary`
-//!   sets the flag and drains the recipients between the check and the lock,
-//!   so a recipient registered after death would never fire.
+//! - `link_to_death` and `unlink_to_death` take the recipient list's lock
+//!   (`DeathRecipients::list`) before reading `obituary_sent`, as
+//!   `BpBinder::linkToDeath` / `unlinkToDeath` read `mObitsSent` inside
+//!   `AutoMutex _l(mLock)`. Checking the flag outside the lock would leave a
+//!   window where `send_obituary` sets the flag and drains the recipients
+//!   between the check and the lock, so a recipient registered after death
+//!   would never fire.
 //! - The list going from empty to non-empty, and back (unlink, drop or
 //!   obituary), is reported to `ProcessState`'s per-handle death registry,
 //!   which decides `BC_REQUEST_DEATH_NOTIFICATION` and
@@ -27,15 +28,16 @@
 //!   (`death` module doc). Unlinking from an already-empty list (the
 //!   `NameNotFound` path) reports nothing. A link fails only if its request
 //!   never reached the kernel (a failed write, or a flush the driver consumed
-//!   nothing of, which is rewound), so `recipients.push` is skipped exactly
+//!   nothing of, which is rewound), so the push to the list is skipped exactly
 //!   when no recipient could be serviced. An unlink's flush result is
 //!   ignored, as C++ ignores `flushCommands`.
 //! - `link_to_death` rejects a recipient whose strong count is already zero
 //!   (`BadValue`) — a common mistake when the caller drops the
 //!   `Arc<dyn DeathRecipient>` before passing the weak, which `send_obituary`
 //!   would otherwise skip silently. The check runs before the registry is
-//!   told, so a dead weak never consumes a kernel subscription. It does not cover a recipient dropped after
-//!   `link_to_death` returns; that is ordinary `Weak` semantics.
+//!   told, so a dead weak never consumes a kernel subscription. It does not
+//!   cover a recipient dropped after `link_to_death` returns; that is ordinary
+//!   `Weak` semantics.
 //! - `unlink_to_death` removes only the first matching entry
 //!   (order-preserving, C++ `removeAt(i)`); a `retain` would drop every
 //!   duplicate registration and silently remove the user's remaining
@@ -43,7 +45,7 @@
 //!
 //! `send_obituary` mirrors `BpBinder::sendObituary`:
 //!
-//! 1. `obituary_sent` is read and set only under the `recipients` lock, so a
+//! 1. `obituary_sent` is read and set only under the list's lock, so a
 //!    racing `link_to_death` cannot push a recipient into the just-drained
 //!    list, where it would never fire.
 //! 2. The list is detached under the lock and the callbacks run after the lock
@@ -56,10 +58,6 @@
 //!    `BR_DEAD_BINDER` is delivered once, so a queueing failure must
 //!    not abort the obituary, or the recipients would never hear of the death
 //!    and `obituary_sent` would never latch.
-//!
-//! The `recipients` lock recovers from poison: the list only ever has a
-//! recipient pushed or removed, so it is valid after any panic. The death
-//! registry's own lock is not recovered (`process_state`).
 //! 5. The `Release` store of `obituary_sent` publishes the teardown to the
 //!    lock-free `Acquire` loads in `submit_transact` and `dump` (C++
 //!    `mAlive = 0; ... mObitsSent = 1`, published by the mutex unlock). Those
@@ -71,6 +69,10 @@
 //!    flush fails, the command stays in `out_parcel` and is sent by
 //!    `finish_obituary`'s phase-2 flush in the same `BR_DEAD_BINDER` arm,
 //!    which preserves kernel ordering.
+//!
+//! The list's lock recovers from poison: the list only ever has a recipient
+//! pushed or removed, so it is valid after any panic. The death registry's own
+//! lock is not recovered (`process_state`).
 //!
 //! # Reference counts
 //!
