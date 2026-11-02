@@ -339,7 +339,6 @@ impl<T: Payload> Subscriber<T> {
     }
 
     /// This subscriber, keeping `session` until it drops.
-    #[cfg(feature = "uds")]
     pub(crate) fn with_session(mut self, session: Arc<dyn Any + Send + Sync>) -> Self {
         self.session = Some(session);
         self

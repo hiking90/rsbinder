@@ -16,6 +16,9 @@ executables() {
 }
 
 cargo build -p tests --features topic-uds --bin topic_uds_probe
+# A target dir of its own: these features would replace the rsb_hub every other script runs.
+CARGO_TARGET_DIR=target/uds cargo build -p rsbinder-tools --features topic,rpc \
+    --bin rsb_hub --bin rsb_service
 mapfile -t tests < <(
     executables cargo test -p rsbinder-topic --features uds --lib --test uds
     executables cargo test -p rsbinder --features rpc --test rpc_unix_fd
@@ -28,4 +31,4 @@ for test in "${tests[@]}"; do
     set -e
     [ "$status" = 0 ] || exit "$status"
 done
-"$RUN" --no-binder --as-root -- "$PWD/tests/container/ac_topic_uds.sh" target/debug
+"$RUN" --no-binder --as-root -- "$PWD/tests/container/ac_topic_uds.sh" target/debug target/uds/debug

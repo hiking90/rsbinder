@@ -59,11 +59,11 @@ fn eventually(what: &str, done: impl Fn() -> bool) {
 #[derive(Clone, Debug, PartialEq)]
 struct K {
     id: u32,
-    handle: Option<u32>,
+    handle: Option<u64>,
 }
 
 impl Key for K {
-    fn handle(&self) -> Option<u32> {
+    fn handle(&self) -> Option<u64> {
         self.handle
     }
 }
@@ -71,19 +71,19 @@ impl Key for K {
 fn key(id: u32) -> K {
     K {
         id,
-        handle: Some(id),
+        handle: Some(u64::from(id)),
     }
 }
 
 #[derive(Default)]
 struct Fake {
-    linked: Vec<u32>,
-    unlinked: Vec<u32>,
-    fail: Option<u32>,
+    linked: Vec<u64>,
+    unlinked: Vec<u64>,
+    fail: Option<u64>,
 }
 
 impl Fake {
-    fn link(&mut self, handle: u32) -> BinderResult<()> {
+    fn link(&mut self, handle: u64) -> BinderResult<()> {
         if self.fail == Some(handle) {
             return Err(StatusCode::DeadObject.into());
         }
@@ -93,15 +93,15 @@ impl Fake {
 }
 
 impl Links<K, K> for Fake {
-    fn link_topic(&mut self, handle: u32, _: &K) -> BinderResult<()> {
+    fn link_topic(&mut self, handle: u64, _: &K) -> BinderResult<()> {
         self.link(handle)
     }
 
-    fn link_watcher(&mut self, handle: u32, _: &K) -> BinderResult<()> {
+    fn link_watcher(&mut self, handle: u64, _: &K) -> BinderResult<()> {
         self.link(handle)
     }
 
-    fn unlink(&mut self, handle: u32) {
+    fn unlink(&mut self, handle: u64) {
         self.unlinked.push(handle);
     }
 }
@@ -650,7 +650,7 @@ fn every_sequence_of_changes_keeps_the_maps_in_step() {
             let uid = 1 + rng.below(2) as u32;
             // One older than the name's, its own, or one newer.
             let generation = (table.lookup(name).1 + rng.below(3)).saturating_sub(1);
-            links.fail = (rng.below(10) == 0).then(|| *rng.pick(&handles));
+            links.fail = (rng.below(10) == 0).then(|| u64::from(*rng.pick(&handles)));
             match rng.below(10) {
                 0 => {
                     let (topic, cross_uid) = (rng.pick(&topics).clone(), rng.below(2) == 0);
@@ -671,7 +671,7 @@ fn every_sequence_of_changes_keeps_the_maps_in_step() {
                     let evicted = [watcher, rng.pick(&watchers).clone()];
                     table.unwatch(name, &evicted, &mut links);
                 }
-                4 => table.forget(*rng.pick(&handles)),
+                4 => table.forget(u64::from(*rng.pick(&handles))),
                 5 => {
                     let sent = rng.sent();
                     table.sent(name, &watcher, generation, sent, now);

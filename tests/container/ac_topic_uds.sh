@@ -4,13 +4,17 @@
 # process to a uid of its own with setpriv. Not named run_*_ac.sh: the host gate and CI run
 # that glob as it is, and this one needs the container.
 #
-#   tests/container/run.sh --no-binder --as-root -- tests/container/ac_topic_uds.sh TARGET_DIR
+#   tests/container/run.sh --no-binder --as-root -- tests/container/ac_topic_uds.sh TARGET HUBS
 #
-# TARGET_DIR holds topic_uds_probe, built with `cargo build -p tests --features topic-uds`.
+# TARGET holds topic_uds_probe (`cargo build -p tests --features topic-uds`) and HUBS rsb_hub and
+# rsb_service built with the `topic` and `rpc` features.
 set -u
 
 TARGET=${1:-target/debug}
+HUBS=${2:-target/uds/debug}
 PROBE=$PWD/$TARGET/topic_uds_probe
+HUB_BIN=$PWD/$HUBS/rsb_hub
+SERVICE_BIN=$PWD/$HUBS/rsb_service
 DIR=/tmp/ac
 mkdir -p "$DIR"
 chmod 0777 "$DIR"
@@ -81,6 +85,184 @@ expect "expect_uid refuses another uid" "RESULT subscribe $SOCK SECURITY" "$out"
 
 kill "$PUBLISHER" 2>/dev/null
 wait "$PUBLISHER" 2>/dev/null
+
+echo "=== a hub of uid 1000, started with umask 0077 and a low descriptor limit"
+HUB_UID=1000
+RUN=/run/rsbinder
+SOCKET=$RUN/topic.sock
+CONFIG=/etc/rsbinder/hub.d
+mkdir -p "$RUN" "$CONFIG"
+chown "$HUB_UID" "$RUN"
+chmod 0755 "$RUN"
+# Owned by root, as the hub's trust check asks; uid 1001 publishes, 1002 subscribes, 1003 neither.
+cat >"$CONFIG/10-topics.toml" <<'TOML'
+[global]
+topics = { uid = [1002] }
+
+[[topic]]
+name = "sensors.*"
+advertise = { uid = [1001] }
+subscribe = { uid = [1002] }
+
+[[topic]]
+name = "open.*"
+advertise = "any"
+subscribe = "any"
+TOML
+start_hub() {
+    (
+        ulimit -Sn 256
+        umask 0077
+        exec setpriv --reuid="$HUB_UID" --regid="$HUB_UID" --clear-groups -- \
+            env RUST_LOG=warn "$HUB_BIN" --topic-socket "$SOCKET" --config "$CONFIG" "$@"
+    ) >>"$DIR/hub.log" 2>&1 &
+    HUB=$!
+    tries=0
+    while [ ! -S "$SOCKET" ] && [ "$tries" -lt 1000 ]; do
+        tries=$((tries + 1))
+        sleep 0.01
+    done
+}
+start_hub
+
+expect "the hub socket is 0666 whatever the umask" 666 "$(stat -c %a "$SOCKET")"
+expect "the hub's directory is private" 700 "$(stat -c %a "$RUN/topic.d")"
+expect "the hub raised its descriptor limit" "$(awk '/open files/ { print $5 }' "/proc/$HUB/limits")" \
+    "$(awk '/open files/ { print $4 }' "/proc/$HUB/limits")"
+
+out=$(as_uid 1003 "$PROBE" advertise:"$SOCKET":sensors.a:hello 2>&1)
+expect "the policy refuses an advertise by uid" "RESULT advertise sensors.a SECURITY" "$out"
+
+as_uid 1001 "$PROBE" advertise:"$SOCKET":sensors.a:hello say:serving hold:60 >"$DIR/hub_pub.log" 2>&1 &
+HUB_PUBLISHER=$!
+tries=0
+while ! grep -q serving "$DIR/hub_pub.log"; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 1000 ] || break
+    sleep 0.01
+done
+expect "a publisher of an allowed uid advertises" "RESULT advertise sensors.a OK" "$(cat "$DIR/hub_pub.log")"
+expect "the directory holds no socket file" 0 "$(find "$RUN/topic.d" -mindepth 1 | wc -l)"
+
+out=$(as_uid 1002 "$PROBE" named:"$SOCKET":sensors.a nrecv 2>&1)
+expect "a subscriber of another uid receives over the ring" "RESULT nrecv hello OK" "$out"
+
+out=$(as_uid 1003 "$PROBE" lookup:"$SOCKET":sensors.a 2>&1)
+expect "the policy gives a refused subscriber no descriptor" "RESULT lookup sensors.a NULL" "$out"
+
+out=$(as_uid 1002 "$PROBE" list:"$SOCKET":sensors 2>&1)
+expect "a uid [global] topics allows lists" "LISTED sensors.a 1001" "$out"
+out=$(as_uid 1003 "$PROBE" list:"$SOCKET":sensors 2>&1)
+expect "a uid it does not is refused" "RESULT list sensors SECURITY" "$out"
+
+out=$(as_uid 1002 "$SERVICE_BIN" topics --topic-socket "$SOCKET" 2>&1)
+expect "rsb_service asks a hub on a socket, with no binder device" "sensors.a" "$out"
+
+out=$(as_uid 1002 "$PROBE" lookup:"$SOCKET":sensors.a peer 2>&1)
+expect "who listens is the publisher, not the hub" "PEER 1001 " "$out"
+
+out=$(as_uid 1002 "$PROBE" named:"$SOCKET":sensors.a:1001 nrecv 2>&1)
+expect "a publisher of the expected uid is subscribed to" "RESULT nrecv hello OK" "$out"
+out=$(as_uid 1002 "$PROBE" named:"$SOCKET":sensors.a:1003 nrecv 2>&1)
+expect "a publisher of another uid is not" "no record arrived within the wait" "$out"
+
+echo "=== who holds a name"
+as_uid 1001 "$PROBE" advertise:"$SOCKET":open.a:one say:serving hold:60 >"$DIR/open_pub.log" 2>&1 &
+OPEN_PUBLISHER=$!
+tries=0
+while ! grep -q serving "$DIR/open_pub.log"; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 1000 ] || break
+    sleep 0.01
+done
+out=$(as_uid 1003 "$PROBE" advertise:"$SOCKET":open.a:two 2>&1)
+expect "a name another uid holds is refused" "RESULT advertise open.a TAKEN" "$out"
+out=$(as_uid 1003 "$PROBE" advertise:"$SOCKET":open.other:two 2>&1)
+expect "another name is not" "RESULT advertise open.other OK" "$out"
+out=$(as_uid 1003 "$PROBE" lookup:"$SOCKET":open.other 2>&1)
+expect "a publisher that ended has taken its name back" "RESULT lookup open.other NULL" "$out"
+
+echo "=== a publisher's end"
+as_uid 1002 "$PROBE" lookup:"$SOCKET":open.a say:looked wait:"$DIR/open_killed" connect \
+    >"$DIR/connect.log" 2>&1 &
+CONNECT=$!
+tries=0
+while ! grep -q looked "$DIR/connect.log"; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 1000 ] || break
+    sleep 0.01
+done
+kill -KILL "$OPEN_PUBLISHER" 2>/dev/null
+wait "$OPEN_PUBLISHER" 2>/dev/null
+touch "$DIR/open_killed"
+wait "$CONNECT"
+expect "the hub keeps no copy of a socket whose publisher died" "RESULT connect - ECONNREFUSED" \
+    "$(cat "$DIR/connect.log")"
+tries=0
+while [ "$tries" -lt 500 ]; do
+    out=$(as_uid 1002 "$PROBE" lookup:"$SOCKET":open.a 2>&1)
+    case "$out" in *NULL*) break ;; esac
+    tries=$((tries + 1))
+    sleep 0.01
+done
+expect "a publisher's death takes its name back" "RESULT lookup open.a NULL" "$out"
+
+echo "=== a second hub on the socket"
+second=$(setpriv --reuid="$HUB_UID" --regid="$HUB_UID" --clear-groups -- \
+    "$HUB_BIN" --topic-socket "$SOCKET" --config "$CONFIG" 2>&1)
+status=$?
+[ "$status" != 0 ] && ok "a second hub is refused" || bad "a second hub: $second"
+out=$(as_uid 1002 "$PROBE" named:"$SOCKET":sensors.a nrecv 2>&1)
+expect "the first goes on" "RESULT nrecv hello OK" "$out"
+
+kill "$HUB_PUBLISHER" 2>/dev/null
+wait "$HUB_PUBLISHER" 2>/dev/null
+
+echo "=== what a hub on a socket does not use"
+cat >"$CONFIG/20-services.toml" <<TOML
+[global]
+list = "any"
+
+[[rule]]
+name = "*"
+add = "any"
+find = "any"
+
+[[service]]
+name = "com.example.IFoo/default"
+start = { exec = ["/usr/bin/true"] }
+TOML
+: >"$DIR/hub.log"
+kill -HUP "$HUB"
+tries=0
+while ! grep -q 'does not use' "$DIR/hub.log" && [ "$tries" -lt 1000 ]; do
+    tries=$((tries + 1))
+    sleep 0.01
+done
+log=$(cat "$DIR/hub.log")
+expect "a reload warns of [[rule]]" "1 [[rule]]" "$log"
+expect "a reload warns of [[service]], and of its start" "whose \`start\` is not run" "$log"
+expect "a reload warns of [global] list" "[global] list" "$log"
+case "$log" in
+*NameNotFound*) bad "a socket hub warned of the kernel registry's rule: $log" ;;
+*) ok "a socket hub does not warn of the kernel registry's rule" ;;
+esac
+out=$(as_uid 1002 "$PROBE" list:"$SOCKET":sensors 2>&1)
+expect "the hub goes on with its topics" "RESULT list sensors OK" "$out"
+kill "$HUB" 2>/dev/null
+wait "$HUB" 2>/dev/null
+
+: >"$DIR/hub.log"
+start_hub
+tries=0
+while ! grep -q 'does not use' "$DIR/hub.log" && [ "$tries" -lt 1000 ]; do
+    tries=$((tries + 1))
+    sleep 0.01
+done
+kill "$HUB" 2>/dev/null
+wait "$HUB" 2>/dev/null
+expect "a start warns as a reload does" "does not use" "$(cat "$DIR/hub.log")"
+rm -f "$CONFIG/20-services.toml"
 
 echo
 echo "PASS $PASS  FAIL $FAIL"

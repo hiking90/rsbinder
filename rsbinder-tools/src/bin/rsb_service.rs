@@ -169,7 +169,29 @@ fn cmd_topics(prefix: &str) -> ExitCode {
             return ExitCode::from(exit::ERR);
         }
     };
-    match resolver.list(prefix) {
+    print_topics(resolver.list(prefix))
+}
+
+/// [`cmd_topics`] on the registry a hub serves on a Unix socket, with no binder device.
+#[cfg(all(feature = "topic", feature = "rpc"))]
+fn cmd_topics_on_socket(socket: &str, prefix: &str) -> ExitCode {
+    use rsbinder_topic::registry::uds::{ResolverOptions, UdsResolver};
+    use rsbinder_topic::uds::Endpoint;
+    let endpoint = Endpoint::Path(socket.into());
+    match UdsResolver::connect(endpoint, &ResolverOptions::default()) {
+        Ok(resolver) => print_topics(resolver.list(prefix)),
+        Err(status) => {
+            eprintln!("rsb_service: no topic registry on {socket}: {status}");
+            ExitCode::from(exit::ERR)
+        }
+    }
+}
+
+#[cfg(feature = "topic")]
+fn print_topics(
+    listed: rsbinder::BinderResult<Vec<rsbinder_topic::registry::TopicListing>>,
+) -> ExitCode {
+    match listed {
         Ok(mut topics) => {
             topics.sort_by(|a, b| a.name.cmp(&b.name));
             let width = topics
@@ -348,6 +370,16 @@ fn cli() -> clap::Command {
                         .index(1)
                         .default_value("")
                         .help("Only list the names that start with this"),
+                )
+                .arg(
+                    clap::Arg::new("topic-socket")
+                        .long("topic-socket")
+                        .value_name("PATH")
+                        .hide(!cfg!(all(feature = "topic", feature = "rpc")))
+                        .help(
+                            "Ask the hub at this Unix socket (rsb_hub --topic-socket), with no \
+                             binder device",
+                        ),
                 ),
         )
 }
@@ -361,6 +393,25 @@ fn main() -> ExitCode {
     if matches.subcommand_name() == Some("topics") {
         eprintln!("rsb_service: built without the `topic` feature, so it has no `topics`");
         return ExitCode::from(exit::ERR);
+    }
+
+    if let Some(("topics", m)) = matches.subcommand() {
+        if let Some(socket) = m.get_one::<String>("topic-socket") {
+            #[cfg(all(feature = "topic", feature = "rpc"))]
+            return cmd_topics_on_socket(
+                socket,
+                m.get_one::<String>("prefix")
+                    .expect("prefix has a default value"),
+            );
+            #[cfg(not(all(feature = "topic", feature = "rpc")))]
+            {
+                eprintln!(
+                    "rsb_service: built without the features `topic` and `rpc`, so {socket} \
+                     cannot be asked"
+                );
+                return ExitCode::from(exit::ERR);
+            }
+        }
     }
 
     let device = matches

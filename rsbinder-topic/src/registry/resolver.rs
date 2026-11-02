@@ -249,7 +249,7 @@ impl<T> Newest<T> {
     }
 
     /// Pass nothing on from now, without the lock: a running call, the caller's own too, goes on.
-    fn end(&self) {
+    pub(super) fn end(&self) {
         self.ended.store(true, Ordering::Release);
     }
 }

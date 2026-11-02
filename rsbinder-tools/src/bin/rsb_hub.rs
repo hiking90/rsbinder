@@ -1729,8 +1729,28 @@ struct Reloadable {
     path: PathBuf,
 }
 
+/// What the configuration holds that this hub's way of serving cannot use, in its log at load
+/// and reload; neither is refused, as one directory can configure a hub of each kind.
+#[cfg_attr(
+    not(feature = "topic"),
+    expect(unused_variables, reason = "only `topic` warns")
+)]
+fn warn_of_config(config: &config::Config, on_a_socket: bool) {
+    #[cfg(feature = "topic")]
+    {
+        let warning = if on_a_socket {
+            config::unused_on_a_topic_socket(config)
+        } else {
+            config::registry_out_of_reach(config)
+        };
+        if let Some(warning) = warning {
+            log::warn!("rsb_hub: {warning}");
+        }
+    }
+}
+
 /// A failed reload keeps the config in force: deny-all breaks IPC, permissive opens it.
-fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) {
+fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifier: Arc<Notifier>) {
     let spawn_result = std::thread::Builder::new()
         .name("rsb_hub:signals".to_owned())
         .spawn(move || {
@@ -1754,7 +1774,7 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
                     std::process::exit(1);
                 }
                 match signo {
-                    libc::SIGHUP => reload(reloadable.as_ref(), &notifier),
+                    libc::SIGHUP => reload(reloadable.as_ref(), on_a_socket, &notifier),
                     // SIGTERM (`systemctl stop`) or SIGINT (Ctrl-C): same intent.
                     _ => {
                         let name = if signo == libc::SIGINT {
@@ -1791,7 +1811,7 @@ fn summary(config: &config::Config) -> String {
 }
 
 /// One SIGHUP's worth of work.
-fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
+fn reload(reloadable: Option<&Reloadable>, on_a_socket: bool, notifier: &Notifier) {
     let Some(Reloadable { enforcer, path }) = reloadable else {
         log::warn!("rsb_hub: SIGHUP ignored; running with --insecure-allow-all, no configuration");
         return;
@@ -1799,6 +1819,7 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
     match config::load(path, &SystemResolver) {
         Ok(loaded) => {
             let summary = summary(&loaded);
+            warn_of_config(&loaded, on_a_socket);
             enforcer.replace(loaded);
             log::info!("rsb_hub: SIGHUP reloaded {summary} from {}", path.display());
             notifier.status(&format!("serving; {summary}"));
@@ -1809,6 +1830,73 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
             path.display()
         ),
     }
+}
+
+/// The directory of a topic socket's files: `<socket's name without .sock>.d` beside it. It is
+/// the one directory the hub empties as it starts.
+#[cfg(all(feature = "topic", feature = "rpc"))]
+fn socket_dir_of(socket: &Path) -> PathBuf {
+    let stem = socket.file_stem().unwrap_or(socket.as_os_str());
+    let mut name = stem.to_os_string();
+    name.push(".d");
+    socket.with_file_name(name)
+}
+
+/// Sessions a hub is sized for on top of its names, each two sockets (a call and a notice one).
+#[cfg(all(feature = "topic", feature = "rpc"))]
+const EXPECTED_SESSIONS: u64 = 1024;
+
+/// A socket hub keeps a descriptor per name and two per session: a soft limit such as the 1024 of
+/// a systemd service runs out long before the registry's own bound, so it goes up to the hard one.
+#[cfg(all(feature = "topic", feature = "rpc"))]
+fn raise_descriptor_limit() {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let raised = Rlimit {
+        current: limit.maximum,
+        maximum: limit.maximum,
+    };
+    if let Err(error) = setrlimit(Resource::Nofile, raised) {
+        log::warn!("rsb_hub: cannot raise the descriptor limit: {error}");
+    }
+    let wanted = rsbinder_topic::registry::MAX_NAMES as u64 + 2 * EXPECTED_SESSIONS;
+    let held = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+    if held < wanted {
+        log::warn!(
+            "rsb_hub: {held} descriptors are too few for {} topic names and {EXPECTED_SESSIONS} \
+             sessions, which take {wanted}: a call past it fails with EMFILE; raise LimitNOFILE",
+            rsbinder_topic::registry::MAX_NAMES
+        );
+    }
+}
+
+/// Serve the topic registry on a Unix socket, without kernel binder: the hub's `--topic-socket`.
+#[cfg(all(feature = "topic", feature = "rpc"))]
+fn serve_topic_socket(
+    socket: &Path,
+    enforcer: Arc<Enforcer>,
+    allow_cross_uid_overwrite: bool,
+    notifier: &Notifier,
+    ready_status: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use rsbinder_topic::registry::uds::{SocketDir, UdsRegistry};
+    use std::os::unix::fs::PermissionsExt;
+
+    raise_descriptor_limit();
+    if let Some(parent) = socket.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Before the directory: a hub already running refuses this bind, and keeps its directory.
+    let server = rsbinder::rpc::RpcServer::setup_unix_server(socket)?;
+    // Who connects is the policy's to judge; left to the umask, systemd's default keeps others out.
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+    let dir = SocketDir::open(&socket_dir_of(socket))?;
+    let registry = UdsRegistry::new(dir, TopicAccess(enforcer))
+        .allow_cross_uid_overwrite(allow_cross_uid_overwrite);
+    registry.serve(&server)?;
+    log::info!("rsb_hub: serving topics on {}", socket.display());
+    notifier.ready(ready_status);
+    Ok(server.run()?)
 }
 
 /// Aborts on a panic off `main` and start threads, like AOSP's FATAL_IF_NOT_ONEWAY (plan 16 Q3).
@@ -1875,6 +1963,20 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                      this flag is set.",
                 ),
         )
+        // Also without the features, hidden: a usage error would say nothing of why.
+        .arg(
+            clap::Arg::new("topic-socket")
+                .long("topic-socket")
+                .value_name("PATH")
+                .conflicts_with("device")
+                .hide(!cfg!(all(feature = "topic", feature = "rpc")))
+                .help(
+                    "Serve only the topic registry, on this Unix socket, without kernel binder \
+                     (e.g. /run/rsbinder/topic.sock, or $XDG_RUNTIME_DIR/rsbinder/topic.sock). \
+                     No service manager runs; of the configuration only [[topic]] and \
+                     [global] topics apply",
+                ),
+        )
         .after_help(
             "Examples:\n    \
             Run with the default binder device:\n    \
@@ -1900,6 +2002,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
     abort_on_a_background_panic();
+
+    let topic_socket = matches.get_one::<String>("topic-socket").map(PathBuf::from);
+    #[cfg(not(all(feature = "topic", feature = "rpc")))]
+    if topic_socket.is_some() {
+        eprintln!("rsb_hub: built without the features `topic` and `rpc`, so no --topic-socket");
+        std::process::exit(1);
+    }
+    let on_a_socket = topic_socket.is_some();
 
     let device_name = matches
         .get_one::<String>("device")
@@ -1939,6 +2049,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Ok(loaded) => {
                 let summary = summary(&loaded);
                 log::info!("rsb_hub: loaded {summary} from {}", path.display());
+                warn_of_config(&loaded, on_a_socket);
                 (Arc::new(Enforcer::enforcing(loaded)), summary)
             }
             Err(err) => exit_without_config(&path, &err),
@@ -1949,7 +2060,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             format!("serving; {summary}"),
         )
     };
-    spawn_signal_thread(reloadable, Arc::clone(&notifier));
+    spawn_signal_thread(reloadable, on_a_socket, Arc::clone(&notifier));
+
+    #[cfg(all(feature = "topic", feature = "rpc"))]
+    if let Some(socket) = &topic_socket {
+        return serve_topic_socket(
+            socket,
+            enforcer,
+            allow_cross_uid_overwrite,
+            &notifier,
+            &ready_status,
+        );
+    }
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 

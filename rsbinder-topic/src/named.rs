@@ -15,6 +15,7 @@
 //! publisher ends with no binder after it, and takes the answer only when no notice came while
 //! it asked; a notice of a binder it cannot use makes it ask once more.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::fd::BorrowedFd;
@@ -31,7 +32,7 @@ use crate::connect::status_of;
 use crate::layout;
 use crate::poll::{Sealed, Wait};
 use crate::receive::Held;
-use crate::resolve::{Lookup, Resolver, ServiceManager, Watch};
+use crate::resolve::{Lookup, Resolved, Resolver, ServiceManager, Watch};
 use crate::subscriber::Interrupt;
 use crate::wake::NamedFds;
 use crate::{
@@ -334,6 +335,8 @@ struct State<T: Payload> {
     kicked: bool,
     /// The binder the name was last given.
     latest: Option<SIBinder>,
+    /// What keeps `latest` usable, if anything does: a connection to it keeps a clone.
+    session: Option<Arc<dyn Any + Send + Sync>>,
     /// Notices `registered` took, each one counted though it repeats `latest`.
     registrations: u64,
     /// A connection the thread made that the subscriber has not taken yet.
@@ -386,6 +389,7 @@ impl<T: Payload> State<T> {
             interrupted: false,
             kicked: false,
             latest: None,
+            session: None,
             registrations: 0,
             ready: None,
             connected: None,
@@ -476,11 +480,11 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             fds,
         });
         let weak = Arc::downgrade(&named);
-        let watch = resolver.watch(
+        let watch = resolver.watch_resolved(
             name,
-            Box::new(move |binder| {
+            Box::new(move |resolved| {
                 if let Some(named) = weak.upgrade() {
-                    named.registered(binder);
+                    named.registered(resolved);
                 }
             }),
         );
@@ -1343,12 +1347,16 @@ impl<T: Payload + 'static> Named<T> {
     }
 
     /// The resolver's callback: keep the binder, and connect to it if nothing else is under way.
-    fn registered(self: &Arc<Self>, binder: SIBinder) {
+    fn registered(self: &Arc<Self>, resolved: Resolved) {
+        let (binder, session) = resolved.into_parts();
+        // Declared before the guard, so that the session it may end closes outside the lock.
+        let _replaced;
         let mut state = self.lock();
         if state.dropped || state.closed.is_some() {
             return;
         }
         state.latest = Some(binder.clone());
+        _replaced = std::mem::replace(&mut state.session, session);
         state.registrations += 1;
         if let Some(connected) = &state.connected {
             // The same binder registered again is the same publisher.
@@ -1439,6 +1447,10 @@ impl<T: Payload + 'static> Named<T> {
                         (binder, looked, delay, told) = (newer, false, FIRST_RETRY, false);
                         continue;
                     }
+                    let subscriber = match state.session.clone() {
+                        Some(session) => subscriber.with_session(session),
+                        None => subscriber,
+                    };
                     state.ready = Some((subscriber, binder.clone()));
                     state.connected = Some(binder);
                     state.connecting = false;
@@ -1523,6 +1535,8 @@ impl<T: Payload + 'static> Named<T> {
 
     /// The binder to subscribe to and whether the lookup gave it; `None` clears `connecting`.
     fn look(&self, ended: Option<&SIBinder>) -> Option<(SIBinder, bool)> {
+        // Declared before the guard, so that the session it may end closes outside the lock.
+        let _replaced;
         let mut state = self.lock();
         if state.dropped || state.closed.is_some() {
             state.connecting = false;
@@ -1563,11 +1577,14 @@ impl<T: Payload + 'static> Named<T> {
                 break None;
             }
             if state.registrations == before {
-                let found = found.filter(|found| usable(found, &state, ended));
-                if let Some(found) = &found {
-                    state.latest = Some(found.clone());
-                }
-                break found.map(|found| (found, true));
+                let found = found.filter(|found| usable(found.binder(), &state, ended));
+                let Some(found) = found else {
+                    break None;
+                };
+                let (binder, session) = found.into_parts();
+                state.latest = Some(binder.clone());
+                _replaced = std::mem::replace(&mut state.session, session);
+                break Some((binder, true));
             }
             let latest = state.latest.clone();
             let latest = latest.filter(|latest| usable(latest, &state, ended));

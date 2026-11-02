@@ -124,7 +124,7 @@ pub use poll::{wait_any, Wait};
 pub use publish::{Authorize, PoolPolicy, PublishError, PublisherPolicy};
 pub use publisher::{Acceptor, LoanMut, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
-pub use resolve::{Advertisement, Resolver, ServiceManager, Watch};
+pub use resolve::{Advertisement, Resolved, Resolver, ServiceManager, Watch};
 pub use sample::Sample;
 pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
 pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
