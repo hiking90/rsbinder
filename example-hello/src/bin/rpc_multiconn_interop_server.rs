@@ -228,6 +228,24 @@ impl Remotable for MultiConn {
     }
 }
 
+/// The root's extension, for gate (e); the launcher only pings it.
+struct Extension;
+
+impl Interface for Extension {}
+impl Remotable for Extension {
+    fn descriptor() -> &'static str {
+        "rsbinder.test.IMultiConnExtension"
+    }
+
+    fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+        Err(StatusCode::UnknownTransaction)
+    }
+
+    fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("rsbinder::rpc=info"),
@@ -256,11 +274,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // second connection (the per-session cap), so this is the
     // load-bearing setting that wires the multi-conn code path.
     server.set_max_threads(max_threads)?;
-    server.set_root(Interface::as_binder(&Binder::new(MultiConn {
+    let root = Binder::new(MultiConn {
         oneway_log: Mutex::new(Vec::new()),
         in_flight: AtomicI32::new(0),
         sched: Arc::new(Mutex::new(None)),
-    })))?;
+    });
+    // Gate (e): libbinder's `getExtension` asks with an empty parcel, no interface token.
+    root.set_extension(&Interface::as_binder(&Binder::new(Extension)))?;
+    server.set_root(Interface::as_binder(&root))?;
 
     println!("[rsbinder-server] READY v2 max_threads={max_threads} on {sock}");
     // Block in the accept loop; the launcher drives every transact.

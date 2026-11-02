@@ -49,6 +49,10 @@
 //       Currently still requires F8.B (split mOutgoing/mIncoming
 //       pools) — deferred behind AC-12.6 (a) passing first.
 //
+//   (e) **`getExtension` with no interface token** (API 37+, plan 18 D1):
+//       `AIBinder_getExtension(root)` returns the server's extension, and
+//       the extension answers a ping.
+//
 // Build (host):
 //   $ANDROID_NDK_HOME/.../bin/aarch64-linux-android36-clang++ \
 //       --target=aarch64-linux-android36 -O2 \
@@ -56,6 +60,7 @@
 //       rpc_multiconn_interop_launcher.cpp \
 //       -o rpc_multiconn_interop_launcher
 
+#include <android/api-level.h>
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
 #include <android/binder_status.h>
@@ -671,6 +676,32 @@ int main(int argc, char** argv) {
                 "[cpp-client] (d) PASS — twoway+oneway from a server thread outside any handler "
                 "(after %d ms)\n",
                 waited_ms);
+    }
+
+    // ---- (e) getExtension (plan 18 D1) ------------------------------
+    // Android 17's IBinder::getExtension marks an empty parcel for the
+    // binder, so it reaches an RPC server with no interface token; earlier
+    // releases send nothing, and the client answers BAD_TYPE itself.
+    {
+        const int api = android_get_device_api_level();
+        AIBinder* ext_raw = nullptr;
+        const binder_status_t rc = AIBinder_getExtension(root, &ext_raw);
+        auto ext_owner = std::unique_ptr<AIBinder, decltype(&AIBinder_decStrong)>(
+                ext_raw, AIBinder_decStrong);
+        if (api < 37) {
+            fprintf(stderr, "[cpp-client] (e) SKIP on API %d: getExtension rc=%d\n", api, rc);
+        } else {
+            if (rc != STATUS_OK || ext_raw == nullptr) {
+                fprintf(stderr, "[cpp-client] (e) FAIL: rc=%d ext=%p\n", rc, ext_raw);
+                return 50;
+            }
+            const binder_status_t ping = AIBinder_ping(ext_raw);
+            if (ping != STATUS_OK) {
+                fprintf(stderr, "[cpp-client] (e) FAIL: ping of the extension rc=%d\n", ping);
+                return 51;
+            }
+            fprintf(stderr, "[cpp-client] (e) PASS — getExtension returned a binder that pings\n");
+        }
     }
 
     printf("AC-12.6 PASS — multi-conn real-libbinder ↔ rsbinder full transact\n");
