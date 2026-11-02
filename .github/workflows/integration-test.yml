@@ -132,8 +132,7 @@ jobs:
           RUST_LOG=info nohup target/debug/rsb_hub --config tests/policy/permissive.toml \
             > rsb_hub.log 2>&1 &
           echo $! > rsb_hub.pid
-          sleep 1
-          kill -0 "$(cat rsb_hub.pid)" || { echo "::error::rsb_hub failed to start"; cat rsb_hub.log; exit 1; }
+          bash scripts/ci_wait_hub_ready.sh rsb_hub.log "$(cat rsb_hub.pid)"
 
       - name: Start test_service
         run: |
@@ -646,8 +645,7 @@ jobs:
           RUST_LOG=info nohup target/debug/rsb_hub --config tests/policy/permissive.toml \
             > rsb_hub.log 2>&1 &
           echo $! > rsb_hub.pid
-          sleep 1
-          kill -0 "$(cat rsb_hub.pid)" || { echo "::error::rsb_hub failed to start"; cat rsb_hub.log; exit 1; }
+          bash scripts/ci_wait_hub_ready.sh rsb_hub.log "$(cat rsb_hub.pid)"
 
       - name: Run the topic fleet (#[ignore]'d)
         env:

@@ -331,8 +331,7 @@ start_hub() {
     RUST_LOG=info target/debug/rsb_hub --config tests/policy/permissive.toml \
         > "$LOG_DIR/rsb_hub.log" 2>&1 &
     HUB_PID=$!
-    sleep 1
-    kill -0 "$HUB_PID" 2>/dev/null
+    bash scripts/ci_wait_hub_ready.sh "$LOG_DIR/rsb_hub.log" "$HUB_PID"
 }
 
 # start_service BIN: (re)start the shared test service and wait for its marker.
