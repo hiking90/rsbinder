@@ -347,6 +347,36 @@ a reference such as "(CHANGELOG *Fixed*)" points to the 0.13.0 section there.
   `getService` for it. The `sleep` needs a runtime whose timer advances
   (`TokioRuntime`'s *Stalls*). Outside a handler nothing changes.
 
+## Parcel reads
+
+Reads now follow AOSP Rust, the NDK and Java where 0.12.0 followed the
+stricter C++ `Parcel`. No wire change: every writer still writes the same
+bytes, so only a peer that wrote something unusual sees a difference.
+
+- **Any nonzero presence word means present.** A nullable or structured
+  parcelable, a `ParcelableHolder` and a default `Option<T>` treat only `0` as
+  null. 0.12.0 refused every value but `0` and `1` with `UnexpectedNull`, so
+  code that matched that error for a garbage word now reads the body.
+  `ParcelFileDescriptor` still refuses a word other than `0` and `1`: AOSP
+  reads it through C++ `Parcel::readData`, which does the same.
+- **A malformed `String16` is null when null is allowed.** `Option<String>`
+  returns `None`, and consumes what it read, for a negative length other than
+  `-1`, a parcel too short for the length, or a missing NUL terminator;
+  0.12.0 returned an error. `String` still fails, with `UnexpectedNull`
+  whatever the cause. An unpaired surrogate is skipped instead of `BadValue`,
+  and an interface token is compared by its raw units, so one holding such a
+  surrogate is a mismatch. Check for `None` where a malformed string has to
+  be told from a null one.
+- **A `Status` message keeps the strict read,** as AOSP's
+  `Status::readFromParcel` does: `-1` is no message, and anything else
+  malformed fails the status with `UnexpectedNull`.
+- **Array errors changed.** A length below `-1` is `BadValue`, not
+  `UnexpectedNull`. A length past the bytes left is `NoMemory`, not
+  `NotEnoughData`, and an array of non-scalar elements that runs out of bytes
+  partway is `NotEnoughData`. A `char` array whose words run out stays
+  `NotEnoughData`. A `sized_read` whose declared size ends past `i32::MAX` is
+  `BadValue`.
+
 ## Code generation (`rsbinder-aidl`, macros)
 
 - **`rsbinder` requires `rsbinder-aidl` with `=`.** Generated code calls

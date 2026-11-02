@@ -137,6 +137,21 @@ accepts both the 0.12.0 bytes and the new ones.
   binder thread until the service appears; `timeout`, `select!` and a drop
   cannot end it. A bounded wait there is a `try_get_interface_async` loop.
 
+**Parcel reads**
+
+- A nullable or structured parcelable, a `ParcelableHolder` and a default
+  `Option<T>` read any nonzero presence word as present, as AOSP Rust and
+  Java do; 0.12.0 refused all but `1` with `UnexpectedNull`. A
+  `ParcelFileDescriptor` still refuses it, as AOSP's does.
+- `Option<String>` reads a malformed `String16` (a negative length other
+  than `-1`, a short parcel, no NUL terminator) as `None`, as the NDK does,
+  and `String` as `UnexpectedNull`; an unpaired surrogate is skipped, not
+  `BadValue`. A `Status` message keeps the strict read: only `-1` is null,
+  anything else malformed is `UnexpectedNull`.
+- An array length below `-1` is `BadValue`, not `UnexpectedNull`. A length
+  past the bytes left is `NoMemory`, not `NotEnoughData`, except when a
+  `char` array's words run out, which stays `NotEnoughData`.
+
 **Code generation (`rsbinder-aidl`, macros)**
 
 - `rsbinder` requires `rsbinder-aidl` with `=`.
