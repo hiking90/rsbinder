@@ -2,7 +2,9 @@
 # Run a command in a container of its own: a binder device of its own, several
 # uids, or no binder at all (plan 6-7 §8, plan 15-pubsub-uds §4.9).
 #
-#   tests/container/run.sh [--no-binder] [--as-root | --uid N] -- COMMAND...
+#   tests/container/run.sh [--no-binder] [--as-root | --uid N] [--rw DIR] -- COMMAND...
+#
+# --rw mounts DIR of the host, which has to exist, writable at its own path.
 #
 # Exit code: COMMAND's. Setup that fails is 125 and says so on stderr, so that
 # it is never read as a test result. No docker is 125 under
@@ -35,11 +37,13 @@ LABEL=rsbinder.test.container
 
 binder=1
 user=
+writable=
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-binder) binder=0 ;;
         --as-root) user=0 ;;
         --uid) user=$2; shift ;;
+        --rw) writable=$2; shift ;;
         --) shift; break ;;
         *) echo "run.sh: unknown argument: $1" >&2; exit 125 ;;
     esac
@@ -62,6 +66,7 @@ options=(
     --rm
     --init
     --label "$LABEL"
+    --label "$LABEL.run=${RSB_CONTAINER_RUN:-}"
     --tmpfs /tmp:mode=1777,exec
     -v "$ROOT:$ROOT:ro"
     -v /usr:/usr:ro
@@ -71,6 +76,10 @@ options=(
     -e "RUST_LOG=${RUST_LOG:-}"
     -e "RUST_BACKTRACE=${RUST_BACKTRACE:-}"
 )
+
+if [ -n "$writable" ]; then
+    options+=(-v "$writable:$writable")
+fi
 
 if [ "$binder" = 1 ]; then
     major=$(awk '$2 == "binder" { print $1 }' /proc/devices)
@@ -96,6 +105,9 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
+# In the background: bash runs a trap only after a foreground command ends, and `wait` returns
+# at once on a signal, so a run that hangs can still be ended from outside.
 docker run --name "$name" "${options[@]}" "$IMAGE" \
-    "$ROOT/tests/container/entry.sh" "$@"
+    "$ROOT/tests/container/entry.sh" "$@" &
+wait $!
 exit $?

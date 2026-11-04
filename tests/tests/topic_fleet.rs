@@ -21,8 +21,8 @@
 //! directories go in (`target/tmp/topic-fleet`), for a device the binaries were pushed to.
 //!
 //! With the feature `topic-uds` and `TOPIC_FLEET_SOCKETS` set to a directory, the fleet runs over
-//! Unix sockets and opens no binder device: `tests/container/topic_uds.sh` runs it in a container
-//! that has none. `steady_state_fleet`, `scripted_faults` and `chaos_faults` take it.
+//! Unix sockets and opens no binder device: `tests/container/topic_fleet_uds.sh` runs it in a
+//! container that has none. `steady_state_fleet`, `scripted_faults` and `chaos_faults` take it.
 //!
 //! On Android the platform service manager is the context manager and the nodes run as root:
 //! `su` is a permissive domain on a userdebug build, so any name can be added under enforcing

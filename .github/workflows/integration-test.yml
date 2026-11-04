@@ -412,7 +412,13 @@ jobs:
         env:
           FLEET_SECS: ${{ github.event.inputs.fleet_secs || '60' }}
           RSB_CONTAINER_REQUIRED: 1
-        run: tests/container/topic_fleet_uds.sh --release
+        run: |
+          tests/container/topic_fleet_uds.sh --release || {
+            echo "::error::topic fleet over Unix sockets failed"
+            mkdir -p artifacts
+            cp -rf target/tmp/topic-fleet-uds artifacts/ 2>/dev/null || true
+            exit 1
+          }
 
       - name: Restart test_service for test_death_recipient
         run: |

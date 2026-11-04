@@ -9,7 +9,9 @@ set -u
 
 cd "$(dirname "$0")/../.." || exit 1
 RUN=tests/container/run.sh
-LABEL=rsbinder.test.container
+# This run's containers alone: another run.sh may be running beside this one.
+export RSB_CONTAINER_RUN=ac-run-$$
+LABEL=rsbinder.test.container.run=$RSB_CONTAINER_RUN
 PASS=0
 FAIL=0
 
@@ -51,7 +53,8 @@ same "--no-binder: no device, no mount, seccomp on" done "$out"
 "$RUN" --no-binder -- sh -c 'touch "$PWD/.rsb-container-probe" 2>/dev/null && exit 1; exit 0'
 same "the repository is read-only" 0 $?
 
-"$RUN" --no-binder -- sleep 30 >/dev/null 2>&1 &
+# Far longer than the wait below: only the trap can end this run in time, not the command.
+"$RUN" --no-binder -- sleep 300 >/dev/null 2>&1 &
 runner=$!
 tries=0
 until [ -n "$(docker ps --filter "label=$LABEL" --format '{{.Names}}')" ]; do
@@ -60,6 +63,17 @@ until [ -n "$(docker ps --filter "label=$LABEL" --format '{{.Names}}')" ]; do
     sleep 0.02
 done
 kill -TERM "$runner"
+tries=0
+while kill -0 "$runner" 2>/dev/null && [ "$tries" -lt 3000 ]; do
+    tries=$((tries + 1))
+    sleep 0.01
+done
+if kill -0 "$runner" 2>/dev/null; then
+    bad "a signalled run ends at once: it still ran after 30 s"
+    docker ps -q --filter "label=$LABEL" | xargs -r docker rm -f >/dev/null
+else
+    ok "a signalled run ends at once"
+fi
 wait "$runner"
 same "a signalled run ends as the signal says" 143 $?
 same "no container left after a run that was signalled" "" \

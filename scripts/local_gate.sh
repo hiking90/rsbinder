@@ -222,12 +222,12 @@ tier_hermetic() {
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
     run "rsbinder-topic" tpass cargo test -p rsbinder-topic
     run "rsbinder-topic (uds)" tpass cargo test -p rsbinder-topic --features uds
-    if docker info >/dev/null 2>&1; then
+    if [ "$(uname -s)" = Linux ] && docker info >/dev/null 2>&1; then
         run "container runner" bash -c 'cargo build -p rsbinder-tools && tests/container/ac_run.sh'
         run "topics in a container with no binder" tests/container/topic_uds.sh
     else
-        skip "container runner" "needs a running docker"
-        skip "topics in a container with no binder" "needs a running docker"
+        skip "container runner" "needs Linux and a running docker"
+        skip "topics in a container with no binder" "needs Linux and a running docker"
     fi
     run "rsbinder-topic loom (ring writer and reader, wait and wake)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-topic --lib --release loom
@@ -248,6 +248,7 @@ tier_hermetic() {
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
     run "rsbinder-tools (topic)" tpass cargo test -p rsbinder-tools --features topic
+    run "rsbinder-tools (topic, rpc)" tpass cargo test -p rsbinder-tools --features topic,rpc
 
     run "rpc build matrix" rpc_build_matrix
     run "rsbinder lib (no binder device)" bash scripts/ci_rsbinder_lib_tests.sh
