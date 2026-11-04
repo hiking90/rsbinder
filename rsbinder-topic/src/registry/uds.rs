@@ -58,7 +58,7 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -333,7 +333,7 @@ struct Inner {
 struct Shared {
     access: Box<dyn RegistryAccess>,
     dir: SocketDir,
-    cross_uid: std::sync::atomic::AtomicBool,
+    cross_uid: AtomicBool,
     next_allocation: AtomicU64,
     /// Taken before `inner` and held while sending: notices leave in the order of their changes.
     fire_order: Mutex<()>,
@@ -796,8 +796,24 @@ impl Shared {
     }
 }
 
+/// Clears `retrying` when the retry thread panics: left set, no later send would start another.
+struct Ending(Weak<Shared>);
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        if let Some(shared) = self.0.upgrade() {
+            let mut inner = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.retrying = false;
+        }
+    }
+}
+
 /// The retry thread: rounds until nothing is owed or the registry is gone.
 fn retry(shared: Weak<Shared>) {
+    let _ending = Ending(shared.clone());
     loop {
         let Some(registry) = shared.upgrade() else {
             return;
@@ -837,7 +853,7 @@ impl UdsRegistry {
         let shared = Arc::new_cyclic(|this| Shared {
             access: Box::new(access),
             dir,
-            cross_uid: std::sync::atomic::AtomicBool::new(false),
+            cross_uid: AtomicBool::new(false),
             next_allocation: AtomicU64::new(1),
             fire_order: Mutex::new(()),
             inner: Mutex::new(Inner {
@@ -892,6 +908,20 @@ impl UdsRegistry {
         server.set_root(self.as_binder())?;
         server.set_reply_timeout(Some(SEND_TIMEOUT))?;
         Ok(())
+    }
+
+    /// Whether `retrying` is still set after a retry thread's panic, for a test.
+    #[cfg(test)]
+    pub(super) fn retrying_after_a_panic(&self) -> bool {
+        self.shared.lock().retrying = true;
+        let ending = Ending(Arc::downgrade(&self.shared));
+        let unwound = std::thread::spawn(move || {
+            let _ending = ending;
+            panic!("the retry thread's panic");
+        })
+        .join();
+        assert!(unwound.is_err());
+        self.shared.lock().retrying
     }
 
     /// Fail the next `count` duplicates of an address, as with no descriptor left, for a test.
@@ -1263,6 +1293,10 @@ impl Resolver for UdsResolver {
         let watcher = BnTopicAddressWatcher::new_binder(Notices {
             name: name.to_owned(),
             newest: newest.clone(),
+            dialer: dialer.clone(),
+            // Weak: the host's session keeps this watcher until the host pays for it.
+            host: Arc::downgrade(&self.host),
+            asking_again: Arc::new(AtomicBool::new(false)),
         });
         let registry = &self.host.registry;
         let reply = match registry.r#watch(name, &watcher) {
@@ -1332,6 +1366,10 @@ impl Drop for Watching {
 struct Notices {
     name: String,
     newest: Arc<Newest<(OwnedFd, i64)>>,
+    dialer: Arc<Dialer>,
+    host: Weak<Host>,
+    /// A thread asks the host again; one is enough, as it asks for the newest.
+    asking_again: Arc<AtomicBool>,
 }
 
 impl Interface for Notices {}
@@ -1346,11 +1384,68 @@ impl ITopicAddressWatcher for Notices {
         if name != self.name {
             return Ok(());
         }
-        let address = socket.as_ref().try_clone().map_err(StatusCode::from)?;
-        self.newest.heard(Some((address, generation)), generation);
+        match self.duplicate(socket) {
+            Ok(address) => self.newest.heard(Some((address, generation)), generation),
+            Err(error) => {
+                log::warn!("topic: no descriptor for a notice of {name:?}, asking again: {error}");
+                self.ask_again();
+            }
+        }
         Ok(())
     }
 }
+
+impl Notices {
+    fn duplicate(&self, socket: &ParcelFileDescriptor) -> std::io::Result<OwnedFd> {
+        #[cfg(test)]
+        if FAILING_NOTICES.lock().expect("lock poisoned").as_deref() == Some(self.name.as_str()) {
+            *FAILING_NOTICES.lock().expect("lock poisoned") = None;
+            return Err(Errno::MFILE.into());
+        }
+        socket.as_ref().try_clone()
+    }
+
+    /// The oneway has no one to fail to, and the host counts it delivered: look the name up.
+    fn ask_again(&self) {
+        if self.asking_again.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let name = self.name.clone();
+        let newest = self.newest.clone();
+        let dialer = self.dialer.clone();
+        let host = self.host.clone();
+        let asking = self.asking_again.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rsbinder-topic-host".into())
+            .spawn(move || {
+                let mut delay = FIRST_RETRY;
+                while !dialer.ended_within(delay) {
+                    let Some(host) = host.upgrade() else {
+                        break;
+                    };
+                    match host.registry.r#lookup(&name) {
+                        Ok(reply) => {
+                            let (address, generation) = parts(reply);
+                            let address = address.map(|address| (address, generation));
+                            newest.heard(address, generation);
+                            break;
+                        }
+                        Err(status) => log::debug!("topic: asking for {name:?}: {status}"),
+                    }
+                    delay = (delay * 2).min(LAST_RETRY);
+                }
+                asking.store(false, Ordering::SeqCst);
+            });
+        if let Err(error) = spawned {
+            log::warn!("topic: no thread to ask for {:?} again: {error}", self.name);
+            self.asking_again.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The name whose next notice fails its duplicate, as with no descriptor left, for a test.
+#[cfg(test)]
+pub(super) static FAILING_NOTICES: Mutex<Option<String>> = Mutex::new(None);
 
 /// The connection of the newest generation one watch has reached.
 struct Reached {
@@ -1376,6 +1471,19 @@ struct Again {
     address: OwnedFd,
     generation: i64,
     at: Instant,
+}
+
+/// Clears `running` when the connecting thread unwinds: left set, no notice would start another.
+struct Dialing<'d>(&'d Dialer);
+
+impl Drop for Dialing<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let queue = self.0.queue.lock();
+        queue.unwrap_or_else(PoisonError::into_inner).running = false;
+    }
 }
 
 /// Whether another connect to the same socket can answer otherwise (see [`UdsResolver`]).
@@ -1457,7 +1565,13 @@ impl Dialer {
         }
     }
 
+    /// `order` guards no data: a callback's panic under it leaves nothing to repair.
+    fn order(&self) -> MutexGuard<'_, ()> {
+        self.order.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn run(self: Arc<Self>) {
+        let _dialing = Dialing(&self);
         let mut again = None;
         let mut tried = None;
         let mut delay = FIRST_RETRY;
@@ -1466,7 +1580,7 @@ impl Dialer {
                 tried = Some(generation);
                 delay = FIRST_RETRY;
             }
-            let _order = self.order.lock().expect("lock poisoned");
+            let _order = self.order();
             match self.reach(&address, generation) {
                 Ok(Some(resolved)) => {
                     if !self.queue.lock().expect("lock poisoned").ended {
@@ -1496,8 +1610,18 @@ impl Dialer {
         address: &OwnedFd,
         generation: i64,
     ) -> BinderResult<Option<Resolved>> {
-        let _order = self.order.lock().expect("lock poisoned");
+        let _order = self.order();
         self.reach(address, generation)
+    }
+
+    /// Until `delay` passes or the dialer ends; whether it ended.
+    fn ended_within(&self, delay: Duration) -> bool {
+        let queue = self.queue.lock().expect("lock poisoned");
+        let (queue, _) = self
+            .changed
+            .wait_timeout_while(queue, delay, |queue| !queue.ended)
+            .expect("lock poisoned");
+        queue.ended
     }
 
     /// [`dial`](Self::dial) for a lookup, whose caller gives up on a failure: the thread goes on.

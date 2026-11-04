@@ -1151,6 +1151,61 @@ fn a_publisher_that_answers_only_later_is_reached_with_no_newer_generation() {
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
 }
 
+/// A notice whose descriptor could not be kept has no one to fail to: the watch asks the host.
+#[test]
+fn a_notice_with_no_descriptor_left_is_made_up_by_asking_the_host() {
+    let fixture = Fixture::new("no_descriptor", AllowAll);
+    let raw = fixture.raw();
+    let resolver = fixture.resolver();
+    let mut subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with("a.lost", &policy(), &resolver).unwrap();
+    assert!(!subscriber.wait_connected(Duration::from_millis(50)));
+
+    *super::uds::FAILING_NOTICES.lock().unwrap() = Some("a.lost".into());
+    let (publisher, _serving, _address, _generation) = served(&raw, "a.lost");
+    assert!(subscriber.wait_connected(WAIT));
+    assert!(super::uds::FAILING_NOTICES.lock().unwrap().is_none());
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+}
+
+/// A callback that panics stops one connect: later ones start, by a notice and by a lookup.
+#[test]
+fn a_panic_in_the_callback_leaves_the_watch_able_to_connect() {
+    let fixture = Fixture::new("panicking_callback", AllowAll);
+    let raw = fixture.raw();
+    let (_publisher, _serving, address, generation) = served(&raw, "a.name");
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let keep = told.clone();
+    let dialer = Arc::new(Dialer::new(
+        Options::default(),
+        Box::new(move |resolved: BinderResult<Resolved>| {
+            let binder = resolved.unwrap().into_binder();
+            let mut told = keep.lock().unwrap();
+            told.push(binder);
+            let first = told.len() == 1;
+            drop(told);
+            assert!(!first, "the callback's panic");
+        }),
+    ));
+    let second = address.try_clone().unwrap();
+    dialer.give(address, generation);
+    eventually("the panicked thread's end", || dialer.idle());
+    assert_eq!(told.lock().unwrap().len(), 1);
+
+    dialer.dial(&second, generation).unwrap().unwrap();
+    dialer.give(second, generation);
+    eventually("a second call", || told.lock().unwrap().len() == 2);
+    dialer.end();
+}
+
+/// A retry thread that panics leaves `retrying` clear, so a later send starts another.
+#[test]
+fn a_panic_in_the_retry_thread_lets_a_later_send_start_another() {
+    let fixture = Fixture::new("panicking_retry", AllowAll);
+    assert!(!fixture.registry.retrying_after_a_panic());
+}
+
 /// A lookup reached this generation first: the notice still calls, with the lookup's binder.
 #[test]
 fn a_notice_of_a_generation_a_lookup_reached_still_calls() {
