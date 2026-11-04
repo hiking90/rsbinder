@@ -74,15 +74,17 @@ pub trait RegistryAccess: Send + Sync {
     /// Whether `caller` may do `action` on `name` (`""` for [`Action::List`]). An action the
     /// implementation does not know is refused.
     ///
-    /// It must not call the registry. When it judges the watchers of a change it runs while the
-    /// registry holds the lock that orders its notices, so its cost holds up the registry's other
-    /// advertises and the sends of owed notices; a withdraw, a watch and a death go on. Every
-    /// other judgement, those of notices sent again among them, runs with no lock of the
-    /// registry held.
+    /// It must not call the registry. When a registry judges the watchers of a change it runs
+    /// while the registry holds the lock that orders its notices, so its cost holds up the
+    /// registry's other changes and the sends of owed notices; a withdraw, a watch and a death
+    /// go on. Every other judgement, those of notices sent again among them, runs with no lock of
+    /// the registry held.
     ///
     /// A panic in it ends the call that asked, and the registry goes on: a change keeps its new
-    /// state, and those of its notices not sent by then are not sent; a notice the retry thread
-    /// was judging stays owed, and the next send starts another thread for it.
+    /// state, and the notice being judged is not sent. On a [`Registry`] those of a change not
+    /// sent by then are not sent either; a notice the retry thread was judging stays owed, and
+    /// the next send starts another thread for it. On a registry on a socket a notice's judgement
+    /// ends no call: the change's other notices go on, and it no longer owes the one judged.
     fn allows(&self, action: Action, name: &str, caller: &Caller) -> bool;
 }
 

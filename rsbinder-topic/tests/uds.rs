@@ -33,8 +33,7 @@ fn path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rsb_uds2_{tag}_{pid}_{serial}.sock"))
 }
 
-/// Run test `name` again in a process of its own, where no other test makes or drops a memfd;
-/// `true` in that process.
+/// Rerun test `name` alone in a new process, away from other tests' memfds; `true` there.
 fn alone(name: &str) -> bool {
     const ALONE: &str = "RSBINDER_TOPIC_ALONE";
     if std::env::var_os(ALONE).is_some() {

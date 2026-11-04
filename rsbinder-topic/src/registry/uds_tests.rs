@@ -5,21 +5,38 @@
 //! so a real registry, its publishers and its subscribers run with no binder device. The calls
 //! that a resolver never makes wrongly are made by hand on the session.
 
+use std::any::Any;
 use std::collections::BTreeSet;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{ErrorKind, IoSlice, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{RpcServer, RpcServerHandle};
-use rsbinder::{Caller, ExceptionCode, Interface, ParcelFileDescriptor, StatusCode, Strong};
+use rsbinder::rpc::transport::UnixTransport;
+use rsbinder::rpc::{
+    FileDescriptorTransportMode, PeerIdentity, RpcClientConfig, RpcResult, RpcServer,
+    RpcServerHandle, RpcSession, RpcTransport,
+};
+use rsbinder::{
+    BinderResult, Caller, ExceptionCode, Interface, ParcelFileDescriptor, Status, StatusCode,
+    Strong,
+};
+use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 
-use super::uds::{ResolverOptions, SocketDir, UdsRegistry, UdsResolver};
+use super::table::MAX_WATCHERS;
+use super::uds::{Dialer, ResolverOptions, SocketDir, UdsRegistry, UdsResolver};
 use super::{Action, AllowAll, RegistryAccess};
-use crate::aidl::ITopic::ITopic;
+use crate::aidl::ITopic::{BnTopic, ITopic};
 use crate::aidl::ITopicAddressWatcher::{BnTopicAddressWatcher, ITopicAddressWatcher};
 use crate::aidl::ITopicUdsRegistry::ITopicUdsRegistry;
+use crate::aidl::SubscribeRequest::SubscribeRequest;
+use crate::aidl::TopicEndpoint::TopicEndpoint;
+use crate::resolve::{Advertisement, OnResolved, Resolved, Watch};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
 use crate::{
     Bytes, Closed, Disconnected, NamedState, NamedSubscriber, Publisher, PublisherPolicy,
@@ -29,9 +46,13 @@ use crate::{
 const WAIT: Duration = Duration::from_secs(10);
 
 fn eventually(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + WAIT;
+    within(WAIT, what, done);
+}
+
+fn within(limit: Duration, what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + limit;
     while !done() {
-        assert!(Instant::now() < deadline, "{what} within {WAIT:?}");
+        assert!(Instant::now() < deadline, "{what} within {limit:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -135,25 +156,74 @@ fn a_socket_directory_is_made_private_and_what_a_crash_left_goes() {
     let stat = rustix::fs::stat(&path).unwrap();
     assert_eq!(stat.st_mode & 0o777, 0o700);
     drop(dir);
-    std::fs::write(path.join("left"), b"").unwrap();
+    drop(UnixListener::bind(path.join("7")).unwrap());
     let _dir = SocketDir::open(&path).unwrap();
     assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
     std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]
-fn a_directory_others_can_write_or_a_symlink_is_not_used() {
+fn a_directory_others_can_reach_a_symlink_or_a_file_is_not_used() {
     use std::os::unix::fs::PermissionsExt;
     let root = scratch("dir_bad");
     let open = root.join("open.d");
     std::fs::create_dir(&open).unwrap();
-    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o770)).unwrap();
-    let refused = SocketDir::open(&open).unwrap_err();
-    assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+    for mode in [0o770, 0o755, 0o711, 0o701, 0o500] {
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(mode)).unwrap();
+        let refused = SocketDir::open(&open).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::InvalidData, "mode {mode:o}");
+    }
     std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
     let link = root.join("link.d");
     std::os::unix::fs::symlink(&open, &link).unwrap();
-    assert!(SocketDir::open(&link).is_err());
+    assert_eq!(
+        SocketDir::open(&link).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    let file = root.join("file.d");
+    std::fs::write(&file, b"").unwrap();
+    assert_eq!(
+        SocketDir::open(&file).unwrap_err().kind(),
+        ErrorKind::InvalidData
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A directory shared with something else, as `/etc/rsbinder/hub.d` is what `hub.sock` asks for.
+#[test]
+fn a_directory_holding_what_no_registry_made_is_refused_and_keeps_all_of_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch("dir_shared");
+    let path = root.join("hub.d");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(UnixListener::bind(path.join("3")).unwrap());
+    for stranger in ["10-local.toml", "12"] {
+        std::fs::write(path.join(stranger), b"").unwrap();
+        let refused = SocketDir::open(&path).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::InvalidData);
+        assert!(refused.to_string().contains(stranger), "{refused}");
+        assert!(path.join(stranger).exists());
+        assert!(path.join("3").exists());
+        std::fs::remove_file(path.join(stranger)).unwrap();
+    }
+    drop(UnixListener::bind(path.join("named")).unwrap());
+    assert!(SocketDir::open(&path).is_err());
+    assert!(path.join("3").exists());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_directory_in_use_is_refused_and_keeps_what_is_in_it() {
+    let root = scratch("dir_held");
+    let path = root.join("topic.d");
+    let held = SocketDir::open(&path).unwrap();
+    drop(UnixListener::bind(path.join("3")).unwrap());
+    let refused = SocketDir::open(&path).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidData);
+    assert!(path.join("3").exists());
+    drop(held);
+    SocketDir::open(&path).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
 }
 
@@ -278,8 +348,7 @@ fn a_replaced_or_withdrawn_allocation_is_not_committed() {
     assert_eq!(code(refused), ExceptionCode::IllegalState);
 }
 
-/// Two publishers of a uid: the later commit wins, whichever allocated first, with a newer
-/// generation.
+/// Two publishers of a uid: the later commit wins, whichever allocated first.
 #[test]
 fn commits_in_the_reverse_order_of_their_allocations_order_the_generations() {
     let fixture = Fixture::new("reversed", AllowAll);
@@ -302,7 +371,7 @@ fn commits_in_the_reverse_order_of_their_allocations_order_the_generations() {
     assert_eq!(found.generation, g1);
 }
 
-/// Refuses every commit but the first, as a reload can, with the right to allocate kept.
+/// Once told, refuses to advertise any name, as a reload can between an allocation and its commit.
 #[derive(Default)]
 struct ReloadedAway(Mutex<bool>);
 
@@ -448,11 +517,15 @@ fn the_policy_refuses_a_name_it_does_not_allow() {
 
 /// Allows a subscriber until told, which a reload can do to a watch already made.
 #[derive(Default)]
-struct WatchersGoAway(Mutex<bool>);
+struct WatchersGoAway(Mutex<bool>, AtomicU32);
 
 impl RegistryAccess for Arc<WatchersGoAway> {
     fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
-        action != Action::Subscribe || !*self.0.lock().unwrap()
+        let allowed = action != Action::Subscribe || !*self.0.lock().unwrap();
+        if !allowed {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
+        allowed
     }
 }
 
@@ -512,7 +585,8 @@ fn a_watcher_that_lost_the_right_is_sent_no_descriptor() {
     raw.registry
         .r#commit("a.name", &topic, again.allocation)
         .unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    // `commit` judges and sends on its thread: what it would have sent, it has by now.
+    assert_eq!(fixture.registry.stats().notices_sent, 1);
     assert_eq!(told.0.lock().unwrap().len(), 1);
 }
 
@@ -768,23 +842,39 @@ fn a_resolver_subscribes_to_the_topic_a_name_has_now() {
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
 }
 
+/// Lets a name be allocated and refuses its commit, the next time the policy is asked of it.
+struct RefusesCommitOf(&'static str, AtomicU32);
+
+impl RegistryAccess for Arc<RefusesCommitOf> {
+    fn allows(&self, action: Action, name: &str, _: &Caller) -> bool {
+        action != Action::Advertise || name != self.0 || self.1.fetch_add(1, Ordering::Relaxed) == 0
+    }
+}
+
 /// A commit the resolver loses keeps what the publisher had, and stops the server it made.
 #[test]
 fn a_commit_a_policy_refuses_leaves_the_publisher_its_name() {
-    let access = Arc::new(ReloadedAway::default());
+    let access = Arc::new(RefusesCommitOf("b.name", AtomicU32::new(0)));
     let fixture = Fixture::new("keep_name", access.clone());
     let resolver = fixture.resolver();
     let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
     publisher.advertise_on("a.name", &resolver).unwrap();
     let raw = fixture.raw();
     let held = raw.registry.r#lookup("a.name").unwrap();
-    *access.0.lock().unwrap() = true;
     let refused = publisher.advertise_on("b.name", &resolver).err().unwrap();
     assert_eq!(code(refused), ExceptionCode::Security);
+    assert_eq!(
+        access.1.load(Ordering::Relaxed),
+        2,
+        "the allocate, then the commit"
+    );
     let found = raw.registry.r#lookup("a.name").unwrap();
     assert_eq!(found.generation, held.generation);
     assert!(found.socket.is_some());
     assert_eq!(fixture.registry.stats().pending, 0);
+    let address = fixture.registry.last_address().unwrap();
+    let stopped = connect_through(&address).unwrap_err();
+    assert_eq!(stopped.raw_os_error(), Some(libc::ECONNREFUSED));
 }
 
 #[test]
@@ -812,10 +902,161 @@ fn a_publisher_of_an_unexpected_uid_is_not_subscribed_to() {
         NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &picky).unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(200)));
     publisher.publish(&Bytes(vec![1])).unwrap();
+    match subscriber.recv_timeout(WAIT) {
+        Err(RecvError::Disconnected(Disconnected::Rejected(status))) => {
+            assert_eq!(status.exception_code(), ExceptionCode::Security);
+        }
+        other => panic!("not told of the refusal: {other:?}"),
+    }
+    assert!(matches!(
+        subscriber.state(),
+        NamedState::Refused(status) if status.exception_code() == ExceptionCode::Security
+    ));
     assert_eq!(
         subscriber.recv_timeout(Duration::from_millis(50)),
         Err(RecvError::Timeout)
     );
+}
+
+/// A resolver that gives up on a publisher tells the subscriber once, and a binder ends that.
+#[test]
+fn a_publisher_given_up_on_is_a_refusal_until_a_binder_comes() {
+    struct GivesUp(Mutex<Option<OnResolved>>);
+
+    impl Resolver for GivesUp {
+        fn advertise(&self, _: &str, _: rsbinder::SIBinder) -> BinderResult<Advertisement> {
+            Ok(Advertisement::none())
+        }
+
+        fn watch(
+            &self,
+            _: &str,
+            _: Box<dyn Fn(rsbinder::SIBinder) + Send + Sync>,
+        ) -> BinderResult<Watch> {
+            Ok(Watch::new(()))
+        }
+
+        fn watch_resolved(&self, _: &str, on_resolved: OnResolved) -> BinderResult<Watch> {
+            *self.0.lock().unwrap() = Some(on_resolved);
+            Ok(Watch::new(()))
+        }
+    }
+
+    let resolver = GivesUp(Mutex::default());
+    let mut subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    let tell = resolver.0.lock().unwrap().take().unwrap();
+    let refusal = || Err(Status::from((ExceptionCode::Security, "not that uid")));
+    tell(refusal());
+    tell(refusal());
+    assert!(matches!(subscriber.state(), NamedState::Refused(_)));
+    assert!(matches!(
+        subscriber.try_recv(),
+        Err(RecvError::Disconnected(Disconnected::Rejected(_)))
+    ));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let (_publisher, topic) = topic();
+    tell(Ok(Resolved::new(topic.as_binder())));
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.state(), NamedState::Connected);
+}
+
+/// A session that ended is no answer for its generation: the publisher lives, and is reached anew.
+#[test]
+fn a_session_that_ended_is_made_again_for_the_same_generation() {
+    let fixture = Fixture::new("session_ended", AllowAll);
+    let raw = fixture.raw();
+    let (_publisher, _serving, address, generation) = served(&raw, "a.name");
+    let dialer = Arc::new(Dialer::new(Options::default(), Box::new(|_| {})));
+    let first = dialer.dial(&address, generation).unwrap().unwrap();
+    let again = dialer.dial(&address, generation).unwrap().unwrap();
+    assert_eq!(again.binder(), first.binder());
+    let (first_binder, session) = first.into_parts();
+    let session = session.unwrap().downcast::<SessionGuard>().unwrap();
+    session.0.close_session();
+    let next = dialer.dial(&address, generation).unwrap().unwrap();
+    assert_ne!(next.binder(), &first_binder);
+    next.binder().ping_binder().unwrap();
+    dialer.end();
+}
+
+/// Its session ending is what the subscriber sees: the name and the publisher stay as they were.
+#[test]
+fn a_subscriber_whose_session_ended_connects_again_with_no_new_generation() {
+    let fixture = Fixture::new("reconnect", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher =
+        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
+            .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let spy = SessionsSeen {
+        resolver: fixture.resolver(),
+        seen: seen.clone(),
+    };
+    let mut subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &spy).unwrap();
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    let session = seen.lock().unwrap()[0].upgrade().unwrap();
+    let guard = session.downcast::<SessionGuard>().unwrap();
+    guard.0.close_session();
+    drop(guard);
+    assert!(matches!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Ended(_)))
+    ));
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    // A session's end reads as the publisher's death, which forgets it: from the oldest again.
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+}
+
+/// A notice could reach neither: no incoming connection to call on, or no descriptor to take.
+#[test]
+fn a_watch_of_a_session_that_cannot_be_told_is_refused() {
+    let fixture = Fixture::new("no_callbacks", AllowAll);
+    let config = || RpcClientConfig::unix(fixture.path.clone(), uds::WIRE);
+    let no_incoming = config().fd_mode(FileDescriptorTransportMode::Unix);
+    let no_fds = config().incoming_connections(1);
+    for config in [no_incoming, no_fds] {
+        let session = RpcSession::setup_client_android13plus_with_config(config).unwrap();
+        let session = SessionGuard(session);
+        let registry: Strong<dyn ITopicUdsRegistry> =
+            session.0.get_root().unwrap().into_interface().unwrap();
+        let watcher = BnTopicAddressWatcher::new_binder(Silent);
+        let refused = registry.r#watch("a.name", &watcher).err().unwrap();
+        assert_eq!(refused.transaction_error(), StatusCode::InvalidOperation);
+        assert_eq!(fixture.registry.stats().watchers, 0);
+    }
+}
+
+/// What a client sends with a frame it never finishes is closed with the read: no call takes one.
+#[test]
+fn a_descriptor_a_client_sends_is_closed_with_the_read() {
+    let fixture = Fixture::new("sent_fd", AllowAll);
+    let mut client = UnixStream::connect(&fixture.path).unwrap();
+    // The android-13+ connection header (version 2, `Unix`, a new session), then its "cci".
+    let mut hello = [0u8; 24];
+    hello[0] = 2;
+    hello[5] = 1;
+    hello[16..19].copy_from_slice(b"cci");
+    client.write_all(&hello).unwrap();
+    client.set_read_timeout(Some(WAIT)).unwrap();
+    client.read_exact(&mut [0u8; 8]).unwrap();
+
+    let (mut kept, sent) = UnixStream::pair().unwrap();
+    kept.set_read_timeout(Some(WAIT)).unwrap();
+    let fds = [sent.as_fd()];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
+    // One byte of a header: a read that took the descriptor would hold it for the rest.
+    let frame = [IoSlice::new(&[0])];
+    rustix::net::sendmsg(&client, &frame, &mut ancillary, SendFlags::empty()).unwrap();
+    drop(sent);
+    assert_eq!(kept.read(&mut [0]).unwrap(), 0, "the host holds it");
 }
 
 #[test]
@@ -852,4 +1093,735 @@ fn a_lookup_and_a_notice_of_one_generation_share_a_binder() {
     let looked = lookup().unwrap().unwrap();
     assert_eq!(looked.binder(), &told.lock().unwrap()[0]);
     assert_eq!(told.lock().unwrap().len(), 1);
+}
+
+// ---- a publisher or a watcher that stops ----
+
+/// A publisher given a name on `raw`'s session: it, what serves it, the address and generation.
+fn served(raw: &Raw, name: &str) -> (Publisher<Bytes>, RpcServerHandle, OwnedFd, i64) {
+    let (publisher, topic) = topic();
+    let allocation = raw.registry.r#allocate(name, &topic).unwrap();
+    let socket = OwnedFd::from(allocation.socket.unwrap());
+    let server = RpcServer::setup_unix_server_from_bound_fd(socket).unwrap();
+    let serving = uds::serve(&server, publisher.as_binder()).unwrap();
+    let generation = raw
+        .registry
+        .r#commit(name, &topic, allocation.allocation)
+        .unwrap();
+    let address = raw.registry.r#lookup(name).unwrap().socket.unwrap();
+    (publisher, serving, OwnedFd::from(address), generation)
+}
+
+/// A socket listening with no one to accept is a publisher that stopped, until it is served.
+#[test]
+fn a_publisher_that_answers_only_later_is_reached_with_no_newer_generation() {
+    let fixture = Fixture::new("late_answer", AllowAll);
+    let raw = fixture.raw();
+    let (publisher, topic) = topic();
+    let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+    let socket = OwnedFd::from(allocation.socket.unwrap());
+    rustix::net::listen(&socket, 8).unwrap();
+    raw.registry
+        .r#commit("a.name", &topic, allocation.allocation)
+        .unwrap();
+    let options = ResolverOptions {
+        timeout: Some(Duration::from_millis(100)),
+        ..ResolverOptions::default()
+    };
+    let endpoint = Endpoint::Path(fixture.path.clone());
+    let resolver = UdsResolver::connect(endpoint, &options).unwrap();
+    let mut subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    assert!(!subscriber.wait_connected(Duration::from_millis(300)));
+
+    let server = RpcServer::setup_unix_server_from_bound_fd(socket).unwrap();
+    let _serving = uds::serve(&server, publisher.as_binder()).unwrap();
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+}
+
+/// A lookup reached this generation first: the notice still calls, with the lookup's binder.
+#[test]
+fn a_notice_of_a_generation_a_lookup_reached_still_calls() {
+    let fixture = Fixture::new("repeat", AllowAll);
+    let raw = fixture.raw();
+    let (_publisher, _serving, address, generation) = served(&raw, "a.name");
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let keep = told.clone();
+    let dialer = Arc::new(Dialer::new(
+        Options::default(),
+        Box::new(move |resolved: BinderResult<Resolved>| {
+            keep.lock().unwrap().push(resolved.unwrap().into_binder());
+        }),
+    ));
+    let looked = dialer.dial(&address, generation).unwrap().unwrap();
+    dialer.give(address, generation);
+    eventually("the notice's call", || !told.lock().unwrap().is_empty());
+    assert_eq!(&told.lock().unwrap()[0], looked.binder());
+    dialer.end();
+}
+
+/// A notice's connection and its call are one step for a lookup of a newer generation.
+#[test]
+fn a_lookup_waits_for_the_call_of_an_older_generation_and_no_older_call_follows_it() {
+    let fixture = Fixture::new("order", AllowAll);
+    let raw = fixture.raw();
+    let (_first, _first_serving, first, first_generation) = served(&raw, "a.first");
+    let (_second, _second_serving, second, second_generation) = served(&raw, "a.second");
+    let (entered, running) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let (entered, released) = (Mutex::new(entered), Mutex::new(released));
+    let calls = Arc::new(Mutex::new(0));
+    let counted = calls.clone();
+    let dialer = Arc::new(Dialer::new(
+        Options::default(),
+        Box::new(move |_| {
+            *counted.lock().unwrap() += 1;
+            entered.lock().unwrap().send(()).unwrap();
+            let _ = released.lock().unwrap().recv();
+        }),
+    ));
+    let address = first.try_clone().unwrap();
+    dialer.give(address, first_generation);
+    running.recv_timeout(WAIT).unwrap();
+
+    let (dialed, dial_returned) = mpsc::channel();
+    let looking = dialer.clone();
+    let lookup = std::thread::spawn(move || {
+        let reached = looking
+            .dial(&second, second_generation)
+            .map(|r| r.is_some());
+        dialed.send(()).unwrap();
+        reached
+    });
+    assert!(dial_returned
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    drop(release);
+    assert_eq!(lookup.join().unwrap().ok(), Some(true));
+
+    dialer.give(first, first_generation);
+    eventually("the older notice's thread", || dialer.idle());
+    assert_eq!(*calls.lock().unwrap(), 1);
+    dialer.end();
+}
+
+/// Blocks in the subscription call until released, as a publisher that stops there.
+struct StoppedTopic {
+    entered: Mutex<mpsc::Sender<()>>,
+    released: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Interface for StoppedTopic {}
+
+impl ITopic for StoppedTopic {
+    fn r#subscribe(&self, _: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        self.entered.lock().unwrap().send(()).unwrap();
+        let _ = self.released.lock().unwrap().recv();
+        Err(StatusCode::DeadObject.into())
+    }
+}
+
+/// `ResolverOptions::timeout` leaves this call without a deadline: the next generation ends it.
+#[test]
+fn a_publisher_stopped_in_the_subscription_call_holds_no_watch_from_the_next_one() {
+    let fixture = Fixture::new("stopped_call", AllowAll);
+    let (entered, running) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let stopped = BnTopic::new_binder(StoppedTopic {
+        entered: Mutex::new(entered),
+        released: Mutex::new(released),
+    });
+    let resolver = fixture.resolver();
+    let _name = resolver.advertise("a.name", stopped.as_binder()).unwrap();
+    let mut subscriber = named(&fixture, "a.name");
+    running.recv_timeout(WAIT).unwrap();
+
+    let publisher =
+        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
+            .unwrap();
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    drop(release);
+}
+
+/// A [`UdsResolver`] that keeps a weak reference to what each binder's session is held by.
+struct SessionsSeen {
+    resolver: UdsResolver,
+    seen: Arc<Mutex<Vec<Weak<dyn Any + Send + Sync>>>>,
+}
+
+impl Resolver for SessionsSeen {
+    fn advertise(&self, name: &str, topic: rsbinder::SIBinder) -> BinderResult<Advertisement> {
+        self.resolver.advertise(name, topic)
+    }
+
+    fn watch(
+        &self,
+        name: &str,
+        on_registered: Box<dyn Fn(rsbinder::SIBinder) + Send + Sync>,
+    ) -> BinderResult<Watch> {
+        self.resolver.watch(name, on_registered)
+    }
+
+    fn watch_resolved(&self, name: &str, on_resolved: OnResolved) -> BinderResult<Watch> {
+        let seen = self.seen.clone();
+        let spied = Box::new(move |resolved: BinderResult<Resolved>| {
+            if let Ok((_, session)) = resolved.clone().map(Resolved::into_parts) {
+                seen.lock()
+                    .unwrap()
+                    .extend(session.as_ref().map(Arc::downgrade));
+            }
+            on_resolved(resolved);
+        });
+        self.resolver.watch_resolved(name, spied)
+    }
+
+    fn host(&self) -> Option<rsbinder::SIBinder> {
+        self.resolver.host()
+    }
+}
+
+/// Nothing else ends this call: the drop has to let go of all that holds the session open.
+#[test]
+fn a_dropped_subscriber_closes_the_session_of_a_publisher_stopped_in_the_call() {
+    let fixture = Fixture::new("stopped_drop", AllowAll);
+    let (entered, running) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let stopped = BnTopic::new_binder(StoppedTopic {
+        entered: Mutex::new(entered),
+        released: Mutex::new(released),
+    });
+    let resolver = fixture.resolver();
+    let _name = resolver.advertise("a.name", stopped.as_binder()).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let spy = SessionsSeen {
+        resolver: fixture.resolver(),
+        seen: seen.clone(),
+    };
+    let subscriber = NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &spy).unwrap();
+    running.recv_timeout(WAIT).unwrap();
+    assert!(!seen.lock().unwrap().is_empty());
+    drop(subscriber);
+    eventually("the session to close", || {
+        seen.lock().unwrap().iter().all(|s| s.strong_count() == 0)
+    });
+    drop(release);
+}
+
+/// Without a descriptor to send, the host owes the notice: nothing else would tell this watcher.
+#[test]
+fn a_notice_with_no_descriptor_to_send_is_sent_again() {
+    let fixture = Fixture::new("no_descriptor", AllowAll);
+    let raw = fixture.raw();
+    let told = Counted::default();
+    let watcher = BnTopicAddressWatcher::new_binder(told.clone());
+    raw.registry.r#watch("a.name", &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    fixture.registry.fail_duplicates(1);
+    let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+    let generation = raw
+        .registry
+        .r#commit("a.name", &topic, allocation.allocation)
+        .unwrap();
+    eventually("the notice", || !told.0.lock().unwrap().is_empty());
+    assert_eq!(*told.0.lock().unwrap(), [generation]);
+    eventually("nothing owed", || fixture.registry.stats().owed == 0);
+    assert_eq!(fixture.registry.stats().notices_retried, 1);
+}
+
+/// Stops in its first notice, so the notices after it fill its socket.
+struct StoppedWatcher(Mutex<mpsc::Receiver<()>>);
+
+impl Interface for StoppedWatcher {}
+
+impl ITopicAddressWatcher for StoppedWatcher {
+    fn r#onAdvertised(&self, _: &str, _: &ParcelFileDescriptor, _: i64) -> BinderResult<()> {
+        let _ = self.0.lock().unwrap().recv();
+        Ok(())
+    }
+}
+
+/// Each step's 5 s is under the 10 s a send would wait, on the thread that makes the change.
+#[test]
+fn a_watcher_that_stopped_holds_up_no_commit_and_no_other_watcher() {
+    const NOTICES: usize = 400;
+    let fixture = Fixture::new("stopped_watcher", AllowAll);
+    let raw = fixture.raw();
+    let stopped = fixture.raw();
+    let (release, released) = mpsc::channel();
+    let watcher = BnTopicAddressWatcher::new_binder(StoppedWatcher(Mutex::new(released)));
+    stopped.registry.r#watch("a.name", &watcher).unwrap();
+    let other = fixture.raw();
+    let told = Counted::default();
+    let listening = BnTopicAddressWatcher::new_binder(told.clone());
+    other.registry.r#watch("a.name", &listening).unwrap();
+
+    let (_publisher, topic) = topic();
+    let mut generations = Vec::new();
+    for _ in 0..NOTICES {
+        let started = Instant::now();
+        let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+        let generation = raw
+            .registry
+            .r#commit("a.name", &topic, allocation.allocation)
+            .unwrap();
+        generations.push(generation);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a commit waited"
+        );
+        // One at a time, so the notice of each is seen before the next change.
+        within(Duration::from_secs(5), "the other watcher's notice", || {
+            told.0.lock().unwrap().last() == Some(&generation)
+        });
+    }
+    assert_eq!(*told.0.lock().unwrap(), generations);
+    let sent = fixture.registry.stats().notices_sent as usize;
+    assert!(sent < 2 * NOTICES, "the stopped watcher took them all");
+    drop(release);
+}
+
+/// A stopped session's socket is full: a commit or an eviction drops its proxies with no wait.
+#[test]
+fn the_last_drops_of_a_stopped_session_hold_up_no_commit_and_no_eviction() {
+    let limit = Duration::from_secs(5);
+    let access = Arc::new(EvictsAfterOne(Mutex::new(None)));
+    let fixture = Fixture::new("stopped_drops", access.clone());
+    let raw = fixture.raw();
+    let stopped = fixture.raw();
+    let (release, released) = mpsc::channel();
+    let first = BnTopicAddressWatcher::new_binder(StoppedWatcher(Mutex::new(released)));
+    stopped.registry.r#watch("a.name", &first).unwrap();
+    let mut watches = vec![first];
+    for _ in 1..MAX_WATCHERS {
+        let watcher = BnTopicAddressWatcher::new_binder(Silent);
+        stopped.registry.r#watch("a.name", &watcher).unwrap();
+        watches.push(watcher);
+    }
+    let (_kept_alive, stopped_topic) = topic();
+    let held = stopped
+        .registry
+        .r#allocate("a.held", &stopped_topic)
+        .unwrap();
+    stopped
+        .registry
+        .r#commit("a.held", &stopped_topic, held.allocation)
+        .unwrap();
+
+    let (_publisher, other_topic) = topic();
+    let mut last = 0;
+    let filling = Instant::now();
+    loop {
+        assert!(
+            filling.elapsed() < Duration::from_secs(60),
+            "no notice owed"
+        );
+        let allocation = raw.registry.r#allocate("a.name", &other_topic).unwrap();
+        let started = Instant::now();
+        raw.registry
+            .r#commit("a.name", &other_topic, allocation.allocation)
+            .unwrap();
+        assert!(started.elapsed() < limit, "a commit waited");
+        let sent = fixture.registry.stats().notices_sent;
+        if fixture.registry.stats().owed > 0 && sent == last {
+            break;
+        }
+        last = sent;
+    }
+
+    let allocation = raw.registry.r#allocate("a.held", &other_topic).unwrap();
+    let started = Instant::now();
+    raw.registry
+        .r#commit("a.held", &other_topic, allocation.allocation)
+        .unwrap();
+    assert!(started.elapsed() < limit, "a commit waited");
+
+    *access.0.lock().unwrap() = Some(1);
+    let watcher = BnTopicAddressWatcher::new_binder(Silent);
+    let started = Instant::now();
+    raw.registry.r#watch("a.name", &watcher).unwrap();
+    assert!(started.elapsed() < limit, "an eviction waited");
+    assert_eq!(fixture.registry.stats().watchers, 1);
+    drop(release);
+}
+
+/// Once told how many to allow, refuses `Subscribe` past them, as a reload does to a full name.
+struct EvictsAfterOne(Mutex<Option<u32>>);
+
+impl RegistryAccess for Arc<EvictsAfterOne> {
+    fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        let mut left = self.0.lock().unwrap();
+        match left.as_mut() {
+            Some(left) if action == Action::Subscribe => {
+                let allowed = *left > 0;
+                *left = left.saturating_sub(1);
+                allowed
+            }
+            _ => true,
+        }
+    }
+}
+
+/// Stops in its first notice until released, then keeps what it hears.
+struct WatcherThatGoesOn {
+    released: Mutex<Option<mpsc::Receiver<()>>>,
+    told: Counted,
+}
+
+impl Interface for WatcherThatGoesOn {}
+
+impl ITopicAddressWatcher for WatcherThatGoesOn {
+    fn r#onAdvertised(&self, name: &str, fd: &ParcelFileDescriptor, gen: i64) -> BinderResult<()> {
+        if let Some(released) = self.released.lock().unwrap().take() {
+            let _ = released.recv();
+        }
+        self.told.r#onAdvertised(name, fd, gen)
+    }
+}
+
+/// Past its socket's room a watcher hears nothing out of order, and the newest generation last.
+#[test]
+fn a_watcher_that_goes_on_hears_the_generations_in_order_up_to_the_newest() {
+    let fixture = Fixture::new("goes_on", AllowAll);
+    let raw = fixture.raw();
+    let slow = fixture.raw();
+    let (release, released) = mpsc::channel();
+    let told = Counted::default();
+    let watcher = BnTopicAddressWatcher::new_binder(WatcherThatGoesOn {
+        released: Mutex::new(Some(released)),
+        told: told.clone(),
+    });
+    slow.registry.r#watch("a.name", &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    let mut newest = 0;
+    let commit = || {
+        let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+        raw.registry
+            .r#commit("a.name", &topic, allocation.allocation)
+            .unwrap()
+    };
+    let filling = Instant::now();
+    while fixture.registry.stats().owed == 0 {
+        assert!(
+            filling.elapsed() < Duration::from_secs(60),
+            "no notice owed"
+        );
+        newest = commit();
+    }
+    for _ in 0..10 {
+        newest = commit();
+    }
+    drop(release);
+    eventually("the newest generation", || {
+        told.0.lock().unwrap().last() == Some(&newest)
+    });
+    let heard = told.0.lock().unwrap().clone();
+    assert!(heard.is_sorted(), "out of order: {heard:?}");
+    eventually("nothing owed", || fixture.registry.stats().owed == 0);
+    assert!(fixture.registry.stats().notices_retried > 0);
+}
+
+/// The descriptors of `dir`'s sockets this process holds: what a registry made and has not closed.
+fn addresses_held(dir: &std::path::Path) -> usize {
+    let open = std::fs::read_dir("/proc/self/fd").unwrap();
+    let links = open.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok());
+    links
+        .filter(|link| link.starts_with(dir) && link != dir)
+        .count()
+}
+
+/// Notices past a stopped watcher's room leave the host one owed entry and no descriptor of theirs.
+#[test]
+fn a_stopped_watcher_costs_the_host_one_notice_owed_however_many_changes() {
+    const CHANGES: usize = 400;
+    let fixture = Fixture::new("bounded", AllowAll);
+    let dir = fixture.path.with_file_name("topic.d");
+    let raw = fixture.raw();
+    let stopped = fixture.raw();
+    let (release, released) = mpsc::channel();
+    let watcher = BnTopicAddressWatcher::new_binder(StoppedWatcher(Mutex::new(released)));
+    stopped.registry.r#watch("a.name", &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    for _ in 0..CHANGES {
+        let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+        raw.registry
+            .r#commit("a.name", &topic, allocation.allocation)
+            .unwrap();
+    }
+    let stats = fixture.registry.stats();
+    assert_eq!(stats.owed, 1, "{stats:?}");
+    // The name's, the test's copy of the last, the stopped call's parcel's, two of a retry's send.
+    let held = addresses_held(&dir);
+    assert!(held <= 5, "{held} addresses held after {CHANGES} changes");
+    drop(release);
+}
+
+/// A notice's frame is one a send that does not wait takes, for the longest name there is.
+#[test]
+fn a_notice_of_the_longest_name_is_sent() {
+    let fixture = Fixture::new("longest", AllowAll);
+    let raw = fixture.raw();
+    let name = "n".repeat(127);
+    let told = Counted::default();
+    let watcher = BnTopicAddressWatcher::new_binder(told.clone());
+    raw.registry.r#watch(&name, &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    let allocation = raw.registry.r#allocate(&name, &topic).unwrap();
+    let generation = raw
+        .registry
+        .r#commit(&name, &topic, allocation.allocation)
+        .unwrap();
+    eventually("the notice", || !told.0.lock().unwrap().is_empty());
+    assert_eq!(*told.0.lock().unwrap(), [generation]);
+    assert_eq!(fixture.registry.stats().notices_failed, 0);
+}
+
+/// A client's end of a socket that keeps the frames it sends.
+struct Recording(UnixTransport, Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl Recording {
+    fn keep(&self, frame: &[u8]) {
+        self.1.lock().unwrap().push(frame.to_vec());
+    }
+}
+
+impl RpcTransport for Recording {
+    fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+        self.keep(buf);
+        self.0.send_raw(buf)
+    }
+    fn send_raw_with_fds(&self, buf: &[u8], fds: &[BorrowedFd<'_>]) -> RpcResult<()> {
+        self.keep(buf);
+        self.0.send_raw_with_fds(buf, fds)
+    }
+    fn __send_no_wait(&self, buf: &[u8], fds: &[BorrowedFd<'_>]) -> Option<RpcResult<bool>> {
+        self.keep(buf);
+        self.0.__send_no_wait(buf, fds)
+    }
+    fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+        self.0.recv_raw(buf)
+    }
+    fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<OwnedFd>)> {
+        self.0.recv_raw_with_fds(buf)
+    }
+    fn peer_identity(&self) -> PeerIdentity {
+        self.0.peer_identity()
+    }
+    fn describe(&self) -> &str {
+        "recording"
+    }
+    fn supports_fd_passing(&self) -> bool {
+        self.0.supports_fd_passing()
+    }
+    fn shutdown(&self) -> RpcResult<()> {
+        self.0.shutdown()
+    }
+}
+
+/// When a notice is written changes, not what: its frame is the stub's but for the oneway number.
+#[test]
+fn a_notice_is_the_frame_the_generated_stub_writes() {
+    let root = scratch("same_frame");
+    let path = root.join("watcher.sock");
+    let server = RpcServer::setup_unix_server(&path).unwrap();
+    let watcher = BnTopicAddressWatcher::new_binder(Silent);
+    let _serving = uds::serve(&server, watcher.as_binder()).unwrap();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let transport = Recording(UnixTransport::connect(&path).unwrap(), frames.clone());
+    let session = RpcSession::connect_android13plus_fd(
+        Box::new(transport),
+        uds::WIRE,
+        FileDescriptorTransportMode::Unix,
+    )
+    .unwrap();
+    let proxy: Strong<dyn ITopicAddressWatcher> =
+        session.get_root().unwrap().into_interface().unwrap();
+    let address = ParcelFileDescriptor::new(std::fs::File::open("/dev/null").unwrap());
+    frames.lock().unwrap().clear();
+    super::uds::try_notice(&proxy, "a.name", &address, 7).unwrap();
+    proxy.r#onAdvertised("a.name", &address, 7).unwrap();
+    session.close_session();
+
+    // `RpcWireHeader` (16 bytes) then address (8), code (4), flags (4) and `asyncNumber` (8).
+    const NUMBER: std::ops::Range<usize> = 32..40;
+    let frames = frames.lock().unwrap();
+    assert_eq!(frames.len(), 2);
+    let (mut ours, mut stubs) = (frames[0].clone(), frames[1].clone());
+    assert_eq!(ours[NUMBER], 0u64.to_le_bytes());
+    assert_eq!(stubs[NUMBER], 1u64.to_le_bytes());
+    ours[NUMBER].fill(0);
+    stubs[NUMBER].fill(0);
+    assert_eq!(ours, stubs);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// Holds the judgement of a change's notice, which a change sends under `fire_order` alone.
+struct HeldJudgement {
+    entered: Mutex<mpsc::Sender<()>>,
+    released: Mutex<mpsc::Receiver<()>>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl RegistryAccess for Arc<HeldJudgement> {
+    fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        if action == Action::Subscribe && self.armed.swap(false, Ordering::SeqCst) {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.released.lock().unwrap().recv();
+        }
+        true
+    }
+}
+
+/// A retry judged before a newer change sends what the name has at the send, not at the judgement.
+#[test]
+fn a_notice_sent_again_is_of_the_generation_the_name_has_by_then() {
+    let (entered, running) = mpsc::channel();
+    let (held, released) = mpsc::channel::<()>();
+    let access = Arc::new(HeldJudgement {
+        entered: Mutex::new(entered),
+        released: Mutex::new(released),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let fixture = Fixture::new("by_then", access.clone());
+    // After `fixture`: on a panic it drops first, so the judgement is let go before a join.
+    let release = held;
+    let raw = fixture.raw();
+    let told = Counted::default();
+    let watcher = BnTopicAddressWatcher::new_binder(told.clone());
+    raw.registry.r#watch("a.name", &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    let commit = || {
+        let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+        raw.registry
+            .r#commit("a.name", &topic, allocation.allocation)
+            .unwrap()
+    };
+    fixture.registry.fail_duplicates(1);
+    let older = commit();
+    access.armed.store(true, Ordering::SeqCst);
+    running.recv_timeout(WAIT).unwrap();
+    fixture.registry.fail_duplicates(1);
+    let newer = commit();
+    assert!(newer > older);
+    drop(release);
+    eventually("the notice", || !told.0.lock().unwrap().is_empty());
+    assert_eq!(*told.0.lock().unwrap(), [newer]);
+    eventually("nothing owed", || fixture.registry.stats().owed == 0);
+}
+
+/// `inner` is not held across what a change does for its notices: a judgement or a send.
+#[test]
+fn a_change_sends_its_notices_with_the_registrys_state_free() {
+    let (entered, running) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let access = Arc::new(HeldJudgement {
+        entered: Mutex::new(entered),
+        released: Mutex::new(released),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let fixture = Fixture::new("state_free", access.clone());
+    let raw = fixture.raw();
+    let watcher = BnTopicAddressWatcher::new_binder(Silent);
+    raw.registry.r#watch("a.name", &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+    access.armed.store(true, Ordering::SeqCst);
+    let registry = raw.registry.clone();
+    let committing = std::thread::spawn(move || {
+        registry
+            .r#commit("a.name", &topic, allocation.allocation)
+            .map(drop)
+    });
+    running.recv_timeout(WAIT).unwrap();
+    let registry = fixture.registry.shared_for_a_test();
+    let (asked, answered) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = asked.send(registry.stats());
+    });
+    let answer = answered.recv_timeout(Duration::from_secs(5));
+    drop(release);
+    if answer.is_err() {
+        // Its `Drop` would join the worker that this regression leaves stuck on the state's lock.
+        std::mem::forget(fixture);
+        panic!("a judgement held the registry's state");
+    }
+    committing.join().unwrap().unwrap();
+}
+
+/// Holds a `list` call at the host, as a host that stopped holds any call on a session.
+struct HeldList {
+    entered: Mutex<mpsc::Sender<()>>,
+    released: Mutex<mpsc::Receiver<()>>,
+}
+
+impl RegistryAccess for Arc<HeldList> {
+    fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        if action == Action::List {
+            let _ = self.entered.lock().unwrap().send(());
+            let _ = self.released.lock().unwrap().recv();
+        }
+        true
+    }
+}
+
+/// The session's one connection is taken: a drop that waited for it would hold the end record.
+#[test]
+fn a_host_that_holds_a_call_holds_no_publisher_drop_and_no_watch_drop() {
+    let (entered, running) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let access = Arc::new(HeldList {
+        entered: Mutex::new(entered),
+        released: Mutex::new(released),
+    });
+    let fixture = Fixture::new("held_host", access);
+    let resolver = fixture.resolver();
+    let publisher =
+        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
+            .unwrap();
+    let watching =
+        NamedSubscriber::<Bytes>::subscribe_with("b.name", &policy(), &resolver).unwrap();
+    let mut subscriber = named(&fixture, "a.name");
+    assert!(subscriber.wait_connected(WAIT));
+
+    let listing = resolver.clone();
+    let list = std::thread::spawn(move || listing.list("").map(|listed| listed.len()));
+    running.recv_timeout(WAIT).unwrap();
+
+    let (dropped, drops_returned) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(publisher);
+        drop(watching);
+        dropped.send(()).unwrap();
+    });
+    let returned = drops_returned.recv_timeout(WAIT / 2);
+    let ended = subscriber.recv_timeout(Duration::from_millis(100));
+    drop(release);
+    assert!(returned.is_ok(), "a drop waited for the host");
+    assert_eq!(
+        ended,
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    list.join().unwrap().map_err(|_: Status| ()).unwrap();
+    eventually("the name to go", || fixture.registry.stats().topics == 0);
+    eventually("the watch to go", || fixture.registry.stats().watched <= 1);
+}
+
+/// A session left to drain keeps the server's listener, on which a connect would go unanswered.
+#[test]
+fn a_dropped_publisher_refuses_a_connect_while_its_sessions_last() {
+    let fixture = Fixture::new("refuses", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher =
+        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
+            .unwrap();
+    let raw = fixture.raw();
+    let address = OwnedFd::from(raw.registry.r#lookup("a.name").unwrap().socket.unwrap());
+    let subscriber = named(&fixture, "a.name");
+    assert!(subscriber.wait_connected(WAIT));
+    drop(publisher);
+    let refused = connect_through(&address).unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(libc::ECONNREFUSED));
 }

@@ -27,28 +27,60 @@
 //!
 //! The file's mode bits are judged again at every connect, whatever the descriptor: they are
 //! 0666, so what decides is the policy behind the descriptor. Root skips them.
+//!
+//! A change's notices go out as a [`Registry`](super::Registry)'s do: on the thread of the call
+//! that made the change, in the order of the changes, each to a watcher with the name's generation
+//! then. A send here takes one system call that waits for no peer, so a watcher that stopped holds
+//! up no change and no other watcher. A notice with no room in the watcher's socket is owed, as one
+//! is on a kernel registry when the watcher's process has no room: it is sent again, under the same
+//! bounds, with the topic the name has by then, so a watcher that does not keep up skips
+//! generations and never hears them out of order. The bound on how many are owed is the
+//! registry's, whichever uid owes them (plan 15 D13-e): a uid allowed to `Subscribe` that stops
+//! reading, or to `Advertise` and `Subscribe` as well and so change a name faster than it reads,
+//! can take that room, and a notice past the bound goes unsent until the name's next change
+//! (`owed_dropped`).
+//!
+//! The descriptors in notices and replies nobody has read count against the host's uid, and past
+//! `RLIMIT_NOFILE` the kernel refuses more unless the host has `CAP_SYS_RESOURCE` or
+//! `CAP_SYS_ADMIN`. A uid that can fill enough sockets can reach that: then every watcher's notice
+//! has no room and is owed as above, and a reply with a descriptor fails its call with
+//! `StatusCode::FailedTransaction`. Nothing waits and no other session ends. An `allocate` refused
+//! that way leaves its name pending, as its caller has no number to withdraw, until the session
+//! ends or allocates that name again.
+//!
+//! Unlike a kernel registry, a process that stopped with its socket full loses its session after
+//! 10 s, which takes its names and watches away; one that goes on reading keeps it. A session that
+//! could not be told at all, with no incoming connection or no descriptors to take, is refused its
+//! watch with `InvalidOperation`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use rsbinder::rpc::{PeerIdentity, RpcServer};
+use rsbinder::rpc::{PeerIdentity, RpcProxy, RpcServer};
 use rsbinder::{
     BinderResult, Caller, DeathLink, DeathRecipient, ExceptionCode, IBinder, Interface,
-    ParcelFileDescriptor, SIBinder, Status, StatusCode, Strong, WIBinder,
+    ParcelFileDescriptor, RemoteProxy, SIBinder, Status, StatusCode, Strong, TransportCaps,
+    WIBinder,
 };
-use rustix::fs::{AtFlags, Mode, OFlags};
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, Shutdown, SocketAddrUnix, SocketFlags, SocketType};
 
 use super::resolver::Newest;
 use super::table::{Key, Links, Notice, Refused, Sent, Table};
-use super::{is_valid_name, link_failed, no_allocation, Action, RegistryAccess, RegistryStats};
+use super::{
+    is_valid_name, link_failed, no_allocation, Action, RegistryAccess, RegistryStats, Sleep,
+};
 use crate::aidl::ITopic::ITopic;
-use crate::aidl::ITopicAddressWatcher::{BnTopicAddressWatcher, ITopicAddressWatcher};
+use crate::aidl::ITopicAddressWatcher::{
+    transactions, BnTopicAddressWatcher, BpTopicAddressWatcher, ITopicAddressWatcher,
+};
 use crate::aidl::ITopicUdsRegistry::{
     BnTopicUdsRegistry, ITopicUdsRegistry, ERROR_LIMIT, ERROR_TAKEN,
 };
@@ -56,8 +88,9 @@ use crate::aidl::TopicAddress::TopicAddress;
 use crate::aidl::TopicAllocation::TopicAllocation;
 use crate::aidl::TopicInfo::TopicInfo;
 use crate::connect::refuse;
+use crate::named::{FIRST_RETRY, LAST_RETRY};
 use crate::registry::TopicListing;
-use crate::resolve::{Advertisement, Resolved, Resolver, Watch};
+use crate::resolve::{Advertisement, OnResolved, Resolved, Resolver, Watch};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
 use crate::{Payload, Subscriber, SubscriberPolicy};
 
@@ -75,24 +108,29 @@ pub struct SocketDir {
 }
 
 impl SocketDir {
-    /// The directory at `path`, made with mode 0700 if it is not there.
+    /// The directory at `path`, made with mode 0700 if it is not there, for this value alone.
     ///
-    /// Refused with `InvalidData` when it is a symlink or anything but a directory, when another
-    /// uid than root or this process's owns it, or when its group or anyone else can write it:
-    /// what another uid made in advance is not used. Whatever a crash left in it is removed.
+    /// A directory is used only if it could only have been made for this: refused with
+    /// `InvalidData` when it is a symlink or anything but a directory, when another uid than root
+    /// or this process's owns it, when its mode is not 0700, when another `SocketDir` holds it,
+    /// or when it holds anything but what a crash of a registry leaves, which is removed: a
+    /// socket with a number for a name. The refusal names what it found, and removes nothing.
     pub fn open(path: &Path) -> io::Result<Self> {
         match rustix::fs::mkdir(path, Mode::RWXU) {
             Ok(()) => {}
-            Err(rustix::io::Errno::EXIST) => {}
+            Err(Errno::EXIST) => {}
             Err(errno) => return Err(errno.into()),
         }
-        let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
-        let dir = rustix::fs::open(path, flags, Mode::empty())?;
-        let stat = rustix::fs::fstat(&dir)?;
         let refused = |why: String| {
             let path = path.display();
             io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {why}"))
         };
+        let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
+        let dir = rustix::fs::open(path, flags, Mode::empty()).map_err(|errno| match errno {
+            Errno::LOOP | Errno::NOTDIR => refused("a symlink, or not a directory".to_owned()),
+            errno => errno.into(),
+        })?;
+        let stat = rustix::fs::fstat(&dir)?;
         let own = rustix::process::geteuid().as_raw();
         if stat.st_uid != 0 && stat.st_uid != own {
             return Err(refused(format!(
@@ -100,29 +138,45 @@ impl SocketDir {
                 stat.st_uid
             )));
         }
-        if stat.st_mode & 0o022 != 0 {
+        if stat.st_mode & 0o777 != 0o700 {
             return Err(refused(format!(
-                "group or other can write it (mode {:o})",
+                "mode {:o}, not 700",
                 stat.st_mode & 0o7777
             )));
+        }
+        match rustix::fs::flock(&dir, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(Errno::WOULDBLOCK) => return Err(refused("in use by another host".to_owned())),
+            Err(errno) => return Err(errno.into()),
         }
         let this = Self {
             dir,
             next: AtomicU64::new(0),
         };
-        this.clear()?;
+        this.clear(refused)?;
         Ok(this)
     }
 
-    /// Remove what a crash between a bind and its unlink left.
-    fn clear(&self) -> io::Result<()> {
+    /// Remove what a crash between a bind and its unlink left, if that is all there is.
+    fn clear(&self, refused: impl Fn(String) -> io::Error) -> io::Result<()> {
+        let mut left = Vec::new();
         for entry in rustix::fs::Dir::read_from(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
             if matches!(name.to_bytes(), b"." | b"..") {
                 continue;
             }
-            if let Err(errno) = rustix::fs::unlinkat(&self.dir, name, AtFlags::empty()) {
+            let stat = rustix::fs::statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            let socket = FileType::from_raw_mode(stat.st_mode) == FileType::Socket;
+            if !socket || !name.to_bytes().iter().all(u8::is_ascii_digit) {
+                return Err(refused(format!(
+                    "it holds {name:?}, which no registry made"
+                )));
+            }
+            left.push(name.to_owned());
+        }
+        for name in left {
+            if let Err(errno) = rustix::fs::unlinkat(&self.dir, &name, AtFlags::empty()) {
                 log::warn!("topic registry: cannot remove {name:?} from its directory: {errno}");
             }
         }
@@ -199,15 +253,14 @@ fn handle_of(binder: &SIBinder) -> Option<u64> {
     Some(std::ptr::from_ref(proxy).cast::<()>() as usize as u64)
 }
 
-/// The links of a change: `link_to_death` of an RPC proxy sends nothing.
+/// The links of a change, made under `inner`: a proxy's link and its last drop wait for no peer.
 struct ShellLinks<'a> {
-    linked: &'a mut std::collections::BTreeMap<u64, Linked>,
+    linked: &'a mut BTreeMap<u64, Linked>,
     links_made: &'a mut u64,
     this: &'a Weak<Shared>,
 }
 
-/// One handle's link. `serial` tells it from an earlier link at the same address, whose notice
-/// may still be on its way when an address comes round again.
+/// One handle's link; `serial` tells it from a link at the same address with a notice on its way.
 struct Linked {
     serial: u64,
     _link: DeathLink,
@@ -271,8 +324,10 @@ impl DeathRecipient for Obituary {
 
 struct Inner {
     table: Table<TopicKey, WatcherKey>,
-    linked: std::collections::BTreeMap<u64, Linked>,
+    linked: BTreeMap<u64, Linked>,
     links_made: u64,
+    /// A retry thread runs: it ends once nothing is owed.
+    retrying: bool,
 }
 
 struct Shared {
@@ -283,7 +338,22 @@ struct Shared {
     /// Taken before `inner` and held while sending: notices leave in the order of their changes.
     fire_order: Mutex<()>,
     inner: Mutex<Inner>,
+    /// Where the retry thread sleeps between rounds.
+    sleep: Arc<Sleep>,
     this: Weak<Shared>,
+    /// Duplicates of an address the host fails from now on, as with no descriptor left.
+    #[cfg(test)]
+    failing_duplicates: AtomicU64,
+    /// A copy of the last address made, for a test to connect through one nobody can look up.
+    #[cfg(test)]
+    last_address: Mutex<Option<OwnedFd>>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // The thread wakes to a registry it cannot upgrade, and ends.
+        self.sleep.wake();
+    }
 }
 
 fn caller() -> BinderResult<Caller> {
@@ -333,12 +403,32 @@ fn topic_address((topic, generation): (Option<TopicKey>, u64)) -> BinderResult<T
     })
 }
 
+/// The oneway `onAdvertised` with no wait for room, which the stub's call would wait for.
+pub(super) fn try_notice(
+    watcher: &Strong<dyn ITopicAddressWatcher>,
+    name: &str,
+    address: &ParcelFileDescriptor,
+    generation: u64,
+) -> rsbinder::Result<()> {
+    let binder = watcher.as_binder();
+    let Some(proxy) = binder.as_any().downcast_ref::<RpcProxy>() else {
+        return Err(StatusCode::InvalidOperation);
+    };
+    let mut data =
+        proxy.prepare_request(<BpTopicAddressWatcher as ITopicAddressWatcher>::descriptor())?;
+    data.write(name)?;
+    data.write(address)?;
+    data.write(&(generation as i64))?;
+    let flags = rsbinder::FLAG_ONEWAY | rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL;
+    proxy.__try_oneway(transactions::r#onAdvertised, &data, flags)
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().expect("lock poisoned")
     }
 
-    /// `fire_order` guards no data: a panic under it, as a judgement may, leaves nothing to repair.
+    /// `fire_order` guards no data: a panic under it leaves nothing to repair.
     fn order(&self) -> MutexGuard<'_, ()> {
         self.fire_order
             .lock()
@@ -366,6 +456,10 @@ impl Shared {
         }
         let (socket, address) = self.dir.bind().map_err(StatusCode::from)?;
         let allocation = self.next_allocation.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            *self.last_address.lock().expect("lock poisoned") = address.try_clone().ok();
+        }
         let key = TopicKey {
             topic: topic.as_binder(),
             allocation,
@@ -377,6 +471,7 @@ impl Shared {
             table,
             linked,
             links_made,
+            ..
         } = &mut *inner;
         let mut links = ShellLinks {
             linked,
@@ -425,6 +520,7 @@ impl Shared {
             table,
             linked,
             links_made,
+            ..
         } = &mut *inner;
         let mut links = ShellLinks {
             linked,
@@ -445,6 +541,7 @@ impl Shared {
             table,
             linked,
             links_made,
+            ..
         } = &mut *inner;
         let mut links = ShellLinks {
             linked,
@@ -464,6 +561,7 @@ impl Shared {
             table,
             linked,
             links_made,
+            ..
         } = &mut *inner;
         let mut links = ShellLinks {
             linked,
@@ -503,6 +601,10 @@ impl Shared {
                 "the policy does not let the caller subscribe to the name",
             ));
         }
+        // Each notice would fail the same until the session ended, holding a place among the owed.
+        let needed = TransportCaps::CALLBACKS | TransportCaps::FD_PASSING;
+        let caps = rsbinder::calling_caps().unwrap_or(TransportCaps::NONE);
+        caps.require(needed, "a watch of a topic's name")?;
         let key = WatcherKey(watcher.clone());
         let watched = match self.try_watch(name, &key, caller) {
             Err(Refused::Full) => {
@@ -531,6 +633,7 @@ impl Shared {
             table,
             linked,
             links_made,
+            ..
         } = &mut *inner;
         let mut links = ShellLinks {
             linked,
@@ -546,6 +649,7 @@ impl Shared {
             table,
             linked,
             links_made,
+            ..
         } = &mut *inner;
         let mut links = ShellLinks {
             linked,
@@ -576,53 +680,152 @@ impl Shared {
         Ok(infos.collect())
     }
 
-    /// Judge and send the notices of a change, with `fire_order` held. A failed send is the end
-    /// of the watcher's session or a send past the server's deadline, which ends it: its watches
-    /// go with its death, so there is nothing to send again as a kernel registry does.
+    /// Judge and send the notices of a change, with `fire_order` held.
     fn deliver(&self, notices: Vec<Notice<TopicKey, WatcherKey>>) {
         for notice in notices {
-            if !self
-                .access
-                .allows(Action::Subscribe, &notice.name, &notice.caller)
-            {
+            // Refused now, by a reload or a failed group lookup: the watch stays (plan 15 D4).
+            if !self.judged(&notice.name, &notice.caller) {
                 continue;
             }
-            let sent = match notice.topic.address.as_deref().map(parcel_address) {
-                Some(Ok(address)) => {
-                    let generation = notice.generation as i64;
-                    let sent = notice
-                        .watcher
-                        .0
-                        .r#onAdvertised(&notice.name, &address, generation);
-                    if sent.is_ok() {
-                        Sent::Delivered
-                    } else {
-                        Sent::Failed
-                    }
-                }
-                _ => Sent::Failed,
-            };
-            if sent == Sent::Failed {
-                log::warn!("topic registry: a notice of {:?} failed", notice.name);
-            }
+            let sent = self.send(
+                &notice.watcher,
+                &notice.name,
+                &notice.topic,
+                notice.generation,
+            );
+            let mut inner = self.lock();
             let now = Instant::now();
-            self.lock()
-                .table
-                .sent(&notice.name, &notice.watcher, notice.generation, sent, now);
+            let owed =
+                inner
+                    .table
+                    .sent(&notice.name, &notice.watcher, notice.generation, sent, now);
+            // Once per owed notice: a watcher that stays stuck fails every round.
+            if owed || sent == Sent::Failed {
+                log::warn!(
+                    "topic registry: a notice of {:?} failed: {sent:?}",
+                    notice.name
+                );
+            }
+            self.owe(inner, owed);
+        }
+    }
+
+    /// Whether the policy lets `caller` hear of `name` now; a judgement that panics did not.
+    fn judged(&self, name: &str, caller: &Caller) -> bool {
+        let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.access.allows(Action::Subscribe, name, caller)
+        }));
+        judged.unwrap_or_else(|payload| {
+            let panic = rsbinder::__panic_message(&payload);
+            log::error!("topic registry: a judgement of {name:?} panicked ({panic})");
+            false
+        })
+    }
+
+    /// One send: final if it would fail the same while the session lives, or the session ended.
+    fn send(&self, watcher: &WatcherKey, name: &str, topic: &TopicKey, generation: u64) -> Sent {
+        let Some(address) = topic.address.as_deref() else {
+            return Sent::Failed;
+        };
+        let address = parcel_address(address);
+        #[cfg(test)]
+        let address = if self.failing_duplicates.load(Ordering::Relaxed) > 0 {
+            self.failing_duplicates.fetch_sub(1, Ordering::Relaxed);
+            Err(StatusCode::from(io::Error::from_raw_os_error(libc::EMFILE)).into())
+        } else {
+            address
+        };
+        let Ok(address) = address else {
+            return Sent::Busy;
+        };
+        match try_notice(&watcher.0, name, &address, generation) {
+            Ok(()) => Sent::Delivered,
+            Err(
+                StatusCode::DeadObject
+                | StatusCode::FdsNotAllowed
+                | StatusCode::InvalidOperation
+                | StatusCode::BadValue,
+            ) => Sent::Failed,
+            Err(_) => Sent::Busy,
+        }
+    }
+
+    /// After a send under `inner`: start the retry thread, or wake it for an earlier due.
+    fn owe(&self, mut inner: MutexGuard<'_, Inner>, added: bool) {
+        if inner.retrying {
+            if added {
+                drop(inner);
+                self.sleep.wake();
+            }
+            return;
+        }
+        // Owed with no thread after a failed spawn: a later send starts one.
+        if !added && inner.table.owed() == 0 {
+            return;
+        }
+        inner.retrying = true;
+        drop(inner);
+        let shared = self.this.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rsbinder-topic-registry".into())
+            .spawn(move || retry(shared));
+        if let Err(error) = spawned {
+            log::warn!("topic registry: no thread to send owed notices again: {error}");
+            self.lock().retrying = false;
+        }
+    }
+
+    /// One round of the retry thread: every owed notice that is due, with the name's topic by now.
+    fn retry_round(&self) {
+        let due = self.lock().table.due(Instant::now());
+        for (name, watcher, caller, generation) in due {
+            if !self.judged(&name, &caller) {
+                self.lock().table.refused(&name, &watcher, generation);
+                continue;
+            }
+            let order = self.order();
+            let target = self.lock().table.retry_target(&name, &watcher);
+            if let Some((topic, generation)) = target {
+                let sent = self.send(&watcher, &name, &topic, generation);
+                self.lock()
+                    .table
+                    .retried(&name, &watcher, generation, sent, Instant::now());
+            }
+            drop(order);
         }
     }
 }
 
+/// The retry thread: rounds until nothing is owed or the registry is gone.
+fn retry(shared: Weak<Shared>) {
+    loop {
+        let Some(registry) = shared.upgrade() else {
+            return;
+        };
+        registry.retry_round();
+        let mut inner = registry.lock();
+        let Some(due) = inner.table.next_due() else {
+            inner.retrying = false;
+            return;
+        };
+        // Read under `inner`, as the failures that wake it count under it.
+        let ticket = registry.sleep.ticket();
+        drop(inner);
+        let sleep = registry.sleep.clone();
+        drop(registry);
+        sleep.until(due, ticket);
+    }
+}
+
 /// The host side of a registry of topic names over a Unix socket: serve
-/// [`as_binder`](Self::as_binder) as the root of an [`RpcServer`] set up with [`serve`](Self::serve).
+/// [`as_binder`](Self::as_binder) as the root of an [`RpcServer`] set up with
+/// [`serve`](Self::serve).
 pub struct UdsRegistry {
     shared: Arc<Shared>,
     binder: SIBinder,
 }
 
-/// How long a send to a watcher may take: a stopped watcher whose socket is full holds the
-/// registry's other changes while it sends, and the session of one that runs out ends, which
-/// takes its watches away. It is what `RpcServer::set_handshake_timeout` gives a silent peer.
+/// How long a send to a watcher may go without progress: `RpcServer`'s default handshake deadline.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl UdsRegistry {
@@ -636,10 +839,16 @@ impl UdsRegistry {
             fire_order: Mutex::new(()),
             inner: Mutex::new(Inner {
                 table: Table::new(),
-                linked: std::collections::BTreeMap::new(),
+                linked: BTreeMap::new(),
                 links_made: 0,
+                retrying: false,
             }),
+            sleep: Arc::new(Sleep::default()),
             this: this.clone(),
+            #[cfg(test)]
+            failing_duplicates: AtomicU64::new(0),
+            #[cfg(test)]
+            last_address: Mutex::default(),
         });
         let binder = BnTopicUdsRegistry::new_binder(Service(shared.clone())).as_binder();
         Self { shared, binder }
@@ -657,13 +866,48 @@ impl UdsRegistry {
     }
 
     /// Set `server` up to serve this registry, which then runs when the caller runs it: the
-    /// settings a client needs, and a deadline on what it sends, so that a stopped watcher
-    /// holds the registry for a bounded time.
+    /// settings a client needs, a deadline on what it sends to a watcher that stopped, and no
+    /// descriptor taken from a client ([`RpcServer::set_receive_fds`]), as no call has one.
+    ///
+    /// The server's serve workers are the caller's to bound
+    /// ([`RpcServer::set_max_connections`]). A session is one worker, up to two callback
+    /// connections with no thread of their own, and two descriptors more in a call: five
+    /// descriptors. A worker is taken before the policy judges any call on it, so a socket any uid
+    /// can connect to needs a bound that leaves the descriptors of [`MAX_NAMES`](super::MAX_NAMES)
+    /// free.
     pub fn serve(&self, server: &RpcServer) -> BinderResult<()> {
         uds::configure(server);
+        server.set_receive_fds(false);
         server.set_root(self.as_binder())?;
         server.set_reply_timeout(Some(SEND_TIMEOUT))?;
         Ok(())
+    }
+
+    /// Fail the next `count` duplicates of an address, as with no descriptor left, for a test.
+    #[cfg(test)]
+    pub(super) fn fail_duplicates(&self, count: u64) {
+        self.shared
+            .failing_duplicates
+            .store(count, Ordering::Relaxed);
+    }
+
+    /// What asks the registry's state from another thread than a fixture's, for a test.
+    #[cfg(test)]
+    pub(super) fn shared_for_a_test(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            binder: self.binder.clone(),
+        }
+    }
+
+    /// The address of the last allocation, whatever became of it, for a test.
+    #[cfg(test)]
+    pub(super) fn last_address(&self) -> Option<OwnedFd> {
+        self.shared
+            .last_address
+            .lock()
+            .expect("lock poisoned")
+            .take()
     }
 
     /// What the registry holds and did.
@@ -750,15 +994,29 @@ impl ITopicUdsRegistry for Service {
 /// How a [`UdsResolver`] connects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolverOptions {
-    /// The bound on each step of connecting and on the call that sets a connection up, to the
-    /// registry and to each publisher ([`Options::timeout`]). Default 10 s.
+    /// The bound on each step of connecting, to the registry and to each publisher, and on the
+    /// subscription call of [`UdsResolver::subscribe`] ([`Options::timeout`]). Default 10 s.
+    ///
+    /// A [`NamedSubscriber`](crate::NamedSubscriber)'s subscription call has no bound, as over
+    /// kernel binder: past a deadline a session ends, where a publisher that goes on again
+    /// answers the call. One that stopped in the call holds that one connection until it goes
+    /// on or ends, or its session closes, as the name going to another publisher or the
+    /// subscriber's drop closes it.
     pub timeout: Option<Duration>,
     /// The uid the registry's host has to be ([`Options::expect_uid`]). Default `None`.
     pub expect_host_uid: Option<u32>,
     /// The uid every publisher a name is given to has to be: a second check beside the host's
     /// policy, for a host that was set up wrong. A publisher of another uid is not subscribed
-    /// to. Default `None`.
+    /// to, and a [`NamedSubscriber`](crate::NamedSubscriber) says so with `EX_SECURITY`, as a
+    /// publisher's refusal. Default `None`.
     pub expect_publisher_uid: Option<u32>,
+    /// The serve workers the server of a topic this resolver advertises runs at once
+    /// ([`RpcServer::set_max_connections`]); a subscriber's session takes one, and a second while
+    /// its other connection attaches. A session is two descriptors and two threads of the
+    /// publisher, and up to 64 descriptors more while its peer holds back the rest of a frame it
+    /// sent them with, as a subscription call takes one. A process that holds the topic's address
+    /// can make as many as this lets it. Default `None`: as many as it asks for.
+    pub publisher_connections: Option<usize>,
 }
 
 impl Default for ResolverOptions {
@@ -767,6 +1025,7 @@ impl Default for ResolverOptions {
             timeout: Options::default().timeout,
             expect_host_uid: None,
             expect_publisher_uid: None,
+            publisher_connections: None,
         }
     }
 }
@@ -777,21 +1036,30 @@ struct Host {
     _session: SessionGuard,
     /// How a connection to a publisher goes.
     publisher: Options,
+    /// The bound on the connections of a topic this resolver serves.
+    publisher_connections: Option<usize>,
 }
 
 /// A [`UdsRegistry`] as a [`Resolver`]: names under the policy of its host, with no binder device.
 ///
 /// One value is one session with the host. `advertise` serves the topic on a socket the host
-/// makes, and the [`Advertisement`] ends both: its drop withdraws the name and stops accepting,
-/// leaving the sessions of subscribers already connected, so that they read the topic's end
-/// record; they close as those subscribers end, or with this process. A
-/// [`Publisher`](crate::Publisher) holds one advertisement, so it is on one registry at a time,
-/// kernel or over a socket; a binder registered with the service manager as well takes none.
+/// makes, and the [`Advertisement`] ends both: its drop stops accepting, so that a connect to the
+/// socket is refused, and withdraws the name from a thread of its own, so that a host that
+/// stopped does not hold the drop. That leaves the sessions of subscribers already connected, so
+/// that they read the topic's end record; they close as those subscribers end, or with this
+/// process. A [`Publisher`](crate::Publisher) holds one advertisement, so it is on one registry
+/// at a time, kernel or over a socket. `advertise_on` with any resolver replaces the one it has;
+/// `rsbinder::hub::add_service` of its binder takes none and goes with it.
 ///
 /// `watch` makes one session for each generation of the name, on a thread of the watch's, so one
 /// publisher that is slow to accept holds up only its own name's watch. A connect into a publisher
 /// whose accept queue is full waits in `connect(2)` until it accepts or ends: that thread is held
 /// that long, and [`ResolverOptions::timeout`] does not reach it.
+///
+/// A connection that fails for any other reason is made again, once a second at first and at
+/// most once in 30 seconds, until it is made, the name has a newer generation or the watch ends.
+/// Two failures are final, as the same socket gives the same answer: a publisher of another uid
+/// than [`ResolverOptions::expect_publisher_uid`], and a socket nobody listens on any more.
 ///
 /// Two resolvers of one host have different host binders, so
 /// [`Publisher::advertise_on`](crate::Publisher::advertise_on) asks again when given the other:
@@ -826,6 +1094,7 @@ impl UdsResolver {
                     timeout: options.timeout,
                     expect_uid: options.expect_publisher_uid,
                 },
+                publisher_connections: options.publisher_connections,
             }),
         })
     }
@@ -850,9 +1119,13 @@ impl UdsResolver {
         uds::subscribe_with(Endpoint::Fd(address), policy, &self.host.publisher)
     }
 
-    fn serve(socket: OwnedFd, topic: SIBinder) -> BinderResult<Arc<RpcServer>> {
+    fn serve(&self, socket: OwnedFd, topic: SIBinder) -> BinderResult<Serving> {
+        let listener = socket.try_clone().map_err(StatusCode::from)?;
         let server = RpcServer::setup_unix_server_from_bound_fd(socket)?;
         uds::configure(&server);
+        if let Some(connections) = self.host.publisher_connections {
+            server.set_max_connections(connections);
+        }
         server.set_root(topic)?;
         let running = server.clone();
         let accepting = std::thread::Builder::new()
@@ -863,7 +1136,7 @@ impl UdsResolver {
                 }
             });
         accepting.map_err(|_| StatusCode::NoMemory)?;
-        Ok(server)
+        Ok(Serving { server, listener })
     }
 }
 
@@ -873,10 +1146,37 @@ impl fmt::Debug for UdsResolver {
     }
 }
 
+/// A topic's server, and its listening socket apart from it to refuse connects with.
+struct Serving {
+    server: Arc<RpcServer>,
+    listener: OwnedFd,
+}
+
+impl Serving {
+    /// The server keeps its listener while a session lives, where a connect would wait unanswered.
+    fn stop(&self) {
+        self.server.stop_accepting();
+        if let Err(errno) = rustix::net::shutdown(&self.listener, Shutdown::Read) {
+            log::debug!("topic: the publisher's socket still takes connects: {errno}");
+        }
+    }
+}
+
+/// A call on a thread of its own: even a oneway one waits for the connection a stopped host holds.
+fn off_this_thread(host: &Arc<Host>, call: impl FnOnce(&Host) + Send + 'static) {
+    let host = host.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rsbinder-topic-host".into())
+        .spawn(move || call(&host));
+    if let Err(error) = spawned {
+        log::warn!("topic registry: no thread for a call; the session's end makes it: {error}");
+    }
+}
+
 /// Withdraws the name when the advertisement is dropped, and stops taking new subscribers.
 struct Advertised {
     host: Arc<Host>,
-    server: Arc<RpcServer>,
+    serving: Serving,
     name: String,
     topic: Strong<dyn ITopic>,
     allocation: i64,
@@ -884,17 +1184,15 @@ struct Advertised {
 
 impl Drop for Advertised {
     fn drop(&mut self) {
-        let withdrawn = self
-            .host
-            .registry
-            .r#withdraw(&self.name, &self.topic, self.allocation);
-        if let Err(status) = withdrawn {
-            log::warn!(
-                "topic registry: withdrawing {:?} failed: {status}",
-                self.name
-            );
-        }
-        self.server.stop_accepting();
+        self.serving.stop();
+        let name = std::mem::take(&mut self.name);
+        let topic = self.topic.clone();
+        let allocation = self.allocation;
+        off_this_thread(&self.host, move |host| {
+            if let Err(status) = host.registry.r#withdraw(&name, &topic, allocation) {
+                log::warn!("topic registry: withdrawing {name:?} failed: {status}");
+            }
+        });
     }
 }
 
@@ -908,9 +1206,9 @@ impl Resolver for UdsResolver {
         let TopicAllocation { socket, allocation } = self.host.registry.r#allocate(name, &typed)?;
         let served = socket
             .ok_or_else(|| Status::from(StatusCode::UnexpectedNull))
-            .and_then(|socket| Self::serve(OwnedFd::from(socket), topic));
-        let server = match served {
-            Ok(server) => server,
+            .and_then(|socket| self.serve(OwnedFd::from(socket), topic));
+        let serving = match served {
+            Ok(serving) => serving,
             Err(status) => {
                 if let Err(withdrawn) = self.host.registry.r#withdraw(name, &typed, allocation) {
                     log::warn!("topic registry: withdrawing {name:?} failed: {withdrawn}");
@@ -920,12 +1218,12 @@ impl Resolver for UdsResolver {
         };
         if let Err(status) = self.host.registry.r#commit(name, &typed, allocation) {
             // The host dropped the allocation with its refusal, or with this session's end.
-            server.stop_accepting();
+            serving.stop();
             return Err(status);
         }
         Ok(Advertisement::new(Advertised {
             host: self.host.clone(),
-            server,
+            serving,
             name: name.to_owned(),
             topic: typed,
             allocation,
@@ -937,21 +1235,16 @@ impl Resolver for UdsResolver {
         name: &str,
         on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
     ) -> BinderResult<Watch> {
-        let on_resolved = Box::new(move |resolved: Resolved| on_registered(resolved.into_binder()));
+        let on_resolved = Box::new(move |resolved: BinderResult<Resolved>| {
+            if let Ok(resolved) = resolved {
+                on_registered(resolved.into_binder());
+            }
+        });
         self.watch_resolved(name, on_resolved)
     }
 
-    fn watch_resolved(
-        &self,
-        name: &str,
-        on_resolved: Box<dyn Fn(Resolved) + Send + Sync>,
-    ) -> BinderResult<Watch> {
-        let dialer = Arc::new(Dialer {
-            options: self.host.publisher.clone(),
-            on_resolved,
-            queue: Mutex::default(),
-            latest: Mutex::default(),
-        });
+    fn watch_resolved(&self, name: &str, on_resolved: OnResolved) -> BinderResult<Watch> {
+        let dialer = Arc::new(Dialer::new(self.host.publisher.clone(), on_resolved));
         let dialing = dialer.clone();
         let newest = Arc::new(Newest::new(Box::new(
             move |(address, generation): (OwnedFd, i64)| dialing.give(address, generation),
@@ -980,7 +1273,7 @@ impl Resolver for UdsResolver {
             let (address, generation) = parts(host.registry.r#lookup(&looked_up)?);
             let found = answers.answer(address.map(|address| (address, generation)), generation);
             match found {
-                Some((address, generation)) => asked.dial(address, generation),
+                Some((address, generation)) => asked.dial_for_lookup(address, generation),
                 None => Ok(None),
             }
         };
@@ -1016,7 +1309,11 @@ impl Drop for Watching {
     fn drop(&mut self) {
         self.newest.end();
         self.dialer.end();
-        let _ = self.host.registry.r#unwatch(&self.name, &self.watcher);
+        let name = std::mem::take(&mut self.name);
+        let watcher = self.watcher.clone();
+        off_this_thread(&self.host, move |host| {
+            let _ = host.registry.r#unwatch(&name, &watcher);
+        });
     }
 }
 
@@ -1048,34 +1345,65 @@ impl ITopicAddressWatcher for Notices {
 struct Reached {
     generation: i64,
     resolved: Resolved,
+    /// A session that ended answers for its generation no more: the publisher may live on.
+    session: Arc<SessionGuard>,
 }
 
 #[derive(Default)]
 struct DialQueue {
     next: Option<(OwnedFd, i64)>,
+    /// The newest generation given: one older, a lookup's overtaken by a notice, goes unused.
+    given: Option<i64>,
     running: bool,
     ended: bool,
+    /// The connection of the newest generation reached, for the repeats of it, until the end.
+    reached: Option<Reached>,
 }
 
-/// Turns the descriptors of one watch into connections, on a thread of its own: a notice runs on
-/// the session with the host, where a connect that waits would hold every other name's notices.
-struct Dialer {
+/// A generation to connect to again.
+struct Again {
+    address: OwnedFd,
+    generation: i64,
+    at: Instant,
+}
+
+/// Whether another connect to the same socket can answer otherwise (see [`UdsResolver`]).
+fn may_connect_again(status: &Status) -> bool {
+    let refused = StatusCode::Errno(-Errno::CONNREFUSED.raw_os_error());
+    status.exception_code() != ExceptionCode::Security && status.transaction_error() != refused
+}
+
+/// One watch's descriptors to connections, off the host session's thread, which all names share.
+pub(super) struct Dialer {
     options: Options,
-    on_resolved: Box<dyn Fn(Resolved) + Send + Sync>,
+    on_resolved: OnResolved,
     queue: Mutex<DialQueue>,
-    /// Held across a connect: lookups and notices of one generation make one session between
-    /// them, and give the same binder, which a subscriber takes as the same publisher.
-    latest: Mutex<Option<Reached>>,
+    /// Wakes a thread waiting to connect again.
+    changed: Condvar,
+    /// Held across a connect and its call, so lookups and notices keep the generations' order.
+    order: Mutex<()>,
 }
 
 impl Dialer {
+    pub(super) fn new(options: Options, on_resolved: OnResolved) -> Self {
+        Self {
+            options,
+            on_resolved,
+            queue: Mutex::default(),
+            changed: Condvar::new(),
+            order: Mutex::default(),
+        }
+    }
+
     /// A notice or the watch's reply: connect to the newest of them, the older go unused.
-    fn give(self: &Arc<Self>, address: OwnedFd, generation: i64) {
+    pub(super) fn give(self: &Arc<Self>, address: OwnedFd, generation: i64) {
         let mut queue = self.queue.lock().expect("lock poisoned");
-        if queue.ended {
+        if queue.ended || queue.given.is_some_and(|given| given > generation) {
             return;
         }
+        queue.given = Some(generation);
         queue.next = Some((address, generation));
+        self.changed.notify_all();
         if queue.running {
             return;
         }
@@ -1091,57 +1419,154 @@ impl Dialer {
         }
     }
 
-    fn run(self: Arc<Self>) {
+    /// What to connect to: a generation given since, or `again` once its time comes.
+    fn next(&self, again: &mut Option<Again>) -> Option<(OwnedFd, i64)> {
+        let mut queue = self.queue.lock().expect("lock poisoned");
         loop {
-            let mut queue = self.queue.lock().expect("lock poisoned");
-            let Some((address, generation)) = queue.next.take() else {
+            if queue.ended {
                 queue.running = false;
-                return;
-            };
-            drop(queue);
-            let known = self.latest.lock().expect("lock poisoned");
-            let repeated = known.as_ref().is_some_and(|r| r.generation >= generation);
-            drop(known);
-            if repeated {
-                continue;
+                return None;
             }
-            match self.dial(address, generation) {
+            if let Some(next) = queue.next.take() {
+                *again = None;
+                return Some(next);
+            }
+            let Some(at) = again.as_ref().map(|again| again.at) else {
+                queue.running = false;
+                return None;
+            };
+            let Some(wait) = at.checked_duration_since(Instant::now()) else {
+                return again.take().map(|again| (again.address, again.generation));
+            };
+            queue = self
+                .changed
+                .wait_timeout(queue, wait)
+                .expect("lock poisoned")
+                .0;
+        }
+    }
+
+    fn run(self: Arc<Self>) {
+        let mut again = None;
+        let mut tried = None;
+        let mut delay = FIRST_RETRY;
+        while let Some((address, generation)) = self.next(&mut again) {
+            if tried != Some(generation) {
+                tried = Some(generation);
+                delay = FIRST_RETRY;
+            }
+            let _order = self.order.lock().expect("lock poisoned");
+            match self.reach(&address, generation) {
                 Ok(Some(resolved)) => {
                     if !self.queue.lock().expect("lock poisoned").ended {
-                        (self.on_resolved)(resolved);
+                        (self.on_resolved)(Ok(resolved));
                     }
                 }
                 Ok(None) => {}
-                // The publisher ended or will not be subscribed to: the next generation is asked.
-                Err(status) => log::debug!("topic: cannot reach the name's publisher: {status}"),
+                Err(status) => {
+                    log::debug!("topic: cannot reach the name's publisher: {status}");
+                    if may_connect_again(&status) {
+                        let at = Instant::now() + delay;
+                        delay = (delay * 2).min(LAST_RETRY);
+                        again = Some(Again {
+                            address,
+                            generation,
+                            at,
+                        });
+                    }
+                }
             }
         }
     }
 
     /// The connection of `generation`, made here unless it exists; `None` for an older one.
-    fn dial(&self, address: OwnedFd, generation: i64) -> BinderResult<Option<Resolved>> {
-        let mut latest = self.latest.lock().expect("lock poisoned");
-        match latest.as_ref() {
-            Some(reached) if reached.generation > generation => return Ok(None),
-            Some(reached) if reached.generation == generation => {
-                return Ok(Some(reached.resolved.clone()));
-            }
-            _ => {}
+    pub(super) fn dial(
+        &self,
+        address: &OwnedFd,
+        generation: i64,
+    ) -> BinderResult<Option<Resolved>> {
+        let _order = self.order.lock().expect("lock poisoned");
+        self.reach(address, generation)
+    }
+
+    /// [`dial`](Self::dial) for a lookup, whose caller gives up on a failure: the thread goes on.
+    fn dial_for_lookup(
+        self: &Arc<Self>,
+        address: OwnedFd,
+        generation: i64,
+    ) -> BinderResult<Option<Resolved>> {
+        let reached = self.dial(&address, generation);
+        if reached.as_ref().is_err_and(may_connect_again) {
+            self.give(address, generation);
         }
-        let session = uds::connect(Endpoint::Fd(address), &self.options)?;
+        reached
+    }
+
+    /// Under `order`; the queue's lock only between the steps, as [`Self::end`] waits for it.
+    fn reach(&self, address: &OwnedFd, generation: i64) -> BinderResult<Option<Resolved>> {
+        {
+            let queue = self.queue.lock().expect("lock poisoned");
+            if queue.ended {
+                return Ok(None);
+            }
+            match queue.reached.as_ref() {
+                Some(reached) if reached.generation > generation => return Ok(None),
+                Some(reached)
+                    if reached.generation == generation && !reached.session.0.is_ended() =>
+                {
+                    return Ok(Some(reached.resolved.clone()));
+                }
+                _ => {}
+            }
+        }
+        let address = address.try_clone().map_err(StatusCode::from)?;
+        let session = uds::connect(Endpoint::Fd(address), &self.options)
+            .inspect_err(|status| self.tell_if_refused(status))?;
         let binder = session.0.get_root()?;
         session.0.set_reply_timeout(None)?;
-        let resolved = Resolved::with_session(binder, Arc::new(session));
-        *latest = Some(Reached {
+        let session = Arc::new(session);
+        let resolved = Resolved::with_session(binder, session.clone());
+        let mut queue = self.queue.lock().expect("lock poisoned");
+        if queue.ended {
+            drop(queue);
+            return Ok(None);
+        }
+        let replaced = queue.reached.replace(Reached {
             generation,
             resolved: resolved.clone(),
+            session,
         });
+        drop(queue);
+        drop(replaced);
         Ok(Some(resolved))
     }
 
-    fn end(&self) {
+    /// Tell the watch of a publisher its check refused, which no connect to that socket changes.
+    fn tell_if_refused(&self, status: &Status) {
+        if status.exception_code() != ExceptionCode::Security {
+            return;
+        }
+        log::warn!("topic: the name's publisher is refused: {status}");
+        if !self.queue.lock().expect("lock poisoned").ended {
+            (self.on_resolved)(Err(status.clone()));
+        }
+    }
+
+    /// Stop connecting, and let go of the connection, which a call in it may be held in for good.
+    pub(super) fn end(&self) {
         let mut queue = self.queue.lock().expect("lock poisoned");
         queue.ended = true;
         queue.next = None;
+        let reached = queue.reached.take();
+        self.changed.notify_all();
+        drop(queue);
+        drop(reached);
+    }
+
+    /// No thread of this dialer runs and none is to, for a test.
+    #[cfg(test)]
+    pub(super) fn idle(&self) -> bool {
+        let queue = self.queue.lock().expect("lock poisoned");
+        !queue.running && queue.next.is_none()
     }
 }

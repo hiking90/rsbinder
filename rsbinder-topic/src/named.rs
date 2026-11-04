@@ -63,9 +63,9 @@ pub enum NamedState {
     /// has no binder yet, a subscription call is under way or waits to be asked again, or the
     /// publisher the name has ended and its successor has yet to register.
     Waiting,
-    /// The publisher the name has refused this subscriber with this status, one a retry cannot
-    /// change ([`Disconnected::Rejected`] lists them). Nothing is asked again until the name is
-    /// given to another binder.
+    /// The publisher the name has, or the resolver's check of it, refused this subscriber with
+    /// this status, one a retry cannot change ([`Disconnected::Rejected`] lists them). Nothing is
+    /// asked again until the name is given to another binder.
     Refused(Status),
     /// The last connection ended at a check of the publisher's memory that failed
     /// ([`Closed::Corrupted`]), and the name still has that publisher. Nothing is asked again
@@ -131,14 +131,16 @@ pub enum NamedState {
 ///
 /// The subscriber remembers a publisher it was connected to by its topic's memory, which stays
 /// the same however it is reached: a publisher a registry on a socket gave a new socket is still
-/// the publisher it read. It forgets one only on what a connection to it saw: the connection read the end record of its
-/// topic (what [`Closed::End`] and [`Closed::Status`] report), after which the publisher refuses
-/// every later subscription, or the notice of its binder's death arrived while the connection
-/// was held. How the connection ended does not decide it, so a publisher no connection saw end
-/// stays remembered, as it may take the name again, until a later connection to it sees its end
-/// or the subscriber drops. A connection sees the records its receives read, those of the drain
-/// before a [`Disconnected::Replaced`] included, and the death notice that arrives while it is
-/// held; an end it read no record of, or a notice that arrives once it is over, goes to none.
+/// the publisher it read. It forgets one only on what a connection to it saw: the connection read
+/// the end record of its topic (what [`Closed::End`] and [`Closed::Status`] report), after which
+/// the publisher refuses every later subscription, or the notice of its binder's death arrived
+/// while the connection was held. How the connection ended does not decide it, so a publisher no
+/// connection saw end stays remembered, as it may take the name again, until a later connection
+/// to it sees its end or the subscriber drops. A connection sees the records its receives read,
+/// those of the drain before a [`Disconnected::Replaced`] included, and the death notice that
+/// arrives while it is held; an end it read no record of, or a notice that arrives once it is
+/// over, goes to none. Over a socket that notice is the end of the session, which a publisher can
+/// outlive: connected to it again, the subscriber can return records it returned before.
 ///
 /// A notice of the name is a oneway call, which fails when this process has no room left for
 /// one, so a subscriber can miss the binder a name was given. With a watch that has a lookup
@@ -179,9 +181,10 @@ pub enum NamedState {
 /// [`trust_publisher`](NamedSubscriber::trust_publisher) makes it [`Trusted`] for every
 /// connection, those it makes later included.
 ///
-/// **The process has to run the binder thread pool**
-/// (`rsbinder::ProcessState::start_thread_pool`): the service manager's notice of the name is a
-/// call into it, and without the pool the subscriber never connects.
+/// **With [`subscribe`](NamedSubscriber::subscribe) or any resolver whose notices come over
+/// kernel binder, the process has to run the binder thread pool**
+/// (`rsbinder::ProcessState::start_thread_pool`): the notice of the name is a call into it, and
+/// without the pool the subscriber never connects.
 ///
 /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
 #[must_use = "dropping the subscriber at once ends the subscription at once"]
@@ -206,10 +209,13 @@ impl<T: Payload> Drop for Leave<T> {
         state.dropped = true;
         state.wake = None;
         let ready = state.ready.take();
+        // Over a socket its end ends a subscription call, which a stopped publisher would hold.
+        let session = state.session.take();
         drop(state);
         // A connection thread asleep before a retry looks at `dropped` and ends.
         self.0.signal();
         drop(ready);
+        drop(session);
     }
 }
 
@@ -348,6 +354,8 @@ struct State<T: Payload> {
     refused: Option<SIBinder>,
     /// The status `refused` was told with; `None` for an ended publisher, which is not told.
     refusal: Option<Status>,
+    /// The resolver gave up on the name's publisher with no binder; a binder for it ends this.
+    unusable: Option<Status>,
     /// The binder of the last connection, when it ended at a check of its memory that failed.
     corrupt: Option<SIBinder>,
     connecting: bool,
@@ -396,6 +404,7 @@ impl<T: Payload> State<T> {
             connected: None,
             refused: None,
             refusal: None,
+            unusable: None,
             corrupt: None,
             connecting: false,
             replaced: false,
@@ -440,7 +449,7 @@ fn refusal(status: &Status) -> Refusal {
         },
         ExceptionCode::TransactionFailed => match status.transaction_error() {
             StatusCode::BadType | StatusCode::InvalidOperation => Refusal::Final { tell: true },
-            // The publisher's process is gone; its successor registers the name anew.
+            // Its process or this session is gone: a successor registers, or the lookup connects.
             StatusCode::DeadObject => Refusal::Final { tell: false },
             _ => Refusal::Retry,
         },
@@ -484,8 +493,12 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
         let watch = resolver.watch_resolved(
             name,
             Box::new(move |resolved| {
-                if let Some(named) = weak.upgrade() {
-                    named.registered(resolved);
+                let Some(named) = weak.upgrade() else {
+                    return;
+                };
+                match resolved {
+                    Ok(resolved) => named.registered(resolved),
+                    Err(status) => named.unusable(status),
                 }
             }),
         );
@@ -656,6 +669,9 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         let stuck = |binder: &Option<SIBinder>| {
             !state.connecting && binder.is_some() && *binder == state.latest
         };
+        if let Some(status) = state.unusable.as_ref().filter(|_| !state.connecting) {
+            return NamedState::Refused(status.clone());
+        }
         match &state.refusal {
             Some(status) if stuck(&state.refused) => NamedState::Refused(status.clone()),
             _ if stuck(&state.corrupt) => NamedState::Corrupted,
@@ -1315,8 +1331,7 @@ impl<T: Payload> Named<T> {
         }
     }
 
-    /// Where a connection to the topic of `ring` starts, by the rule of [`NamedSubscriber`]'s
-    /// documentation.
+    /// Where a connection to the topic of `ring` starts, as [`NamedSubscriber`] documents.
     fn start_of(&self, ring: RingId) -> Start {
         let state = self.lock();
         if state.joined.contains(&ring) {
@@ -1358,6 +1373,7 @@ impl<T: Payload + 'static> Named<T> {
             return;
         }
         state.latest = Some(binder.clone());
+        state.unusable = None;
         _replaced = std::mem::replace(&mut state.session, session);
         state.registrations += 1;
         if let Some(connected) = &state.connected {
@@ -1388,6 +1404,26 @@ impl<T: Payload + 'static> Named<T> {
         state.connecting = true;
         drop(state);
         self.connect(Begin::At(binder), Duration::ZERO);
+    }
+
+    /// The resolver's callback for a publisher it gave up on: told once, until a binder comes.
+    fn unusable(&self, status: Status) {
+        let mut state = self.lock();
+        if state.dropped || state.closed.is_some() {
+            return;
+        }
+        if state.unusable.is_none() {
+            let told = Disconnected::Rejected(status.clone());
+            state.notices.push_back(told);
+        }
+        state.unusable = Some(status);
+        let wake = state.wake.clone();
+        drop(state);
+        self.signal();
+        // A notice: a receive in a connection's wait looks at the state, and returns that.
+        if let Some(wake) = wake {
+            wake.notice();
+        }
     }
 
     /// Start the connection thread at `begin` after `after`; the caller set `connecting`.
@@ -1538,8 +1574,9 @@ impl<T: Payload + 'static> Named<T> {
 
     /// The binder to subscribe to and whether the lookup gave it; `None` clears `connecting`.
     fn look(&self, ended: Option<&SIBinder>) -> Option<(SIBinder, bool)> {
-        // Declared before the guard, so that the session it may end closes outside the lock.
+        // Declared before the guard, so that the sessions they may end close outside the lock.
         let _replaced;
+        let mut unused = Vec::<Resolved>::new();
         let mut state = self.lock();
         if state.dropped || state.closed.is_some() {
             state.connecting = false;
@@ -1577,18 +1614,25 @@ impl<T: Payload + 'static> Named<T> {
             };
             state = self.lock();
             if state.dropped || state.closed.is_some() {
+                unused.extend(found);
                 break None;
             }
             if state.registrations == before {
-                let found = found.filter(|found| usable(found.binder(), &state, ended));
-                let Some(found) = found else {
-                    break None;
-                };
-                let (binder, session) = found.into_parts();
-                state.latest = Some(binder.clone());
-                _replaced = std::mem::replace(&mut state.session, session);
-                break Some((binder, true));
+                match found {
+                    Some(found) if usable(found.binder(), &state, ended) => {
+                        let (binder, session) = found.into_parts();
+                        state.latest = Some(binder.clone());
+                        state.unusable = None;
+                        _replaced = std::mem::replace(&mut state.session, session);
+                        break Some((binder, true));
+                    }
+                    other => {
+                        unused.extend(other);
+                        break None;
+                    }
+                }
             }
+            unused.extend(found);
             let latest = state.latest.clone();
             let latest = latest.filter(|latest| usable(latest, &state, ended));
             if latest.is_some() || !std::mem::take(&mut again) {

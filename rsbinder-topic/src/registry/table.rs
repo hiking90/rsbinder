@@ -24,12 +24,14 @@ pub(crate) const MAX_OWED: usize = MAX_WATCHERS;
 /// A process has one proxy per handle, so a handle says which binder a key is of. Keys of one
 /// handle differ only by what they add to it, as the allocation of a socket.
 pub(crate) trait Key: Clone + PartialEq {
-    /// The handle of a proxy, whichever transport gave it; `None` for a binder of this process,
-    /// which is not linked.
+    /// What tells this binder from another while the key lives; `None` for one that is not linked.
     fn handle(&self) -> Option<u64>;
 }
 
 /// The death links the table asks for: one per handle, on its first use and given up on its last.
+///
+/// `unlink` runs under the shell's lock, and the table drops keys under it, so a binder's last
+/// reference goes there: a shell's binders wait for no peer and run no recipient as they drop.
 pub(crate) trait Links<T, W> {
     fn link_topic(&mut self, handle: u64, topic: &T) -> BinderResult<()>;
     fn link_watcher(&mut self, handle: u64, watcher: &W) -> BinderResult<()>;
@@ -522,6 +524,7 @@ impl<T: Key, W: Key> Table<T, W> {
             }
             (Sent::Busy, None) if full => {
                 self.counts.dropped += 1;
+                log::warn!("topic registry: too many notices owed; {name:?}'s waits for a change");
                 false
             }
             (Sent::Busy, None) => {

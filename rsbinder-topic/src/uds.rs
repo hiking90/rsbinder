@@ -18,8 +18,11 @@
 //! // The publishing process.
 //! let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default())?;
 //! let server = RpcServer::setup_unix_server("/run/example/topic.sock")?;
-//! let _serving = uds::serve(&server, publisher.as_binder())?;
+//! let serving = uds::serve(&server, publisher.as_binder())?;
 //! publisher.publish(&Bytes(b"hello".to_vec()))?;
+//! // In this order: subscribers read the topic's end before the server ends their sessions.
+//! drop(publisher);
+//! drop(serving);
 //!
 //! // A subscribing process.
 //! let endpoint = uds::Endpoint::Path("/run/example/topic.sock".into());
@@ -31,13 +34,14 @@
 //! # What differs from kernel binder
 //!
 //! - **The caller's identity is fixed at connect.** Kernel binder names the caller of each
-//!   transaction. Here [`Authorize`](crate::Authorize) and [`SubscriberInfo`](crate::SubscriberInfo)
-//!   see `SO_PEERCRED` of the connection: a process that hands its connected socket to another
-//!   makes that one's calls look like its own.
+//!   transaction. Here [`Authorize`](crate::Authorize) and
+//!   [`SubscriberInfo`](crate::SubscriberInfo) see `SO_PEERCRED` of the connection: a process
+//!   that hands its connected socket to another makes that one's calls look like its own.
 //! - **Resources grow per subscriber.** Kernel binder serves every peer with one descriptor and
 //!   one thread pool. Here each subscriber's session is two sockets and two threads at each end
-//!   (measured, plans/15-pubsub-uds §12), for as long as it lasts. A server given
-//!   [`RpcServer::set_max_connections`] needs room for two per subscriber.
+//!   (measured, plans/15-pubsub-uds §12), for as long as it lasts. The bound of
+//!   [`RpcServer::set_max_connections`] counts serve threads: one per subscriber, plus one free
+//!   while a subscriber's second socket attaches.
 //! - **Death is the session's end.** The loss of any connection of a session is a death: a
 //!   deadline on the session that runs out on a slow callback reads as
 //!   [`Closed::PublisherDied`](crate::Closed::PublisherDied). The session [`subscribe`] makes has
@@ -45,11 +49,11 @@
 //!   gives [`Subscriber::request`] keeps what the caller set.
 //! - **`uid` and `pid` depend on the namespaces.** Across user namespaces a uid with no mapping
 //!   reads 65534 to [`Authorize`](crate::Authorize) and to [`Options::expect_uid`], and a pid
-//!   outside this pid namespace reads 0.
+//!   outside this pid namespace reads -1 ([`PeerIdentity::pid`] returns `None`).
 //! - **A publisher serves one name at a time.** [`Publisher`](crate::Publisher) holds one
-//!   advertisement, so one publisher is not advertised to a kernel registry and over a socket at
-//!   once. Registering its binder with the service manager takes no advertisement and goes with
-//!   either.
+//!   advertisement, and `advertise_on` with any resolver replaces the one it has, so one publisher
+//!   is not advertised to a kernel registry and over a socket at once. `rsbinder::hub::add_service`
+//!   of its binder takes no advertisement and goes with either.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::OwnedFd;
@@ -72,8 +76,7 @@ use crate::{layout, Payload, Subscriber, SubscriberPolicy};
 /// notices arrive on, and only that wire has them.
 pub(crate) const WIRE: u32 = rsbinder::entry::WireVersion::MAX.get();
 
-/// How long [`Options::timeout`] waits by default: what `RpcServer::set_handshake_timeout` gives
-/// a silent peer on the other side of the same connect.
+/// The server's default handshake deadline: both ends wait as long for one connect.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where a publisher listens.
@@ -215,8 +218,8 @@ pub fn subscribe_with<T: Payload>(
 ///
 /// `InvalidOperation` when `topic` is an RPC binder, or the server has already started.
 pub fn serve(server: &Arc<RpcServer>, topic: SIBinder) -> BinderResult<RpcServerHandle> {
-    configure(server);
     server.set_root(topic)?;
+    configure(server);
     Ok(server.run_background()?)
 }
 

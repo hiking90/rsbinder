@@ -28,9 +28,9 @@ pub trait Resolver: Send + Sync {
     /// dropped.
     ///
     /// A [`Publisher`](crate::Publisher) holds the advertisement and drops it as it ends, before
-    /// it writes the topic's end record, so a resolver that takes the name back on the drop has
-    /// been asked to before any subscriber can read that end. A resolver that keeps the name, as
-    /// the service manager does, returns [`Advertisement::none`].
+    /// it writes the topic's end record, so a drop that waits holds that record back from every
+    /// subscriber: taking the name back must not wait for the resolver's host. A resolver that
+    /// keeps the name, as the service manager does, returns [`Advertisement::none`].
     fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<Advertisement>;
 
     /// Call `on_registered` with every binder `name` is given from now on, and at once with the
@@ -54,14 +54,14 @@ pub trait Resolver: Send + Sync {
     /// [`Resolved`], and a [`NamedSubscriber`](crate::NamedSubscriber), which calls this method,
     /// keeps it for as long as it uses the binder. By default the calls of `watch`, with nothing
     /// to keep.
-    fn watch_resolved(
-        &self,
-        name: &str,
-        on_resolved: Box<dyn Fn(Resolved) + Send + Sync>,
-    ) -> BinderResult<Watch> {
+    ///
+    /// An `Err` says that the resolver gave up on the publisher the name was given, with no
+    /// binder to show for it, and that asking again would not change that: the subscriber
+    /// reports it as a refusal by that publisher, until the next `Ok`.
+    fn watch_resolved(&self, name: &str, on_resolved: OnResolved) -> BinderResult<Watch> {
         self.watch(
             name,
-            Box::new(move |binder| on_resolved(Resolved::new(binder))),
+            Box::new(move |binder| on_resolved(Ok(Resolved::new(binder)))),
         )
     }
 
@@ -84,6 +84,9 @@ pub trait Resolver: Send + Sync {
         None
     }
 }
+
+/// What [`Resolver::watch_resolved`] calls with each binder the name is given.
+pub type OnResolved = Box<dyn Fn(BinderResult<Resolved>) + Send + Sync>;
 
 /// A name [`Resolver::advertise`] gave: dropping it takes the name back, as far as the resolver
 /// does.

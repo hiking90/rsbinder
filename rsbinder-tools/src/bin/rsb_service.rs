@@ -7,7 +7,8 @@
 //! registered, who registered it, what is declared but not started, and
 //! what a service says about itself when asked to dump.
 //!
-//! Every question goes over binder as an ordinary client, so `rsb_hub`'s
+//! Every question goes over binder, or over the hub's Unix socket for
+//! `topics --topic-socket`, as an ordinary client, so `rsb_hub`'s
 //! policy applies to `rsb_service` exactly as it does to anything else —
 //! running it does not grant a view a normal caller would not have. Where
 //! the policy withholds an answer, the tool says so rather than reporting
@@ -32,7 +33,7 @@ mod exit {
     pub const OK: u8 = 0;
     /// Answered no; `test`-style so `rsb_service check foo || start-foo` reads right.
     pub const NO: u8 = 1;
-    /// Unanswerable: no service manager, or its policy denied the request.
+    /// Unanswerable: no hub to ask, or its policy denied the request.
     pub const ERR: u8 = 2;
 }
 
@@ -41,7 +42,7 @@ fn report(what: &str, status: &Status) -> ExitCode {
     eprintln!("rsb_service: {what} failed: {status}");
     if status.exception_code() == ExceptionCode::Security {
         eprintln!(
-            "  The service manager's policy denies this to uid {}. Grant it in \
+            "  The hub's policy denies this to uid {}. Grant it in \
              the hub's configuration (`rsb_hub --config <DIR>`, default \
              /etc/rsbinder/hub.d) or run as a user the policy allows.",
             rustix::process::getuid().as_raw()
@@ -173,7 +174,11 @@ fn cmd_topics(prefix: &str) -> ExitCode {
 }
 
 /// [`cmd_topics`] on the registry a hub serves on a Unix socket, with no binder device.
-#[cfg(all(feature = "topic", feature = "rpc"))]
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
 fn cmd_topics_on_socket(socket: &str, prefix: &str) -> ExitCode {
     use rsbinder_topic::registry::uds::{ResolverOptions, UdsResolver};
     use rsbinder_topic::uds::Endpoint;
@@ -375,7 +380,11 @@ fn cli() -> clap::Command {
                     clap::Arg::new("topic-socket")
                         .long("topic-socket")
                         .value_name("PATH")
-                        .hide(!cfg!(all(feature = "topic", feature = "rpc")))
+                        .hide(!cfg!(all(
+                            feature = "topic",
+                            feature = "rpc",
+                            any(target_os = "linux", target_os = "android")
+                        )))
                         .help(
                             "Ask the hub at this Unix socket (rsb_hub --topic-socket), with no \
                              binder device",
@@ -397,17 +406,25 @@ fn main() -> ExitCode {
 
     if let Some(("topics", m)) = matches.subcommand() {
         if let Some(socket) = m.get_one::<String>("topic-socket") {
-            #[cfg(all(feature = "topic", feature = "rpc"))]
+            #[cfg(all(
+                feature = "topic",
+                feature = "rpc",
+                any(target_os = "linux", target_os = "android")
+            ))]
             return cmd_topics_on_socket(
                 socket,
                 m.get_one::<String>("prefix")
                     .expect("prefix has a default value"),
             );
-            #[cfg(not(all(feature = "topic", feature = "rpc")))]
+            #[cfg(not(all(
+                feature = "topic",
+                feature = "rpc",
+                any(target_os = "linux", target_os = "android")
+            )))]
             {
                 eprintln!(
-                    "rsb_service: built without the features `topic` and `rpc`, so {socket} \
-                     cannot be asked"
+                    "rsb_service: {socket} takes the features `topic` and `rpc`, on Linux or \
+                     Android; this build is not that"
                 );
                 return ExitCode::from(exit::ERR);
             }

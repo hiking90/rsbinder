@@ -55,12 +55,20 @@ fn publish(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR: serve
     let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default())?;
     let server = RpcServer::setup_unix_server(path)?;
-    let _serving = uds::serve(&server, publisher.as_binder())?;
+    let serving = uds::serve(&server, publisher.as_binder())?;
+    let mut published = Ok(());
     for n in 0u64.. {
-        publisher.publish(&Bytes(n.to_le_bytes().to_vec()))?;
+        published = publisher.publish(&Bytes(n.to_le_bytes().to_vec()));
+        if published.is_err() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // In this order: subscribers read the topic's end before the server ends their sessions.
+    drop(publisher);
+    drop(serving);
     // ANCHOR_END: serve
+    published?;
     Ok(())
 }
 
