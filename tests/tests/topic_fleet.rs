@@ -1099,8 +1099,16 @@ fn memfd_counts(pid: i32) -> (usize, usize, usize) {
     (memfds, maps, threads)
 }
 
-/// The open files of the `rsb_hub` this machine runs, if one.
-fn hub_fds() -> Option<usize> {
+/// The open files of what serves the fleet's names: the socket registry's node, or the `rsb_hub`
+/// this machine runs, if one.
+fn hub_fds(fleet: &Fleet) -> Option<usize> {
+    #[cfg(feature = "topic-uds")]
+    if transport::sockets().is_some() {
+        let fds = format!("/proc/{}/fd", fleet.pid(transport::HUB));
+        return Some(fs::read_dir(fds).ok()?.count());
+    }
+    #[cfg(not(feature = "topic-uds"))]
+    let _ = fleet;
     let hub = fs::read_dir("/proc")
         .ok()?
         .filter_map(Result::ok)
@@ -1287,7 +1295,7 @@ fn stop_point(
                 )
             })
             .collect(),
-        hub_fds: hub_fds(),
+        hub_fds: hub_fds(fleet),
     };
 
     // Android 10's service manager lists a dead service's name for good, an earlier run's too.

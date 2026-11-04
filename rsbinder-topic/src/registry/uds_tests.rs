@@ -1138,8 +1138,10 @@ fn a_publisher_that_answers_only_later_is_reached_with_no_newer_generation() {
         timeout: Some(Duration::from_millis(100)),
         ..ResolverOptions::default()
     };
-    let endpoint = Endpoint::Path(fixture.path.clone());
-    let resolver = UdsResolver::connect(endpoint, &options).unwrap();
+    // Tried again: the deadline meant for the publisher limits this connect too, under load.
+    let resolver = (0..100)
+        .find_map(|_| UdsResolver::connect(Endpoint::Path(fixture.path.clone()), &options).ok())
+        .expect("a connect to the host within 100 tries");
     let mut subscriber =
         NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(300)));
@@ -1509,7 +1511,8 @@ fn a_session_past_the_limit_of_unpaid_notices_ends_and_no_other_does() {
 /// Each step's 5 s is under the 10 s a send would wait, on the thread that makes the change.
 #[test]
 fn a_watcher_that_stopped_holds_up_no_commit_and_no_other_watcher() {
-    const NOTICES: usize = 400;
+    /// Changes after the first notice with no room, so some are made with its socket full.
+    const WITH_THE_SOCKET_FULL: usize = 50;
     let fixture = Fixture::new("stopped_watcher", AllowAll);
     let raw = fixture.raw();
     let stopped = fixture.raw();
@@ -1523,7 +1526,14 @@ fn a_watcher_that_stopped_holds_up_no_commit_and_no_other_watcher() {
 
     let (_publisher, topic) = topic();
     let mut generations = Vec::new();
-    for _ in 0..NOTICES {
+    let mut with_the_socket_full = 0;
+    let filling = Instant::now();
+    while with_the_socket_full < WITH_THE_SOCKET_FULL {
+        assert!(
+            filling.elapsed() < Duration::from_secs(120),
+            "the stopped watcher's socket has room after {} notices",
+            generations.len()
+        );
         let started = Instant::now();
         let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
         let generation = raw
@@ -1539,10 +1549,11 @@ fn a_watcher_that_stopped_holds_up_no_commit_and_no_other_watcher() {
         within(Duration::from_secs(5), "the other watcher's notice", || {
             told.0.lock().unwrap().last() == Some(&generation)
         });
+        if fixture.registry.stats().owed > 0 {
+            with_the_socket_full += 1;
+        }
     }
     assert_eq!(*told.0.lock().unwrap(), generations);
-    let sent = fixture.registry.stats().notices_sent as usize;
-    assert!(sent < 2 * NOTICES, "the stopped watcher took them all");
     drop(release);
 }
 
@@ -1615,6 +1626,10 @@ struct EvictsAfterOne(Mutex<Option<u32>>);
 
 impl RegistryAccess for Arc<EvictsAfterOne> {
     fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        // The retry thread judges an owed notice whenever it is due: its turn takes no count.
+        if std::thread::current().name() == Some("rsbinder-topic-registry") {
+            return true;
+        }
         let mut left = self.0.lock().unwrap();
         match left.as_mut() {
             Some(left) if action == Action::Subscribe => {
@@ -1707,11 +1722,22 @@ fn a_stopped_watcher_costs_the_host_one_notice_owed_however_many_changes() {
     let watcher = BnTopicAddressWatcher::new_binder(StoppedWatcher(Mutex::new(released)));
     stopped.registry.r#watch("a.name", &watcher).unwrap();
     let (_publisher, topic) = topic();
-    for _ in 0..CHANGES {
+    let change = || {
         let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
         raw.registry
             .r#commit("a.name", &topic, allocation.allocation)
             .unwrap();
+    };
+    let filling = Instant::now();
+    while fixture.registry.stats().owed == 0 {
+        assert!(
+            filling.elapsed() < Duration::from_secs(120),
+            "no notice owed"
+        );
+        change();
+    }
+    for _ in 0..CHANGES {
+        change();
     }
     let stats = fixture.registry.stats();
     assert_eq!(stats.owed, 1, "{stats:?}");
