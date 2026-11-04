@@ -148,7 +148,7 @@
 //! # Failed sends
 //!
 //! One rule covers every frame written to a pooled slot: a request, a reply, and a
-//! `DEC_STRONG` from any of its three senders. Only a codec or protocol error
+//! `DEC_STRONG` from any of its senders. Only a codec or protocol error
 //! (`FrameTooLarge`, `Protocol`), raised before any byte, leaves the session up. Every
 //! transport failure ends the session (`end_after_failed_send` → `fail_session`), as
 //! libbinder's `rpcSend` does through `handleRpcError`: a write that stopped part-way left the
@@ -158,6 +158,25 @@
 //! not read for the whole deadline. The failing call gets `TimedOut` for an expired send
 //! deadline wherever it stopped (a mid-frame `EAGAIN` would otherwise project to `WouldBlock`,
 //! which says nothing was sent) and the transport error's status otherwise.
+//!
+//! `Protocol` includes the kernel's refusal of a frame's fds, as the uid has too many in flight
+//! (`ETOOMANYREFS`). AOSP's `rpcSend` would end the session; here no byte went out, and the count
+//! is of every session this process has, so one peer that stops reading ends no other peer's. The
+//! call that had those fds fails, and a reply goes out as `FAILED_TRANSACTION` like an oversized
+//! one.
+//!
+//! A write that fails takes the lifecycle out of `Live` before its slot goes back, and `send_msg`
+//! and `send_msg_no_wait`, which every frame on a pooled slot passes, write nothing once it is out
+//! of `Live`. So no frame can follow one that was cut, on any transport, from any thread: the
+//! one that cut it, through a pin, included. (The reaper's write has its own check: its claim of
+//! a slot looks at the lifecycle, and nothing else writes there while it holds the slot.)
+//!
+//! `send_dec_strong` and `RpcProxy::__try_oneway` run under whatever lock their callers hold, so
+//! a failure there runs no death sequence on that thread. It only stops the session
+//! (`stop_for_the_reaper`): `force_dying` and every connection cut that has a `shutdown_handle`;
+//! the reaper runs the rest (`ReaperJob::End`, "Deferred `DEC_STRONG`"). A send that found no room
+//! and sent nothing is no failure when it does not wait: the frame is still owed, and the session
+//! goes on.
 //!
 //! # Reply deadlines
 //!
@@ -196,10 +215,11 @@
 //! * A handshake is bounded when its caller gives it a deadline: an attach by the session's
 //!   `set_timeout`, a config connect by `RpcClientConfig::timeout`; `from_preconnected_fd` arms a
 //!   fixed 10 s, and the transport-taking `connect_android13plus*` entries arm none. That
-//!   deadline covers both directions, as the server arms both for its half. It is cleared on drop: the reply guard
-//!   restores only a deadline it armed, and arms none when the session has neither a timeout
-//!   nor an idle value (every client session), so a leftover handshake deadline would bound every
-//!   later `recv` and send on the slot and break a client's callback serve loop outright.
+//!   deadline covers both directions, as the server arms both for its half. It is cleared on
+//!   drop: the reply guard restores only a deadline it armed, and arms none when the session has
+//!   neither a timeout nor an idle value (every client session), so a leftover handshake deadline
+//!   would bound every later `recv` and send on the slot and break a client's callback serve loop
+//!   outright.
 //!
 //! # Liveness
 //!
@@ -336,28 +356,38 @@
 //!
 //! # Deferred `DEC_STRONG`
 //!
-//! Every `DEC_STRONG` this end owes goes through `send_dec_strong`: a proxy's drop, an excess
-//! receipt, one of our own binders coming home, on the android-13+ wire the target of each
-//! inbound transaction, and a proxy's release held until the peer paid back the sends of its
-//! address (`super::state` module doc "Ref-count model"). The route below never orders a
-//! release after a send on another connection; the hold does. It never waits for a
-//! slot, because `RpcProxy::drop` runs on arbitrary user threads and a slot wait there would let
-//! a hung peer block the user's `Drop`. It writes only where the peer is reading. A peer reads a
-//! connection none of its serve loops drives inside its reply wait, and, if it drains, while a
-//! send of its own there waits for room ("Draining sends"); at any other time nothing reads it,
-//! so frames written there fill the socket buffer until the writer blocks and its serve loop
-//! stops reading too. `dec_route` picks, in this order:
+//! Every `DEC_STRONG` this end owes, but for a twoway's target (below), goes through
+//! `send_dec_strong`: a proxy's drop, an excess receipt, one of our own binders coming home, on the
+//! android-13+ wire the target of each inbound oneway, and a proxy's release held until the peer
+//! paid back the sends of its address (`super::state` module doc "Ref-count model"). The route
+//! below never orders a release after a send on another connection; the hold does.
+//!
+//! `RpcProxy::drop` runs on arbitrary user threads, under whatever locks they hold, so a
+//! `DEC_STRONG` never waits for a slot. Its write waits for no peer either on a transport with a
+//! send that does not wait (`__send_no_wait`, `UnixTransport` on Linux and Android): one `sendmsg`
+//! puts the whole frame on the socket or nothing ("A send that does not wait" in
+//! `transport::unix`). Any other transport has no such send, since a partial write there would end
+//! the session of a peer that is only slow, and its write waits for room as AOSP's `rpcSend` does.
+//! On every transport a failed write runs no death sequence on this thread ("Failed sends").
+//!
+//! It writes only where the peer is reading. A peer reads a connection none of its serve loops
+//! drives inside its reply wait, and, if it drains, while a send of its own there waits for room
+//! ("Draining sends"); at any other time nothing reads it, so frames written there fill the socket
+//! buffer until the writer blocks and its serve loop stops reading too. `dec_route` picks, in this
+//! order:
 //!
 //! 1. **The pin, when the peer reads it**: an `Outgoing` pin, which the peer serves, or an
 //!    `Incoming` pin whose dispatch grants `allow_nested`, where the peer waits for the reply of
 //!    the twoway being handled. That covers a twoway handler, the arguments it received (the
 //!    request parcel drops before the reply, as AOSP destroys `data` before it, so their
-//!    `DEC_STRONG`s precede it), and every binder entered while a reply is read.
+//!    `DEC_STRONG`s precede it), and every binder entered while a reply is read. What finds no
+//!    room goes to the reaper from an `Outgoing` pin, and is held from an `Incoming` one (step 3).
 //! 2. **A free `Outgoing` slot**, one with no `exclusive_tid` at all (claiming one this thread
 //!    already drives would, on the guard's drop, clear an `exclusive_tid` the outer frame still
 //!    owns). The peer's serve loop reads it. This pays for an `Incoming` pin without
 //!    `allow_nested` (a oneway handler, the accounting after a oneway drain) and for a thread
-//!    that drives no slot.
+//!    that drives no slot. What finds no room goes to the reaper, or from that pin, once the reaper
+//!    owes `HELD_DEC_STRONG_LIMIT` addresses, is held there (step 4 says why).
 //! 3. **Held on that `Incoming` pin**, when no `Outgoing` slot is free: added to the slot's
 //!    `pending_dec`, one entry per address with the amounts summed, and written just before the
 //!    next `REPLY` on the slot, which the peer is waiting to read. `write_reply` writes every
@@ -368,33 +398,101 @@
 //!    reads nothing there while it sends nothing, and some never drain: libbinder from
 //!    android-16.0.0_r4 with incoming threads, android-12. A
 //!    peer that sends only oneways, with no callback connection, gets the held `DEC_STRONG`s
-//!    with its next twoway. A hold dies with its slot, which leaves the pool only with the
-//!    session, and a session end resets the peer's counts anyway. The peer picks the addresses,
-//!    so a pin holds at most `HELD_DEC_STRONG_LIMIT` of them; a new address past that is written
-//!    on the pin itself, as AOSP does. A peer that drains reads it at its next send there. One
-//!    that does not, or sends nothing more, fills the socket buffer and leaves this handler
-//!    blocked in the write until it next reads the connection or the send deadline ends the
-//!    session, as AOSP leaves its own writer.
-//! 4. **The reaper**, for a thread that drives no slot when no `Outgoing` slot is free: the
-//!    amount is queued, and a reaper thread per session waits for one. A session with no
-//!    `Outgoing` slot at all (a server whose client opened no callback connection) drops it,
-//!    and the node is released at session end.
+//!    with its next twoway on that connection. A hold dies with its slot, which leaves the pool
+//!    only with the session, and a session end resets the peer's counts anyway. The peer picks
+//!    the addresses, so a pin holds `HELD_DEC_STRONG_LIMIT` of them; a new address past that is
+//!    written on the pin itself, as AOSP does. A peer that drains reads it at its next send there.
+//!    What finds no room is held past the limit, and the loop that reads the slot, a serve loop or
+//!    a reply wait, writes only that excess before it reads the next frame: a peer cannot raise the
+//!    excess past what one dispatch drops, since nothing more is read. A serve loop holds no
+//!    handler or caller lock there, and a reply wait is already waiting for this peer. One that
+//!    does not drain, or sends nothing more, fills the socket buffer and leaves this worker blocked
+//!    in that write until it next reads the connection or the send deadline ends the session, as
+//!    AOSP leaves its own writer.
+//! 4. **The reaper**, for a thread that drives no slot when no `Outgoing` slot is free, and for
+//!    what found no room above: the amount is added to what the session owes that address, one
+//!    entry per address, and a reaper thread per session waits for a free `Outgoing` slot and room
+//!    on it. The amounts add as they do in one `RpcDecStrong` (AOSP `sendDecStrongToTarget`
+//!    combines concurrent releases the same way, android-17.0.0_r1 `RpcState.cpp:887-891`), and the
+//!    module doc's next paragraphs hold of the sum: it never passes what this end received. No
+//!    burst of drops ends a session. What a thread that drives no slot adds is the release of a
+//!    proxy it held, so what it costs is what those proxies cost. A peer's frames can only add
+//!    through a thread that reads them, and each such thread stops at `HELD_DEC_STRONG_LIMIT`:
+//!    from an `Incoming` pin the amount is held instead, which step 3 limits; on an `Outgoing` pin,
+//!    whose slot the reaper may be waiting for, the loop that reads the slot writes what the
+//!    session owes past the limit itself before it reads the next frame. An amount is never
+//!    dropped from a session that can still send: the peer's node would keep its count until the
+//!    session ends. A session with no `Outgoing` slot at all (a server whose client opened no
+//!    callback connection) has sent no oneway and has nowhere to write: it drops the amount, which
+//!    pays the receipts as a write does, and the node is released at session end. The dropped
+//!    amount keeps the peer's node alive past the book, so a session that gains an `Outgoing` slot
+//!    later from the peer's attach can send a oneway a number the peer refuses: once a later proxy
+//!    of the address has numbered oneways and its release closed the book, the next proxy numbers
+//!    from 0, below what the node expects, and an rsbinder peer's `Drop(StaleAsyncNumber)` drops
+//!    it. libbinder opens its incoming connections at setup, so only an rsbinder client gets there.
+//!    Keeping each dropped amount for the attach would cost an entry per address the peer picked.
+//!    A serve loop keeps its `Outgoing` slot through each read, so where every such slot is in a
+//!    serve loop's read the reaper waits until the peer's next frame lets one go: a quiet peer gets
+//!    the amount then or not before the session ends, with its node and this end's book open
+//!    meanwhile. That loop writes only what is past the limit itself.
 //!
-//! On the android-13+ wire the target of a twoway is held (step 3's mechanism), so it goes out right
-//! before its `REPLY`, where AOSP `flushExcessBinderRefs` sends it; it stays its own frame,
+//! On the android-13+ wire the target of a twoway is held (step 3's mechanism), so it goes out
+//! right before its `REPLY`, where AOSP `flushExcessBinderRefs` sends it; it stays its own frame,
 //! since a reply's fds ride its first `sendmsg` and AOSP `processDecStrong` takes none
 //! (android-17.0.0_r1 `RpcState.cpp:948-983`). A oneway drain pays its targets once, after the
 //! drain, as one `DEC_STRONG` with the summed amount (AOSP `RpcState.cpp:1284`); a transaction
 //! still parked is paid when it runs or is dropped. The r34 wire has no amount field, so its
 //! codec repeats a one-reference frame.
 //!
-//! In steady state a `DEC_STRONG` goes out synchronously, keeping the order callers rely on
-//! (after a drop, the peer has processed the `DEC_STRONG` before the next reply). The reaper
-//! holds only a `Weak` of the session, and the inner's drop closes the channel, which ends it
-//! after the queued entries drain. Send failures are not reported to the dropper (a dead
-//! session means the peer is gone, AOSP parity), but a transport failure still ends the
-//! session ("Failed sends"). A connection joins the pool only after its attach is confirmed,
-//! so `confirm_attach`, which reads nothing but a `REPLY`, never meets a `DEC_STRONG`.
+//! While its socket has room a `DEC_STRONG` goes out synchronously, keeping the order callers rely
+//! on (after a drop, the peer has processed the `DEC_STRONG` before the next reply). On a socket
+//! with no room it goes out later, as one does when no slot is free. The peer subtracts it from its
+//! `timesSent`, and a later send of the same address adds to that count, so the sum never passes
+//! what this end received (AOSP `processDecStrong`), and the node stays while either is
+//! outstanding, at its next async number. So this end keeps that number until the address's last
+//! amount is on the wire, on every route: each write, and the drop in step 4, pays the receipts it
+//! covers (`RpcState::pay_receipts`, "Send-side async numbers"). A proxy made for the address
+//! before then numbers on. The peer's abort on a binder it never sent is the hold's to prevent,
+//! which `RpcState::release_proxy` decides before any route.
+//!
+//! A hold lasts until the peer pays. A peer that does not pay a send of an address, a target send
+//! included, leaves that address's `remote_sends` and number-book entries until the session ends,
+//! as AOSP keeps `sentRef`.
+//!
+//! The reaper does not keep the session alive. Between jobs it holds a `Weak`; a wait on a socket
+//! holds that `Weak`, the transport and its claim on the slot (`wait_without_the_session`), so the
+//! last handle or proxy can drop while it waits. That drop cuts the socket the reaper waits on
+//! (`reaper_wake`) and closes the channel, which ends the reaper; `close_session` wakes it by
+//! shutting every connection down, and nothing joins it. The one wait with a strong reference is
+//! for a slot, and a slot is only ever held by a thread with a strong reference of its own.
+//! With no `shutdown_handle`, from a transport that has none or a duplicate that failed for want
+//! of a descriptor, nothing can cut that wait from a drop: the reaper stays in that send until it
+//! returns or `close_session` shuts the connection down, and the session is released all the same.
+//!
+//! The same goes for a stop with nothing to cut. Its `ReaperJob::End` waits behind the reaper's
+//! write, so its recipients run when that write returns, which `close_session` can always make it
+//! do: `close` shuts every connection down even when a stop already took the session out of `Live`.
+//!
+//! Send failures are not reported to the dropper (a dead session means the peer is gone,
+//! AOSP parity), but a transport failure still ends the session ("Failed sends"), from the reaper.
+//! A connection joins the pool only after its attach is confirmed, so `confirm_attach`, which
+//! reads nothing but a `REPLY`, never meets a `DEC_STRONG`.
+//!
+//! `RpcProxy::__try_oneway` is the same send for a oneway, which is how `rsbinder-topic`'s hub
+//! tells a stopped watcher's session nothing and waits for nothing. It takes a free `Outgoing`
+//! slot or answers `WouldBlock`. What it could not send it takes back: the async number and the
+//! target's send, so the frames and numbers the peer sees are those of a `transactAddress` (AOSP
+//! `RpcState.cpp:638-649`), which has no "not sent, go on" path because its write waits. A number
+//! that cannot be taken back, because another send reserved the next one, would park every later
+//! oneway to the address at the peer (`:1099`), so that ends the session, here and in
+//! `client_transact`, whose frame the codec or the kernel can refuse the same way.
+//!
+//! Nothing waiting in a send means nothing for the send deadline to judge, so a slot with no
+//! room also queues one `ReaperJob::AwaitRoom`. The reaper claims the slot, so that no other
+//! writer changes what it compares, and waits in `__wait_for_room` by the rule of a send that
+//! waits ("A slow peer" in `transport`): a peer that takes a frame in time goes on, and one that
+//! does not loses its session when the deadline passes, at the time a send would have. While it
+//! waits, that slot's senders find no free slot.
 //!
 //! # Draining sends
 //!
@@ -575,19 +673,24 @@
 //! frame cannot be put back in step: the wire has no frame sequence, no receipt and no reply
 //! id, so a oneway number the peer never received parks every later oneway to that object in
 //! its `async_todo`, and a lost `DEC_STRONG` or binder reply leaves the two ends' counts apart
-//! (plan 2-24 §1.2). Two entry points take the lifecycle from `Live` to `Dying` with
-//! `force_dying` and run `on_session_dead`; the one that wins the edge runs it, the others
-//! return at once:
+//! (plan 2-24 §1.2). Three entry points take the lifecycle from `Live` to `Dying` with
+//! `force_dying`, and whichever wins the edge gets `on_session_dead` run:
 //!
 //! - `close` is this end's decision (`close_session`, `RpcServer::terminate`, a serve loop that
 //!   found the whole session idle, "Idle", and a serve loop whose own armed read deadline cut
 //!   a frame, `DeadlineMidFrame`; the `end` module's table): it sets `ended_locally` first, so
-//!   every loop it wakes reports `EndedBy::Local`.
-//! - `fail_session` is a fault: a transport failure on any send ("Failed sends"), any failure
-//!   of a reply wait after its request went out (a lost stream, an undecodable frame, an expired
-//!   reply deadline, a nested dispatch that could not reply), any other serve loop end, and a
-//!   client's attach, in either direction, that fails once the server may hold the connection
-//!   ("Slot pool" "Leaving"). It leaves `ended_locally` alone, so the loops it wakes report `NotLocal`.
+//!   every loop it wakes reports `EndedBy::Local`. It runs the sequence on its own thread. If it
+//!   lost the edge it shuts every connection down all the same, as the sequence may be waiting
+//!   behind the reaper's write, and returns.
+//! - `fail_session` is a fault on a thread free to run the sequence: a send's transport failure
+//!   ("Failed sends") in `client_transact`, `write_reply` or the reaper, any failure of a reply
+//!   wait after its request went out (a lost stream, an undecodable frame, an expired reply
+//!   deadline, a nested dispatch that could not reply), any other serve loop end, and a client's
+//!   attach, in either direction, that fails once the server may hold the connection ("Slot pool"
+//!   "Leaving"). It leaves `ended_locally` alone, so the loops it wakes report `NotLocal`. It runs
+//!   the sequence on its own thread, or returns at once if it lost the edge.
+//! - `stop_for_the_reaper` is the same fault on a thread under its caller's locks, a drop or
+//!   `__try_oneway`: it queues `ReaperJob::End` and the reaper runs the sequence.
 //!
 //! A serve loop's end ends the session whichever connection it served: its worker calls
 //! `close` when `SessionEnd::by` is `Local` and `fail_session` otherwise. A panic that escapes
@@ -603,10 +706,10 @@
 //! (its early-out skips the send); `find_conn` re-checks the lifecycle and an empty pool on
 //! every wake-up, so neither order parks it.
 //!
-//! Both entry points re-enter user `Drop` code through `on_session_dead`, so a caller holds no
-//! session lock. A client's incoming (callback) connection ends the session like any other:
-//! AOSP's client-side `onSessionAllIncomingThreadsEnded` is a no-op, but a session that lost a
-//! connection is not left running here in any direction.
+//! `close` and `fail_session` re-enter user `Drop` code through `on_session_dead`, so a caller
+//! holds no session lock. A client's incoming (callback) connection ends the session like any
+//! other: AOSP's client-side `onSessionAllIncomingThreadsEnded` is a no-op, but a session that lost
+//! a connection is not left running here in any direction.
 
 use std::cell::RefCell;
 use std::os::fd::{AsFd, OwnedFd};
@@ -1751,16 +1854,30 @@ impl ConnUse {
 
 /// Where a `DEC_STRONG` goes; module doc "Deferred `DEC_STRONG`".
 enum DecRoute<'a> {
-    /// Written now on this slot: a pin the peer is reading, or a free `Outgoing` slot.
+    /// Written now on this slot: an `Outgoing` pin, or a free `Outgoing` slot.
     Conn(ConnGuard<'a>),
+    /// Written now on this free `Outgoing` slot, for a thread on this `Incoming` pin.
+    ConnFromPin(ConnGuard<'a>, u64),
+    /// Written now on this `Incoming` pin, where the peer waits for the reply of a twoway.
+    ServedPin(ConnGuard<'a>),
     /// Held on this `Incoming` pin until its next `REPLY`.
     Pending(u64),
     /// Handed to the reaper, which waits for an `Outgoing` slot.
     Reaper,
 }
 
-/// Addresses an `Incoming` pin holds before it writes as AOSP does (module doc, step 3).
+/// Addresses a thread reading a peer's frames leaves owed before it writes (module doc).
 const HELD_DEC_STRONG_LIMIT: usize = 10_000;
+
+/// What the reaper thread does; module doc "Deferred `DEC_STRONG`".
+enum ReaperJob {
+    /// Write `ConnState::reaper_owed` on the first free `Outgoing` slot, waiting for room.
+    Dec,
+    /// Wait for room on this `Outgoing` slot, and end the session if the send deadline passes.
+    AwaitRoom(u64),
+    /// Run the death sequence of the session `stop_for_the_reaper` stopped.
+    End,
+}
 
 /// What `DEC_STRONG`s read during a send released, settled once the frame is whole.
 #[derive(Default)]
@@ -1778,12 +1895,9 @@ enum ReplyNotSent {
 }
 
 impl ReplyNotSent {
-    /// An oversized reply is `FailedTransaction`, as AOSP `processTransactInternal` and the kernel.
-    fn refused(e: RpcError) -> Self {
-        match e {
-            RpcError::FrameTooLarge { .. } => ReplyNotSent::Refused(StatusCode::FailedTransaction),
-            e => ReplyNotSent::Refused(e.into()),
-        }
+    /// `FailedTransaction` whatever refused it, as AOSP `processTransactInternal` and the kernel.
+    fn refused(_: RpcError) -> Self {
+        ReplyNotSent::Refused(StatusCode::FailedTransaction)
     }
 }
 
@@ -1828,6 +1942,10 @@ mod slot_pool {
         pub(super) next_slot_id: u64,
         /// The founding connection's traits; every later slot must match.
         pub(super) traits: ConnTraits,
+        /// `DEC_STRONG` amounts for the reaper, one entry per address; module doc step 4.
+        pub(super) reaper_owed: std::collections::HashMap<RpcAddress, u32>,
+        /// A `ReaperJob::Dec` is queued or running: one is enough for a session.
+        pub(super) reaper_dec_queued: bool,
     }
 
     impl ConnState {
@@ -1843,6 +1961,8 @@ mod slot_pool {
                 slots,
                 next_slot_id: 2,
                 traits,
+                reaper_owed: std::collections::HashMap::new(),
+                reaper_dec_queued: false,
             }
         }
     }
@@ -1952,6 +2072,13 @@ impl ConnTraits {
             passes_fds: transport.supports_fd_passing(),
             principal: Principal::of(&transport.peer_identity()),
         }
+    }
+}
+
+impl ConnSlot {
+    /// Whether any thread may claim it to send on: one this thread holds is not free either.
+    fn is_free_outgoing(&self) -> bool {
+        self.exclusive_tid.is_none() && self.role == SlotRole::Outgoing
     }
 }
 
@@ -2140,6 +2267,8 @@ pub(crate) struct SharedSession {
     fd_mode: AtomicU8,
     /// Server role: whether `GET_FD_MODE` advertises `Unix` fd support (default false).
     fd_unix_supported: AtomicBool,
+    /// Server role, set before any read: reads leave the fds a peer sends for the kernel to close.
+    discard_peer_fds: AtomicBool,
     /// `GET_SESSION_ID`'s random id: AOSP `kSessionIdBytes == 32`, libbinder refuses other sizes.
     rpc_session_id: RpcSessionId,
     /// r34 `GET_SESSION_ID`: the `int32` an `RpcServer` minted, `RPC_SESSION_ID_NEW` if none.
@@ -2268,7 +2397,11 @@ pub(crate) struct RpcSessionInner {
     /// What `parcel_ops` hands every parcel of this session, built once with the inner.
     parcel_ops: Arc<SessionParcelOps>,
     /// The reaper's queue; its drop ends the reaper. See module doc "Deferred `DEC_STRONG`".
-    dec_strong_tx: mpsc::Sender<(RpcAddress, u32)>,
+    reaper_tx: mpsc::Sender<ReaperJob>,
+    /// A `ReaperJob::AwaitRoom` is queued or running: one is enough for a session.
+    awaiting_room: AtomicBool,
+    /// Cuts the socket the reaper waits on, which holds no strong reference: this inner's drop.
+    reaper_wake: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Session-wide state (nodes, root, id, lifecycle): the leak and teardown books in one place.
     shared: Arc<SharedSession>,
     /// Threads serving this client's incoming connections, by slot id; `close_session` joins them.
@@ -2475,12 +2608,17 @@ impl RpcSessionInner {
             match st.slots.iter().find(|s| s.id == slot_id) {
                 // Read by the peer: it serves an `Outgoing` slot, awaits a twoway's reply here.
                 Some(s) if s.role == SlotRole::Outgoing || s.allow_nested => {
-                    return DecRoute::Conn(ConnGuard {
+                    let conn = ConnGuard {
                         inner: self,
                         slot_id,
                         transport: Arc::clone(&s.transport),
                         reentrant: true,
-                    });
+                    };
+                    return if s.role == SlotRole::Outgoing {
+                        DecRoute::Conn(conn)
+                    } else {
+                        DecRoute::ServedPin(conn)
+                    };
                 }
                 Some(_) => pending_on = Some(slot_id),
                 // The session ended since the push: the send below finds nothing to write on.
@@ -2488,12 +2626,15 @@ impl RpcSessionInner {
             }
         }
         // A slot another frame of this thread holds is not free: its drop would release it.
-        let free = st
-            .slots
-            .iter()
-            .position(|s| s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing);
+        let free = st.slots.iter().position(ConnSlot::is_free_outgoing);
+        // A failed write stops the session before its slot is free: it may hold a cut frame.
+        let free = free.filter(|_| !self.shared.lifecycle.is_torn_down());
         if let Some(idx) = free {
-            return DecRoute::Conn(self.claim_slot(&mut st.slots[idx], tid));
+            let conn = self.claim_slot(&mut st.slots[idx], tid);
+            return match pending_on {
+                Some(pin) => DecRoute::ConnFromPin(conn, pin),
+                None => DecRoute::Conn(conn),
+            };
         }
         match pending_on {
             Some(slot_id) => DecRoute::Pending(slot_id),
@@ -2501,21 +2642,34 @@ impl RpcSessionInner {
         }
     }
 
-    /// Reaper `find_conn`: `None` once torn down or drained, so the reaper drops its strong `Arc`.
-    fn find_conn_for_reaper(&self) -> Option<ConnGuard<'_>> {
+    /// A free `Outgoing` slot now, or why not: a send that waits for nothing does not wait here.
+    fn find_conn_no_wait(&self) -> Result<ConnGuard<'_>> {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        if self.shared.lifecycle.is_torn_down() || st.slots.is_empty() {
+            return Err(StatusCode::DeadObject);
+        }
+        match st.slots.iter().position(ConnSlot::is_free_outgoing) {
+            Some(idx) => Ok(self.claim_slot(&mut st.slots[idx], current_tid())),
+            None if st.slots.iter().any(|s| s.role == SlotRole::Outgoing) => {
+                Err(StatusCode::WouldBlock)
+            }
+            // Only a peer attach adds an `Outgoing` slot: no retry of this one can succeed.
+            None => Err(StatusCode::InvalidOperation),
+        }
+    }
+
+    /// Reaper `find_conn`: a claim with no guard, as its wait holds no reference to the session.
+    fn find_conn_for_reaper(&self) -> Option<(u64, Arc<dyn RpcTransport>)> {
         let tid = current_tid();
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         loop {
             if self.shared.lifecycle.is_torn_down() || st.slots.is_empty() {
                 return None;
             }
-            // `Outgoing`, unclaimed: `reaper_loop` drops each guard, so no claim is this thread's.
-            let pick = st
-                .slots
-                .iter()
-                .position(|s| s.exclusive_tid.is_none() && s.role == SlotRole::Outgoing);
-            if let Some(idx) = pick {
-                return Some(self.claim_slot(&mut st.slots[idx], tid));
+            // `Outgoing`, unclaimed: the reaper gives each claim back, so none is this thread's.
+            if let Some(slot) = st.slots.iter_mut().find(|s| s.is_free_outgoing()) {
+                slot.exclusive_tid = Some(tid);
+                return Some((slot.id, Arc::clone(&slot.transport)));
             }
             // Only a peer attach adds an `Outgoing` slot; parking would hold the strong `Arc`.
             if !st.slots.iter().any(|s| s.role == SlotRole::Outgoing) {
@@ -2523,6 +2677,34 @@ impl RpcSessionInner {
             }
             st = self.slot_cv.wait(st).expect("slot_cv poisoned");
         }
+    }
+
+    /// `slot_id` claimed for `ReaperJob::AwaitRoom`, as soon as it is free; `None` once it is gone.
+    fn claim_for_room(&self, slot_id: u64) -> Option<Arc<dyn RpcTransport>> {
+        let tid = current_tid();
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        loop {
+            if self.shared.lifecycle.is_torn_down() {
+                return None;
+            }
+            let slot = st.slots.iter_mut().find(|s| s.id == slot_id)?;
+            if slot.exclusive_tid.is_none() {
+                slot.exclusive_tid = Some(tid);
+                return Some(Arc::clone(&slot.transport));
+            }
+            st = self.slot_cv.wait(st).expect("slot_cv poisoned");
+        }
+    }
+
+    /// Give back a claim `find_conn_for_reaper` or `claim_for_room` made.
+    fn release_reaper_claim(&self, slot_id: u64) {
+        {
+            let mut st = self.conn_state.lock().expect("conn_state poisoned");
+            if let Some(s) = st.slots.iter_mut().find(|s| s.id == slot_id) {
+                s.exclusive_tid = None;
+            }
+        }
+        self.slot_cv.notify_all();
     }
 
     /// A worker's own slot, reentrant via `DRIVING`; `DeadObject` once the session ended.
@@ -2798,13 +2980,32 @@ impl RpcSessionInner {
         }
     }
 
+    /// `fail_session` for a thread that runs no death sequence: the reaper does ("Failed sends").
+    fn stop_for_the_reaper(&self) {
+        if !self.shared.lifecycle.force_dying() {
+            return;
+        }
+        // Not `shutdown`, which may write. This also wakes whatever the reaper waits on.
+        for t in self.slot_transports() {
+            if let Some(cut) = t.shutdown_handle() {
+                cut();
+            }
+        }
+        self.slot_cv.notify_all();
+        let _ = self.reaper_tx.send(ReaperJob::End);
+    }
+
     /// End the session whatever its connection count; exactly one caller runs `on_session_dead`.
     pub(crate) fn close(&self) {
         if self.shared.lifecycle.force_dying() {
             // Set before the transports go down, so a worker they wake already sees it.
             self.shared.ended_locally.store(true, Ordering::SeqCst);
             self.on_session_dead();
+            return;
         }
+        // A stop may have cut nothing, and its `End` waits behind the reaper's write: wake that.
+        let _serial = self.shared.liveness.lock().expect("liveness poisoned");
+        self.shutdown_all_transports();
     }
 
     /// The death sequence, entered at `Dying`: unblock, obituaries, `Dead`, release (module doc).
@@ -2824,7 +3025,7 @@ impl RpcSessionInner {
         let root = self.shared.root.lock().expect("root poisoned").take();
         let locals = {
             let mut st = self.shared.state.lock().expect("rpc state poisoned");
-            st.clear_remote_sends();
+            st.clear_remote_counts();
             st.clear_local()
         };
         drop(locals);
@@ -2848,6 +3049,10 @@ impl RpcSessionInner {
         fds: &[OwnedFd],
         drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
     ) -> RpcResult<()> {
+        // No frame follows one that was cut, which left `Live` before its slot went back.
+        if self.shared.lifecycle.is_torn_down() {
+            return Err(RpcError::EndOfStream);
+        }
         // A frame on its way out is activity until its write returns, at any pace ("Idle").
         let _sending = OpenCall::enter(&self.shared);
         // AOSP wire: no length prefix; fds ride the first `sendmsg` (`RpcTransportRaw`).
@@ -2859,6 +3064,26 @@ impl RpcSessionInner {
         debug_assert!(fds.is_empty(), "a non-Unix session must not carry fds");
         let _ = fds; // release: `debug_assert!` is compiled out, so `fds` is otherwise unused
         write_aosp_message_with_fds(transport, frame, &[], drain)
+    }
+
+    /// [`send_msg`](Self::send_msg) with no wait for room; `None` for a transport without one.
+    fn send_msg_no_wait(
+        &self,
+        transport: &dyn RpcTransport,
+        frame: &[u8],
+        fds: &[OwnedFd],
+    ) -> Option<RpcResult<bool>> {
+        // As in `send_msg`: a transport may have this send and a `send_raw` that cut a frame.
+        if self.shared.lifecycle.is_torn_down() {
+            return Some(Err(RpcError::EndOfStream));
+        }
+        let _sending = OpenCall::enter(&self.shared);
+        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+            let borrowed: Vec<_> = fds.iter().map(|f| f.as_fd()).collect();
+            return transport.__send_no_wait(frame, &borrowed);
+        }
+        debug_assert!(fds.is_empty(), "a non-Unix session must not carry fds");
+        transport.__send_no_wait(frame, &[])
     }
 
     /// AOSP `drainCommands(CONTROL_ONLY)` for one message; module doc "Draining sends".
@@ -2923,7 +3148,8 @@ impl RpcSessionInner {
     ) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
         // Header, then `bodySize` bytes; each read that moved bytes bumps `io_gen` ("Idle").
         let io_gen = &self.shared.io_gen;
-        if self.fd_mode() == FileDescriptorTransportMode::Unix {
+        let discard = self.shared.discard_peer_fds.load(Ordering::Relaxed);
+        if self.fd_mode() == FileDescriptorTransportMode::Unix && !discard {
             return read_aosp_message_with_fds(
                 |buf| {
                     let got = transport.recv_raw_with_fds(buf)?;
@@ -3509,12 +3735,114 @@ impl RpcSessionInner {
     }
 
     /// Undo a oneway attempt's `async_number` reservation; binder bumps belong to the parcel.
-    fn cancel_oneway_number(&self, addr: RpcAddress, consumed: u64) {
+    fn cancel_oneway_number(&self, addr: RpcAddress, consumed: u64) -> bool {
         self.shared
             .state
             .lock()
             .expect("rpc state poisoned")
-            .cancel_send_async_number(addr, consumed);
+            .cancel_send_async_number(addr, consumed)
+    }
+
+    /// `RpcProxy::__try_oneway`: a oneway on a free `Outgoing` slot that waits for nothing.
+    ///
+    /// `Ok` is sent. `WouldBlock` is not sent, with the session as it was; the reaper judges a
+    /// slot with no room ("Deferred `DEC_STRONG`"). `InvalidOperation` is a session or transport
+    /// with no such send, `BadValue` a frame past the transport's limit, and `DeadObject` a
+    /// session ended or ending, which the reaper does. A caller sends one at a time per `addr`: a
+    /// reservation it could not take back ends the session rather than leave a gap in the numbers.
+    pub(crate) fn try_oneway(
+        &self,
+        addr: RpcAddress,
+        code: u32,
+        data: &Parcel,
+        flags: u32,
+    ) -> Result<()> {
+        self.check_parcel_session(data)?;
+        data.rpc_begin_send()?;
+        let conn = match self.find_conn_no_wait() {
+            Ok(conn) => conn,
+            Err(e) => {
+                data.rpc_end_send(false);
+                return Err(e);
+            }
+        };
+        let slot_id = conn.slot_id;
+        let counts_target = !addr.is_zero() && self.profile.counts_transaction_targets();
+        let async_number = {
+            let mut st = self.shared.state.lock().expect("rpc state poisoned");
+            if counts_target {
+                st.on_proxy_leaving(addr);
+            }
+            st.next_send_async_number(addr)
+        };
+        let txn = WireTransactionRef {
+            address: &addr,
+            code,
+            flags: flags | FLAG_ONEWAY,
+            async_number,
+            data: data.rpc_data_bytes(),
+            object_positions: data.rpc_object_positions(),
+        };
+        let sent = match self.profile.codec().encode_transact_ref(txn) {
+            Ok(frame) => self.send_msg_no_wait(conn.transport(), &frame, data.rpc_out_fds()),
+            Err(e) => Some(Err(e)),
+        };
+        // While this thread holds the slot: nothing may be written after a cut frame.
+        if let Some(Err(e)) = &sent {
+            self.end_on_the_reaper(e);
+        }
+        // Before the release a rollback lets go: it picks its slot, and this one may be free.
+        drop(conn);
+        let take_back = || {
+            data.rpc_end_send(false);
+            self.take_back_oneway(addr, async_number, counts_target)
+        };
+        match sent {
+            Some(Ok(true)) => {
+                data.rpc_end_send(true);
+                Ok(())
+            }
+            None => {
+                take_back();
+                Err(StatusCode::InvalidOperation)
+            }
+            Some(Ok(false)) => {
+                if !take_back() {
+                    return Err(StatusCode::DeadObject);
+                }
+                if !self.awaiting_room.swap(true, Ordering::SeqCst) {
+                    let _ = self.reaper_tx.send(ReaperJob::AwaitRoom(slot_id));
+                }
+                Err(StatusCode::WouldBlock)
+            }
+            Some(Err(e @ (RpcError::FrameTooLarge { .. } | RpcError::Protocol(_)))) => {
+                take_back();
+                Err(e.into())
+            }
+            Some(Err(_)) => {
+                take_back();
+                Err(StatusCode::DeadObject)
+            }
+        }
+    }
+
+    /// An unsent oneway's number and target send; `false` if the session has to end for a gap.
+    fn take_back_oneway(&self, addr: RpcAddress, number: u64, counts_target: bool) -> bool {
+        let numbered = self.cancel_oneway_number(addr, number);
+        if !numbered {
+            log::warn!("RPC: a oneway's number cannot be taken back; ending the session");
+            self.stop_for_the_reaper();
+        }
+        if counts_target {
+            let held = self
+                .shared
+                .state
+                .lock()
+                .expect("rpc state poisoned")
+                .pay_proxy_sends(&addr, 1);
+            self.send_dec_strong(addr, held);
+        }
+        numbered
     }
 
     /// Outbound transaction: the reply (`None` if oneway), applying interleaved `DEC_STRONG`s.
@@ -3569,16 +3897,19 @@ impl RpcSessionInner {
         };
         // The attempt owns the async number and target send; returns a release the send let go.
         let rollback = || {
-            if oneway {
-                self.cancel_oneway_number(addr, async_number);
-            }
+            let numbered = !oneway || self.cancel_oneway_number(addr, async_number);
             data.rpc_end_send(false);
-            if counts_target {
+            let held = if counts_target {
                 let mut st = self.shared.state.lock().expect("rpc state poisoned");
                 st.pay_proxy_sends(&addr, 1)
             } else {
                 0
+            };
+            if !numbered {
+                log::warn!("RPC: a oneway's number cannot be taken back; ending the session");
+                self.fail_session();
             }
+            held
         };
         let frame = match self.profile.codec().encode_transact_ref(txn) {
             Ok(frame) => frame,
@@ -3634,6 +3965,7 @@ impl RpcSessionInner {
             Err(e) => return fail(e.into()),
         };
         loop {
+            self.write_held_past_limit(&conn);
             let (frame, in_fds) = match self.recv_msg(transport) {
                 Ok(v) => v,
                 Err(e) => return fail(e.into()),
@@ -3672,27 +4004,130 @@ impl RpcSessionInner {
         }
     }
 
-    /// Pay `amount` receipts of `addr` without waiting; module doc "Deferred `DEC_STRONG`".
+    /// Pay `amount` receipts of `addr` with no wait and no death sequence: "Deferred `DEC_STRONG`".
     pub(crate) fn send_dec_strong(&self, addr: RpcAddress, amount: u32) {
         // Past `Live` the pool is draining; the best-effort send is skipped.
         if amount == 0 || self.shared.lifecycle.is_torn_down() {
             return;
         }
         match self.dec_route() {
-            // Best-effort; a transport failure in `write_dec_strong` ends the session.
             DecRoute::Conn(conn) => {
-                let _ = self.write_dec_strong(&conn, addr, amount);
+                let left = self.write_dec_no_wait(&conn, addr, amount);
+                // First: the reaper may want this slot.
+                drop(conn);
+                self.reap_dec_strong(addr, left);
             }
+            DecRoute::ConnFromPin(conn, pin) => {
+                let left = self.write_dec_no_wait(&conn, addr, amount);
+                drop(conn);
+                self.owe_from_pin(pin, addr, left);
+            }
+            DecRoute::ServedPin(conn) => self.write_dec_on_pin(&conn, addr, amount),
             DecRoute::Pending(slot_id) => match self.held_past_limit(slot_id, &addr) {
-                Some(conn) => {
-                    let _ = self.write_dec_strong(&conn, addr, amount);
-                }
+                Some(conn) => self.write_dec_on_pin(&conn, addr, amount),
                 None => self.hold_dec_strong(slot_id, addr, amount),
             },
-            DecRoute::Reaper => {
-                let _ = self.dec_strong_tx.send((addr, amount));
+            DecRoute::Reaper => self.reap_dec_strong(addr, amount),
+        }
+    }
+
+    /// Write on this `Incoming` pin, or hold what finds no room for its next `REPLY`.
+    fn write_dec_on_pin(&self, conn: &ConnGuard<'_>, addr: RpcAddress, amount: u32) {
+        let left = self.write_dec_no_wait(conn, addr, amount);
+        if left > 0 {
+            self.hold_dec_strong(conn.slot_id, addr, left);
+        }
+    }
+
+    /// The `DEC_STRONG` frames for `addr` on `conn` with no wait for room: the amount left unsent.
+    fn write_dec_no_wait(&self, conn: &ConnGuard<'_>, addr: RpcAddress, amount: u32) -> u32 {
+        let Some((frame, times)) = self.profile.codec().encode_dec_strong(&addr, amount) else {
+            return 0;
+        };
+        for written in 0..times {
+            let sent = self
+                .send_msg_no_wait(conn.transport(), &frame, &[])
+                .unwrap_or_else(|| {
+                    self.send_msg(conn.transport(), &frame, &[], None)
+                        .map(|()| true)
+                });
+            match sent {
+                Ok(true) => {}
+                // `times` is `amount` where a frame is one reference, else 1.
+                Ok(false) => {
+                    self.pay_receipts(&addr, written);
+                    return amount - written;
+                }
+                Err(e) => {
+                    self.end_on_the_reaper(&e);
+                    return 0;
+                }
             }
         }
+        self.pay_receipts(&addr, amount);
+        0
+    }
+
+    /// `RpcState::pay_receipts`, after the write that paid them; the state lock is not held there.
+    fn pay_receipts(&self, addr: &RpcAddress, amount: u32) {
+        // Reached from a `Drop`, maybe while unwinding: a poisoned table is still consistent.
+        let mut st = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.pay_receipts(addr, amount);
+    }
+
+    /// Add `amount` to what the reaper owes `addr`, and wake it if nothing else will (step 4).
+    fn reap_dec_strong(&self, addr: RpcAddress, amount: u32) {
+        if amount == 0 {
+            return;
+        }
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        let owed = st.reaper_owed.entry(addr).or_insert(0);
+        *owed = owed.saturating_add(amount);
+        let queued = std::mem::replace(&mut st.reaper_dec_queued, true);
+        drop(st);
+        if !queued {
+            let _ = self.reaper_tx.send(ReaperJob::Dec);
+        }
+    }
+
+    /// What the reaper is to write next, as a whole; `None` ends its `ReaperJob::Dec`.
+    fn take_reaper_owed(&self) -> Option<std::collections::HashMap<RpcAddress, u32>> {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        if st.reaper_owed.is_empty() {
+            st.reaper_dec_queued = false;
+            return None;
+        }
+        Some(std::mem::take(&mut st.reaper_owed))
+    }
+
+    /// What a free slot's write left for `pin`: its frames stop adding to the reaper at the limit.
+    fn owe_from_pin(&self, pin: u64, addr: RpcAddress, left: u32) {
+        if left == 0 {
+            return;
+        }
+        let st = self.conn_state.lock().expect("conn_state poisoned");
+        let past = st.reaper_owed.len() >= HELD_DEC_STRONG_LIMIT;
+        drop(st);
+        if past {
+            self.hold_dec_strong(pin, addr, left);
+        } else {
+            self.reap_dec_strong(addr, left);
+        }
+    }
+
+    /// `end_after_failed_send` for a thread that runs no death sequence, holding the slot.
+    fn end_on_the_reaper(&self, e: &RpcError) {
+        if matches!(e, RpcError::FrameTooLarge { .. } | RpcError::Protocol(_)) {
+            return;
+        }
+        if !matches!(e, RpcError::EndOfStream) {
+            log::warn!("RPC: a send failed ({e}); ending the session");
+        }
+        self.stop_for_the_reaper();
     }
 
     /// Write the `DEC_STRONG` frames for `addr` on `conn`; a failed send follows "Failed sends".
@@ -3712,6 +4147,7 @@ impl RpcSessionInner {
                 return Err(e);
             }
         }
+        self.pay_receipts(&addr, amount);
         Ok(())
     }
 
@@ -3740,6 +4176,36 @@ impl RpcSessionInner {
         // Keyed: a peer-sized backlog would make a linear search quadratic under `conn_state`.
         let owed = slot.pending_dec.entry(addr).or_insert(0);
         *owed = owed.saturating_add(amount);
+    }
+
+    /// Write what `conn`'s reader leaves owed past `HELD_DEC_STRONG_LIMIT`, between frames.
+    fn write_held_past_limit(&self, conn: &ConnGuard<'_>) {
+        fn past_limit(
+            owed: &mut std::collections::HashMap<RpcAddress, u32>,
+        ) -> Vec<(RpcAddress, u32)> {
+            let excess = owed.len().saturating_sub(HELD_DEC_STRONG_LIMIT);
+            let addrs: Vec<RpcAddress> = owed.keys().take(excess).copied().collect();
+            addrs.iter().filter_map(|a| owed.remove_entry(a)).collect()
+        }
+        let past: Vec<(RpcAddress, u32)> = {
+            let mut guard = self.conn_state.lock().expect("conn_state poisoned");
+            let st = &mut *guard;
+            let Some(slot) = st.slots.iter_mut().find(|s| s.id == conn.slot_id) else {
+                return;
+            };
+            let mut past = past_limit(&mut slot.pending_dec);
+            // The reaper may be waiting for this very slot, and no frame is read meanwhile.
+            if slot.role == SlotRole::Outgoing {
+                past.extend(past_limit(&mut st.reaper_owed));
+            }
+            past
+        };
+        for (addr, amount) in past {
+            // A failure ended the session: the loop's read ends with it.
+            if self.write_dec_strong(conn, addr, amount).is_err() {
+                return;
+            }
+        }
     }
 
     /// The `DEC_STRONG`s held for `slot_id`, emptied: its `REPLY` is about to go out.
@@ -4135,6 +4601,7 @@ impl RpcSessionInner {
                 Err(e) => return ServeStep::Ended(recv_end_reason(e)),
             }
         }
+        self.write_held_past_limit(&conn);
         let (frame, in_fds) = match self.recv_msg(transport) {
             Ok(f) => f,
             Err(e) => return ServeStep::Ended(recv_end_reason(e)),
@@ -4314,8 +4781,9 @@ impl RpcSession {
     /// addresses on the shared connection).
     /// Fails when the `Initiator`'s preamble cannot be sent (the
     /// transport's error, projected as `From<RpcError> for StatusCode`
-    /// does), and when `getrandom` cannot mint the session id — an
-    /// early-boot container without a working CSPRNG.
+    /// does), when `getrandom` cannot mint the session id — an
+    /// early-boot container without a working CSPRNG — and when the
+    /// process cannot spawn the session's thread.
     ///
     /// # Direction
     ///
@@ -4383,11 +4851,7 @@ impl RpcSession {
         space: AddressSpace,
         profile: WireProfile,
     ) -> RpcResult<RpcSession> {
-        Ok(Self::with_shared(
-            transport,
-            profile,
-            Self::fresh_shared(space)?,
-        ))
+        Self::with_shared(transport, profile, Self::fresh_shared(space)?)
     }
 
     /// A new session's shared state; `lifecycle` starts at `Live(1)` for the founding connection.
@@ -4401,6 +4865,7 @@ impl RpcSession {
             serve_read_deadline: AtomicU64::new(0),
             fd_mode: AtomicU8::new(FD_MODE_NONE),
             fd_unix_supported: AtomicBool::new(false),
+            discard_peer_fds: AtomicBool::new(false),
             rpc_session_id: gen_rpc_session_id()?,
             r34_session_id: AtomicI32::new(RPC_SESSION_ID_NEW),
             server_session_id: Mutex::new(None),
@@ -4423,12 +4888,12 @@ impl RpcSession {
         }))
     }
 
-    /// Build the inner with `transport` as a fresh `shared`'s founding slot; spawn the reaper.
+    /// The inner with `transport` as a fresh `shared`'s founding slot, and its reaper, or `Err`.
     fn with_shared(
         transport: Box<dyn RpcTransport>,
         profile: WireProfile,
         shared: Arc<SharedSession>,
-    ) -> RpcSession {
+    ) -> RpcResult<RpcSession> {
         // Founding role: AOSP `setupClient` (sends) vs `RpcServer::establishConnection` (serves).
         let founding_role = match shared.space() {
             AddressSpace::Initiator => SlotRole::Outgoing,
@@ -4438,7 +4903,7 @@ impl RpcSession {
         let peer = transport.peer_identity();
         let founding: Arc<dyn RpcTransport> = Arc::from(transport);
         let armed = Arc::clone(&founding);
-        let (dec_strong_tx, dec_strong_rx) = mpsc::channel();
+        let (reaper_tx, reaper_rx) = mpsc::channel();
         let inner = Arc::new_cyclic(|weak: &Weak<RpcSessionInner>| RpcSessionInner {
             conn_state: Mutex::new(ConnState::new(founding, founding_role, traits)),
             slot_cv: Condvar::new(),
@@ -4447,7 +4912,9 @@ impl RpcSession {
             self_weak: weak.clone(),
             parcel_ops: Arc::new(SessionParcelOps(weak.clone())),
             shared,
-            dec_strong_tx,
+            reaper_tx,
+            awaiting_room: AtomicBool::new(false),
+            reaper_wake: Mutex::new(None),
             incoming_threads: Mutex::new(Vec::new()),
             incoming_live: AtomicUsize::new(0),
             incoming_joined: AtomicUsize::new(0),
@@ -4456,14 +4923,10 @@ impl RpcSession {
         inner.arm_liveness(&*armed);
         // Detached reaper for deferred DEC_STRONG; exits when the inner drops its sender.
         let weak_for_reaper = Arc::downgrade(&inner);
-        if let Err(e) = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("rsbinder-rpc-reaper".into())
-            .spawn(move || reaper_loop(weak_for_reaper, dec_strong_rx))
-        {
-            // The receiver died with the spawn: deferred DEC_STRONGs leak nodes to session end.
-            log::error!("RPC: reaper thread spawn failed ({e}); deferred DEC_STRONG will be lost");
-        }
-        RpcSession { inner }
+            .spawn(move || reaper_loop(weak_for_reaper, reaper_rx))?;
+        Ok(RpcSession { inner })
     }
 
     /// Test-only leak probe: a `Weak` on the inner, to assert the session graph is reclaimed.
@@ -4571,7 +5034,7 @@ impl RpcSession {
         }
         let negotiated = codec.version();
         let shared = Self::fresh_shared(AddressSpace::Acceptor)?;
-        let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared);
+        let session = Self::with_shared(transport, WireProfile::Android13Plus(codec), shared)?;
         if server_fd_unix && client_fd_mode == FD_MODE_UNIX && negotiated >= PROTOCOL_V1 {
             session
                 .inner
@@ -4845,6 +5308,14 @@ impl RpcSession {
             .store(unix, Ordering::SeqCst);
     }
 
+    /// `RpcServer::set_receive_fds(false)` for this session, before its first read.
+    pub(crate) fn discard_peer_fds(&self) {
+        self.inner
+            .shared
+            .discard_peer_fds
+            .store(true, Ordering::Relaxed);
+    }
+
     /// Client role: negotiate the FD-over-RPC mode.
     /// On r34, sends exactly one `GET_FD_MODE` packet; the agreed mode is
     /// `Unix` iff *both* peers opted in, else `None` (never an error).
@@ -4960,7 +5431,7 @@ impl RpcSession {
     /// On a client over a Unix socket this is [`PeerIdentity::Local`] from `SO_PEERCRED`: the
     /// credentials of the process that called `listen(2)` on the socket, which is not always the
     /// one that made the socket. Across user namespaces a uid with no mapping reads 65534, and a
-    /// pid not visible in this pid namespace reads 0.
+    /// pid not visible in this pid namespace reads -1 ([`PeerIdentity::pid`] returns `None`).
     pub fn peer_identity(&self) -> PeerIdentity {
         self.inner.peer.clone()
     }
@@ -5312,7 +5783,9 @@ impl RpcSession {
     ///   socket transports the deadline counts from the peer's last progress,
     ///   and on Linux and Android a reply wait does not expire while the peer
     ///   is still taking the request either
-    ///   ([`transport` doc "A slow peer"](super::transport#a-slow-peer)).
+    ///   ([`transport` doc "A slow peer"](super::transport#a-slow-peer)). On a
+    ///   Unix socket progress is a whole frame read: the bytes of a part of one
+    ///   do not move what the socket reports.
     /// - **The peer's host**, on TCP (`tcp_debug`, `tls` over TCP): the
     ///   kernel's check that the host still answers, sized to `d` and on
     ///   with `None` too, ends the session once the host goes silent even
@@ -6234,25 +6707,115 @@ impl RpcSession {
     }
 }
 
-/// Best-effort sender of the `DEC_STRONG`s `send_dec_strong` defers; holds a `Weak` only.
-fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<(RpcAddress, u32)>) {
-    while let Ok((addr, amount)) = rx.recv() {
+impl Drop for RpcSessionInner {
+    fn drop(&mut self) {
+        let wake = self.reaper_wake.get_mut();
+        let wake = wake.unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cut) = wake.take() {
+            cut();
+        }
+    }
+}
+
+/// The thread that waits and ends sessions for those that must not; module doc.
+fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<ReaperJob>) {
+    while let Ok(job) = rx.recv() {
         let Some(inner) = weak.upgrade() else {
             return;
         };
-        if inner.shared.lifecycle.is_torn_down() {
-            continue;
+        match job {
+            ReaperJob::Dec => reap_owed(&weak, inner),
+            ReaperJob::AwaitRoom(slot_id) => await_room(&weak, inner, slot_id),
+            // Whoever queued this took the session to `Dying` and left the sequence to us.
+            ReaperJob::End => inner.on_session_dead(),
         }
-        // Blocks only this reaper thread and bails on teardown or drain: never parks forever.
-        let Some(conn) = inner.find_conn_for_reaper() else {
-            drop(inner);
-            continue;
-        };
-        // Best-effort, but a transport failure still ends the session ("Failed sends").
-        let _ = inner.write_dec_strong(&conn, addr, amount);
-        drop(conn);
-        drop(inner);
     }
+}
+
+/// Run `wait` with no strong reference to the session; `None` if the session went meanwhile.
+fn wait_without_the_session<T>(
+    weak: &Weak<RpcSessionInner>,
+    inner: Arc<RpcSessionInner>,
+    transport: &dyn RpcTransport,
+    wait: impl FnOnce(&SharedSession) -> T,
+) -> Option<(Arc<RpcSessionInner>, T)> {
+    let shared = Arc::clone(&inner.shared);
+    *inner.reaper_wake.lock().expect("reaper_wake poisoned") = transport.shutdown_handle();
+    drop(inner);
+    let waited = wait(&shared);
+    let inner = weak.upgrade()?;
+    let wake = inner
+        .reaper_wake
+        .lock()
+        .expect("reaper_wake poisoned")
+        .take();
+    drop(wake);
+    Some((inner, waited))
+}
+
+/// `ReaperJob::Dec`: what the session owes, until it owes nothing; the session may go meanwhile.
+fn reap_owed(weak: &Weak<RpcSessionInner>, mut inner: Arc<RpcSessionInner>) {
+    while let Some(owed) = inner.take_reaper_owed() {
+        for (addr, amount) in owed {
+            inner = match reap_dec(weak, inner, addr, amount) {
+                Some(inner) => inner,
+                None => return,
+            };
+        }
+    }
+}
+
+/// One address's amount: best-effort, but a transport failure ends the session ("Failed sends").
+fn reap_dec(
+    weak: &Weak<RpcSessionInner>,
+    inner: Arc<RpcSessionInner>,
+    addr: RpcAddress,
+    amount: u32,
+) -> Option<Arc<RpcSessionInner>> {
+    let Some((frame, times)) = inner.profile.codec().encode_dec_strong(&addr, amount) else {
+        return Some(inner);
+    };
+    // Waits only on this thread, and gives up on teardown or drain.
+    let Some((slot_id, transport)) = inner.find_conn_for_reaper() else {
+        // Step 4's drop: the peer's node stays alive, so a later `Outgoing` can misnumber a oneway.
+        inner.pay_receipts(&addr, amount);
+        return Some(inner);
+    };
+    let sent = wait_without_the_session(weak, inner, &*transport, |shared| {
+        // A frame on its way out is activity ("Idle"); no drain, as AOSP `sendDecStrongToTarget`.
+        let _sending = OpenCall::enter(shared);
+        (0..times).try_for_each(|_| write_aosp_message_with_fds(&*transport, &frame, &[], None))
+    });
+    let (inner, sent) = sent?;
+    // Before the slot goes back: a failed write may have left a cut frame on it.
+    match sent {
+        Ok(()) => inner.pay_receipts(&addr, amount),
+        Err(e) => inner.end_after_failed_send(&e),
+    }
+    inner.release_reaper_claim(slot_id);
+    Some(inner)
+}
+
+/// `ReaperJob::AwaitRoom`: the slot held until there is room, so no writer fills it meanwhile.
+fn await_room(weak: &Weak<RpcSessionInner>, inner: Arc<RpcSessionInner>, slot_id: u64) {
+    let Some(transport) = inner.claim_for_room(slot_id) else {
+        inner.awaiting_room.store(false, Ordering::SeqCst);
+        return;
+    };
+    let room = wait_without_the_session(weak, inner, &*transport, |_| transport.__wait_for_room());
+    let Some((inner, room)) = room else {
+        return;
+    };
+    match room {
+        Ok(true) => {}
+        Ok(false) => {
+            log::warn!("RPC: a peer took nothing for the send deadline; ending the session");
+            inner.fail_session();
+        }
+        Err(e) => inner.end_after_failed_send(&e),
+    }
+    inner.release_reaper_claim(slot_id);
+    inner.awaiting_room.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -6349,15 +6912,18 @@ mod tests {
     //!   count `Timeout` as a close in `fail_awaiting_cci` and it stays up.
     //!   `an_incoming_attach_cut_inside_cci_ends_the_session`: exempt `Truncated` outside the
     //!   `received == 0` test and its EOF case stays up; drop the `received == 0` test and its
-    //!   no-`close_notify` case stays up. `an_incoming_attach_closed_before_cci_leaves_the_session_up` and
+    //!   no-`close_notify` case stays up.
+    //!   `an_incoming_attach_closed_before_cci_leaves_the_session_up` and
     //!   `an_incoming_attach_reset_before_cci_leaves_the_session_up` are the other half: drop
     //!   `EndOfStream` from the close arm and the session ends;
     //!   `an_incoming_attach_uncleanly_closed_before_cci_leaves_the_session_up` does the same for
     //!   `UncleanEndOfStream`.
-    //! * The outgoing attach, one test per class. `an_outgoing_attach_failing_past_its_header_ends_the_session`:
+    //! * The outgoing attach, one test per class.
+    //!   `an_outgoing_attach_failing_past_its_header_ends_the_session`:
     //!   return the error without `end_past_outgoing_header` on the `"cci"` write or on the
     //!   probe's deadline arm and its case of that name stays up; so does its expiry case once
-    //!   the probe's failure skips it. `an_outgoing_attach_closed_before_the_reply_ends_the_session`:
+    //!   the probe's failure skips it.
+    //!   `an_outgoing_attach_closed_before_the_reply_ends_the_session`:
     //!   exempt a close (`EndOfStream`, `UncleanEndOfStream`) before any reply byte, at the read
     //!   (EOF, no-`close_notify` cases), at the `"cci"` write or at the probe's write, and that
     //!   case stays up. `an_outgoing_attach_cut_inside_the_reply_ends_the_session` and
@@ -6367,8 +6933,43 @@ mod tests {
     //!   once the header write goes through `end_past_outgoing_header`;
     //!   `an_outgoing_attach_below_the_session_version_never_connects` and
     //!   `an_outgoing_attach_echoing_the_client_local_id_never_connects` connect once their
-    //!   check moves after the connect; `an_outgoing_attach_on_another_transport_kind_is_refused_before_its_header`
+    //!   check moves after the connect;
+    //!   `an_outgoing_attach_on_another_transport_kind_is_refused_before_its_header`
     //!   sends its header once the `admits` check ahead of it is dropped.
+    //! * `a_proxy_drop_on_a_full_socket_waits_for_nothing` and
+    //!   `a_release_read_in_a_reply_wait_on_a_full_socket_waits_for_nothing`: have
+    //!   `send_msg_no_wait` answer `None` in `write_dec_no_wait` and the drop waits for the send
+    //!   deadline.
+    //! * `a_failed_release_runs_no_recipient_on_the_dropping_thread_*`: have `end_on_the_reaper`
+    //!   call `fail_session` and the recipient runs on the dropping thread.
+    //! * `a_slot_with_no_room_is_judged_as_a_waiting_send_is`: drop the `AwaitRoom` send and no
+    //!   judgement comes; replace `__wait_for_room`'s `SendWait` with a sleep of the deadline and a
+    //!   peer that takes frames loses its session.
+    //! * `a_pin_past_its_limit_with_no_room_holds_and_the_serve_loop_writes_the_excess`: drop
+    //!   `write_held_past_limit` from `serve_once_on_slot` and the hold stays past its limit.
+    //!   `a_reply_wait_writes_what_its_slot_holds_past_the_limit`: the same in `client_transact`.
+    //! * `nothing_is_written_after_a_frame_cut_with_no_death_sequence_on_this_thread`: have
+    //!   `stop_for_the_reaper` only queue `End` and the job ahead of it writes after the cut.
+    //! * `a_reaper_waiting_to_write_keeps_no_session_alive`,
+    //!   `a_reaper_judging_a_full_socket_keeps_no_session_alive`: keep a clone of `inner` across
+    //!   `wait_without_the_session`'s wait and the session outlives its handle; drop
+    //!   `RpcSessionInner`'s `Drop` and the reaper keeps the socket, so the peer sees no end.
+    //! * `a_thread_that_cut_a_frame_writes_nothing_more_on_its_pin`: drop the lifecycle check of
+    //!   `send_msg` and a reply follows the frame this thread cut, on a transport with nothing to
+    //!   cut it. `a_stopped_session_sends_nothing_that_does_not_wait`: the same in
+    //!   `send_msg_no_wait`.
+    //! * `close_session_ends_what_a_stop_with_nothing_to_cut_left_waiting`: return from `close`
+    //!   when it lost the edge, and `close_session` stays in its join.
+    //! * `a_burst_of_releases_ends_no_session_and_each_address_gets_its_sum`: end the session past
+    //!   a length of `reaper_owed` and the burst fails; `insert` over `entry` loses a sum.
+    //! * `a_reply_wait_on_an_outgoing_pin_writes_what_the_reaper_owes_past_the_limit`: drop the
+    //!   `reaper_owed` arm of `write_held_past_limit`.
+    //!   `an_incoming_pin_holds_what_the_reaper_owes_no_more_of`: have `owe_from_pin` always add to
+    //!   the reaper. Either way a peer's frames grow it for good.
+    //! * `a_oneway_refused_past_a_later_number_ends_the_session`: drop the `fail_session` of
+    //!   `client_transact`'s `rollback` and the gap stays.
+    //! * `a_reply_past_the_fds_in_flight_fails_the_call_and_leaves_the_session_up`: drop the
+    //!   `TOOMANYREFS` arm of `send_stream` and the victim's session ends.
     //! * `an_idle_expiry_on_a_slot_the_session_dropped_is_not_an_eviction`: drop the loop's
     //!   `slot_role` arm ahead of the idle check and the loop reports `Frame(TimedOut)`, `Local`:
     //!   an idle eviction of a session another connection's fault ended. The transport's read
@@ -7164,6 +7765,1157 @@ mod tests {
         assert!(
             !inner.shared.lifecycle.is_torn_down(),
             "the session stays up"
+        );
+    }
+
+    /// What fills a socket: frames this size go in until a send that does not wait finds no room.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const FILLER: usize = 256;
+
+    /// Fill the session's one socket; the bytes the peer has to read before anything else.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn fill_socket(session: &RpcSession) -> usize {
+        let transports = session.inner.slot_transports();
+        let filler = [0u8; FILLER];
+        let mut filled = 0;
+        while transports[0]
+            .__send_no_wait(&filler, &[])
+            .expect("a Unix socket")
+            .expect("a send")
+        {
+            filled += FILLER;
+        }
+        filled
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn full_r34_client() -> (RpcSession, crate::rpc::transport::UnixTransport, usize) {
+        let (a, peer) = crate::rpc::transport::UnixTransport::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        // The session-id preamble went first.
+        let filled = 4 + fill_socket(&session);
+        (session, peer, filled)
+    }
+
+    /// `len` bytes from the peer's end, whatever the reads they take.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_bytes(peer: &dyn RpcTransport, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        let mut read = 0;
+        while read < len {
+            let n = peer.recv_raw(&mut bytes[read..]).expect("the peer's read");
+            assert!(n > 0, "the end of stream after {read} of {len} bytes");
+            read += n;
+        }
+        bytes
+    }
+
+    /// Past the filler, the next frame the peer reads is this `DEC_STRONG`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn expect_r34_dec_strong(peer: &dyn RpcTransport, filled: usize, addr: RpcAddress) {
+        read_bytes(peer, filled);
+        let (frame, _) = R34Codec.encode_dec_strong(&addr, 1).expect("a frame");
+        let read = read_bytes(peer, frame.len());
+        assert_eq!(read, frame, "the DEC_STRONG");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_address(serial: u64) -> RpcAddress {
+        let mut counter = serial;
+        RpcAddress::unique(&mut counter, AddressSpace::Acceptor)
+    }
+
+    /// A last drop writes with no wait; on no room the reaper does, once the peer reads.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_proxy_drop_on_a_full_socket_waits_for_nothing() {
+        let (session, peer, filled) = full_r34_client();
+        session
+            .set_reply_timeout(Some(Duration::from_secs(60)))
+            .expect("deadline");
+        let addr = peer_address(1);
+        let proxy = RpcProxy::new(addr, session.inner.clone());
+        let (dropped, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(proxy);
+            let _ = dropped.send(());
+        });
+        let returned = returned.recv_timeout(Duration::from_secs(1));
+        if returned.is_err() {
+            session.close_session();
+        }
+        assert!(returned.is_ok(), "the drop waited for the peer");
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
+        expect_r34_dec_strong(&peer, filled, addr);
+    }
+
+    /// The same inside a reply wait, whose slot only the reply gives back.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_release_read_in_a_reply_wait_on_a_full_socket_waits_for_nothing() {
+        let (session, peer, filled) = full_r34_client();
+        session
+            .set_reply_timeout(Some(Duration::from_secs(60)))
+            .expect("deadline");
+        let addr = peer_address(2);
+        {
+            let mut st = session.inner.shared.state.lock().expect("state");
+            st.on_proxy_leaving(addr);
+            assert_eq!(st.release_proxy(&addr, std::ptr::null()), 0, "it is held");
+        }
+        let inner = session.inner.clone();
+        let (entered, returned) = mpsc::channel();
+        let (reply, replied) = mpsc::channel::<()>();
+        let waiting = std::thread::spawn(move || {
+            let conn = inner.find_conn().expect("the slot");
+            inner.apply_dec_strong(addr, 1);
+            let _ = entered.send(());
+            let _ = replied.recv();
+            drop(conn);
+        });
+        let returned = returned.recv_timeout(Duration::from_secs(1));
+        if returned.is_err() {
+            session.close_session();
+        }
+        assert!(returned.is_ok(), "the release waited in the reply wait");
+        drop(reply);
+        waiting.join().expect("the wait");
+        expect_r34_dec_strong(&peer, filled, addr);
+    }
+
+    /// Records the thread a death recipient runs on.
+    #[derive(Default)]
+    struct RanOn(Mutex<Option<std::thread::ThreadId>>);
+
+    impl crate::binder::DeathRecipient for RanOn {
+        fn binder_died(&self, _who: &crate::binder::WIBinder) {
+            *self.0.lock().expect("lock") = Some(std::thread::current().id());
+        }
+    }
+
+    /// `peer` closed, a drop's write fails: the recipients of `transport`'s session run elsewhere.
+    fn a_failed_release_runs_no_recipient_here(
+        transport: Box<dyn RpcTransport>,
+        peer: Box<dyn RpcTransport>,
+    ) {
+        let session = RpcSession::new(transport, AddressSpace::Initiator).expect("session");
+        session
+            .inner
+            .shared
+            .serve_declared
+            .store(1, Ordering::SeqCst);
+        let mut counter = 7;
+        let watched = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let inner = session.inner.clone();
+        let (kept, _) = session
+            .inner
+            .shared
+            .state
+            .lock()
+            .expect("state")
+            .remote_proxy(watched, || {
+                SIBinder::new(Arc::new(RpcProxy::new(watched, inner))).expect("proxy")
+            })
+            .expect("a proxy");
+        let ran = Arc::new(RanOn::default());
+        let weak: Weak<RanOn> = Arc::downgrade(&ran);
+        kept.link_to_death(weak).expect("a link");
+
+        drop(peer);
+        let released = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        drop(RpcProxy::new(released, session.inner.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ran.0.lock().expect("lock").is_none() {
+            assert!(Instant::now() < deadline, "the session did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ran_on = ran.0.lock().expect("lock").take();
+        assert_ne!(ran_on, Some(std::thread::current().id()));
+    }
+
+    #[test]
+    fn a_failed_release_runs_no_recipient_on_the_dropping_thread_unix() {
+        use crate::rpc::transport::UnixTransport;
+        let (a, peer) = UnixTransport::pair().expect("socketpair");
+        a_failed_release_runs_no_recipient_here(Box::new(a), Box::new(peer));
+    }
+
+    #[test]
+    fn a_failed_release_runs_no_recipient_on_the_dropping_thread_default_transport() {
+        use crate::rpc::transport::MemTransport;
+        let (a, peer) = MemTransport::pair();
+        a_failed_release_runs_no_recipient_here(Box::new(a), Box::new(peer));
+    }
+
+    /// A transport with no send that does not wait keeps its write on the dropping thread.
+    #[test]
+    fn a_drop_on_a_transport_with_no_such_send_writes_on_its_own_thread() {
+        struct WroteOn(Arc<Mutex<Option<std::thread::ThreadId>>>);
+        impl RpcTransport for WroteOn {
+            fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+                *self.0.lock().expect("lock") = Some(std::thread::current().id());
+                Ok(())
+            }
+            fn recv_raw(&self, _: &mut [u8]) -> RpcResult<usize> {
+                Err(RpcError::EndOfStream)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "wrote-on"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+        }
+        let wrote_on = Arc::new(Mutex::new(None));
+        let transport = Box::new(WroteOn(wrote_on.clone()));
+        let session = RpcSession::new(transport, AddressSpace::Initiator).expect("session");
+        *wrote_on.lock().expect("lock") = None;
+        let mut counter = 13;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        drop(RpcProxy::new(addr, session.inner.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while wrote_on.lock().expect("lock").is_none() {
+            assert!(Instant::now() < deadline, "no write");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let wrote_on = wrote_on.lock().expect("lock").take();
+        assert_eq!(wrote_on, Some(std::thread::current().id()));
+    }
+
+    /// What found no room leaves no number, no session's end, and the next send goes on from it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_oneway_with_no_room_is_not_sent_and_the_session_goes_on() {
+        let (session, mut peer) = a13_client_with_raw_peer();
+        let proxy = RpcProxy::new(peer_address(3), session.inner.clone());
+        let send = || {
+            let data = proxy.request_parcel("t").expect("a parcel");
+            proxy.__try_oneway(1, &data, FLAG_ONEWAY)
+        };
+        let read_number = |peer: &mut std::os::unix::net::UnixStream| {
+            let frame = read_aosp_message(peer).expect("a frame");
+            let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+            match codec.decode_message(&frame).expect("a message") {
+                WireMessage::Transact(t) => t.async_number,
+                _ => panic!("not a TRANSACT"),
+            }
+        };
+        assert_eq!(send(), Ok(()));
+        let filled = fill_socket(&session);
+        assert_eq!(send(), Err(StatusCode::WouldBlock));
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
+        assert_eq!(read_number(&mut peer), 0);
+        let mut filler = vec![0u8; filled];
+        std::io::Read::read_exact(&mut peer, &mut filler).expect("the filler");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match send() {
+                Ok(()) => break,
+                // The reaper still holds the slot.
+                Err(StatusCode::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("after the peer read: {e:?}"),
+            }
+            assert!(Instant::now() < deadline, "no room after the peer read");
+        }
+        assert_eq!(read_number(&mut peer), 1, "the unsent one left no number");
+    }
+
+    /// What found no room leaves no send of its target unpaid: the proxy's release is not held.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_oneway_with_no_room_leaves_no_send_to_pay_back() {
+        let (session, _peer) = a13_client_with_raw_peer();
+        let addr = peer_address(24);
+        let proxy = RpcProxy::new(addr, session.inner.clone());
+        fill_socket(&session);
+        let data = proxy.request_parcel("t").expect("a parcel");
+        assert_eq!(
+            proxy.__try_oneway(1, &data, FLAG_ONEWAY),
+            Err(StatusCode::WouldBlock)
+        );
+        let mut st = session.inner.shared.state.lock().expect("state");
+        assert_eq!(
+            st.release_proxy(&addr, std::ptr::null()),
+            1,
+            "a send unpaid"
+        );
+    }
+
+    /// A send past the transport's limit is refused before any byte, and the session stays up.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_oneway_too_long_for_a_send_that_does_not_wait_is_refused() {
+        let (session, _peer) = a13_client_with_raw_peer();
+        let proxy = RpcProxy::new(peer_address(4), session.inner.clone());
+        let mut data = proxy.request_parcel("t").expect("a parcel");
+        data.write(&vec![0u8; 4096]).expect("payload");
+        assert_eq!(
+            proxy.__try_oneway(1, &data, FLAG_ONEWAY),
+            Err(StatusCode::BadValue)
+        );
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// A number another send reserved past it cannot come back: a gap would park the rest.
+    #[test]
+    fn a_oneway_number_that_cannot_be_taken_back_ends_the_session() {
+        use crate::rpc::transport::MemTransport;
+        let (a, _peer) = MemTransport::pair();
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        let mut counter = 11;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let (first, _next) = {
+            let mut st = session.inner.shared.state.lock().expect("state");
+            (
+                st.next_send_async_number(addr),
+                st.next_send_async_number(addr),
+            )
+        };
+        assert!(!session.inner.take_back_oneway(addr, first, false));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !session.inner.shared.lifecycle.is_torn_down() {
+            assert!(Instant::now() < deadline, "the session did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// No room and no frame taken loses the session at the send deadline; a frame taken does not.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_slot_with_no_room_is_judged_as_a_waiting_send_is() {
+        let deadline = Duration::from_secs(1);
+        let (session, _unread, _) = full_r34_client();
+        session.set_reply_timeout(Some(deadline)).expect("deadline");
+        let proxy = RpcProxy::new(peer_address(5), session.inner.clone());
+        let send = |proxy: &RpcProxy| {
+            let data = proxy.request_parcel("t");
+            proxy.__try_oneway(1, &data.expect("a parcel"), FLAG_ONEWAY)
+        };
+        let started = Instant::now();
+        while !session.inner.shared.lifecycle.is_torn_down() {
+            // Sends in the meantime change nothing of the judgement.
+            assert_ne!(send(&proxy), Ok(()));
+            assert!(started.elapsed() < Duration::from_secs(5), "no judgement");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            started.elapsed() >= deadline * 3 / 4,
+            "{:?}",
+            started.elapsed()
+        );
+
+        let (session, peer, _) = full_r34_client();
+        session.set_reply_timeout(Some(deadline)).expect("deadline");
+        let proxy = RpcProxy::new(peer_address(6), session.inner.clone());
+        assert_eq!(send(&proxy), Err(StatusCode::WouldBlock));
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            read_bytes(&peer, FILLER);
+            let _ = send(&proxy);
+            assert!(!session.inner.shared.lifecycle.is_torn_down());
+        }
+    }
+
+    /// Past the limit with no room a pin holds on, and the serve loop writes only the excess.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_pin_past_its_limit_with_no_room_holds_and_the_serve_loop_writes_the_excess() {
+        const EXCESS: usize = 3;
+        let (t0, peer) = crate::rpc::transport::UnixTransport::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("build session");
+        let filled = fill_socket(&session);
+        let inner = session.inner.clone();
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        let held = || {
+            let st = inner.conn_state.lock().expect("conn_state");
+            st.slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| s.pending_dec.len())
+        };
+        let sess_ptr = &*inner as *const RpcSessionInner as usize;
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        let mut counter = 0;
+        for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
+            inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Initiator), 1);
+        }
+        DRIVING.with(|d| d.borrow_mut().pop());
+        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT + EXCESS));
+
+        let codec = Android13PlusCodec::android14_15();
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        let (frame, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
+        peer.send_raw(&frame).expect("a frame for the serve loop");
+        let read = std::thread::spawn(move || {
+            read_bytes(&peer, filled + EXCESS * frame.len());
+            peer
+        });
+        assert!(matches!(
+            inner.serve_once_on_slot(slot_id),
+            ServeStep::Continue
+        ));
+        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT), "only the excess");
+        let peer = read.join().expect("the peer");
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("peer timeout");
+        let mut more = [0u8; 1];
+        assert!(peer.recv_raw(&mut more).is_err(), "more than the excess");
+    }
+
+    /// How many addresses the reaper owes and has not taken yet.
+    fn reaper_owed_len(inner: &RpcSessionInner) -> usize {
+        inner
+            .conn_state
+            .lock()
+            .expect("conn_state")
+            .reaper_owed
+            .len()
+    }
+
+    /// Wait until the reaper has taken what it owes: it now writes or waits for a slot with that.
+    fn reaper_takes_what_it_owes(inner: &RpcSessionInner) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reaper_owed_len(inner) > 0 {
+            assert!(Instant::now() < deadline, "the reaper took nothing");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A burst of drops past any limit, with the only slot busy: no end, and every amount goes.
+    #[test]
+    fn a_burst_of_releases_ends_no_session_and_each_address_gets_its_sum() {
+        use crate::rpc::wire_android13::read_aosp_message;
+        const BURST: usize = 2 * HELD_DEC_STRONG_LIMIT;
+        let (session, mut peer) = a13_client_with_raw_peer();
+        let inner = &*session.inner;
+        let taken = inner.find_conn().expect("the slot");
+        let mut counter = 0;
+        let first = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        inner.reap_dec_strong(first, 1);
+        reaper_takes_what_it_owes(inner);
+        let repeated = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        for _ in 0..3 {
+            inner.reap_dec_strong(repeated, 1);
+        }
+        for _ in 0..BURST {
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+            inner.reap_dec_strong(addr, 1);
+        }
+        assert_eq!(reaper_owed_len(inner), BURST + 1, "one entry per address");
+        assert!(!inner.shared.lifecycle.is_torn_down(), "a burst ended it");
+        drop(taken);
+
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let mut frames = 0;
+        let mut total = 0u64;
+        let mut of_repeated = 0;
+        while frames < BURST + 2 {
+            let frame = read_aosp_message(&mut peer).expect("a frame");
+            let WireMessage::DecStrong(addr, amount) = codec.decode_message(&frame).expect("frame")
+            else {
+                panic!("not a DEC_STRONG");
+            };
+            frames += 1;
+            total += u64::from(amount);
+            if addr == repeated {
+                of_repeated = amount;
+            }
+        }
+        assert_eq!(of_repeated, 3, "the sum of one address");
+        assert_eq!(total, BURST as u64 + 4, "the sum of them all");
+        assert!(!inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// With no `Outgoing` slot what the reaper owes has nowhere to go: dropped, with no end.
+    #[test]
+    fn a_session_with_nothing_to_write_on_drops_what_the_reaper_owes() {
+        use crate::rpc::transport::MemTransport;
+        let (a, _peer) = MemTransport::pair();
+        let session = RpcSession::from_android13plus(
+            Box::new(a),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = &*session.inner;
+        let mut counter = 0;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        drop(inner.enter_binder(addr).expect("a receipt"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while inner
+            .conn_state
+            .lock()
+            .expect("conn_state")
+            .reaper_dec_queued
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper stayed with what it owes"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!inner.shared.lifecycle.is_torn_down());
+        let books = inner
+            .shared
+            .state
+            .lock()
+            .expect("state")
+            .remote_book_count();
+        assert_eq!(books, 0, "a dropped amount pays the receipts it covers");
+    }
+
+    /// An `Outgoing` pin's frames add to what the reaper owes: its reader writes what is past it.
+    #[test]
+    fn a_reply_wait_on_an_outgoing_pin_writes_what_the_reaper_owes_past_the_limit() {
+        use crate::rpc::wire_android13::write_aosp_message;
+        const EXCESS: usize = 3;
+        let (session, mut peer) = a13_client_with_raw_peer();
+        let inner = session.inner.clone();
+        let conn = inner.find_conn().expect("the slot");
+        let mut counter = 0;
+        let first = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        inner.reap_dec_strong(first, 1);
+        reaper_takes_what_it_owes(&inner);
+        for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+            inner.reap_dec_strong(addr, 1);
+        }
+        let peer_side = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("peer timeout");
+            read_aosp_message(&mut peer).expect("the request");
+            for _ in 0..EXCESS {
+                let _ = read_aosp_message(&mut peer);
+            }
+            let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+            let reply = codec
+                .encode_reply_ref(WireReplyRef {
+                    status: 0,
+                    data: &[],
+                    object_positions: &[],
+                })
+                .expect("a reply");
+            write_aosp_message(&mut peer, &reply).expect("the reply");
+            peer
+        });
+        let replied = inner.client_transact(
+            RpcAddress::zero(),
+            SpecialTransaction::GetSessionId.code(),
+            &Parcel::new(),
+            0,
+        );
+        let _peer = peer_side.join().expect("the peer");
+        assert!(replied.is_ok(), "{replied:?}");
+        assert_eq!(reaper_owed_len(&inner), HELD_DEC_STRONG_LIMIT, "the excess");
+        drop(conn);
+    }
+
+    /// An `Incoming` pin's frames stop adding to what the reaper owes at the limit: it holds.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_incoming_pin_holds_what_the_reaper_owes_no_more_of() {
+        use crate::rpc::transport::UnixTransport;
+        let (t0, _p0) = UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = session.inner.clone();
+        // Two: the reaper waits in one's full socket, and the other is free for the route.
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (t, peer) = UnixTransport::pair().expect("socketpair");
+            session.add_callback_slot(Box::new(t), 2).expect("a slot");
+            peers.push(peer);
+        }
+        for t in &inner.slot_transports()[1..] {
+            while t
+                .__send_no_wait(&[0u8; FILLER], &[])
+                .expect("a Unix socket")
+                .expect("a send")
+            {}
+        }
+        let mut counter = 0;
+        let first = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        inner.reap_dec_strong(first, 1);
+        reaper_takes_what_it_owes(&inner);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = inner.conn_state.lock().expect("conn_state");
+            if st.slots.iter().any(|s| s.exclusive_tid.is_some()) {
+                break;
+            }
+            drop(st);
+            assert!(Instant::now() < deadline, "the reaper took no slot");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..HELD_DEC_STRONG_LIMIT {
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+            inner.reap_dec_strong(addr, 1);
+        }
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        let sess_ptr = &*inner as *const RpcSessionInner as usize;
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        inner.send_dec_strong(addr, 1);
+        DRIVING.with(|d| d.borrow_mut().pop());
+        assert_eq!(
+            reaper_owed_len(&inner),
+            HELD_DEC_STRONG_LIMIT,
+            "added past it"
+        );
+        let st = inner.conn_state.lock().expect("conn_state");
+        let held = st
+            .slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .map(|s| s.pending_dec.len());
+        drop(st);
+        assert_eq!(held, Some(1), "not held on the pin");
+        session.close_session();
+    }
+
+    /// Fails its first frame part-way, as a send deadline does, and counts what is written after.
+    struct CutsAFrame {
+        cut_next: Arc<AtomicBool>,
+        writes_after: Arc<AtomicUsize>,
+    }
+
+    impl RpcTransport for CutsAFrame {
+        fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+            if self.cut_next.swap(false, Ordering::SeqCst) {
+                return Err(RpcError::Io(std::io::ErrorKind::WouldBlock.into()));
+            }
+            self.writes_after.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn recv_raw(&self, _: &mut [u8]) -> RpcResult<usize> {
+            Err(RpcError::EndOfStream)
+        }
+        fn peer_identity(&self) -> PeerIdentity {
+            PeerIdentity::Anonymous
+        }
+        fn describe(&self) -> &str {
+            "cuts-a-frame"
+        }
+        fn shutdown(&self) -> RpcResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A release the reaper already waits to write on this slot never follows the frame cut there.
+    #[test]
+    fn nothing_is_written_after_a_frame_cut_with_no_death_sequence_on_this_thread() {
+        let cut_next = Arc::new(AtomicBool::new(false));
+        let writes_after = Arc::new(AtomicUsize::new(0));
+        let transport = CutsAFrame {
+            cut_next: cut_next.clone(),
+            writes_after: writes_after.clone(),
+        };
+        let session =
+            RpcSession::new(Box::new(transport), AddressSpace::Initiator).expect("session");
+        let inner = &*session.inner;
+        writes_after.store(0, Ordering::SeqCst);
+        cut_next.store(true, Ordering::SeqCst);
+        let mut counter = 17;
+        let conn = inner.find_conn().expect("the slot");
+        inner.reap_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1);
+        reaper_takes_what_it_owes(inner);
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        assert_eq!(inner.write_dec_no_wait(&conn, addr, 1), 0);
+        assert!(
+            inner.shared.lifecycle.is_torn_down(),
+            "before the slot goes back"
+        );
+        // With the slot still held: the stop's own wake is what the reaper needs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while inner.slot_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper ran no death sequence"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(conn);
+        assert_eq!(
+            writes_after.load(Ordering::SeqCst),
+            0,
+            "a frame after the cut"
+        );
+    }
+
+    /// The thread that cut a frame goes on through its pin: nothing it sends reaches the socket.
+    #[test]
+    fn a_thread_that_cut_a_frame_writes_nothing_more_on_its_pin() {
+        /// Stays in `shutdown` until told, so the slot stays pooled while the test writes.
+        struct HoldsItsEnd {
+            frames: CutsAFrame,
+            ending: Mutex<mpsc::Receiver<()>>,
+        }
+        impl RpcTransport for HoldsItsEnd {
+            fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+                self.frames.send_raw(buf)
+            }
+            fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+                self.frames.recv_raw(buf)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                self.frames.peer_identity()
+            }
+            fn describe(&self) -> &str {
+                self.frames.describe()
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                let ending = self.ending.lock().expect("ending");
+                let _ = ending.recv_timeout(Duration::from_secs(10));
+                Ok(())
+            }
+        }
+        let cut_next = Arc::new(AtomicBool::new(false));
+        let writes_after = Arc::new(AtomicUsize::new(0));
+        let (end, ending) = mpsc::channel();
+        let transport = HoldsItsEnd {
+            frames: CutsAFrame {
+                cut_next: cut_next.clone(),
+                writes_after: writes_after.clone(),
+            },
+            ending: Mutex::new(ending),
+        };
+        let session =
+            RpcSession::new(Box::new(transport), AddressSpace::Initiator).expect("session");
+        let inner = &*session.inner;
+        writes_after.store(0, Ordering::SeqCst);
+        cut_next.store(true, Ordering::SeqCst);
+        let conn = inner.find_conn().expect("the slot");
+        let mut counter = 29;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        assert_eq!(inner.write_dec_no_wait(&conn, addr, 1), 0);
+        assert!(inner.shared.lifecycle.is_torn_down());
+        assert!(
+            inner.slot_count() > 0,
+            "the reaper's sequence is in shutdown"
+        );
+        assert!(matches!(
+            inner.write_reply(0, &[], &[], &[]),
+            Err(ReplyNotSent::Failed(StatusCode::DeadObject))
+        ));
+        assert!(inner.write_dec_strong(&conn, addr, 1).is_err());
+        let called = inner.client_transact(
+            RpcAddress::zero(),
+            SpecialTransaction::GetSessionId.code(),
+            &Parcel::new(),
+            0,
+        );
+        assert_eq!(called.err(), Some(StatusCode::DeadObject));
+        assert_eq!(
+            writes_after.load(Ordering::SeqCst),
+            0,
+            "a frame after the cut"
+        );
+        drop(conn);
+        let _ = end.send(());
+    }
+
+    /// A stopped session sends nothing on a send that does not wait, whatever room there is.
+    #[test]
+    fn a_stopped_session_sends_nothing_that_does_not_wait() {
+        let (session, peer) = a13_client_with_raw_peer();
+        let inner = &*session.inner;
+        assert!(inner.shared.lifecycle.force_dying());
+        let transports = inner.slot_transports();
+        let sent = inner.send_msg_no_wait(&*transports[0], b"frame", &[]);
+        assert!(matches!(sent, Some(Err(RpcError::EndOfStream))), "{sent:?}");
+        peer.set_nonblocking(true).expect("nonblocking");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            std::io::Read::read(&mut &peer, &mut byte).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "a frame reached the peer"
+        );
+    }
+
+    /// A send only `shutdown` ends, on a transport with no `shutdown_handle`: `close_session` ends.
+    #[test]
+    fn close_session_ends_what_a_stop_with_nothing_to_cut_left_waiting() {
+        #[derive(Default)]
+        struct Down {
+            down: Mutex<bool>,
+            changed: Condvar,
+        }
+        impl Down {
+            /// What a blocked send or recv does: up to a limit, so that a failure ends the test.
+            fn wait(&self) -> RpcResult<usize> {
+                let down = self.down.lock().expect("down");
+                let limit = Duration::from_secs(30);
+                let woke = self.changed.wait_timeout_while(down, limit, |d| !*d);
+                drop(woke.expect("down"));
+                Err(RpcError::EndOfStream)
+            }
+        }
+        struct WaitsForShutdown {
+            blocks: Arc<AtomicBool>,
+            down: Arc<Down>,
+        }
+        impl RpcTransport for WaitsForShutdown {
+            fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+                if self.blocks.load(Ordering::SeqCst) {
+                    self.down.wait()?;
+                }
+                Ok(())
+            }
+            fn recv_raw(&self, _: &mut [u8]) -> RpcResult<usize> {
+                self.down.wait()
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "waits-for-shutdown"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                *self.down.down.lock().expect("down") = true;
+                self.down.changed.notify_all();
+                Ok(())
+            }
+        }
+        let blocks = Arc::new(AtomicBool::new(false));
+        let down = Arc::new(Down::default());
+        let transport = WaitsForShutdown {
+            blocks: blocks.clone(),
+            down: down.clone(),
+        };
+        let session =
+            RpcSession::new(Box::new(transport), AddressSpace::Initiator).expect("session");
+        let inner = session.inner.clone();
+        // What `close_session` joins: a thread in `recv`, as a connection's serve loop is.
+        let serving = std::thread::spawn({
+            let down = down.clone();
+            move || {
+                let _ = down.wait();
+            }
+        });
+        inner
+            .incoming_threads
+            .lock()
+            .expect("incoming_threads")
+            .push((2, serving));
+        blocks.store(true, Ordering::SeqCst);
+        let mut counter = 31;
+        inner.reap_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1);
+        reaper_takes_what_it_owes(&inner);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = inner.conn_state.lock().expect("conn_state");
+            if st.slots.iter().any(|s| s.exclusive_tid.is_some()) {
+                break;
+            }
+            drop(st);
+            assert!(Instant::now() < deadline, "the reaper took no slot");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        inner.stop_for_the_reaper();
+        assert!(inner.shared.lifecycle.is_torn_down());
+        assert!(
+            inner.slot_count() > 0,
+            "the stop cut nothing, so it runs behind"
+        );
+        let (closed, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            session.close_session();
+            let _ = closed.send(());
+        });
+        assert!(
+            returned.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "close_session stayed in its join"
+        );
+        while inner.slot_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper ran no death sequence"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A slot free in a stopped session may hold a cut frame: a release is not written there.
+    #[test]
+    fn a_stopped_session_routes_no_release_to_its_free_slot() {
+        use crate::rpc::transport::MemTransport;
+        let (a, _peer) = MemTransport::pair();
+        let session = RpcSession::new(Box::new(a), AddressSpace::Initiator).expect("session");
+        assert!(matches!(session.inner.dec_route(), DecRoute::Conn(_)));
+        assert!(session.inner.shared.lifecycle.force_dying());
+        assert!(matches!(session.inner.dec_route(), DecRoute::Reaper));
+    }
+
+    /// A oneway refused after another send reserved the next number would leave a gap: it ends.
+    #[test]
+    fn a_oneway_refused_past_a_later_number_ends_the_session() {
+        struct ReservesTheNext {
+            session: Arc<Mutex<Weak<RpcSessionInner>>>,
+            addr: RpcAddress,
+        }
+        impl RpcTransport for ReservesTheNext {
+            fn send_raw(&self, _: &[u8]) -> RpcResult<()> {
+                let session = self.session.lock().expect("lock").upgrade();
+                let Some(inner) = session else {
+                    return Ok(());
+                };
+                let mut st = inner.shared.state.lock().expect("state");
+                st.next_send_async_number(self.addr);
+                Err(RpcError::Protocol("refused before any byte"))
+            }
+            fn recv_raw(&self, _: &mut [u8]) -> RpcResult<usize> {
+                Err(RpcError::EndOfStream)
+            }
+            fn peer_identity(&self) -> PeerIdentity {
+                PeerIdentity::Anonymous
+            }
+            fn describe(&self) -> &str {
+                "reserves-the-next"
+            }
+            fn shutdown(&self) -> RpcResult<()> {
+                Ok(())
+            }
+        }
+        let mut counter = 19;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let cell = Arc::new(Mutex::new(Weak::new()));
+        let transport = ReservesTheNext {
+            session: cell.clone(),
+            addr,
+        };
+        let session =
+            RpcSession::new(Box::new(transport), AddressSpace::Initiator).expect("session");
+        *cell.lock().expect("lock") = Arc::downgrade(&session.inner);
+        assert!(session
+            .inner
+            .client_transact(addr, 1, &Parcel::new(), FLAG_ONEWAY)
+            .is_err());
+        assert!(session.inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// What a pin holds past its limit goes out before a reply wait reads on, as in a serve loop.
+    #[test]
+    fn a_reply_wait_writes_what_its_slot_holds_past_the_limit() {
+        use crate::rpc::wire_android13::write_aosp_message;
+        const EXCESS: usize = 3;
+        let (session, mut peer) = a13_client_with_raw_peer();
+        let inner = session.inner.clone();
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        let held = || {
+            let st = inner.conn_state.lock().expect("conn_state");
+            st.slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| s.pending_dec.len())
+        };
+        let mut counter = 0;
+        for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+            inner.hold_dec_strong(slot_id, addr, 1);
+        }
+        let peer_side = std::thread::spawn(move || {
+            peer.set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("peer timeout");
+            read_aosp_message(&mut peer).expect("the request");
+            // Whether or not they come, the reply does: a read that fails is the verdict below.
+            for _ in 0..EXCESS {
+                let _ = read_aosp_message(&mut peer);
+            }
+            let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+            let reply = codec
+                .encode_reply_ref(WireReplyRef {
+                    status: 0,
+                    data: &[],
+                    object_positions: &[],
+                })
+                .expect("a reply");
+            write_aosp_message(&mut peer, &reply).expect("the reply");
+            peer
+        });
+        let replied = inner.client_transact(
+            RpcAddress::zero(),
+            SpecialTransaction::GetSessionId.code(),
+            &Parcel::new(),
+            0,
+        );
+        let _peer = peer_side.join().expect("the peer");
+        assert!(replied.is_ok(), "{replied:?}");
+        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT), "only the excess");
+    }
+
+    /// `session`'s reaper waits for room: its last handle and proxy end it all the same.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn the_last_handle_ends_a_session_with_its_reaper_waiting(
+        session: RpcSession,
+        peer: &dyn RpcTransport,
+        filled: usize,
+    ) {
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = session.inner.conn_state.lock().expect("conn_state");
+            let claimed = st
+                .slots
+                .iter()
+                .any(|s| s.id == slot_id && s.exclusive_tid.is_some());
+            drop(st);
+            if claimed {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the reaper took no slot");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let probe = session.inner_weak();
+        drop(session);
+        while probe.strong_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper's wait keeps the session"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // With nothing read: a read would give the reaper the room it waits for.
+        while peer.peer_closed() != Some(true) {
+            assert!(Instant::now() < deadline, "the peer sees no end of stream");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer timeout");
+        read_bytes(peer, filled);
+        let mut more = [0u8; 1];
+        assert!(
+            matches!(peer.recv_raw(&mut more), Ok(0) | Err(RpcError::EndOfStream)),
+            "a frame after what was in the socket",
+        );
+    }
+
+    /// `ReaperJob::Dec` in a socket's wait, on a session with no deadline.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_reaper_waiting_to_write_keeps_no_session_alive() {
+        let (session, peer, filled) = full_r34_client();
+        drop(RpcProxy::new(peer_address(21), session.inner.clone()));
+        the_last_handle_ends_a_session_with_its_reaper_waiting(session, &peer, filled);
+    }
+
+    /// `ReaperJob::AwaitRoom` in a socket's wait, on a session with no deadline.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_reaper_judging_a_full_socket_keeps_no_session_alive() {
+        let (session, peer, filled) = full_r34_client();
+        let proxy = RpcProxy::new(peer_address(22), session.inner.clone());
+        let data = proxy.request_parcel("t").expect("a parcel");
+        assert_eq!(
+            proxy.__try_oneway(1, &data, FLAG_ONEWAY),
+            Err(StatusCode::WouldBlock)
+        );
+        drop(data);
+        drop(proxy);
+        the_last_handle_ends_a_session_with_its_reaper_waiting(session, &peer, filled);
+    }
+
+    /// `close_session` wakes the same wait, and the reaper keeps nothing after it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn close_session_ends_a_reapers_wait_for_room() {
+        let (session, _peer, _) = full_r34_client();
+        drop(RpcProxy::new(peer_address(23), session.inner.clone()));
+        session.close_session();
+        let probe = session.inner_weak();
+        drop(session);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while probe.strong_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the reaper's wait keeps the session"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A reply with fds past the uid's fds in flight fails the call; its session stays up.
+    #[test]
+    // Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_arch = "s390x")
+    ))]
+    fn a_reply_past_the_fds_in_flight_fails_the_call_and_leaves_the_session_up() {
+        // Root has the capability that passes this check.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        crate::tests::in_child_process(
+            "rpc::session::tests::\
+             a_reply_past_the_fds_in_flight_fails_the_call_and_leaves_the_session_up",
+            || {
+                use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+                let held = Rlimit {
+                    current: Some(16),
+                    maximum: getrlimit(Resource::Nofile).maximum,
+                };
+                setrlimit(Resource::Nofile, held).expect("RLIMIT_NOFILE");
+                let (t0, _peer) = crate::rpc::transport::UnixTransport::pair().expect("socketpair");
+                let session = RpcSession::from_android13plus(
+                    Box::new(t0),
+                    Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"),
+                    FD_MODE_UNIX,
+                    true,
+                )
+                .expect("session");
+                let inner = &*session.inner;
+                let file = std::fs::File::open("/dev/null").expect("/dev/null");
+                let fd = OwnedFd::from(file);
+                let transport = &inner.slot_transports()[0];
+                let slot_id = RpcSession::FOUNDING_SLOT_ID;
+                let sess_ptr = inner as *const RpcSessionInner as usize;
+                DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+                let mut sent = 0;
+                let replied = loop {
+                    while transport
+                        .__send_no_wait(b"frame", &[fd.as_fd()])
+                        .expect("a Unix socket")
+                        .expect("a send")
+                    {
+                        sent += 1;
+                        assert!(sent < 64, "no limit on what is in flight");
+                    }
+                    // The count is the uid's: another process may have let some go since the fill.
+                    let replied = inner.write_reply(0, &[0; 8], &[], std::slice::from_ref(&fd));
+                    if replied.is_err() {
+                        break replied;
+                    }
+                    sent += 1;
+                    assert!(sent < 64, "no limit on what is in flight");
+                };
+                DRIVING.with(|d| d.borrow_mut().pop());
+                assert!(matches!(
+                    replied,
+                    Err(ReplyNotSent::Refused(StatusCode::FailedTransaction))
+                ));
+                assert!(!inner.shared.lifecycle.is_torn_down());
+            },
         );
     }
 

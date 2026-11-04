@@ -55,7 +55,10 @@
 //! already yields), and every other failure, at any position, stays the
 //! transport error. The session ends on both (its "Failed sends" rule: the
 //! peer did not read for the whole deadline either way); the variant keeps
-//! saying which position the stream was left in. The writer must report
+//! saying which position the stream was left in. The one exception is a
+//! kernel's refusal of a frame's fds because the uid has too many in flight
+//! (`ETOOMANYREFS`): that says nothing of this peer, and is
+//! [`RpcError::Protocol`], which fails the call and leaves the session up. The writer must report
 //! partial progress honestly, as a socket does. An adapter that hands the
 //! whole buffer to another
 //! all-or-nothing send does not, and classifies at its own level instead:
@@ -104,6 +107,12 @@
 //!   `SIOCOUTQ` as a send does; one with nothing queued is the plain blocking
 //!   read under `SO_RCVTIMEO`. While a read deadline is armed, each read
 //!   costs one `ioctl` to tell the two apart.
+//!
+//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG` on
+//!   Linux and Android's `UnixTransport`, a hub's notice) is judged by the
+//!   same rule apart from the send: the session's reaper waits on the slot in
+//!   `__wait_for_room`, a `SendWait` of its own, and ends the session when the
+//!   deadline passes (`session` module doc "Deferred `DEC_STRONG`").
 //!
 //! The `ioctl` runs only while a deadline is armed: a send or read without
 //! one has no verdict for it to change. A socket that refuses it once
@@ -546,6 +555,28 @@ pub trait RpcTransport: Send + Sync {
     /// fds (plain [`RpcTransport::recv_raw`]); only `unix` overrides.
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_raw(buf)?, Vec::new()))
+    }
+
+    /// Not part of the API: one small frame that waits for nothing.
+    ///
+    /// `Ok(true)` is the whole of `buf` and `fds` sent; `Ok(false)` is none of them sent, for want
+    /// of room or of a kernel resource, with the stream as it was; any other failure is the
+    /// transport's, and a `buf` past the transport's limit is [`RpcError::FrameTooLarge`] before
+    /// anything is sent. `None`, the default, is a transport that cannot promise this.
+    #[doc(hidden)]
+    fn __send_no_wait(
+        &self,
+        _buf: &[u8],
+        _fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        None
+    }
+
+    /// Not part of the API: wait as a send that found no room waits. `Ok(true)` is room, or an
+    /// error a send will report; `Ok(false)` is the send deadline passed with no peer progress.
+    #[doc(hidden)]
+    fn __wait_for_room(&self) -> RpcResult<bool> {
+        Ok(true)
     }
 
     /// [`send_raw_with_fds`](Self::send_raw_with_fds) for a transaction,

@@ -70,6 +70,25 @@
 //! on the socket; std sets it only on sockets std itself creates, not on a
 //! `socketpair` from `pair` or an fd adopted by `from_owned_fd`.
 //!
+//! ## A send that does not wait
+//!
+//! On Linux and Android, `__send_no_wait` is one `sendmsg` with `MSG_DONTWAIT` that
+//! puts the whole frame on the socket or none of it. `unix_stream_sendmsg`
+//! (`net/unix/af_unix.c`) allocates one skb of `min(left, sk_sndbuf / 2 - 64)`
+//! bytes at a time and returns what it sent so far when an allocation fails.
+//! `SOCK_MIN_SNDBUF` (4608 on 64-bit) is the least `SO_SNDBUF` the kernel keeps and
+//! the peer cannot change it, so a frame of up to 2240 bytes is one skb on any such
+//! socket. The limit is 2048 (`NO_WAIT_FRAME_LIMIT`); a longer frame is refused
+//! before it is sent. `SCM_RIGHTS` rides that skb, and a failed allocation sends
+//! no fd. `ETOOMANYREFS` (the uid's fds in flight past `RLIMIT_NOFILE`), `ENOMEM` and
+//! `ENOBUFS` are "not sent" too: the socket has sent nothing of the frame, and the
+//! same send can work later. (A send that waits has no "not sent": `send_stream`
+//! makes `ETOOMANYREFS` [`RpcError::Protocol`], a refusal of that frame alone.)
+//! A partial `sendmsg` cannot happen under that limit; if
+//! it did, it is a transport failure and ends the session. Apple keeps the trait's
+//! default: XNU's `AF_UNIX` was not read for this, and `MSG_DONTWAIT` means nothing
+//! there.
+//!
 //! ## Tests
 //!
 //! - `fd_mode_frames_queued_back_to_back_keep_their_own_fds`: a frame that
@@ -176,7 +195,8 @@ pub(crate) const WAITING_SENDS: bool = cfg!(any(target_os = "linux", target_os =
 /// The send rule of the `transport` module doc ("Short reads and writes"): a deadline that
 /// expires before the first byte is `Timeout`, after it `Io(WouldBlock)`; a `sendmsg` that takes
 /// nothing is `WriteZero`; any other failure is the transport error. Too many fds, or fds with
-/// nothing to carry them, are refused before anything is sent.
+/// nothing to carry them, are refused before anything is sent, and so is a frame whose fds the
+/// kernel will not take for now (`ETOOMANYREFS`, module doc).
 pub(crate) fn send_stream(
     sock: std::os::fd::BorrowedFd<'_>,
     slices: &mut [std::io::IoSlice<'_>],
@@ -245,10 +265,63 @@ pub(crate) fn send_stream(
                     None => return Err(RpcError::Io(std::io::ErrorKind::WouldBlock.into())),
                 }
             }
+            // Too many fds in flight for this uid, other sessions' among them; no byte went out.
+            Err(rustix::io::Errno::TOOMANYREFS) if sent == 0 => {
+                return Err(RpcError::Protocol("too many fds in flight"))
+            }
             Err(e) => return Err(std::io::Error::from(e).into()),
         }
     }
     Ok(())
+}
+
+/// The most a `__send_no_wait` takes, which is one skb on any socket (module doc).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const NO_WAIT_FRAME_LIMIT: usize = 2048;
+
+/// `__send_no_wait` on a Unix socket: `buf` and `fds` whole, or nothing (module doc).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn send_whole_or_none(
+    sock: std::os::fd::BorrowedFd<'_>,
+    buf: &[u8],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+) -> RpcResult<bool> {
+    use rustix::io::Errno;
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    use std::mem::MaybeUninit;
+
+    if buf.len() > NO_WAIT_FRAME_LIMIT {
+        return Err(RpcError::FrameTooLarge {
+            declared: buf.len(),
+            max: NO_WAIT_FRAME_LIMIT,
+        });
+    }
+    if fds.len() > MAX_FDS_PER_FRAME {
+        return Err(RpcError::Protocol("too many fds in one RPC frame"));
+    }
+    if buf.is_empty() {
+        // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
+        return Err(RpcError::Protocol("an empty RPC frame"));
+    }
+    let slices = [std::io::IoSlice::new(buf)];
+    let mut space = [MaybeUninit::uninit(); FD_SPACE];
+    loop {
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        if !fds.is_empty() && !anc.push(SendAncillaryMessage::ScmRights(fds)) {
+            return Err(RpcError::Protocol(
+                "failed to attach SCM_RIGHTS ancillary data",
+            ));
+        }
+        match rustix::net::sendmsg(sock, &slices, &mut anc, SEND_FLAGS | SendFlags::DONTWAIT) {
+            Ok(n) if n == buf.len() => return Ok(true),
+            Ok(_) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Err(Errno::INTR) => continue,
+            Err(Errno::AGAIN | Errno::TOOMANYREFS | Errno::NOMEM | Errno::NOBUFS) => {
+                return Ok(false)
+            }
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+    }
 }
 
 /// `send_raw` and `send_raw_draining` of a socket transport that passes no fds (`tcp_debug`,
@@ -752,6 +825,21 @@ impl RpcTransport for UnixTransport {
         )
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn __send_no_wait(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        Some(send_whole_or_none(self.stream.as_fd(), buf, fds))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn __wait_for_room(&self) -> RpcResult<bool> {
+        let mut wait = SendWait::new(self.stream.as_fd(), &self.queue);
+        Ok(wait.wait(false)?.is_some())
+    }
+
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
     /// Received fds are `O_CLOEXEC` (`MSG_CMSG_CLOEXEC`; on Apple, which
     /// lacks it, `fcntl_setfd` after receipt — same as
@@ -809,6 +897,89 @@ mod tests {
     use super::*;
     use crate::rpc::RpcError;
     use std::sync::Arc;
+
+    /// On the smallest send buffer a socket can have: whole or nothing, fd included (module doc).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_send_that_does_not_wait_is_whole_or_nothing_with_its_fds() {
+        let (a, b) = UnixTransport::pair().expect("socketpair");
+        rustix::net::sockopt::set_socket_send_buffer_size(&a.stream, 1).expect("SO_SNDBUF");
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let fds = [file.as_fd()];
+        let frame = [7u8; NO_WAIT_FRAME_LIMIT];
+        let mut sent = 0;
+        while a
+            .__send_no_wait(&frame, &fds)
+            .expect("a Unix socket")
+            .expect("a send")
+        {
+            sent += 1;
+        }
+        assert!(sent > 0, "nothing went in");
+        let refused = a.__send_no_wait(&[0u8; NO_WAIT_FRAME_LIMIT + 1], &[]);
+        assert!(matches!(
+            refused,
+            Some(Err(RpcError::FrameTooLarge {
+                declared: 2049,
+                max: 2048
+            }))
+        ));
+        b.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .expect("read deadline");
+        let (mut bytes, mut got) = (0, 0);
+        let mut buf = [0u8; NO_WAIT_FRAME_LIMIT];
+        loop {
+            match b.recv_raw_with_fds(&mut buf) {
+                Ok((read, fds)) => {
+                    bytes += read;
+                    got += fds.len();
+                }
+                Err(RpcError::Timeout) => break,
+                Err(e) => panic!("the peer's read: {e}"),
+            }
+        }
+        assert_eq!(bytes, sent * NO_WAIT_FRAME_LIMIT, "a frame was cut");
+        assert_eq!(got, sent, "a frame's fd was lost");
+    }
+
+    /// Past the uid's fds in flight: nothing sent, and the same socket takes a frame with none.
+    #[test]
+    // Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_arch = "s390x")
+    ))]
+    fn a_send_past_the_fds_in_flight_is_not_sent_and_leaves_the_socket_up() {
+        // Root has the capability that passes this check.
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        crate::tests::in_child_process(
+            "rpc::transport::unix::tests::\
+             a_send_past_the_fds_in_flight_is_not_sent_and_leaves_the_socket_up",
+            || {
+                use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+                let held = Rlimit {
+                    current: Some(16),
+                    maximum: getrlimit(Resource::Nofile).maximum,
+                };
+                setrlimit(Resource::Nofile, held).expect("RLIMIT_NOFILE");
+                let (a, _peer) = UnixTransport::pair().expect("socketpair");
+                let file = std::fs::File::open("/dev/null").expect("/dev/null");
+                let fds = [file.as_fd()];
+                let mut sent = 0;
+                while a
+                    .__send_no_wait(b"frame", &fds)
+                    .expect("a Unix socket")
+                    .expect("a send")
+                {
+                    sent += 1;
+                    assert!(sent < 64, "no limit on what is in flight");
+                }
+                assert!(matches!(a.__send_no_wait(b"frame", &[]), Some(Ok(true))));
+            },
+        );
+    }
 
     /// A send deadline: `Timeout` before the first byte, then `Io(WouldBlock)`; poll and sendmsg.
     #[test]

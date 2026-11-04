@@ -53,6 +53,14 @@
 //!   released node's `Drop`) is caught too, and the session keeps serving.
 //! - `t17_a_panic_escaping_a_frame_ends_the_session`: the same `Drop` after an `Err` reply,
 //!   outside any handler guard, ends the serve loop as `Dispatch(Unknown)` and the session.
+//! - `t18_an_address_received_again_before_its_release_is_written_numbers_on`: rsbinder on both
+//!   ends; the release waits for the reaper, the address comes back in a reply, and a oneway on
+//!   the new proxy carries the number the peer's node expects.
+//! - `t19_the_last_release_on_the_wire_closes_the_book_on_every_route`: a free slot, the reaper,
+//!   a hold on a pin. The book stays until the write, so it holds no address past its last release.
+//! - `t20_a_peer_that_pays_no_send_keeps_its_entries_until_the_session_ends`: a raw owner that
+//!   reads every oneway and pays none gets no release, its count of addresses does not end the
+//!   session, and the session's end takes the books.
 //!
 //! # Mutation gates
 //!
@@ -70,14 +78,20 @@
 //!   a proxy in `write_binder` (R6).
 //! - T6: skip `enter_every_binder` in `receive_parcel` (R3).
 //! - T7: stop `enter_every_binder` at the first failure.
-//! - T8: let `dec_route` take an `Incoming` pin whatever its `allow_nested`; both halves time
-//!   out (with a callback connection the pin still comes first).
+//! - T8: let `dec_route` take an `Incoming` pin whatever its `allow_nested`; both halves fail:
+//!   the first reads `DEC_STRONG`s ahead of the reply, and in the second the pin still comes
+//!   first, so none comes over the callback connection.
 //! - T9, T11: drop the target count in `client_transact` (`counts_target`).
 //! - T10, T12: drop the proxy count in `write_binder` (fails at v2).
 //! - `state::tests::a_held_release_keeps_the_send_counter_for_a_successor`: close the
 //!   `async_number` book in `RpcState::release_proxy`'s held arm.
+//! - T18: close the book in `RpcState::release_proxy`'s other arm.
+//! - T19: drop the `pay_receipts` call in `write_dec_no_wait` (the free slot), `reap_dec` (the
+//!   reaper) or `write_dec_strong` (the pin).
+//! - T20: drop the clear of `remote_books` in `RpcState::clear_remote_counts`.
 //!
-//! Outside this file, `strong_session_tests::argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`
+//! Outside this file,
+//! `strong_session_tests::argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`
 //! fails when `execute_dispatched` arms `AllowNestedGuard` after building `reply` (its proxies
 //! then drop without `allow_nested` and take the idle callback slot), and
 //! `tests/rpc_e2e.rs` `a_sent_parcel_is_refused_on_resend` fails without the `drop(reader)`
@@ -295,9 +309,13 @@ struct Pair {
 
 impl Pair {
     fn new(wire: Wire) -> Self {
+        Self::with_root(wire, local())
+    }
+
+    fn with_root(wire: Wire, root: SIBinder) -> Self {
         let (a, b) = UnixStream::pair().expect("socketpair");
         let server = session(a, AddressSpace::Acceptor, wire);
-        server.set_root(local()).expect("set_root");
+        server.set_root(root).expect("set_root");
         let s = server.clone();
         let serve = std::thread::spawn(move || s.serve_blocking());
         let client = session(b, AddressSpace::Initiator, wire);
@@ -844,8 +862,7 @@ fn t9_a_proxy_release_waits_for_the_owners_receipt() {
     }
 }
 
-/// T10: at v2 a proxy sent as an argument is a send too, and the release waits for both
-/// receipts. Below v2 the owner pays an argument only if it reads it, so it is not counted.
+/// T10: at v2 a proxy argument is a send too; below v2 the owner pays only what it reads.
 #[test]
 fn t10_a_proxy_argument_counts_at_v2() {
     for (version, sends) in [(1, 1), (PROTOCOL_V2, 2)] {
@@ -873,8 +890,7 @@ fn t10_a_proxy_argument_counts_at_v2() {
     }
 }
 
-/// T12: at v2 a proxy a handler returns in its reply is a send; the proxy's release waits for
-/// the caller to pay it back, however the reply and the release are routed.
+/// T12: at v2 a proxy in a handler's reply is a send, and its release waits for the payment.
 #[test]
 fn t12_a_proxy_in_a_v2_reply_waits_for_its_receipt() {
     let (a, b) = UnixStream::pair().expect("socketpair");
@@ -932,9 +948,7 @@ fn t12_a_proxy_in_a_v2_reply_waits_for_its_receipt() {
     let _ = serve.join();
 }
 
-/// T11: rsbinder on both ends. The r34 wire does not count targets, so the release goes at
-/// once; on android-13+ it waits for the server's receipt, which the server holds for its
-/// next `REPLY`.
+/// T11: rsbinder on both ends: at once on r34, on android-13+ after the server's receipt.
 #[test]
 fn t11_the_release_waits_on_the_wires_that_count_targets() {
     for (wire, counts_targets) in [(Wire::R34, false), (Wire::V(1), true)] {
@@ -1104,6 +1118,223 @@ fn t17_a_panic_escaping_a_frame_ends_the_session() {
             "{wire:?}"
         );
     }
+}
+
+/// Counts each transaction it runs.
+struct Counts(Arc<AtomicUsize>);
+impl Interface for Counts {}
+impl Remotable for Counts {
+    fn descriptor() -> &'static str {
+        CARRIER
+    }
+    fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Puts one binder in every reply; `TX_MAKE` waits for the test first.
+struct Gives {
+    given: SIBinder,
+    entered: mpsc::Sender<()>,
+    gate: Mutex<mpsc::Receiver<()>>,
+}
+impl Interface for Gives {}
+impl Remotable for Gives {
+    fn descriptor() -> &'static str {
+        DESC
+    }
+    fn on_transact(&self, code: TransactionCode, _: &mut Parcel, reply: &mut Parcel) -> Result<()> {
+        if code == TX_MAKE {
+            self.entered.send(()).map_err(|_| StatusCode::BadValue)?;
+            let gate = self.gate.lock().unwrap();
+            let opened = gate.recv_timeout(Duration::from_secs(10));
+            opened.map_err(|_| StatusCode::BadValue)?;
+        }
+        reply.write(&self.given)
+    }
+    fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// T18: a release still on its way when the address comes back leaves its numbers to the new proxy.
+#[test]
+fn t18_an_address_received_again_before_its_release_is_written_numbers_on() {
+    const SENT: usize = 3;
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered) = mpsc::channel();
+    let (open, gate) = mpsc::channel();
+    let root = Interface::as_binder(&Binder::new(Gives {
+        given: Interface::as_binder(&Binder::new(Counts(ran.clone()))),
+        entered: entered_tx,
+        gate: Mutex::new(gate),
+    }));
+    // Wire v2 enters a reply's binders in the reply wait, so before the reaper can have the slot.
+    let p = Pair::with_root(Wire::V(PROTOCOL_V2), root);
+    let run_oneway = |proxy: &SIBinder| {
+        let d = rpc_of(proxy).request_parcel(CARRIER).expect("request");
+        rpc_of(proxy)
+            .send(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
+            .expect("oneway");
+    };
+    let first: SIBinder = p.call(TX_ECHO, None).expect("give").read().expect("binder");
+    let addr = rpc_of(&first).address();
+    for _ in 0..SENT {
+        run_oneway(&first);
+    }
+    // Its reply wait reads what the peer paid for those sends: nothing holds the release.
+    first.ping_binder().expect("ping");
+    assert_eq!(ran.load(Ordering::SeqCst), SENT);
+
+    let client_root = p.root().clone();
+    let wait = std::thread::spawn(move || {
+        let rp = rpc_of(&client_root);
+        let d = rp.request_parcel(DESC).expect("request");
+        let mut reply = rp.send(TX_MAKE, &d, 0).expect("give").expect("a reply");
+        reply.read::<SIBinder>().expect("binder")
+    });
+    entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the handler runs: the call holds the only slot");
+    drop(first);
+    let reaper_has_it = p.client.inner.conn_state.lock().unwrap().reaper_dec_queued;
+    assert!(reaper_has_it, "the test's premise: no slot, no hold");
+    open.send(()).unwrap();
+    let second = wait.join().expect("the call");
+    assert_eq!(rpc_of(&second).address(), addr);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dec_received(&p.server, &addr).0 == 0 {
+        assert!(Instant::now() < deadline, "the release never came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    run_oneway(&second);
+    second.ping_binder().expect("ping");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        SENT + 1,
+        "the peer's node is alive at number {SENT}: a new proxy's oneway has to run"
+    );
+}
+
+fn open_books(s: &RpcSessionInner) -> usize {
+    s.shared.state.lock().unwrap().remote_book_count()
+}
+
+/// T19: the write of an address's last release closes its book, whichever route it took.
+#[test]
+fn t19_the_last_release_on_the_wire_closes_the_book_on_every_route() {
+    // At once, on a free slot.
+    let (client, _raw, target, root) = raw_owner(PROTOCOL_V2);
+    let inner = client.inner.clone();
+    assert_eq!(open_books(&inner), 1);
+    drop(root);
+    assert_eq!(open_books(&inner), 0, "written at once");
+
+    // The reaper: the only slot is another thread's until the test lets it go.
+    let again = inner.enter_binder(target).expect("a receipt");
+    let (claimed, is_claimed) = mpsc::channel();
+    let (free, freed) = mpsc::channel::<()>();
+    let holder = {
+        let inner = inner.clone();
+        std::thread::spawn(move || {
+            let conn = inner.find_conn().expect("the slot");
+            claimed.send(()).unwrap();
+            let _ = freed.recv_timeout(Duration::from_secs(10));
+            drop(conn);
+        })
+    };
+    is_claimed
+        .recv_timeout(Duration::from_secs(10))
+        .expect("claimed");
+    drop(again);
+    assert!(inner.conn_state.lock().unwrap().reaper_dec_queued);
+    assert_eq!(open_books(&inner), 1, "the reaper has no slot to write on");
+    free.send(()).unwrap();
+    holder.join().expect("holder");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while open_books(&inner) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "written, and the book still open"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    client.close_session();
+
+    // Held on an `Incoming` pin: a oneway handler with no callback connection.
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let server = session(a, AddressSpace::Acceptor, Wire::V(PROTOCOL_V2));
+    let inner = server.inner.clone();
+    let mut ctr = 0u64;
+    let mine = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
+    let sess_ptr = &*inner as *const RpcSessionInner as usize;
+    DRIVING.with(|d| {
+        d.borrow_mut()
+            .push((sess_ptr, RpcSession::FOUNDING_SLOT_ID))
+    });
+    drop(inner.enter_binder(mine).expect("a receipt"));
+    assert_eq!(open_books(&inner), 1, "held for the next reply");
+    assert!(inner.write_reply(0, &[], &[], &[]).is_ok());
+    DRIVING.with(|d| d.borrow_mut().pop());
+    assert_eq!(open_books(&inner), 0, "written ahead of the reply");
+    drop(b);
+    server.close_session();
+}
+
+/// One receipt of a new address, a oneway on its proxy, and the proxy's drop.
+fn oneway_and_release(inner: &RpcSessionInner, addr: RpcAddress) {
+    let proxy = inner.enter_binder(addr).expect("a receipt");
+    let d = rpc_of(&proxy).request_parcel(CARRIER).expect("request");
+    rpc_of(&proxy)
+        .send(FIRST_CALL_TRANSACTION, &d, FLAG_ONEWAY)
+        .expect("oneway");
+}
+
+/// T20: a peer that pays no send keeps its addresses' entries until the session ends, in any count.
+#[test]
+fn t20_a_peer_that_pays_no_send_keeps_its_entries_until_the_session_ends() {
+    let (client, mut raw, _target, root) = raw_owner(PROTOCOL_V2);
+    let inner = client.inner.clone();
+    let owner = std::thread::spawn(move || {
+        let (mut sends, mut releases) = (0usize, 0usize);
+        while let Ok(frame) = read_aosp_message(&mut raw.stream) {
+            match raw.codec.decode_message(&frame).expect("decode") {
+                WireMessage::Transact(_) => sends += 1,
+                WireMessage::DecStrong(..) => releases += 1,
+                WireMessage::Reply(_) => {}
+            }
+        }
+        (sends, releases)
+    });
+    // Past `raw_owner`'s own address.
+    let mut ctr = 1u64;
+    const ADDRESSES: usize = HELD_DEC_STRONG_LIMIT + 1;
+    for _ in 0..ADDRESSES {
+        oneway_and_release(&inner, RpcAddress::unique(&mut ctr, AddressSpace::Acceptor));
+    }
+    assert!(!client.is_ended(), "no count of addresses ends the session");
+    assert_eq!(open_books(&inner), ADDRESSES + 1, "and the root's");
+    client.close_session();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while open_books(&inner) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the session's end left its books"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (sends, releases) = owner.join().expect("the owner");
+    assert_eq!(sends, ADDRESSES);
+    assert_eq!(
+        releases, 0,
+        "a release ahead of its payment is what libbinder aborts on"
+    );
+    drop(root);
 }
 
 /// After `DRIVING` is destroyed a dropped proxy is released, a call refused (child: a bug aborts).

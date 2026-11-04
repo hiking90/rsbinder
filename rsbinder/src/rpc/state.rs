@@ -48,8 +48,8 @@
 //! * **Receiving a peer's address.** One `RpcProxy` per address
 //!   ([`RpcState::remote_proxy`]). Each receipt owes the sender one
 //!   `DEC_STRONG`: the receipt that mints the proxy is paid when the proxy
-//!   drops, and a receipt deduped onto a live proxy (`excess`) is paid at once
-//!   (AOSP `flushExcessBinderRefs`). The total equals AOSP's `timesRecd`.
+//!   drops, and a receipt deduped onto a live proxy (`excess`) is paid at once.
+//!   The total equals AOSP's `timesRecd`, which AOSP pays whole at the proxy's drop.
 //! * **Receiving one of our own addresses.** The peer took a `timesSent` for
 //!   it when it sent it, so each receipt is paid with `DEC_STRONG` 1 at once
 //!   (AOSP `flushExcessBinderRefs` on a local binder). On the android-13+ wire
@@ -98,9 +98,9 @@
 //!
 //! The send-side counters ([`RpcState::next_send_async_number`], AOSP
 //! `nodeProgressAsyncNumber` on the send path) live apart from
-//! `remote_proxies`, so a counter survives a stale proxy `Drop` whose
-//! address was already re-cached (`forget_remote_if` checks identity): the
-//! peer's node is still alive, and a reset counter would replay numbers its
+//! `remote_proxies`, so a counter survives every proxy of an address whose
+//! `DEC_STRONG` the peer can still be waiting for ([`RpcState::pay_receipts`]):
+//! the peer's node is still alive, and a reset counter would replay numbers its
 //! `asyncTodo` already processed.
 
 use std::cmp::Reverse;
@@ -191,6 +191,15 @@ struct RemoteSends {
     held: u32,
 }
 
+/// The rest of AOSP `BinderNode` for a peer's address; see "Send-side async numbers".
+#[derive(Default)]
+struct RemoteBook {
+    /// AOSP `timesRecd`: receipts whose `DEC_STRONG` has not reached the wire.
+    times_recd: u64,
+    /// AOSP `asyncNumber` (client side): the number of the next oneway.
+    next_async_number: u64,
+}
+
 /// A local object exposed to the peer under [`RpcAddress`].
 struct LocalNode {
     /// Strong ref keeps the local object alive while the peer holds it.
@@ -213,15 +222,21 @@ struct LocalNode {
 ///
 /// # Send-side async numbers
 ///
-/// The per-remote-address send counters (AOSP `BinderNode::asyncNumber`,
-/// client side) are dropped when the address's last `DEC_STRONG` goes out: with the
-/// proxy slot in `forget_remote_if`, or, for a release held by unpaid sends, when
-/// `pay_proxy_sends` sends it and no successor proxy uses the counter. The peer's
-/// `timesSent` also reaches 0 then, so its
-/// `BinderNode` is GC'd and the counter restart matches. The narrow race —
-/// a `DEC_STRONG` still in flight when a sibling connection re-resolves the
-/// same address — drops every oneway numbered below the peer's counter on
-/// the peer's `Drop(StaleAsyncNumber)` arm.
+/// A peer address's [`RemoteBook`] counts what this end received of it (`remote_proxy`, +1 per
+/// receipt) until the `DEC_STRONG`s paying that are on the wire (`pay_receipts`, −`amount`), and
+/// holds the number of the next oneway to it (AOSP `BinderNode::asyncNumber`, client side). The
+/// book goes at 0. A peer forgets a node only after it has processed those `DEC_STRONG`s, so while
+/// the book is open the node is alive at that number, on whichever route the amounts are: slot,
+/// reaper, held on a pin, or held for unpaid sends. A proxy made for the address meanwhile numbers
+/// on. The state lock orders a receipt against the last payment.
+///
+/// Left is the last frame on its way to a peer that has not read it. If that peer sends the address
+/// again first, its `timesSent` stays above 0, its node keeps its number, and a proxy made here
+/// numbers from 0: the peer's `Drop(StaleAsyncNumber)` arm drops those oneways. AOSP has the same
+/// window: `sendDecStrongToTarget` erases the node before its `rpcSend` (android-17.0.0_r1
+/// `RpcState.cpp:871-905`). Below wire v2 a receipt counts when a parcel is read, so a binder in a
+/// parcel not read yet is in that window too. Keeping every book until the session ends would close
+/// it, at one entry for each address a oneway ever went to.
 pub struct RpcState {
     /// Objects we exposed to the peer, keyed by assigned address.
     local_nodes: HashMap<RpcAddress, LocalNode>,
@@ -229,8 +244,8 @@ pub struct RpcState {
     local_by_ptr: HashMap<usize, RpcAddress>,
     /// Remote proxies by address, `Weak`: dedups one `RpcProxy` per address and sees its last drop.
     remote_proxies: HashMap<RpcAddress, sync::Weak<dyn IBinder>>,
-    /// AOSP `BinderNode::asyncNumber` (client side); see "Send-side async numbers" above.
-    remote_send_async_counters: HashMap<RpcAddress, u64>,
+    /// Present while a receipt of the address is unpaid; see "Send-side async numbers" above.
+    remote_books: HashMap<RpcAddress, RemoteBook>,
     /// Sends of a peer address the peer has not paid back yet; present only while one is unpaid.
     remote_sends: HashMap<RpcAddress, RemoteSends>,
     /// Monotonic address allocator (per-session).
@@ -254,7 +269,7 @@ impl RpcState {
             local_nodes: HashMap::new(),
             local_by_ptr: HashMap::new(),
             remote_proxies: HashMap::new(),
-            remote_send_async_counters: HashMap::new(),
+            remote_books: HashMap::new(),
             remote_sends: HashMap::new(),
             addr_counter: 0,
             space,
@@ -270,8 +285,8 @@ impl RpcState {
     /// The first send creates the node at `strong = 1`; a
     /// re-send of the same object reuses the address and **increments**
     /// `strong` (the peer will `DEC_STRONG` once per receipt — directly
-    /// at proxy drop, or as an `flushExcessBinderRefs` excess DEC if it
-    /// dedups; see the module doc). Returning without bumping would let
+    /// at proxy drop, or as an excess DEC if it dedups; see the module
+    /// doc). Returning without bumping would let
     /// the first connection's DEC free a node still referenced over a
     /// sibling connection (`DeadObject`).
     ///
@@ -400,7 +415,7 @@ impl RpcState {
     /// its `timesSent` on every send (`on_binder_leaving`) but our
     /// one deduped proxy only `DEC_STRONG`s once at its drop, the
     /// caller owes the sender one excess `DEC_STRONG` for this receipt
-    /// (AOSP `flushExcessBinderRefs`). The caller must send it
+    /// (the total equals AOSP `timesRecd`). The caller must send it
     /// **outside** the `RpcState` lock (no I/O under the lock — see
     /// `RpcSessionInner::read_binder`). A fresh / re-minted proxy
     /// (dead `Weak`) is **not** excess: it is the single proxy that
@@ -419,6 +434,7 @@ impl RpcState {
     {
         if let Some(weak) = self.remote_proxies.get(&addr) {
             if let Some(arc) = weak.upgrade() {
+                self.remote_books.entry(addr).or_default().times_recd += 1;
                 return Ok((SIBinder::from_arc(arc), true));
             }
         }
@@ -429,6 +445,7 @@ impl RpcState {
         let sib = make();
         self.remote_proxies
             .insert(addr, Arc::downgrade(sib.as_arc()));
+        self.remote_books.entry(addr).or_default().times_recd += 1;
         Ok((sib, false))
     }
 
@@ -442,8 +459,8 @@ impl RpcState {
 
     /// Forget the remote-proxy table entry for `addr`, but **only if
     /// the slot still points at the proxy `who`** (the dropping
-    /// `RpcProxy`'s data address). Called from `RpcProxy::drop` after
-    /// its `DEC_STRONG` is sent.
+    /// `RpcProxy`'s data address). Called from `RpcProxy::drop` through
+    /// [`release_proxy`](Self::release_proxy), before its `DEC_STRONG` is sent.
     ///
     /// A proxy whose `Arc` strong-count hit 0 in the window *before*
     /// its `Drop` body runs may already have been replaced in the
@@ -455,22 +472,8 @@ impl RpcState {
     /// `DEC_STRONG`" invariant. The identity check makes
     /// a stale `Drop` a no-op against a re-cached successor.
     ///
-    /// On a match it also drops the per-address send-side `async_number`
-    /// counter. The proxy that owned the address is gone and its matching
-    /// `DEC_STRONG` is sent shortly; after it lands, the peer's `BinderNode`
-    /// either survives (`timesSent > 0` on the peer side — the next resolve
-    /// restarts from 0) or is GC'd (the counter is irrelevant). Either way
-    /// the book is closed for *this* proxy generation, and dropping it keeps
-    /// the map bounded by the live address set.
+    /// The address's [`RemoteBook`] is not this table's: the peer's node outlives the proxy.
     pub fn forget_remote_if(&mut self, addr: &RpcAddress, who: *const ()) {
-        if self.forget_remote_slot_if(addr, who) {
-            // Close this generation's `async_number` book (see fn doc).
-            self.remote_send_async_counters.remove(addr);
-        }
-    }
-
-    /// The identity-checked table half of [`forget_remote_if`](Self::forget_remote_if).
-    fn forget_remote_slot_if(&mut self, addr: &RpcAddress, who: *const ()) -> bool {
         let matches = self
             .remote_proxies
             .get(addr)
@@ -478,7 +481,6 @@ impl RpcState {
         if matches {
             self.remote_proxies.remove(addr);
         }
-        matches
     }
 
     /// One send of the peer's `addr`, which the peer pays back with a `DEC_STRONG` (AOSP
@@ -491,19 +493,33 @@ impl RpcState {
     /// A proxy of `addr` dropped (`RpcProxy::drop`). Returns the `DEC_STRONG` amount to send
     /// now, outside the lock: 1, or 0 while sends of `addr` are unpaid. Then the release is
     /// held for [`pay_proxy_sends`](Self::pay_proxy_sends) (AOSP keeps the proxy in `sentRef`
-    /// until then), and the `async_number` book stays open: the peer's node is still alive.
+    /// until then). The `async_number` book stays open either way, until
+    /// [`pay_receipts`](Self::pay_receipts): the peer's node is still alive.
+    ///
+    /// A peer that does not pay a send of `addr`, a target send included, leaves `addr`'s
+    /// `remote_sends` and number-book entries until the session ends, as AOSP keeps `sentRef`.
     #[must_use = "send the returned DEC_STRONG amount outside the RpcState lock"]
     pub fn release_proxy(&mut self, addr: &RpcAddress, who: *const ()) -> u32 {
+        self.forget_remote_if(addr, who);
         match self.remote_sends.get_mut(addr) {
             Some(sends) => {
                 sends.held += 1;
-                self.forget_remote_slot_if(addr, who);
                 0
             }
-            None => {
-                self.forget_remote_if(addr, who);
-                1
-            }
+            None => 1,
+        }
+    }
+
+    /// `amount` of `addr`'s `DEC_STRONG` reached the wire, or goes nowhere because no connection
+    /// has ever been able to carry it, or a oneway number with it. The book closes with the last
+    /// receipt: "Send-side async numbers". An address that was not received has no book.
+    pub fn pay_receipts(&mut self, addr: &RpcAddress, amount: u32) {
+        let Some(book) = self.remote_books.get_mut(addr) else {
+            return;
+        };
+        book.times_recd = book.times_recd.saturating_sub(u64::from(amount));
+        if book.times_recd == 0 {
+            self.remote_books.remove(addr);
         }
     }
 
@@ -522,20 +538,13 @@ impl RpcState {
         }
         let held = sends.held;
         self.remote_sends.remove(addr);
-        // The last release of this generation goes out; a live successor keeps the book.
-        let successor = self
-            .remote_proxies
-            .get(addr)
-            .is_some_and(|weak| weak.strong_count() > 0);
-        if held > 0 && !successor {
-            self.remote_send_async_counters.remove(addr);
-        }
         held
     }
 
-    /// Session death: every unpaid send and held release goes with the peer's counts.
-    pub fn clear_remote_sends(&mut self) {
+    /// Session death: every unpaid send, held release and number book goes with the peer's counts.
+    pub fn clear_remote_counts(&mut self) {
         self.remote_sends.clear();
+        self.remote_books.clear();
     }
 
     /// Test/diagnostic: number of live local nodes (leak check).
@@ -554,10 +563,10 @@ impl RpcState {
 
     /// Post-increment `addr`'s send-side oneway number (from 0); module doc "Async-number wrap".
     pub fn next_send_async_number(&mut self, addr: RpcAddress) -> u64 {
-        let counter = self.remote_send_async_counters.entry(addr).or_insert(0);
-        let n = *counter;
-        *counter = n.wrapping_add(1);
-        if *counter == 0 {
+        let book = self.remote_books.entry(addr).or_default();
+        let n = book.next_async_number;
+        book.next_async_number = n.wrapping_add(1);
+        if book.next_async_number == 0 {
             warn_async_wrap(&addr);
         }
         n
@@ -573,13 +582,17 @@ impl RpcState {
     /// which the session goes on. Unlike the strong-count rollback this
     /// is an *ordering* sequence, so only roll back when we were the last
     /// consumer (`counter == consumed + 1`); if another thread already reserved
-    /// the next number, rolling back would hand it out twice, so we leave the
-    /// gap (the existing `ASYNC_TODO_TERMINATE_LEVEL` watermark is the backstop).
-    pub fn cancel_send_async_number(&mut self, addr: RpcAddress, consumed: u64) {
-        if let Some(counter) = self.remote_send_async_counters.get_mut(&addr) {
-            if *counter == consumed.wrapping_add(1) {
-                *counter = consumed;
+    /// the next number, rolling back would hand it out twice, so this leaves the
+    /// number gone and the caller ends the session.
+    /// Returns whether no gap is left, for a caller that goes on sending.
+    pub fn cancel_send_async_number(&mut self, addr: RpcAddress, consumed: u64) -> bool {
+        match self.remote_books.get_mut(&addr) {
+            Some(book) if book.next_async_number == consumed.wrapping_add(1) => {
+                book.next_async_number = consumed;
+                true
             }
+            Some(_) => false,
+            None => true,
         }
     }
 
@@ -664,6 +677,12 @@ impl RpcState {
             }
         }
         out
+    }
+
+    /// Test: peer addresses with a book open.
+    #[cfg(test)]
+    pub(crate) fn remote_book_count(&self) -> usize {
+        self.remote_books.len()
     }
 
     /// Test: `(amount sum, command count)` of `DEC_STRONG`s received for `addr`, local or not.
@@ -959,9 +978,9 @@ mod tests {
         assert!(!ex3, "re-mint after forget is a fresh proxy — not excess");
     }
 
-    /// A matching `forget_remote_if` resets the send counter to 0; a stale one leaves it intact.
+    /// The send counter outlives a proxy's release; it restarts once every receipt is on the wire.
     #[test]
-    fn forget_remote_if_gcs_send_counter() {
+    fn the_send_counter_restarts_once_every_receipt_is_paid() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
         let addr = RpcAddress::from_wire_bytes([3u8; 32]);
 
@@ -973,7 +992,7 @@ mod tests {
         assert_eq!(st.next_send_async_number(addr), 0);
         assert_eq!(st.next_send_async_number(addr), 1);
 
-        // Stale Drop (P2 re-cached): identity mismatch makes `forget_remote_if` a no-op.
+        // Stale Drop (P2 re-cached): the identity check leaves P2's slot.
         drop(got1);
         drop(sib1);
         let sib2 = SIBinder::new(Arc::new(Dummy)).unwrap();
@@ -981,27 +1000,44 @@ mod tests {
             .remote_proxy(addr, || sib2.clone())
             .expect("remote_proxy");
         let p2 = Arc::as_ptr(got2.as_arc()) as *const ();
-        st.forget_remote_if(&addr, p1);
+        assert_eq!(st.release_proxy(&addr, p1), 1);
         assert_eq!(
             st.next_send_async_number(addr),
             2,
-            "stale forget must not evict the live counter"
+            "a release owed: the peer's node is alive"
         );
+        st.pay_receipts(&addr, 1);
+        assert_eq!(st.next_send_async_number(addr), 3, "P2's receipt is unpaid");
 
-        // Genuine `forget`: the counter drops and the next read restarts at 0.
-        drop(got2);
-        drop(sib2);
-        st.forget_remote_if(&addr, p2);
-        assert_eq!(
-            st.next_send_async_number(addr),
-            0,
-            "post-forget counter restarts from 0 (peer's BinderNode \
-             reaches timesSent=0 in lockstep with the matching DEC)"
-        );
+        // An excess receipt is paid at once and leaves the proxy's own.
+        let (again, excess) = st
+            .remote_proxy(addr, || panic!("must dedup to P2"))
+            .expect("remote_proxy");
+        assert!(excess);
+        st.pay_receipts(&addr, 1);
+        assert_eq!(st.next_send_async_number(addr), 4);
+
+        drop((again, got2, sib2));
+        assert_eq!(st.release_proxy(&addr, p2), 1);
+        assert_eq!(st.remote_book_count(), 1, "not on the wire yet");
+        assert_eq!(st.next_send_async_number(addr), 5);
+
+        // The address comes back before the release is written, which pays the old receipt only.
+        let sib3 = SIBinder::new(Arc::new(Dummy)).unwrap();
+        let (got3, excess) = st.remote_proxy(addr, || sib3.clone()).unwrap();
+        assert!(!excess);
+        st.pay_receipts(&addr, 1);
+        assert_eq!(st.next_send_async_number(addr), 6, "numbered on");
+
+        let p3 = Arc::as_ptr(got3.as_arc()) as *const ();
+        drop((got3, sib3));
+        assert_eq!(st.release_proxy(&addr, p3), 1);
+        st.pay_receipts(&addr, 1);
+        assert_eq!(st.remote_book_count(), 0, "the last receipt closes it");
+        assert_eq!(st.next_send_async_number(addr), 0);
     }
 
-    /// A release held by an unpaid send keeps the `async_number` book open (the peer's node is
-    /// alive), a successor proxy numbers on from it, and the book closes with the last release.
+    /// A held release keeps the number book open for a successor, until its last release.
     #[test]
     fn a_held_release_keeps_the_send_counter_for_a_successor() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
@@ -1029,15 +1065,16 @@ mod tests {
             "the successor numbers on"
         );
         assert_eq!(st.pay_proxy_sends(&addr, 1), 1, "P1's release goes");
+        st.pay_receipts(&addr, 1);
         assert_eq!(st.next_send_async_number(addr), 3, "P2 still uses the book");
 
         drop((got2, sib2));
         assert_eq!(st.release_proxy(&addr, p2), 1, "nothing unpaid: at once");
+        st.pay_receipts(&addr, 1);
         assert_eq!(st.next_send_async_number(addr), 0, "the book closed");
     }
 
-    /// With no successor the held release closes the book; payments saturate at 0, a rolled
-    /// back send counts as paid, and session death drops what is held.
+    /// A held release, once written, closes the book; a rollback pays; session death drops holds.
     #[test]
     fn held_releases_settle_on_payment_rollback_and_session_death() {
         let mut st = RpcState::new(AddressSpace::Acceptor);
@@ -1063,12 +1100,26 @@ mod tests {
             "an overpayment settles at 0"
         );
         assert_eq!(st.pay_proxy_sends(&addr, 1), 0, "nothing left to pay");
+        st.pay_receipts(&addr, 1);
         assert_eq!(st.next_send_async_number(addr), 0, "the book closed");
 
         st.on_proxy_leaving(addr);
         assert_eq!(st.release_proxy(&addr, std::ptr::null()), 0);
-        st.clear_remote_sends();
+        st.clear_remote_counts();
         assert_eq!(st.pay_proxy_sends(&addr, 1), 0, "dropped with the session");
+    }
+
+    /// The session's end empties the number books.
+    #[test]
+    fn the_session_end_clears_the_number_books() {
+        let mut st = RpcState::new(AddressSpace::Initiator);
+        let mut ctr = 0u64;
+        let addr = RpcAddress::unique(&mut ctr, AddressSpace::Acceptor);
+        assert_eq!(st.next_send_async_number(addr), 0);
+        assert_eq!(st.remote_book_count(), 1);
+        st.clear_remote_counts();
+        assert_eq!(st.remote_book_count(), 0);
+        assert!(st.cancel_send_async_number(addr, 0), "no book, no gap");
     }
 
     /// `timesSent` nets one `DEC_STRONG` per send: N sends to one peer, or one send per connection.

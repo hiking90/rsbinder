@@ -3373,6 +3373,7 @@ pub fn rsbinder::rpc::RpcServer::set_handshake_timeout(&self, core::option::Opti
 pub fn rsbinder::rpc::RpcServer::set_idle_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcServer::set_max_connections(&self, usize)
 pub fn rsbinder::rpc::RpcServer::set_max_threads(&self, u32) -> rsbinder::Result<()>
+pub fn rsbinder::rpc::RpcServer::set_receive_fds(&self, bool)
 pub fn rsbinder::rpc::RpcServer::set_reply_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcServer::set_root(&self, rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcServer::set_supported_fd_modes(&self, &[rsbinder::rpc::FileDescriptorTransportMode])

@@ -7,8 +7,11 @@
 
 #![cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::io::{ErrorKind, IoSlice, Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -22,7 +25,10 @@ use rsbinder::{
     Binder, Interface, Parcel, Remotable, Result, SIBinder, StatusCode, TransactionCode,
 };
 use rustix::fs::{Mode, OFlags};
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use rustix::net::{
+    AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix,
+    SocketFlags, SocketType,
+};
 
 const WIRE: u32 = 2;
 
@@ -85,6 +91,67 @@ fn serve(socket: OwnedFd) -> (Arc<RpcServer>, RpcServerHandle) {
     server.set_root(root()).unwrap();
     let handle = server.run_background().unwrap();
     (server, handle)
+}
+
+/// Whether the fd of a pair sent with the first byte of a frame closes, while `wait` passes.
+fn closes_when_sent_with_a_frame_cut_short(
+    server: &Arc<RpcServer>,
+    path: &PathBuf,
+    wait: Duration,
+) -> bool {
+    let _handle = server.run_background().unwrap();
+    let mut client = UnixStream::connect(path).unwrap();
+    // The android-13+ connection header (version 2, `Unix`, a new session), then its "cci".
+    let mut hello = [0u8; 24];
+    hello[0] = 2;
+    hello[5] = 1;
+    hello[16..19].copy_from_slice(b"cci");
+    client.write_all(&hello).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    client.read_exact(&mut [0u8; 8]).unwrap();
+
+    let (mut kept, sent) = UnixStream::pair().unwrap();
+    kept.set_read_timeout(Some(wait)).unwrap();
+    let fds = [sent.as_fd()];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    assert!(ancillary.push(SendAncillaryMessage::ScmRights(&fds)));
+    let frame = [IoSlice::new(&[0])];
+    rustix::net::sendmsg(&client, &frame, &mut ancillary, SendFlags::empty()).unwrap();
+    drop(sent);
+    match kept.read(&mut [0]) {
+        Ok(0) => true,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => false,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn server_at(tag: &str) -> (Arc<RpcServer>, PathBuf) {
+    let path = path(tag);
+    let server = RpcServer::setup_unix_server(&path).unwrap();
+    server.set_android13plus(WIRE);
+    server.set_supported_fd_modes(&[FdMode::Unix]);
+    server.set_root(root()).unwrap();
+    (server, path)
+}
+
+#[test]
+fn a_session_holds_the_fds_of_a_frame_cut_short_unless_told_to_take_none() {
+    let (server, path) = server_at("takes_fds");
+    assert!(!closes_when_sent_with_a_frame_cut_short(
+        &server,
+        &path,
+        Duration::from_millis(200)
+    ));
+    let (server, path) = server_at("takes_none");
+    server.set_receive_fds(false);
+    assert!(closes_when_sent_with_a_frame_cut_short(
+        &server,
+        &path,
+        Duration::from_secs(10)
+    ));
 }
 
 fn connect(address: OwnedFd) -> Result<RpcSession> {
