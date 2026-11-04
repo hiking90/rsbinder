@@ -390,10 +390,13 @@ pub trait RpcTransport: Send + Sync {
     ///
     /// A [`link_to_death`](crate::IBinder::link_to_death) on a session that nothing reads between
     /// its calls polls a duplicate of this on a thread of its own, and is refused when a
-    /// connection returns `None`. The bundled socket transports return their socket on Linux and
+    /// connection returns `None` when the thread starts. Once it has started, a connection added
+    /// that returns `None`, or whose socket cannot be duplicated, goes unwatched, with a log, and
+    /// every link, made before or after it, is accepted.
+    /// The bundled socket transports return their socket on Linux and
     /// Android and `None` elsewhere, where a blocking `poll` of this kind has not been measured:
     /// XNU registers a read filter for `POLLHUP`, so what wakes it there is not known. TLS returns
-    /// the socket of a [`TlsStream`] that has one; a peer that sends `close_notify` and keeps the
+    /// the socket of a `TlsStream` that has one; a peer that sends `close_notify` and keeps the
     /// socket open is not seen here, nor by [`peer_closed`](Self::peer_closed).
     fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         None
@@ -591,8 +594,9 @@ pub trait RpcTransport: Send + Sync {
     /// none of them taken, for want of room or of a kernel resource, with the stream as it was; any
     /// other failure is the transport's, and a `buf` past the transport's limit is
     /// [`RpcError::FrameTooLarge`] before anything is sent. `None`, the default, is a transport
-    /// that cannot promise this, which finds no room on every release: a handler's own connection
-    /// holds it for its next reply, and any other leaves it to the session's reaper thread.
+    /// that cannot promise this, which finds no room on every release: a thread's own connection,
+    /// in a reply wait as in a handler, holds it for its next frame, and a thread that drives no
+    /// connection leaves it to the session's reaper thread.
     #[doc(hidden)]
     fn __send_no_wait(
         &self,

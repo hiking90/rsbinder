@@ -73,7 +73,7 @@ impl PeerWatch {
         Ok((this, body))
     }
 
-    /// Have the thread watch `socket` too, if it still runs; waits for nothing and raises no signal.
+    /// Have the thread watch `socket` too, if it still runs; no wait, no signal.
     pub(super) fn add(&self, socket: OwnedFd) {
         self.added
             .lock()
@@ -82,6 +82,14 @@ impl PeerWatch {
         // `EAGAIN`: a byte is there to be read. `EPIPE`: the thread ended.
         let flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
         let _ = rustix::net::send(&self.wake, &[1], flags);
+    }
+
+    /// Whether the thread has ended, which closed its end of the wake.
+    #[cfg(all(test, not(target_arch = "s390x")))]
+    pub(super) fn thread_ended(&self) -> bool {
+        let wait = Some(std::time::Duration::ZERO);
+        super::transport::poll_one(self.wake.as_fd(), PollFlags::RDHUP, wait)
+            .is_ok_and(|seen| !seen.is_empty())
     }
 }
 

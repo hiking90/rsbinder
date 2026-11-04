@@ -219,11 +219,10 @@ impl RpcTransport for TcpDebugTransport {
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android
-    /// RPC wire has no length prefix), as `VsockTransport`'s;
-    /// the trait default refuses raw access, which is right only for a
-    /// frame-only backend and wrong here — `RpcSession::from_preconnected_fd`
-    /// wraps an `AF_INET` fd in this transport and goes straight into the
-    /// android-13+ handshake, whose first byte is a raw write.
+    /// RPC wire has no length prefix), as `VsockTransport`'s:
+    /// `RpcSession::from_preconnected_fd` wraps an `AF_INET` fd in this
+    /// transport and goes straight into the android-13+ handshake, whose first
+    /// byte is a raw write.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         send_raw_no_fds(
             self.stream.as_fd(),
@@ -343,7 +342,7 @@ mod tests {
         sender.join().unwrap();
     }
 
-    /// Plan 2-21: TCP serves the raw (unframed) android-13+ path the trait default refuses.
+    /// Plan 2-21: TCP serves the raw (unframed) android-13+ path.
     #[test]
     fn tcp_debug_raw_bytes_roundtrip() {
         let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");
@@ -427,7 +426,7 @@ mod tests {
         (sender, peer, total)
     }
 
-    /// A read leaves what is carried alone: writing is for a send or a flush, which know their wait.
+    /// A read leaves what is carried alone: a send or a flush writes it, and they know their wait.
     #[test]
     fn a_read_writes_nothing_of_what_is_carried() {
         let (sender, peer) = pair_carrying_part_of_a_frame();

@@ -106,8 +106,10 @@
 //! of another stream reads the cut as `Truncated`. A read writes nothing of it. The session keeps
 //! the rest off every slot that is about to be read: only a free slot has any, and what next holds
 //! that slot writes it first, its reaper included (`__flush_carried`, `session` module doc
-//! "Deferred `DEC_STRONG`"). A frame the socket takes none of is `Ok(false)`, and a `Carry` that
-//! holds bytes takes no other frame, so it holds at most one, of at most `NO_WAIT_FRAME_LIMIT`.
+//! "Deferred `DEC_STRONG`"). A frame the socket takes none of is `Ok(false)`, but TLS has sequenced
+//! its record by then, so it keeps all of it and returns `Ok(true)`. A `Carry` that holds bytes
+//! takes no other frame, so it holds at most one, of at most `NO_WAIT_FRAME_LIMIT` plus, under TLS,
+//! the record's overhead and the control records rustls queued.
 //! Fds need the frame whole in one `sendmsg`, so Apple has no such send for a frame with fds.
 //!
 //! ## Tests

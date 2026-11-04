@@ -40,10 +40,12 @@
 //! connection, alive. The session's `remote_proxies` table is `Weak`, so the
 //! only cycle back to the session runs through a local object the peer
 //! holds. `RpcSessionInner::on_session_dead` breaks it; it runs when a serve
-//! loop ends, when a transaction fails on a lost connection, or on an
-//! explicit [`RpcSession::close_session`](super::RpcSession::close_session),
-//! the last being the only break available to a session that neither serves
-//! nor transacts again.
+//! loop ends, when a transaction fails on a lost connection, when the watcher
+//! a [`link_to_death`](crate::IBinder::link_to_death) starts sees the peer's
+//! close, or on an explicit
+//! [`RpcSession::close_session`](super::RpcSession::close_session), the last
+//! being, with a peer that has not closed, the only break available to a
+//! session that neither serves nor transacts again.
 //!
 //! # Death notification
 //!
@@ -297,7 +299,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
 
 impl Drop for RpcProxy {
     fn drop(&mut self) {
-        // Identity-checked; on a transport with a no-wait send it waits for nothing (session doc).
+        // Identity-checked; waits only to finish a frame a no-wait send left on a pin (session).
         self.session
             .release_proxy(self.addr, self as *const RpcProxy as *const ());
     }
@@ -353,11 +355,26 @@ impl IBinder for RpcProxy {
     /// that call returns, on the session's reaper thread. So it runs late while
     /// such a call's thread is in a nested handler, or, with no send deadline,
     /// while the reaper writes to a peer that shut only its writing side and
-    /// stopped reading. A peer whose host vanishes is noticed as the transport's
-    /// own liveness check allows ([`set_liveness`][liveness]), which a session
-    /// with no deadline leaves at the system's defaults, and vsock has none. A
-    /// TLS peer that sends `close_notify` and keeps its socket open is not seen.
+    /// stopped reading. A call that fails on the lost connection, with no reply
+    /// to read, runs the session's death sequence on its own thread: the
+    /// recipient runs there before the call returns, so it must not wait for a
+    /// lock the caller holds across the call. A peer whose host vanishes is
+    /// noticed as the transport's own liveness check allows
+    /// ([`set_liveness`][liveness]), which a session with no deadline leaves at
+    /// the system's defaults, and vsock has none. A TLS peer that sends
+    /// `close_notify` and keeps its socket open is not seen.
     /// The thread takes two descriptors, and one more per outgoing connection.
+    /// A `poll` of them that fails (`ENOMEM`, or a descriptor limit lowered
+    /// below their count) ends the thread with a log: the session goes on with
+    /// nothing watching, so its links, later ones included, hear only of what a
+    /// failed call tells. So does a link made while a `spawn_serve` is starting
+    /// its loop, if neither that loop's thread nor the watcher's can be spawned;
+    /// that second failure is logged as an error.
+    ///
+    /// The binders of that reply are kept on wire v2, where a binder enters as
+    /// the frame arrives. Below v2 a binder enters as the caller reads it, after
+    /// the call returned, so that read can be [`StatusCode::DeadObject`] once the
+    /// session has ended. A session with a reader has the same race.
     ///
     /// **Refused with [`StatusCode::InvalidOperation`]** where the session
     /// neither reads nor can watch: on other platforms, Apple's included, and on
@@ -367,9 +384,10 @@ impl IBinder for RpcProxy {
     /// returned as what caused it, and the recipient is not registered, so a
     /// later link can try again.
     ///
-    /// The checks run in this order: those above, then
-    /// [`StatusCode::DeadObject`] after the obituary, then
-    /// [`StatusCode::BadValue`] for a recipient with no strong reference left.
+    /// The checks run in this order: [`StatusCode::DeadObject`] once the session
+    /// has ended, on any session, then the refusal above or what kept the
+    /// watcher from starting, then [`StatusCode::BadValue`] for a recipient with
+    /// no strong reference left.
     ///
     /// [incoming]: super::session::RpcClientConfig::incoming_connections
     /// [liveness]: super::transport::RpcTransport::set_liveness

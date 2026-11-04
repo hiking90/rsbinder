@@ -34,8 +34,8 @@
 //!
 //! "Local decision?" is `Local` when this end had decided, else `NotLocal`. A fault this loop
 //! observed itself (a cut, an undecodable frame, a lost position) is `Lost` whoever decided;
-//! only the ambiguous ends — a session another connection already ended, a dispatch that
-//! failed — are read in the light of who ended the session.
+//! only the ambiguous ends — a session another connection already ended, a dispatch or a write
+//! of the loop that failed — are read in the light of who ended the session.
 //!
 //! Every loop's end ends the whole session, whichever connection it served: a fault on one
 //! connection leaves the others no way to tell what the peer lost (a oneway number, a
@@ -151,6 +151,18 @@ pub enum EndReason {
     /// the handler's own, which is replied as `Unknown` and leaves the
     /// session serving, but one from user code a release ran, such as
     /// the `Drop` of a binder the session let go.
+    ///
+    /// It is also any other write of the loop that failed, in place of its
+    /// next read: a `DEC_STRONG` the connection held, the rest of a frame, or
+    /// a release written on that connection as a frame's dispatch ended.
+    /// The code is that write's, `TimedOut` for a send deadline that expired.
+    /// A write that finds the peer closed is not one of these: the read goes
+    /// on to report the end, [`EndOfStream`](Self::EndOfStream) when the peer
+    /// closed cleanly, and dispatches nothing the peer queued before it closed.
+    /// A send deadline here is not an idle eviction, which
+    /// is [`Frame`](Self::Frame)`(TimedOut)` with a deadline armed: this
+    /// reason keeps it from being read as one, since a peer that stopped
+    /// reading lost a frame this end owed it.
     Dispatch(StatusCode),
 }
 

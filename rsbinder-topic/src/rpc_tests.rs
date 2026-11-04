@@ -121,6 +121,22 @@ fn a_session_with_no_incoming_connection_is_refused_a_subscription() {
     server.terminate();
 }
 
+/// An ended session is gone, not refused: `DeadObject` sends a named subscriber to its lookup.
+#[test]
+fn a_session_that_has_ended_answers_a_subscription_with_dead_object() {
+    let publisher = publisher();
+    let (name, server) = serve(publisher.as_binder());
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    session.close_session();
+    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    assert_eq!(
+        refused.err().map(|e| e.transaction_error()),
+        Some(StatusCode::DeadObject)
+    );
+    server.terminate();
+}
+
 #[test]
 fn a_publisher_takes_a_token_from_over_rpc_and_sees_its_session_end() {
     let publisher = publisher();

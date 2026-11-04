@@ -516,7 +516,8 @@ let client = rsbinder::Client::open_with(uri, |o, _| o.incoming_connections = So
 
 Without one, the client's end refuses with `StatusCode::InvalidOperation`
 before any call is made — `Receiver::new` when the client consumes,
-`Sink::open` when it produces — and logs which option is missing. `Client::caps()` reports
+`Sink::open` when it produces — and logs which option is missing. A session that
+has ended answers both with `StatusCode::DeadObject` instead. `Client::caps()` reports
 `TransportCaps::CALLBACKS` when the session can carry a stream. A session with
 incoming connections has to be ended explicitly, with
 `client.session().unwrap().close_session()`: its serving threads keep it

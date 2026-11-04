@@ -537,18 +537,36 @@ bytes, so only a peer that wrote something unusual sees a difference.
   outgoing connection, and it delays the peer's sight of the close after the last
   handle drops by that thread's wake-up. Code that fell back to `spawn_serve` on the
   refusal no longer takes that path and goes on working. Off Linux and Android, and on
-  a transport with no `peer_close_fd`, the link is refused as before; a custom
-  transport returns its socket from `peer_close_fd` to take part. `is_ended` turns
+  a transport with no `peer_close_fd`, a live session's link is refused as before; a
+  custom transport returns its socket from `peer_close_fd` to take part. A connection
+  added after the thread started that has no socket, or whose socket cannot be
+  duplicated, goes unwatched, with a log. `is_ended` turns
   `true` on such a session with no call. The recipient runs on the session's reaper
-  thread.
-- **`Receiver` and a ring's `Sink::open` over RPC ask for `TransportCaps::CALLBACKS`
-  before anything else.** A client served only by `spawn_serve` and a server session
-  with no callback connection get `InvalidOperation` from `Receiver::new` in their own
-  process; 0.12.0 opened the `Receiver` and the other end's `Sink::open` failed.
-- **`Subscriber::request` asks for `TransportCaps::CALLBACKS` too**: the publisher's
-  word of an eviction is a call on the token. A session with `spawn_serve` and a second
-  outgoing connection, accepted by the 0.12.0 link, is refused; open an incoming
-  connection.
+  thread, or, for a call the close failed with no reply to read, on that call's thread
+  before it returns. If the watcher's thread or descriptors cannot be had,
+  `link_to_death` returns what caused it in place of `InvalidOperation`, the recipient is not registered, and a
+  later link can try again. A link on a session that has ended answers `DeadObject`, on
+  every platform and transport; 0.12.0 refused it with `InvalidOperation` on a session
+  with no incoming connection and no serve loop.
+- **A serve loop's own write that fails ends it as `EndReason::Dispatch(status)`**, a
+  lost stream, so `into_result()` is `Err(DeadObject)`. 0.12.0's loop wrote only replies,
+  and a `DEC_STRONG` that failed in a `drop` left the loop an end of stream, `Ok(())`. A
+  write that finds the peer closed still reads `EndOfStream`, `Ok(())`, and the session
+  is over by then: a frame the peer queued before it closed is not dispatched, where
+  0.12.0's loop dispatched it. The receipt of a oneway, written on the loop's connection
+  as the frame's dispatch ends, is such a write: a peer that sends oneways and closes
+  leaves the loop `EndOfStream`, `Ok(())`, where 0.12.0 ended it as `SessionEnded`,
+  `Err(DeadObject)`, and in both the oneways past the first whose receipt finds it closed
+  do not run. A reply wait's write of what its connection holds that fails returns that
+  write's status, `TimedOut` for a send deadline.
+- **`Receiver` and `Sink::open` over RPC ask for `TransportCaps::CALLBACKS`
+  before anything else.** A client served only by `spawn_serve` and a live server
+  session with no callback connection get `InvalidOperation` from `Receiver::new` in
+  their own process; 0.12.0 opened the `Receiver` and the other end's `Sink::open`
+  failed. A session that has ended gets `DeadObject` from both, as `Receiver::new` on a
+  server session did in 0.12.0; 0.12.0's `Sink::open` returned `InvalidOperation` there.
+  `Sink::open` asks before it checks its arguments, so `initial_credits` of 0 on such a
+  session is the same value where 0.12.0 returned `BadValue`.
 - **On an Android SDK 31/32 host the stability word after a binder on the
   android-13+ RPC wire changed** (CHANGELOG *Fixed*). It is the bare level
   (`0x0c` for a system binder), as on every other host; 0.12.0 wrote the
@@ -620,8 +638,9 @@ bytes, so only a peer that wrote something unusual sees a difference.
 - **`link_to_death` on an RPC proxy refuses a recipient with no strong
   reference left** with `BadValue`, as a kernel proxy always has: such a
   recipient could never be notified. 0.12.0 returned `Ok` and dropped it at
-  the obituary. The checks run in the order `InvalidOperation` (a session
-  that neither reads nor can be watched), `DeadObject`, `BadValue`. Keep a strong
+  the obituary. The checks run in the order `DeadObject` once the session has
+  ended, then `InvalidOperation` (a session that neither reads nor can be watched)
+  or what kept the watcher from starting, then `BadValue`. Keep a strong
   `Arc` of the recipient for as long as the link should last.
 - An RPC session on the android-13+ wire takes a null binder's stability
   from the low 16 bits of the word, as libbinder 13+ does, and accepts a
@@ -648,14 +667,16 @@ bytes, so only a peer that wrote something unusual sees a difference.
   `EndOfStream`. Code that matched `EndOfStream` for these cases matches
   the new codes.
 - **The last drop of an RPC proxy waits for no peer on any transport, and runs no
-  death recipients on the dropping thread.** With no room in the socket a handler's own
-  connection holds the `DEC_STRONG` for its next reply or nested call, and for any other
-  the session's reaper thread writes it once the peer reads, where 0.12.0's drop
-  waited in the write. A transport that cannot send without waiting finds no room on
+  death recipients on the dropping thread.** With no room in the socket a thread's own
+  connection, in a reply wait as in a handler, holds the `DEC_STRONG` for its next frame
+  or until the thread gives the connection back, and for a thread that drives no
+  connection the session's reaper thread writes it once the peer reads, where 0.12.0's
+  drop waited in the write. A transport that cannot send without waiting finds no room on
   every release, so a release there can come after the next reply: a custom
   `RpcTransport` without the hidden no-wait send, and TLS over a `TlsStream` with no
   `socket`. A connection its thread is about to read keeps no part of a frame, so on
-  vsock and Apple platforms a handler's `drop`, and a `drop` in a reply wait, holds the
+  vsock, TLS over vsock included, and Apple platforms a handler's `drop`, and a `drop`
+  in a reply wait, holds the
   release until the next frame there or the connection goes back. A handler that
   drops a proxy and then waits for what the peer does on that release waits for
   its own reply there, as it does on a full socket anywhere: wake it some other way.
@@ -718,13 +739,14 @@ bytes, so only a peer that wrote something unusual sees a difference.
   refuses a call that sends an fd.
 - **An object a parcel's table cannot back ends the session**, as libbinder ends it: a
   type this wire does not have, a binder in the table below v2, or a binder that fails
-  to enter. The call fails with `BadValue` and `is_ended` is true, where 0.12.0 entered
+  to enter. The call fails with `BadValue`, or the status the binder's entry failed with,
+  and `is_ended` is true, where 0.12.0 entered
   the rest of the parcel, failed the call and kept the connection.
 - **A `DEC_STRONG` with no connection to go on is written later, not dropped.** A
-  session with no outgoing connection writes it before a later reply on a connection
-  the peer has called on, or on the peer's attach, where 0.12.0 dropped it and the
-  peer's node stayed until the session ended. A test that reads the frames of a reply
-  on such a session reads the `DEC_STRONG` first. A later proxy's oneway keeps the
+  session with no outgoing connection writes it before a later reply or nested call on a
+  connection the peer has called on, or on the peer's attach, where 0.12.0 dropped it and
+  the peer's node stayed until the session ended. A test that reads the frames of a reply
+  or nested call on such a session reads the `DEC_STRONG` first. A later proxy's oneway keeps the
   number the peer's node expects, where 0.12.0 could restart at 0 and the peer dropped
   or parked it.
 

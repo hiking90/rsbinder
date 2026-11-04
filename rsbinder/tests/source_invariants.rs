@@ -720,14 +720,15 @@ fn drop_impls(lines: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// `rpc/peer_watch.rs` names no session: what its thread holds cannot keep one alive.
+/// `rpc/peer_watch.rs` names no session; its `signal` is `the_watcher_keeps_no_session_alive`'s.
 #[test]
 fn the_peer_watch_refers_to_no_session() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rpc/peer_watch.rs");
-    let Ok(src) = fs::read_to_string(&path) else {
-        eprintln!("skipping: {} is not reachable", path.display());
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    if !src_root.is_dir() {
+        eprintln!("skipping: sources not reachable at {}", src_root.display());
         return;
-    };
+    }
+    let src = fs::read_to_string(src_root.join("rpc/peer_watch.rs")).expect("rpc/peer_watch.rs");
     for line in src.lines().map(code_only) {
         for word in ["RpcSession", "SharedSession", "Weak"] {
             assert!(!line.contains(word), "`{word}` in {line}");

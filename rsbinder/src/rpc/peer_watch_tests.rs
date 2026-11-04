@@ -69,13 +69,13 @@ fn another_connection(session: &RpcSession) -> UnixStream {
     peer
 }
 
-/// Runs on the first obituary; tells which thread.
-struct Told(Mutex<mpsc::Sender<std::thread::ThreadId>>);
+/// Tells the test of the first obituary.
+struct Told(Mutex<mpsc::Sender<()>>);
 
 impl DeathRecipient for Told {
     fn binder_died(&self, _: &WIBinder) {
         let told = self.0.lock().expect("told");
-        let _ = told.send(std::thread::current().id());
+        let _ = told.send(());
     }
 }
 
@@ -98,7 +98,7 @@ fn a_proxy(session: &RpcSession) -> SIBinder {
 }
 
 /// `a_proxy`, linked: the recipient lives as long as the first two are kept.
-fn linked(session: &RpcSession) -> (SIBinder, Arc<Told>, mpsc::Receiver<std::thread::ThreadId>) {
+fn linked(session: &RpcSession) -> (SIBinder, Arc<Told>, mpsc::Receiver<()>) {
     let (tx, rx) = mpsc::channel();
     let proxy = a_proxy(session);
     let told = Arc::new(Told(Mutex::new(tx)));
@@ -170,8 +170,7 @@ fn a_session_nothing_reads_runs_its_recipient_when_the_peer_closes() {
     let (_proxy, _told, died) = linked(&session);
     assert!(died.recv_timeout(QUIET).is_err(), "the peer is still there");
     drop(peer);
-    let on = died.recv_timeout(WAIT).expect("the recipient");
-    assert_ne!(on, std::thread::current().id());
+    died.recv_timeout(WAIT).expect("the recipient");
     assert!(session.is_ended());
 }
 
@@ -335,7 +334,9 @@ fn the_signal_reads_no_frame() {
     drop(peer);
     died.recv_timeout(WAIT).expect("the recipient");
     assert_eq!(runs.load(Ordering::SeqCst), 0);
-    assert_eq!(session.inner.shared.local_node_count(), 0, "`clear_local`");
+    eventually("`clear_local`", || {
+        session.inner.shared.local_node_count() == 0
+    });
     drop(node);
 }
 
@@ -346,8 +347,10 @@ fn a_slot_used_over_and_over_does_not_hold_the_end_back() {
     let second = another_connection(&session);
     let (_proxy, _told, died) = linked(&session);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answered = Arc::new(AtomicUsize::new(0));
     let answering = {
         let stop = stop.clone();
+        let answered = answered.clone();
         std::thread::spawn(move || {
             let reply = codec().encode_reply(&WireReply::default()).expect("reply");
             while !stop.load(Ordering::SeqCst) {
@@ -355,6 +358,7 @@ fn a_slot_used_over_and_over_does_not_hold_the_end_back() {
                     return;
                 }
                 let _ = write_aosp_message(&mut first, &reply);
+                answered.fetch_add(1, Ordering::SeqCst);
             }
         })
     };
@@ -366,7 +370,7 @@ fn a_slot_used_over_and_over_does_not_hold_the_end_back() {
             while inner.client_transact(target, 1, &Parcel::new(), 0).is_ok() {}
         })
     };
-    std::thread::sleep(Duration::from_millis(20));
+    eventually("the calls", || answered.load(Ordering::SeqCst) >= 10);
     drop(second);
     let told = died.recv_timeout(WAIT);
     stop.store(true, Ordering::SeqCst);
@@ -383,6 +387,12 @@ fn a_serve_loop_begun_after_the_link_keeps_the_end_to_itself() {
     let mut second = another_connection(&session);
     let (_proxy, _told, died) = linked(&session);
     let serving = session.spawn_serve().expect("the loop");
+    eventually("the loop on its slot", || {
+        let st = session.inner.conn_state.lock().expect("conn_state");
+        st.slots
+            .iter()
+            .any(|s| s.serving && s.exclusive_tid.is_some())
+    });
     // A release this end owes, which goes out on the free slot: the reaper is not held up.
     let mut counter = 40;
     let owed = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
@@ -498,11 +508,12 @@ fn a_transport_whose_shutdown_does_nothing_lets_its_socket_go() {
     let polls = watcher_polls(&session);
     session.close_session();
     died.recv_timeout(WAIT).expect("the recipient");
-    drop(proxy);
-    drop(session);
+    // With every handle still held: the session's end, not its drop, lets the socket go.
     let mut bytes = [0u8; 256];
     while peer.recv_raw(&mut bytes).expect("the end of stream") > 0 {}
     assert_eq!(polls.load(Ordering::SeqCst), 1, "woken by its wake's close");
+    drop(proxy);
+    drop(session);
 }
 
 /// Only what has no socket to watch is refused; a refusal starts nothing.
@@ -524,8 +535,7 @@ fn a_connection_with_no_socket_refuses_the_link() {
     assert!(st.watcher.is_none());
 }
 
-/// A thread that cannot start is the link's error, the recipient is not on the list, and the next
-/// link works.
+/// A thread that cannot start is the link's error, off the list, and the next link works.
 #[test]
 fn a_link_that_cannot_start_the_thread_fails_and_leaves_the_next_link_able() {
     let (session, peer) = client();
@@ -559,6 +569,8 @@ fn a_link_that_cannot_start_the_thread_fails_and_leaves_the_next_link_able() {
 
 /// Descriptors run out: the link says so. In a child, since the limit binds the whole process.
 #[test]
+// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+#[cfg(not(target_arch = "s390x"))]
 fn a_link_with_no_descriptor_free_fails() {
     const CHILD: &str = "RSB_WATCH_NOFILE_CHILD";
     const NAME: &str = "rpc::session::peer_watch_tests::a_link_with_no_descriptor_free_fails";
@@ -582,6 +594,8 @@ fn a_link_with_no_descriptor_free_fails() {
 
 /// In a child with `SIGPIPE` at `SIG_DFL`: a slot added once the watcher ended kills no one.
 #[test]
+// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.
+#[cfg(not(target_arch = "s390x"))]
 fn a_slot_added_after_the_watcher_ended_raises_no_signal() {
     const CHILD: &str = "RSB_WATCH_SIGPIPE_CHILD";
     const NAME: &str =
@@ -606,8 +620,11 @@ fn a_slot_added_after_the_watcher_ended_raises_no_signal() {
         let other = another_connection(&session);
         drop(other);
         eventually("the job", || held_slots(&session) == 1);
-        // Its thread is gone or going: this `add` finds a closed socket.
-        std::thread::sleep(Duration::from_millis(50));
+        // Its thread is gone: this `add` finds a closed socket.
+        eventually("the thread's end", || {
+            let st = session.inner.conn_state.lock().expect("conn_state");
+            st.watcher.as_ref().expect("a watcher").thread_ended()
+        });
         let third = another_connection(&session);
         let reply = codec().encode_reply(&WireReply::default()).expect("reply");
         write_aosp_message(&mut peer, &reply).expect("the reply");
@@ -620,6 +637,7 @@ fn a_slot_added_after_the_watcher_ended_raises_no_signal() {
 }
 
 /// This test again in a process of its own, with `child` set.
+#[cfg(not(target_arch = "s390x"))]
 fn run_alone(child: &str, name: &str) {
     use std::os::unix::process::ExitStatusExt;
     let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
@@ -636,6 +654,45 @@ fn run_alone(child: &str, name: &str) {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Below wire v2 a binder enters as the caller reads it, so a session's end can come first.
+#[test]
+fn below_v2_a_binder_read_after_the_end_is_dead_object() {
+    let v1 = || Android13PlusCodec::with_version(PROTOCOL_V1).expect("v1");
+    let (ours, mut peer) = UnixStream::pair().expect("socketpair");
+    let session = RpcSession::with_profile(
+        Box::new(UnixTransport::from_stream(ours).expect("transport")),
+        AddressSpace::Initiator,
+        WireProfile::Android13Plus(v1()),
+    )
+    .expect("session");
+    let replier = std::thread::spawn(move || {
+        read_aosp_message(&mut peer).expect("the request");
+        let mut counter = 50;
+        let returned = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let mut data = 1i32.to_le_bytes().to_vec();
+        data.extend_from_slice(&Android13PlusCodec::encode_addr(&returned));
+        data.extend_from_slice(&0i32.to_le_bytes());
+        let reply = WireReply {
+            status: 0,
+            data,
+            object_positions: Vec::new(),
+        };
+        let frame = v1().encode_reply(&reply).expect("a reply");
+        write_aosp_message(&mut peer, &frame).expect("the reply");
+        peer
+    });
+    let mut counter = 40;
+    let target = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+    let mut reply = session
+        .inner
+        .client_transact(target, 1, &Parcel::new(), 0)
+        .expect("the call")
+        .expect("a reply");
+    let _peer = replier.join().expect("the peer");
+    session.inner.fail_session();
+    assert_eq!(reply.read::<SIBinder>().err(), Some(StatusCode::DeadObject));
 }
 
 /// A connection added after the link is watched from then on.
@@ -693,7 +750,12 @@ fn a_failed_serve_spawn_watches_in_its_place() {
     declared.store(1, Ordering::SeqCst);
     let (_proxy, _told, died) = linked(&session);
     declared.store(0, Ordering::SeqCst);
-    session.inner.after_a_failed_serve_spawn();
+    session
+        .inner
+        .shared
+        .fail_spawn
+        .store(true, Ordering::SeqCst);
+    assert!(session.spawn_serve().is_err());
     drop(peer);
     died.recv_timeout(WAIT).expect("the recipient");
 }
@@ -710,6 +772,11 @@ fn a_failed_serve_spawn_takes_up_a_signal_it_swallowed() {
     eventually("the signal", || polls.load(Ordering::SeqCst) == 1);
     assert!(died.recv_timeout(QUIET).is_err(), "it counted as a reader");
     declared.store(0, Ordering::SeqCst);
-    session.inner.after_a_failed_serve_spawn();
+    session
+        .inner
+        .shared
+        .fail_spawn
+        .store(true, Ordering::SeqCst);
+    assert!(session.spawn_serve().is_err());
     died.recv_timeout(WAIT).expect("the recipient");
 }

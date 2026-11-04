@@ -102,8 +102,7 @@ impl VsockTransport {
 impl RpcTransport for VsockTransport {
     /// Raw, unframed write for the android-13+ profile (the real android
     /// RPC wire has no length prefix).
-    /// The trait default refuses raw access, and a
-    /// `vsock://…?profile=android13plus` session starts with a raw write:
+    /// A `vsock://…?profile=android13plus` session starts with a raw write:
     /// on Microdroid/AVF the peer is libbinder and speaks only this wire.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         use std::os::fd::AsFd;

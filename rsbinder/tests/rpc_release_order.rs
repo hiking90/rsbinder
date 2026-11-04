@@ -7,14 +7,16 @@
 //! Over `mem` and `AF_UNIX` the scenario tests in `rpc_e2e` state these orders. Here the same
 //! calls run on TCP and TLS, on one connection and on several, and on `Link::HoldingPins`: TCP
 //! under a transport that says nothing of a frame's being taken whole, as vsock does, so a pin
-//! holds every release.
+//! holds every release. On several, one thread's frames all take the first free connection, which
+//! is what gives them an order: nothing orders frames between two connections.
 //!
 //! # Mutation gates
 //!
 //! - `a_release_in_a_handler_comes_before_its_nested_call`, on `HoldingPins`: drop the writes of
 //!   what the slot holds from `client_transact`, and the nested call overtakes the release.
 //! - `a_handler_can_wait_for_what_it_released`: hold on every pin, as `HoldingPins` does, and the
-//!   handler's wait passes with the release still on its slot.
+//!   handler's wait passes with the release still on its slot. So it runs on Linux and Android
+//!   only: elsewhere every pin holds (`session` module doc "Deferred `DEC_STRONG`").
 //!
 //! `ConnGuard::drop`'s writes have their gates in the `session` tests, where a raw peer can see
 //! that nothing else writes them: here a next request writes what the slot holds as well.
@@ -22,7 +24,7 @@
 #![cfg(all(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -293,6 +295,7 @@ struct Fixture {
     gone: mpsc::Sender<()>,
     _server: Arc<RpcServer>,
     _accept: Option<RpcServerHandle>,
+    _tcp_accept: Option<TcpAccept>,
 }
 
 impl Drop for Fixture {
@@ -301,11 +304,30 @@ impl Drop for Fixture {
     }
 }
 
+/// `tcp_server`'s accept thread, which its drop wakes with a connection of its own and joins.
+struct TcpAccept {
+    stop: Arc<AtomicBool>,
+    addr: SocketAddr,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TcpAccept {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Unwoken, the thread stays in `accept`: a join would turn a failing test into a hang.
+        if TcpStream::connect(self.addr).is_ok() {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
 /// A server whose own listener is never run, fed plain TCP connections through `wrap`.
 fn tcp_server(
     root_tag: *const AtomicUsize,
     wrap: fn(TcpStream) -> Result<Box<dyn RpcTransport>>,
-) -> (Arc<RpcServer>, SocketAddr) {
+) -> (Arc<RpcServer>, SocketAddr, Option<TcpAccept>) {
     let path = std::env::temp_dir().join(format!(
         "rsb_release_order_{}_{root_tag:p}.sock",
         std::process::id()
@@ -315,14 +337,24 @@ fn tcp_server(
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let addr = listener.local_addr().expect("address");
     let accepting = server.clone();
-    std::thread::spawn(move || {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
             let Ok(stream) = stream else { return };
             let Ok(t) = wrap(stream) else { return };
             accepting.serve_connection(t);
         }
     });
-    (server, addr)
+    let accept = TcpAccept {
+        stop,
+        addr,
+        thread: Some(thread),
+    };
+    (server, addr, Some(accept))
 }
 
 impl Fixture {
@@ -336,14 +368,14 @@ impl Fixture {
         })
         .as_binder();
         let tag = Arc::as_ptr(&live);
-        let (server, addr) = match link {
+        let (server, addr, tcp_accept) = match link {
             Link::Tcp => tcp_server(tag, |s| Ok(Box::new(TcpDebugTransport::from_stream(s)?))),
             Link::HoldingPins => tcp_server(tag, holding_pins),
             Link::Tls => {
                 let server = RpcServer::setup_tcp_server_tls(("127.0.0.1", 0), tls_server_config())
                     .expect("server");
                 let addr = server.tcp_address().expect("address");
-                (server, addr)
+                (server, addr, None)
             }
         };
         server.set_android13plus(2);
@@ -376,6 +408,7 @@ impl Fixture {
             gone,
             _server: server,
             _accept: accept,
+            _tcp_accept: tcp_accept,
         }
     }
 
@@ -430,8 +463,7 @@ fn a_release_comes_before_the_next_reply() {
     }
 }
 
-/// A release held until the peer paid the oneway's target, as the wait for a `REPLY` reads that
-/// payment: `oneway; drop; echo; echo`, and the second `echo`'s reply comes after it.
+/// `oneway; drop; echo; echo`: a release held for the oneway's payment precedes the second reply.
 #[test]
 fn a_release_a_payment_lets_go_comes_before_the_next_call() {
     for link in LINKS {
@@ -505,6 +537,7 @@ fn a_release_in_a_nested_handler_comes_before_its_reply() {
 }
 
 /// `drop; wait for the peer's Drop` in a handler: over TCP and TLS the release goes at once.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn a_handler_can_wait_for_what_it_released() {
     for link in [Link::Tcp, Link::Tls] {
@@ -524,8 +557,7 @@ fn a_handler_can_wait_for_what_it_released() {
     }
 }
 
-/// Where a pin cannot write in a handler, the release goes with the reply: the handler's wait
-/// passes, and the object is gone by the reply (`session` module doc "Deferred `DEC_STRONG`").
+/// Where a pin cannot write, the handler's wait passes and the reply brings the release.
 #[test]
 fn a_pin_that_holds_releases_with_the_reply() {
     let f = Fixture::new(Link::HoldingPins, 1);

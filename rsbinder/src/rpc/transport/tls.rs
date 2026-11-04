@@ -29,10 +29,10 @@
 //! `RpcTransportCtx::newTransport(fd)`): the crypto state machine
 //! (`rustls::Connection`) is held separately from the byte stream, so it
 //! runs over **any** [`TlsStream`] — `TcpStream`, `UnixStream`, or a
-//! `vsock` stream — not just TCP. It is also **profile-agnostic**: it
-//! implements both the R34 length-framed I/O (`send_frame`/`recv_frame`)
-//! and the android-13+ raw I/O (`send_raw`/`recv_raw`), so the opt-in
-//! android-13+ `RpcSession` profile can run over TLS.
+//! `vsock` stream — not just TCP. It is also **profile-agnostic**: both
+//! wire profiles of an `RpcSession` go through its raw I/O
+//! (`send_raw`/`recv_raw`). `send_frame`/`recv_frame` are a separate API that
+//! no session calls.
 //!
 //! ## Concurrency
 //!
@@ -255,8 +255,9 @@ pub trait TlsStream: Send + Sync {
     /// default is `None`: such a send then blocks without reading, and a
     /// peer that writes on the connection meanwhile can stall it. With no
     /// socket to look at there is also no send that waits for nothing, so
-    /// every release of a remote binder finds no room: a handler's own
-    /// connection holds it for its next reply, and any other leaves it to the
+    /// every release of a remote binder finds no room: a thread's own
+    /// connection, in a reply wait as in a handler, holds it for its next
+    /// frame, and a thread that drives no connection leaves it to the
     /// session's reaper thread, so it can come after the next reply. The
     /// bundled streams return their socket.
     ///
@@ -365,6 +366,14 @@ impl TlsStream for vsock::VsockStream {
         use std::os::fd::AsFd;
         Some(self.as_fd())
     }
+}
+
+/// `__whole_small_frame_now` on a stream's socket; vsock's `POLLOUT` is only a byte of credit.
+fn whole_small_frame_now(sock: std::os::fd::BorrowedFd<'_>) -> bool {
+    use rustix::net::AddressFamily as Af;
+    super::unix::tcp_whole_small_frame_now(sock)
+        && rustix::net::getsockname(sock)
+            .is_ok_and(|addr| matches!(addr.address_family(), Af::INET | Af::INET6 | Af::UNIX))
 }
 
 /// `&dyn TlsStream` as `std::io::{Read, Write}` so rustls's blocking `complete_io` can drive it.
@@ -1040,9 +1049,7 @@ impl RpcTransport for TlsTransport {
     }
 
     fn __whole_small_frame_now(&self) -> bool {
-        self.stream
-            .socket()
-            .is_some_and(super::unix::tcp_whole_small_frame_now)
+        self.stream.socket().is_some_and(whole_small_frame_now)
     }
 
     fn __wait_for_room(&self) -> RpcResult<bool> {
@@ -1282,5 +1289,19 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         let fds = [std::os::fd::AsFd::as_fd(&a)];
         assert!(matches!(sender.__send_no_wait(&FRAME, &fds), Some(Err(_))));
+    }
+
+    /// Only a family known to take a small send whole says so; netlink stands in for vsock here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_of_another_family_says_no_frame_goes_whole() {
+        use rustix::net::{socket, AddressFamily, SocketType};
+        use std::os::fd::AsFd;
+        let other = socket(AddressFamily::NETLINK, SocketType::RAW, None).expect("a socket");
+        assert!(!whole_small_frame_now(other.as_fd()));
+        let (unix, _peer) = UnixStream::pair().expect("socketpair");
+        assert!(whole_small_frame_now(unix.as_fd()));
+        let (sender, _peer) = pair();
+        assert!(sender.__whole_small_frame_now());
     }
 }

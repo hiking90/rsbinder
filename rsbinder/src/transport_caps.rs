@@ -150,6 +150,21 @@ impl TransportCaps {
         Self::KERNEL
     }
 
+    /// Not part of the API: [`require`](Self::require) on what a call on `binder` has. A session
+    /// that has ended lacks every connection, and that is `DeadObject`, not a setup to correct.
+    #[doc(hidden)]
+    pub fn __require_of_binder(binder: &crate::SIBinder, needed: Self, what: &str) -> Result<()> {
+        let caps = Self::__of_binder(binder);
+        // After `caps`: an end that emptied the slots has moved the lifecycle by then.
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            if proxy.session().is_ended() {
+                return Err(StatusCode::DeadObject);
+            }
+        }
+        caps.require(needed, what)
+    }
+
     /// Whether every bit in `other` is set here. `contains(NONE)` is
     /// always true.
     pub const fn contains(self, other: Self) -> bool {

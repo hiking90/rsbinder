@@ -260,12 +260,13 @@ says what a peer does with the 0.12.0 value.
   nothing is `WriteZero` on Apple too; 0.12.0 returned `EndOfStream`
   there.
 - The last drop of an RPC proxy does not wait for the peer on any transport, and
-  runs no death recipients on the dropping thread. With no room, a handler's own connection
-  holds the `DEC_STRONG` for its next reply or nested call, and any other waits for the
+  runs no death recipients on the dropping thread. With no room, a thread's own connection,
+  in a reply wait as in a handler, holds the `DEC_STRONG` for its next frame or until the
+  thread gives the connection back, and a thread that drives no connection leaves it to the
   session's reaper thread, so it can come after the next reply. A transport that cannot send
   without waiting finds no room on every release: a custom `RpcTransport` without the
-  hidden no-wait send, and TLS over a `TlsStream` with no `socket`. On vsock and Apple
-  platforms a handler's `drop` and a `drop` in a reply wait hold the release until the next
+  hidden no-wait send, and TLS over a `TlsStream` with no `socket`. On vsock, TLS over
+  vsock included, and Apple platforms a handler's `drop` and a `drop` in a reply wait hold the release until the next
   frame there or the connection goes back: a handler that waits for what the peer does on
   that release waits for its own reply. Where every outgoing
   connection is in a serve loop's read, the reaper waits for the peer's next frame, so a
@@ -276,10 +277,29 @@ says what a peer does with the 0.12.0 value.
   Android, where 0.12.0 refused it with `InvalidOperation`: the first link starts a thread
   that watches the outgoing connections' sockets until the session ends, with two
   descriptors and one per connection. Elsewhere, and on a transport with no
-  `RpcTransport::peer_close_fd`, it is refused as before.
-- `Receiver` and a ring's `Sink::open` over RPC, and `Subscriber::request`, ask for
-  `TransportCaps::CALLBACKS` first. A session served only by `spawn_serve`, or with no
-  callback connection, gets `InvalidOperation` from them in its own process.
+  `RpcTransport::peer_close_fd`, a live session's link is refused as before. A link on a
+  session that has ended answers `DeadObject`, on every platform and transport; 0.12.0
+  refused it with `InvalidOperation` on a session with no incoming connection and no serve
+  loop. A thread or descriptors the watcher cannot have make the link return what caused
+  it, in place of `InvalidOperation`: the recipient is not registered, and a later link can
+  try again.
+- A serve loop's own write that fails ends it as `EndReason::Dispatch(status)`, a lost
+  stream, so `into_result()` is `Err(DeadObject)`. 0.12.0's loop wrote only replies, and a
+  `DEC_STRONG` that failed in a `drop` left the loop an end of stream, `Ok(())`. A write
+  that finds the peer closed still reads `EndOfStream`, `Ok(())`, and the session is over
+  by then: a frame the peer queued before it closed is not dispatched, where 0.12.0's loop
+  dispatched it. The receipt of a oneway, written on the loop's connection as the frame's
+  dispatch ends, is such a write: a peer that sends oneways and closes leaves the loop
+  `EndOfStream`, `Ok(())`, where 0.12.0 ended it as `SessionEnded`, `Err(DeadObject)`, and in
+  both the oneways past the first whose receipt finds it closed do not run. A reply wait's
+  write of what its connection holds that fails returns that write's status, `TimedOut` for a
+  send deadline.
+- `Receiver` and `Sink::open` over RPC ask for `TransportCaps::CALLBACKS` first. A live
+  session served only by `spawn_serve`, or with no callback connection, gets
+  `InvalidOperation` from them in its own process, and a session that has ended gets
+  `DeadObject`, where 0.12.0's `Sink::open` returned `InvalidOperation`. `Sink::open` asks
+  before it checks its arguments, so `initial_credits` of 0 on such a session is the same
+  value where 0.12.0 returned `BadValue`.
 - A frame's fds refused for too many in flight for the uid (`ETOOMANYREFS`) are
   `RpcError::Protocol` and fail that call with `StatusCode::RpcError`, and a reply
   that had them fails the peer's call with `FAILED_TRANSACTION`, where 0.12.0 ended
@@ -320,8 +340,8 @@ says what a peer does with the 0.12.0 value.
   handler, whose read of a missing fd failed. An object the table cannot back, a
   binder below v2 among them, also ends the session, as libbinder ends it.
 - **wire**: a session with no connection to write a `DEC_STRONG` on keeps it, and
-  writes it before a later reply on a connection the peer has called on, or on the
-  peer's attach, where 0.12.0 dropped it. A later proxy's oneways keep their numbers,
+  writes it before a later reply or nested call on a connection the peer has called on,
+  or on the peer's attach, where 0.12.0 dropped it. A later proxy's oneways keep their numbers,
   where 0.12.0 restarted at 0. The frame's format is the same.
 
 **Streams and topics**
@@ -406,6 +426,10 @@ says what a peer does with the 0.12.0 value.
 
 ### Added
 
+- **`RpcTransport::peer_close_fd`**: the socket that tells of a peer's close on
+  Linux and Android, `None` by default. `link_to_death` on a session nothing reads
+  polls a duplicate of it on a thread of its own, so a transport of your own
+  returns its socket to take part.
 - **`Status::ok()`**: the success status (`EX_NONE`), as AOSP Rust binder
   has it.
 - **`DeathLink`**: a death notification that unregisters when it drops.
@@ -529,7 +553,9 @@ says what a peer does with the 0.12.0 value.
   memfd that every subscriber maps read-only, so one copy serves all of them
   and receiving makes no binder call. See the book's
   [Topics](https://hiking90.github.io/rsbinder/topics.html) chapter and the
-  crate's `examples/`.
+  crate's `examples/`. `Subscriber::request` refuses an RPC binder of a session with
+  no incoming connection with `InvalidOperation`, in its own process: the publisher
+  could not tell it of an eviction. A session that has ended is `DeadObject`.
   - Its feature `uds` (off by default) makes the subscription call over RPC
     on a Unix domain socket, where a binder device cannot be had:
     `uds::subscribe` and `uds::serve`, with `uds::Options::expect_uid` to
@@ -801,10 +827,11 @@ says what a peer does with the 0.12.0 value.
   of the frame on a free connection, which the next send writes first, or a serve
   loop before it reads, or the reaper thread. No read writes it: a connection its
   thread is about to read keeps no part of a frame. It writes only where the frame
-  goes whole, on TCP and TLS by `POLLOUT` on Linux and Android, and otherwise holds
-  the release for its next frame or until the thread gives the connection back. With
-  no room a handler's own connection holds it for its next reply or nested call, and
-  for any other the session's reaper thread writes it once the peer reads, and a peer that takes
+  goes whole, on TCP and TLS by `POLLOUT` on Linux and Android, TLS over vsock excepted,
+  and otherwise holds the release for its next frame or until the thread gives the
+  connection back. With no room a thread's own connection, in a reply wait as in a
+  handler, holds it the same way, and for a thread that drives no connection the
+  session's reaper thread writes it once the peer reads, and a peer that takes
   nothing for the send deadline loses the session there; 0.12.0's drop waited in
   the write, for as long as a session with no deadline lasts. The reaper's wait
   keeps no session alive: with no incoming connection, the last handle and proxy
@@ -1075,8 +1102,8 @@ says what a peer does with the 0.12.0 value.
 - **A `DEC_STRONG` with no connection to go on is kept for one.** A session with no
   outgoing connection dropped it, which kept the peer's node until the session
   ended, and after a late attach a later proxy could number its oneways from 0 below
-  what the node expects. It now goes out before a later reply on a connection the
-  peer has called on, or on the attach, and the number lasts until then.
+  what the node expects. It now goes out before a later reply or nested call on a
+  connection the peer has called on, or on the attach, and the number lasts until then.
 - **A frame that names fds it did not bring is refused**, as AOSP
   `rpcSetDataReference` refuses it, before any handler runs. An object the table
   cannot back ends the session, as there.

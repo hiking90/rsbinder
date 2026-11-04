@@ -4273,7 +4273,7 @@ fn entry_client_open_with_incoming() {
     ));
 }
 
-/// AC-20.5: incoming conn ⇒ eager death; none ⇒ no death link, and a failed call ends the session.
+/// AC-20.5: incoming conn ⇒ eager death; none: the watcher's, or a refusal off Linux and Android.
 #[test]
 fn server_death_is_eager_with_incoming() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_A13_SERVER") {
@@ -4304,8 +4304,10 @@ fn server_death_is_eager_with_incoming() {
     )
     .expect("eager client");
     let lazy = RpcSession::setup_unix_client_android13plus(&path, 2).expect("lazy client");
+    let unlinked = RpcSession::setup_unix_client_android13plus(&path, 2).expect("unlinked client");
     let eager_root = eager.get_root().expect("root");
     let lazy_root = lazy.get_root().expect("root");
+    let unlinked_root = unlinked.get_root().expect("root");
     let (tx_e, rx_e) = std::sync::mpsc::sync_channel::<()>(1);
     let (tx_l, rx_l) = std::sync::mpsc::sync_channel::<()>(1);
     let flag_e: Arc<DeathFlag> = Arc::new(DeathFlag(tx_e));
@@ -4340,12 +4342,21 @@ fn server_death_is_eager_with_incoming() {
     assert_eq!(
         EchoProxy(lazy_root.clone()).echo("y"),
         Err(StatusCode::DeadObject),
-        "the failed call declares the session dead"
+        "an ended session's call"
+    );
+    // Nothing watches or reads this one, so its first call is what finds the loss.
+    assert!(!unlinked.is_ended());
+    assert!(EchoProxy(unlinked_root.clone()).echo("x").is_err());
+    assert!(unlinked.is_ended(), "the failed call declares it dead");
+    assert_eq!(
+        EchoProxy(unlinked_root.clone()).echo("y"),
+        Err(StatusCode::DeadObject)
     );
     eager.close_session();
     assert_eq!(eager.__incoming_thread_live_count(), 0);
     assert_eq!(eager.__incoming_thread_count(), 0);
     lazy.close_session();
+    unlinked.close_session();
     let _ = std::fs::remove_file(&path);
 }
 
