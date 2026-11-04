@@ -669,10 +669,14 @@ bytes, so only a peer that wrote something unusual sees a difference.
   reads keeps the release, and the peer's node, until the session ends, where 0.12.0
   released it. A service that relies on the release should read its binder arguments,
   or use wire v2, where the peer enters them on receipt.
-- **From wire v1 on, a parcel that names other fds than it came with is `BadValue`**,
-  and so is a binder in the object table below v2. A handler does not run and a reply's
-  call fails, where 0.12.0 ran the handler and failed only its read of a missing fd. A
-  server with `set_receive_fds(false)` therefore refuses a call that sends an fd.
+- **From wire v1 on, a parcel that names other fds than it came with is `BadValue`.** A
+  handler does not run and a reply's call fails, where 0.12.0 ran the handler and failed
+  only its read of a missing fd. A server with `set_receive_fds(false)` therefore
+  refuses a call that sends an fd.
+- **An object a parcel's table cannot back ends the session**, as libbinder ends it: a
+  type this wire does not have, a binder in the table below v2, or a binder that fails
+  to enter. The call fails with `BadValue` and `is_ended` is true, where 0.12.0 entered
+  the rest of the parcel, failed the call and kept the connection.
 - **A `DEC_STRONG` with no connection to go on is written later, not dropped.** A
   session with no outgoing connection writes it before its next reply, or on the
   peer's attach, where 0.12.0 dropped it and the peer's node stayed until the session

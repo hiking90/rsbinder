@@ -27,9 +27,8 @@
 //!   parcel is refused.
 //! - `t6_an_unread_v2_reply_pays_its_binders`: at v2 a reply dropped unread still releases
 //!   the node it named; at v1 it does not (AOSP pays only what it reads there).
-//! - `t7_a_failed_v2_entry_enters_the_rest_and_keeps_the_connection`: a v2 reply whose first
-//!   binder cannot be entered fails the call, the second binder is entered and paid back,
-//!   and the next call on the connection succeeds.
+//! - `t7_a_failed_v2_entry_ends_the_session`: a v2 reply whose binder cannot be entered fails
+//!   the call and ends the session, as AOSP.
 //! - `t8_oneway_only_traffic_never_stalls`: 10⁴ oneways carrying a callback, with no
 //!   callback connection, finish in bounded time; the owed `DEC_STRONG`s arrive in one
 //!   command per address before the next reply. With a callback connection they arrive on
@@ -82,7 +81,7 @@
 //!   frees the server's root and the next call is `DeadObject`), or the send-state check for
 //!   a proxy in `write_binder` (R6).
 //! - T6: skip `validate_objects` in `receive_parcel` (R3).
-//! - T7: stop `validate_objects` at the first failure.
+//! - T7: drop the `stop_for_the_reaper` call in `validate_objects`.
 //! - T8: let `dec_route` take an `Incoming` pin whatever its `allow_nested`; both halves fail:
 //!   the first reads `DEC_STRONG`s ahead of the reply, and in the second the pin still comes
 //!   first, so none comes over the callback connection.
@@ -594,9 +593,9 @@ fn t6_an_unread_v2_reply_pays_its_binders() {
     }
 }
 
-/// T7: a v2 reply whose first binder fails still enters the second, and the session goes on.
+/// T7: a v2 reply whose binder fails to enter fails its call and ends the session, as AOSP.
 #[test]
-fn t7_a_failed_v2_entry_enters_the_rest_and_keeps_the_connection() {
+fn t7_a_failed_v2_entry_ends_the_session() {
     let (a, b) = UnixStream::pair().expect("socketpair");
     let client = session(a, AddressSpace::Initiator, Wire::V(2));
     b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -606,57 +605,39 @@ fn t7_a_failed_v2_entry_enters_the_rest_and_keeps_the_connection() {
     };
     let mut server_ctr = 0u64;
     let target = RpcAddress::unique(&mut server_ctr, AddressSpace::Acceptor);
-    let second = RpcAddress::unique(&mut server_ctr, AddressSpace::Acceptor);
     // An address in the client's own subspace that it never minted: refused on entry.
     let mut forged_ctr = 1000u64;
     let forged = RpcAddress::unique(&mut forged_ctr, AddressSpace::Initiator);
 
     let caller = client.clone();
-    let calls = std::thread::spawn(move || {
-        let first = caller
+    let call = std::thread::spawn(move || {
+        caller
             .inner
             .client_transact(target, FIRST_CALL_TRANSACTION, &Parcel::new(), 0)
-            .map(drop);
-        let next = caller
-            .inner
-            .client_transact(target, FIRST_CALL_TRANSACTION, &Parcel::new(), 0)
-            .map(drop);
-        (first, next)
+            .map(drop)
     });
 
-    let binder = |addr: &RpcAddress| {
-        let mut obj = 1i32.to_le_bytes().to_vec();
-        obj.extend_from_slice(&Android13PlusCodec::encode_addr(addr));
-        obj.extend_from_slice(&0i32.to_le_bytes());
-        obj
-    };
     assert!(matches!(raw.recv(), WireMessage::Transact(_)));
-    let mut data = binder(&forged);
-    data.extend(binder(&second));
+    let mut data = 1i32.to_le_bytes().to_vec();
+    data.extend_from_slice(&Android13PlusCodec::encode_addr(&forged));
+    data.extend_from_slice(&0i32.to_le_bytes());
     let frame = raw
         .codec
         .encode_reply(&WireReply {
             status: 0,
             data,
-            object_positions: vec![0, 16],
+            object_positions: vec![0],
         })
         .unwrap();
     write_aosp_message(&mut raw.stream, &frame).unwrap();
-    match raw.recv() {
-        WireMessage::DecStrong(a, 1) if a == second => {}
-        other => panic!("the second binder must be entered and paid back, got {other:?}"),
-    }
-    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
-    let frame = raw.codec.encode_reply(&WireReply::default()).unwrap();
-    write_aosp_message(&mut raw.stream, &frame).unwrap();
 
-    let (first, next) = calls.join().expect("caller");
-    assert_eq!(
-        first,
-        Err(StatusCode::BadValue),
-        "the call fails with the entry"
-    );
-    assert_eq!(next, Ok(()), "the connection carries the next call");
+    let first = call.join().expect("caller");
+    assert_eq!(first, Err(StatusCode::BadValue), "fails with the entry");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client.is_ended() {
+        assert!(Instant::now() < deadline, "the session went on");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     client.close_session();
 }
 

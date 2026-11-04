@@ -660,11 +660,11 @@
 //!   later read of the position returns the recorded binder. On any other
 //!   parcel a read only looks the address up. At v2 `receive_parcel` enters
 //!   every `TYPE_BINDER` position as the parcel arrives (AOSP
-//!   `rpcSetDataReference`), read or not, and goes on past a failure so no
-//!   position keeps the peer's count; then the parcel is refused: a reply
-//!   fails its call, a twoway request gets a `BadValue` reply, a oneway is
-//!   dropped. AOSP ends the session there; rsbinder keeps the connection,
-//!   whose frame was read whole, and does not reset the counts.
+//!   `rpcSetDataReference`), read or not. A position that fails, a type the
+//!   wire does not have and a binder in the table below v2 end the session, as
+//!   AOSP ends it, so no count is left to settle. Fds other than the table names
+//!   only refuse the parcel, as there: a reply fails its call, a twoway request
+//!   gets a `BadValue` reply, a oneway is dropped.
 //!   A parcel holding entered proxies drops outside every lock. The `parcel`
 //!   module doc "RPC fields" has the table.
 //!
@@ -3578,18 +3578,17 @@ impl RpcSessionInner {
         (p, entered)
     }
 
-    /// AOSP android-16.0.0_r4 `rpcSetDataReference` object loop, going on past a failure.
+    /// AOSP android-17.0.0_r1 `rpcSetDataReference` object loop: a bad object ends the session, so
+    /// no count is left to settle, and fds that do not match only refuse the parcel.
     fn validate_objects(&self, p: &mut Parcel, received_fds: usize) -> Result<()> {
         use super::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
         const TYPE_BINDER: i32 = 1;
-        let mut result = Ok(());
         let mut named_fds = 0;
         // By index: reading a binder never changes the table, and `read_binder` looks it up.
         for i in 0..p.rpc_object_positions().len() {
             let pos = p.rpc_object_positions()[i];
             p.set_data_position(pos as usize);
-            // A skipped position's `timesSent` would stay with the peer for the session's life.
-            let entered = match p.read::<i32>() {
+            let object = match p.read::<i32>() {
                 Ok(TYPE_BINDER) if self.profile.records_binder_positions() => {
                     p.set_data_position(pos as usize);
                     self.read_binder(p).map(drop)
@@ -3604,15 +3603,17 @@ impl RpcSessionInner {
                 }
                 Err(e) => Err(e),
             };
-            if let (Ok(()), Err(e)) = (&result, entered) {
-                result = Err(e);
+            if let Err(e) = object {
+                log::error!("RPC: a parcel's object at {pos} is not readable ({e}); session ends");
+                self.stop_for_the_reaper();
+                return Err(e);
             }
         }
-        if result.is_ok() && named_fds != received_fds {
+        if named_fds != received_fds {
             log::error!("RPC: a parcel names {named_fds} fds and came with {received_fds}");
-            result = Err(StatusCode::BadValue);
+            return Err(StatusCode::BadValue);
         }
-        result
+        Ok(())
     }
 
     /// AOSP `appendFrom` `TYPE_BINDER` arm (`lookupAddress`, `onBinderLeaving`), one lock per copy.
@@ -4578,7 +4579,7 @@ impl RpcSessionInner {
         let _nested = AllowNestedGuard::arm(self, !oneway);
         let (mut reader, entered) = self.receive_parcel(t.data, t.object_positions, in_fds);
         if let Err(e) = entered {
-            // AOSP ends the session on most of these; this keeps the connection, its frame read.
+            // After an unreadable object the reply finds the session ended, as in AOSP.
             log::error!("RPC: a transaction's objects failed validation ({e:?}); refused");
             return if oneway {
                 Ok(())
@@ -11860,9 +11861,22 @@ mod tests {
         assert_eq!(entered(vec![0; 8], vec![], vec![fd()]), refused, "unnamed");
         let two = vec![fd(), fd()];
         assert_eq!(entered(fd_object(), vec![0], two), refused, "one too many");
+        assert!(
+            !session.inner.shared.lifecycle.is_torn_down(),
+            "only refused"
+        );
 
+        // As AOSP terminates: `Parcel.cpp` "Binder objects should only be in object positions".
         let binder = 1i32.to_le_bytes().to_vec();
         assert_eq!(entered(binder, vec![0], vec![]), refused, "a binder at v1");
+        assert!(session.inner.shared.lifecycle.is_torn_down());
+        let session = parcel_session(WireProfile::Android13Plus(
+            Android13PlusCodec::android14_15(),
+        ));
+        let unknown = 7i32.to_le_bytes().to_vec();
+        let received = session.inner.receive_parcel(unknown, vec![0], vec![]);
+        assert_eq!(received.1, refused, "an object of no known type");
+        assert!(session.inner.shared.lifecycle.is_torn_down());
 
         // No object table to count: an fd's read says what is missing.
         let session = parcel_session(WireProfile::R34(R34Codec));

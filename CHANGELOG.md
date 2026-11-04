@@ -1041,7 +1041,8 @@ says what a peer does with the 0.12.0 value.
   what the node expects. It now goes out before the next reply on any connection, or
   on the attach, and the number lasts until then.
 - **A frame that names fds it did not bring is refused**, as AOSP
-  `rpcSetDataReference` refuses it, before any handler runs.
+  `rpcSetDataReference` refuses it, before any handler runs. An object the table
+  cannot back ends the session, as there.
 
 ### Security
 
