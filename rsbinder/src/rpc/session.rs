@@ -4600,22 +4600,27 @@ impl RpcSessionInner {
             return Ok(());
         };
 
-        if !oneway {
-            // The target receipt, paid just before the `REPLY`; module doc "Deferred `DEC_STRONG`".
+        // The target receipt, on every exit that replies to a found target, whatever the status.
+        let address = t.address;
+        let pay_target = || {
             if self.profile.pays_target_before_reply() {
                 if let Ok(Some(slot_id)) = self.driving_slot() {
-                    self.hold_dec_strong(slot_id, t.address, 1);
+                    self.hold_dec_strong(slot_id, address, 1);
                 }
             }
+        };
+        if !oneway {
             // No token: libbinder answers PING in `BBinder::transact`, INTERFACE in `onTransact`.
             match t.code {
                 INTERFACE_TRANSACTION => {
                     let mut reply = Parcel::new();
                     reply.attach_rpc_ops(self.parcel_ops());
                     reply.write(&target.descriptor())?;
+                    pay_target();
                     return self.send_reply_parcel(&reply);
                 }
                 PING_TRANSACTION => {
+                    pay_target();
                     return self.send_reply(0, &[], &[], &[]);
                 }
                 _ => {}
@@ -4631,11 +4636,11 @@ impl RpcSessionInner {
             if self.shared.lifecycle.is_torn_down() {
                 return Err(e);
             }
-            return if oneway {
-                Ok(())
-            } else {
-                self.send_reply(StatusCode::BadValue.into(), &[], &[], &[])
-            };
+            if oneway {
+                return Ok(());
+            }
+            pay_target();
+            return self.send_reply(StatusCode::BadValue.into(), &[], &[], &[]);
         }
         // A oneway reply is never sent: no buffer unless the handler writes into it.
         let mut reply = if oneway {
@@ -4698,6 +4703,7 @@ impl RpcSessionInner {
             // Never sent: `reply` drops unsent and gives its bumps back (on a panic, already did).
             return Ok(());
         }
+        pay_target();
         match result {
             Ok(()) => self.send_reply_parcel(&reply),
             // `reply` then drops unsent and gives its bumps back; a panic's was already dropped.
@@ -12531,6 +12537,172 @@ mod tests {
             Err(StatusCode::InvalidOperation),
             "a sent parcel is never sent again"
         );
+    }
+
+    /// A target that a nested call may run under: its handler calls back if it has a session.
+    struct TargetOfACall(Mutex<Option<Arc<RpcSessionInner>>>);
+
+    impl crate::Interface for TargetOfACall {}
+
+    impl crate::Remotable for TargetOfACall {
+        fn descriptor() -> &'static str {
+            "rsbinder.test.ITargetOfACall"
+        }
+        fn on_transact(
+            &self,
+            _code: crate::TransactionCode,
+            _reader: &mut Parcel,
+            _reply: &mut Parcel,
+        ) -> Result<()> {
+            let session = self.0.lock().expect("session cell").clone();
+            if let Some(session) = session {
+                let nested = Parcel::new();
+                session.client_transact(RpcAddress::zero(), 1, &nested, 0)?;
+            }
+            Ok(())
+        }
+        fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The next frame a raw peer reads, decoded.
+    fn raw_peer_reads(peer: &mut std::os::unix::net::UnixStream) -> WireMessage {
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let frame = read_aosp_message(peer).expect("a frame");
+        codec.decode_message(&frame).expect("decode")
+    }
+
+    /// A target's receipt goes right before the `REPLY` from every exit, whatever the status.
+    #[test]
+    fn every_reply_to_a_found_target_comes_right_behind_its_receipt() {
+        use crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
+        use crate::{Binder, Interface, Remotable};
+        use std::io::Write;
+
+        let (session, mut peer) = a13_client_with_raw_peer();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let target: SIBinder = Binder::new(TargetOfACall(Mutex::new(None))).as_binder();
+        let addr = session
+            .inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state")
+            .on_binder_leaving(&target)
+            .expect("an address");
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let mut token = Parcel::new();
+        write_rpc_interface_token(&mut token, TargetOfACall::descriptor()).expect("token");
+        let token = token.rpc_data_bytes().to_vec();
+        let mut unnamed_fd = TYPE_NATIVE_FILE_DESCRIPTOR.to_le_bytes().to_vec();
+        unnamed_fd.extend_from_slice(&0i32.to_le_bytes());
+        let call = crate::FIRST_CALL_TRANSACTION;
+        let exits = [
+            ("ping", PING_TRANSACTION, Vec::new(), Vec::new(), true),
+            (
+                "interface",
+                INTERFACE_TRANSACTION,
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+            ("objects refused", call, unnamed_fd, vec![0], false),
+            ("a failed handler", call, Vec::new(), Vec::new(), false),
+            ("a handler", call, token, Vec::new(), true),
+        ];
+        for (what, code, data, object_positions, ok) in exits {
+            let frame = codec
+                .encode_transact(&WireTransaction {
+                    address: addr,
+                    code,
+                    flags: 0,
+                    async_number: 0,
+                    data,
+                    object_positions,
+                })
+                .expect("encode");
+            peer.write_all(&frame).expect("the call");
+            assert!(
+                matches!(
+                    session
+                        .inner
+                        .serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+                    ServeStep::Continue
+                ),
+                "{what}"
+            );
+            match raw_peer_reads(&mut peer) {
+                WireMessage::DecStrong(paid, 1) => assert_eq!(paid, addr, "{what}"),
+                other => panic!("{what}: the receipt comes first, got {other:?}"),
+            }
+            match raw_peer_reads(&mut peer) {
+                WireMessage::Reply(reply) => assert_eq!(reply.status == 0, ok, "{what}"),
+                other => panic!("{what}: the reply comes next, got {other:?}"),
+            }
+        }
+        session.close_session();
+    }
+
+    /// A nested call goes out ahead of the target's receipt, which waits for its own `REPLY`.
+    #[test]
+    fn a_target_receipt_waits_past_a_nested_call_for_its_reply() {
+        use crate::{Binder, Interface, Remotable};
+        use std::io::Write;
+
+        let (session, mut peer) = a13_client_with_raw_peer();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        session
+            .set_reply_timeout(Some(Duration::from_secs(10)))
+            .expect("deadline");
+        let target: SIBinder =
+            Binder::new(TargetOfACall(Mutex::new(Some(session.inner.clone())))).as_binder();
+        let addr = session
+            .inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state")
+            .on_binder_leaving(&target)
+            .expect("an address");
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let mut token = Parcel::new();
+        write_rpc_interface_token(&mut token, TargetOfACall::descriptor()).expect("token");
+        let frame = codec
+            .encode_transact(&WireTransaction {
+                address: addr,
+                code: crate::FIRST_CALL_TRANSACTION,
+                flags: 0,
+                async_number: 0,
+                data: token.rpc_data_bytes().to_vec(),
+                object_positions: Vec::new(),
+            })
+            .expect("encode");
+        peer.write_all(&frame).expect("the call");
+        let served = {
+            let inner = session.inner.clone();
+            std::thread::spawn(move || {
+                let step = inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID);
+                matches!(step, ServeStep::Continue)
+            })
+        };
+        match raw_peer_reads(&mut peer) {
+            WireMessage::Transact(nested) => assert!(nested.address.is_zero()),
+            other => panic!("the nested call comes first, got {other:?}"),
+        }
+        let reply = codec
+            .encode_reply(&WireReply::default())
+            .expect("a nested reply");
+        peer.write_all(&reply).expect("the nested reply");
+        match raw_peer_reads(&mut peer) {
+            WireMessage::DecStrong(paid, 1) => assert_eq!(paid, addr),
+            other => panic!("the receipt comes next, got {other:?}"),
+        }
+        assert!(matches!(raw_peer_reads(&mut peer), WireMessage::Reply(_)));
+        assert!(served.join().expect("the serve step"));
+        session.close_session();
     }
 }
 
