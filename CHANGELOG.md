@@ -270,6 +270,10 @@ says what a peer does with the 0.12.0 value.
   `RpcError::Protocol` and fail that call with `StatusCode::RpcError`, and a reply
   that had them fails the peer's call with `FAILED_TRANSACTION`, where 0.12.0 ended
   the session on the transport error.
+- A frame whose fds a process has no free descriptor for (`MSG_CTRUNC` with fewer
+  fds than the ancillary buffer holds) fails alone with `BadValue`, where 0.12.0
+  and AOSP `OS_unix_base.cpp` end the session. A frame with more fds than the
+  buffer holds still ends it.
 - A oneway refused before any byte (`FrameTooLarge`, `Protocol`) ends the session
   if another thread has already reserved the proxy's next async number, where
   0.12.0 left a gap that held back later oneways to that address at the peer.
@@ -1049,6 +1053,9 @@ says what a peer does with the 0.12.0 value.
 - **A frame that names fds it did not bring is refused**, as AOSP
   `rpcSetDataReference` refuses it, before any handler runs. An object the table
   cannot back ends the session, as there.
+- **A process that runs out of descriptors keeps its RPC sessions.** The kernel
+  delivers a frame's bytes with as many of its fds as fit; the frame fails alone,
+  and the next call works once a descriptor is free.
 
 ### Security
 

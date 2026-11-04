@@ -70,6 +70,14 @@
 //! on the socket; std sets it only on sockets std itself creates, not on a
 //! `socketpair` from `pair` or an fd adopted by `from_owned_fd`.
 //!
+//! `MSG_CTRUNC` has two causes, told apart by how many fds came. Fds filling the ancillary
+//! buffer mean a peer sent more than a frame may have, which is `RpcError::Protocol` and ends the
+//! session, as AOSP `OS_unix_base.cpp` ends it for either. Fewer mean this process has no
+//! descriptor free: on Linux `recvmsg` still returns the data, with as many fds as fit. The stream
+//! is intact, so the read succeeds and only that frame fails, where the fds its parcel names and
+//! the fds it came with differ (`RpcSessionInner::validate_objects`), or a read of a missing fd
+//! fails below wire v1. A process that runs out of descriptors keeps its session.
+//!
 //! ## A send that does not wait
 //!
 //! On Linux and Android, `__send_no_wait` is one `sendmsg` with `MSG_DONTWAIT` that
@@ -1085,12 +1093,7 @@ fn take_scm_rights(
 ) -> RpcResult<()> {
     use rustix::net::{RecvAncillaryMessage, ReturnFlags};
 
-    // `MSG_CTRUNC`: the kernel dropped surplus fds; fail, as AOSP `OS_unix_base.cpp` (EPIPE).
-    if flags.contains(ReturnFlags::CTRUNC) {
-        return Err(RpcError::Protocol(
-            "SCM_RIGHTS control message truncated (too many fds in one message)",
-        ));
-    }
+    let before = fds.len();
     for msg in anc.drain() {
         if let RecvAncillaryMessage::ScmRights(iter) = msg {
             for fd in iter {
@@ -1103,6 +1106,17 @@ fn take_scm_rights(
                 }
             }
         }
+    }
+    if flags.contains(ReturnFlags::CTRUNC) {
+        // Our buffer's whole room: the peer sent more than a frame has (module doc "fd passing").
+        if fds.len() - before >= MAX_FDS_PER_FRAME {
+            return Err(RpcError::Protocol(
+                "SCM_RIGHTS control message truncated (too many fds in one message)",
+            ));
+        }
+        log::warn!(
+            "RPC: this process has no descriptor free for a frame's fds; that frame fails alone"
+        );
     }
     Ok(())
 }
@@ -1336,6 +1350,87 @@ mod tests {
                 payload.len()
             );
         }
+    }
+
+    /// A process with no descriptor free loses a frame's fds and none of its bytes; own process.
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_arch = "s390x")
+    ))]
+    #[test]
+    fn a_full_fd_table_loses_a_frames_fds_and_keeps_the_stream() {
+        use std::os::fd::AsFd;
+        const CHILD: &str = "RSB_UNIX_FULL_TABLE_CHILD";
+        const NAME: &str =
+            "rpc::transport::unix::tests::a_full_fd_table_loses_a_frames_fds_and_keeps_the_stream";
+
+        if std::env::var_os(CHILD).is_some() {
+            let (a, b) = UnixTransport::pair().expect("socketpair");
+            let file = std::fs::File::open("/dev/null").expect("/dev/null");
+            let limit = rustix::process::Rlimit {
+                current: Some(512),
+                maximum: rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum,
+            };
+            rustix::process::setrlimit(rustix::process::Resource::Nofile, limit).expect("limit");
+            let mut filling = Vec::new();
+            while let Ok(next) = file.try_clone() {
+                filling.push(next);
+            }
+            let mut buf = [0u8; 16];
+            let fd = [file.as_fd()];
+            a.send_raw_with_fds(b"none", &fd).expect("a send");
+            let (n, fds) = b.recv_raw_with_fds(&mut buf).expect("the stream goes on");
+            assert_eq!((&buf[..n], fds.len()), (&b"none"[..], 0));
+
+            filling.pop();
+            a.send_raw_with_fds(b"some", &[file.as_fd(), file.as_fd()])
+                .expect("a send");
+            let (n, fds) = b.recv_raw_with_fds(&mut buf).expect("the stream goes on");
+            assert_eq!((&buf[..n], fds.len()), (&b"some"[..], 1));
+            drop(fds);
+
+            filling.pop();
+            a.send_raw_with_fds(b"both", &[file.as_fd(), file.as_fd()])
+                .expect("a send");
+            let (n, fds) = b.recv_raw_with_fds(&mut buf).expect("the stream goes on");
+            assert_eq!((&buf[..n], fds.len()), (&b"both"[..], 2));
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Zero tests run would also exit 0: the filter must have found this test.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{:?}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// More fds than a frame may have, from a peer that does not hold to it, end the read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn more_fds_than_a_frame_has_are_a_protocol_error() {
+        use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsFd;
+
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let b = UnixTransport::wrap(b).expect("a transport");
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let fds = vec![file.as_fd(); MAX_FDS_PER_FRAME + 1];
+        let mut space = [MaybeUninit::uninit(); 512];
+        let mut anc = SendAncillaryBuffer::new(&mut space);
+        assert!(anc.push(SendAncillaryMessage::ScmRights(&fds)));
+        let slices = [std::io::IoSlice::new(b"frame")];
+        rustix::net::sendmsg(&a, &slices, &mut anc, SEND_FLAGS).expect("a raw send");
+        let mut buf = [0u8; 16];
+        let read = b.recv_raw_with_fds(&mut buf);
+        assert!(matches!(read, Err(RpcError::Protocol(_))), "{read:?}");
     }
 
     /// Not on s390x: CI runs it under qemu-user with no binfmt entry, so the child cannot start.

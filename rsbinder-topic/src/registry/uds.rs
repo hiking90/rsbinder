@@ -42,9 +42,9 @@
 //!
 //! A notice says that a name changed and the watch asks for what it has now, with `lookup`, so a
 //! notice carries no descriptor. A process with no descriptor free takes it and asks later, once
-//! it has one: a frame that brings a descriptor to such a process ends its session, as the kernel
-//! cannot deliver it (`MSG_CTRUNC`). The watch's asking can still lose that race to another thread
-//! of the process, as a call can whose reply brings a descriptor.
+//! it has one: a reply that brings a descriptor to such a process fails, as the kernel cannot
+//! deliver it (`MSG_CTRUNC`). The watch's asking can still lose that race to another thread of the
+//! process; that reply fails alone, and the watch asks again.
 //!
 //! The descriptors in replies nobody has read count against the host's uid, and past
 //! `RLIMIT_NOFILE` the kernel refuses more unless the host has `CAP_SYS_RESOURCE` or

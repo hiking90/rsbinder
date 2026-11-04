@@ -645,7 +645,11 @@ bytes, so only a peer that wrote something unusual sees a difference.
 - **A frame's fds refused for too many in flight for the uid** (`ETOOMANYREFS`)
   fail that call with `StatusCode::RpcError`, and a reply that had them fails the
   peer's call with `FAILED_TRANSACTION`. Both leave the session up, where 0.12.0
-  ended the session on the transport error; the next item is the one exception.
+  ended the session on the transport error; the item after next is the one
+  exception.
+- **A frame whose fds a process has no free descriptor for fails alone** with
+  `BadValue`, and the session stays up, where 0.12.0 and AOSP end the session. A
+  frame with more fds than the ancillary buffer holds still ends it.
 - **A oneway refused before any byte (`FrameTooLarge`, `Protocol`) ends the session
   if another thread has already reserved the proxy's next async number**, where
   0.12.0 left a gap that held back later oneways to that address at the peer. The
