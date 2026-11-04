@@ -678,11 +678,12 @@ bytes, so only a peer that wrote something unusual sees a difference.
   to enter. The call fails with `BadValue` and `is_ended` is true, where 0.12.0 entered
   the rest of the parcel, failed the call and kept the connection.
 - **A `DEC_STRONG` with no connection to go on is written later, not dropped.** A
-  session with no outgoing connection writes it before its next reply, or on the
-  peer's attach, where 0.12.0 dropped it and the peer's node stayed until the session
-  ended. A test that reads the frames of a reply on such a session reads the
-  `DEC_STRONG` first. A later proxy's oneway keeps the number the peer's node expects,
-  where 0.12.0 could restart at 0 and the peer dropped or parked it.
+  session with no outgoing connection writes it before a later reply on a connection
+  the peer has called on, or on the peer's attach, where 0.12.0 dropped it and the
+  peer's node stayed until the session ended. A test that reads the frames of a reply
+  on such a session reads the `DEC_STRONG` first. A later proxy's oneway keeps the
+  number the peer's node expects, where 0.12.0 could restart at 0 and the peer dropped
+  or parked it.
 
 ## Streams and topics
 

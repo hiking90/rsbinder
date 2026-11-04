@@ -8458,6 +8458,10 @@ mod tests {
             false,
         )
         .expect("session");
+        // Writing what is owed would fill the socket: a deadline makes that a failure, not a hang.
+        session
+            .set_reply_timeout(Some(Duration::from_secs(2)))
+            .expect("deadline");
         let inner = session.inner.clone();
         let codec = Android13PlusCodec::android14_15();
         let mut counter = 0;
