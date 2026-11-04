@@ -425,8 +425,9 @@
 //!    session owes past the limit itself before it reads the next frame. An amount is never
 //!    dropped: the peer's node would keep its count until the session ends. A session with no
 //!    `Outgoing` slot at all (a server whose client opened no callback connection) keeps what it
-//!    owes, and its book, until the next `REPLY` on any connection, which the peer is waiting to
-//!    read, or the peer's attach, which wakes the reaper. AOSP keeps the count there too: its
+//!    owes, and its book, until the next `REPLY` on a connection the peer has made a twoway call
+//!    on, or the peer's attach, which wakes the reaper. A connection with no such call is left
+//!    alone: an attach's probe reads one `REPLY` there. AOSP keeps the count there too: its
 //!    `ExclusiveConnection::find` fails before `RpcState::sendDecStrongToTarget` takes the amount
 //!    off `timesRecd` (android-17.0.0_r1 `RpcSession.cpp:293-297`). That costs an entry per address
 //!    released, and the loop reading an `Incoming` slot writes what is past the limit there.
@@ -477,8 +478,9 @@
 //!
 //! Send failures are not reported to the dropper (a dead session means the peer is gone,
 //! AOSP parity), but a transport failure still ends the session ("Failed sends"), from the reaper.
-//! A connection joins the pool only after its attach is confirmed, so `confirm_attach`, which
-//! reads nothing but a `REPLY`, never meets a `DEC_STRONG`.
+//! A connection joins the pool only after its attach is confirmed, and a peer writes a `DEC_STRONG`
+//! on one only once a twoway call has been made there, so `confirm_attach`, which reads nothing but
+//! a `REPLY`, never meets a `DEC_STRONG`.
 //!
 //! `RpcProxy::__try_oneway` is the same send for a oneway, which is how `rsbinder-topic`'s hub
 //! tells a stopped watcher's session nothing and waits for nothing. It takes a free `Outgoing`
@@ -1930,6 +1932,8 @@ mod slot_pool {
         pub(super) role: SlotRole,
         /// AOSP `allowNested`: set only while a twoway dispatched here runs; the peer reads then.
         pub(super) allow_nested: bool,
+        /// The peer made a twoway call here, past any attach's probe, whose read takes one `REPLY`.
+        pub(super) peer_called: bool,
         /// A serve loop runs on it, frame after frame, and keeps it while the peer is quiet.
         pub(super) serving: bool,
         /// `DEC_STRONG`s held for this slot's next `REPLY`; module doc "Deferred `DEC_STRONG`".
@@ -1986,6 +1990,7 @@ mod slot_pool {
                 id,
                 role,
                 allow_nested: false,
+                peer_called: false,
                 serving: false,
                 pending_dec: std::collections::HashMap::new(),
                 _pooled: (),
@@ -2198,6 +2203,7 @@ impl<'a> AllowNestedGuard<'a> {
         let mut st = inner.conn_state.lock().expect("conn_state poisoned");
         let slot = st.slots.iter_mut().find(|s| s.id == slot_id)?;
         let prev = std::mem::replace(&mut slot.allow_nested, allow);
+        slot.peer_called |= allow;
         Some(Self {
             inner,
             slot_id,
@@ -4232,9 +4238,9 @@ impl RpcSessionInner {
                 return;
             };
             let mut past = past_limit(&mut slot.pending_dec);
-            let outgoing = slot.role == SlotRole::Outgoing;
+            let (outgoing, called) = (slot.role == SlotRole::Outgoing, slot.peer_called);
             // The reaper may be waiting for this very slot, or have no slot to write on at all.
-            if outgoing || !st.has_outgoing() {
+            if outgoing || (called && !st.has_outgoing()) {
                 past.extend(past_limit(&mut st.reaper_owed));
             }
             past
@@ -4281,14 +4287,13 @@ impl RpcSessionInner {
     fn take_held_dec_strongs(&self, slot_id: u64) -> std::collections::HashMap<RpcAddress, u32> {
         let mut guard = self.conn_state.lock().expect("conn_state poisoned");
         let st = &mut *guard;
-        let mut held = st
-            .slots
-            .iter_mut()
-            .find(|s| s.id == slot_id)
-            .map(|s| std::mem::take(&mut s.pending_dec))
-            .unwrap_or_default();
+        let Some(slot) = st.slots.iter_mut().find(|s| s.id == slot_id) else {
+            return std::collections::HashMap::new();
+        };
+        let mut held = std::mem::take(&mut slot.pending_dec);
+        let called = slot.peer_called;
         // With an `Outgoing` slot they are the reaper's; without one this is their way out.
-        if !st.has_outgoing() {
+        if called && !st.has_outgoing() {
             for (addr, amount) in std::mem::take(&mut st.reaper_owed) {
                 let owed = held.entry(addr).or_insert(0);
                 *owed = owed.saturating_add(amount);
@@ -8382,6 +8387,7 @@ mod tests {
         )
         .expect("session");
         let inner = session.inner.clone();
+        inner.conn_state.lock().expect("conn_state").slots[0].peer_called = true;
         let codec = Android13PlusCodec::android14_15();
         let mut counter = 0;
         let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
@@ -8416,6 +8422,7 @@ mod tests {
         )
         .expect("session");
         let inner = session.inner.clone();
+        inner.conn_state.lock().expect("conn_state").slots[0].peer_called = true;
         let codec = Android13PlusCodec::android14_15();
         let mut counter = 0;
         for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
@@ -8430,6 +8437,52 @@ mod tests {
             ServeStep::Continue
         ));
         assert_eq!(reaper_owed_len(&inner), HELD_DEC_STRONG_LIMIT);
+        session.close_session();
+    }
+
+    /// An attach's probe reads one `REPLY`: what the reaper owes waits for a call on the connection.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_attach_reads_only_its_reply_however_much_the_reaper_owes() {
+        use crate::rpc::transport::UnixTransport;
+        const OWED: usize = HELD_DEC_STRONG_LIMIT + 3;
+        let (t0, peer) = UnixTransport::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = session.inner.clone();
+        let codec = Android13PlusCodec::android14_15();
+        let mut counter = 0;
+        for _ in 0..OWED {
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+            inner.reap_dec_strong(addr, 1);
+        }
+        let probe = codec
+            .encode_transact(&WireTransaction {
+                address: RpcAddress::zero(),
+                code: SpecialTransaction::GetSessionId.code(),
+                flags: 0,
+                async_number: 0,
+                data: Vec::new(),
+                object_positions: Vec::new(),
+            })
+            .expect("a probe");
+        peer.send_raw(&probe).expect("the probe");
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Continue
+        ));
+        let mut io = RawTransportIo(&peer);
+        let first = read_aosp_message(&mut io).expect("a frame");
+        let first = codec.decode_message(&first).expect("decode");
+        assert!(matches!(first, WireMessage::Reply(_)), "{first:?}");
+        assert_eq!(reaper_owed_len(&inner), OWED);
         session.close_session();
     }
 
