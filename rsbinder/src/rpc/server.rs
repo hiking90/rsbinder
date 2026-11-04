@@ -451,6 +451,8 @@ pub struct RpcServer {
     fd_unix_supported: AtomicBool,
     /// `set_receive_fds(false)`: its sessions read with no room for the fds a peer sends.
     discard_peer_fds: AtomicBool,
+    /// `__limit_unpaid_addresses`, for the sessions made from then on; `None`: no limit.
+    unpaid_address_limit: Mutex<Option<usize>>,
     /// `None` ⇒ android-12 r34 wire; `Some(max)` ⇒ AOSP handshake negotiating `min(max, client)`.
     wire_max_version: Mutex<Option<u32>>,
     /// Cap on live connection workers (`None` = none); see module doc "Admission and deadlines".
@@ -689,6 +691,7 @@ impl RpcServer {
             max_threads: AtomicU32::new(1),
             fd_unix_supported: AtomicBool::new(false),
             discard_peer_fds: AtomicBool::new(false),
+            unpaid_address_limit: Mutex::new(None),
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
             handshake_timeout: Mutex::new(Some(DEFAULT_HANDSHAKE_TIMEOUT)),
@@ -1313,6 +1316,20 @@ impl RpcServer {
         self.discard_peer_fds.store(!receive, Ordering::SeqCst);
     }
 
+    /// Not part of the API: in the sessions this server makes from now on, a
+    /// [`RpcProxy::__try_oneway`](crate::rpc::RpcProxy::__try_oneway) that would leave more than
+    /// `limit` addresses with an unpaid send ends the session instead, with
+    /// [`StatusCode::DeadObject`](crate::StatusCode::DeadObject). For a host that reads every
+    /// connection its clients pay on: `rsbinder-topic`'s hub is the one caller (session doc
+    /// "Deferred `DEC_STRONG`").
+    #[doc(hidden)]
+    pub fn __limit_unpaid_addresses(&self, limit: usize) {
+        *self
+            .unpaid_address_limit
+            .lock()
+            .expect("unpaid_address_limit poisoned") = Some(limit);
+    }
+
     /// Opt in to the **android-13+ versioned RPC wire**.
     /// `max_version` is the highest `RPC_WIRE_PROTOCOL_VERSION`
     /// this server offers (`0` = android-13, `1` = android-14/15,
@@ -1370,6 +1387,13 @@ impl RpcServer {
         }
         if self.discard_peer_fds.load(Ordering::SeqCst) {
             session.discard_peer_fds();
+        }
+        let unpaid = *self
+            .unpaid_address_limit
+            .lock()
+            .expect("unpaid_address_limit poisoned");
+        if let Some(limit) = unpaid {
+            session.limit_unpaid_addresses(limit);
         }
     }
 

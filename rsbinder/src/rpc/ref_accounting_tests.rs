@@ -63,6 +63,9 @@
 //!   session, and the session's end takes the books.
 //! - `t21_a_dropped_release_keeps_the_numbers_for_a_late_attach`: a release with no connection is
 //!   dropped, the peer attaches, and each later proxy of the address numbers on from the last.
+//! - `t22_a_limit_on_unpaid_addresses_ends_the_session_past_it`,
+//!   `t22_a_paid_address_leaves_room_under_the_limit`: `RpcServer::__limit_unpaid_addresses`
+//!   counts addresses, not sends, and only what is still unpaid.
 //!
 //! # Mutation gates
 //!
@@ -1338,6 +1341,69 @@ fn t20_a_peer_that_pays_no_send_keeps_its_entries_until_the_session_ends() {
         "a release ahead of its payment is what libbinder aborts on"
     );
     drop(root);
+}
+
+/// T22: past a limit a no-wait oneway to a new address ends the session; a payment makes room.
+#[test]
+fn t22_a_limit_on_unpaid_addresses_ends_the_session_past_it() {
+    let (client, mut raw, _root_addr, root) = raw_owner(PROTOCOL_V2);
+    let inner = client.inner.clone();
+    client.limit_unpaid_addresses(2);
+    let mut ctr = 1u64;
+    let mut proxy = || {
+        let addr = RpcAddress::unique(&mut ctr, AddressSpace::Acceptor);
+        (addr, inner.enter_binder(addr).expect("a receipt"))
+    };
+    let oneway = |binder: &SIBinder| {
+        let body = rpc_of(binder).request_parcel(CARRIER).expect("request");
+        rpc_of(binder).__try_oneway(FIRST_CALL_TRANSACTION, &body, FLAG_ONEWAY)
+    };
+    let (first, first_proxy) = proxy();
+    let (_second, second_proxy) = proxy();
+    let (_third, third_proxy) = proxy();
+    assert_eq!(oneway(&first_proxy), Ok(()));
+    assert_eq!(oneway(&first_proxy), Ok(()), "an address with one unpaid");
+    assert_eq!(oneway(&second_proxy), Ok(()));
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+
+    // Two sends of `first` unpaid: one payment leaves its entry, and both make room.
+    inner.apply_dec_strong(first, 1);
+    assert_eq!(oneway(&third_proxy), Err(StatusCode::DeadObject));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client.is_ended() {
+        assert!(Instant::now() < deadline, "the session goes on");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop((first_proxy, second_proxy, third_proxy, root));
+}
+
+/// T22, the other side: with the address paid back, the send is under the limit again.
+#[test]
+fn t22_a_paid_address_leaves_room_under_the_limit() {
+    let (client, mut raw, _root_addr, root) = raw_owner(PROTOCOL_V2);
+    let inner = client.inner.clone();
+    client.limit_unpaid_addresses(1);
+    let mut ctr = 1u64;
+    let first = RpcAddress::unique(&mut ctr, AddressSpace::Acceptor);
+    let second = RpcAddress::unique(&mut ctr, AddressSpace::Acceptor);
+    let (first_proxy, second_proxy) = (
+        inner.enter_binder(first).expect("a receipt"),
+        inner.enter_binder(second).expect("a receipt"),
+    );
+    let oneway = |binder: &SIBinder| {
+        let body = rpc_of(binder).request_parcel(CARRIER).expect("request");
+        rpc_of(binder).__try_oneway(FIRST_CALL_TRANSACTION, &body, FLAG_ONEWAY)
+    };
+    assert_eq!(oneway(&first_proxy), Ok(()));
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+    inner.apply_dec_strong(first, 1);
+    assert_eq!(oneway(&second_proxy), Ok(()));
+    assert!(matches!(raw.recv(), WireMessage::Transact(_)));
+    assert!(!client.is_ended());
+    client.close_session();
+    drop((first_proxy, second_proxy, root));
 }
 
 /// T21: a release dropped with no connection leaves the peer's node, so a late attach numbers on.

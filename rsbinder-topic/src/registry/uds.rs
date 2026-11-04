@@ -828,6 +828,9 @@ pub struct UdsRegistry {
 /// How long a send to a watcher may go without progress: `RpcServer`'s default handshake deadline.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Watch addresses of one session with an unpaid notice: past what a socket buffer of 12 MB queues.
+const MAX_UNPAID_WATCHES: usize = 10_000;
+
 impl UdsRegistry {
     /// A registry whose callers `access` judges and whose sockets are made in `dir`.
     pub fn new(dir: SocketDir, access: impl RegistryAccess + 'static) -> Self {
@@ -875,9 +878,17 @@ impl UdsRegistry {
     /// descriptors. A worker is taken before the policy judges any call on it, so a socket any uid
     /// can connect to needs a bound that leaves the descriptors of [`MAX_NAMES`](super::MAX_NAMES)
     /// free.
+    ///
+    /// A client that takes its notices and does not pay them back, watching a new address each
+    /// time, would have the registry keep an entry for each until its session ends. The session
+    /// ends at 10 000 such addresses instead. A client paying for its notices stays far under
+    /// that, as what it has not paid for is what its socket buffer holds, and an `rsbinder-topic`
+    /// client pays on the connection the registry reads. A libbinder client would pay on the
+    /// callback connection, which the registry does not read, and meet the limit.
     pub fn serve(&self, server: &RpcServer) -> BinderResult<()> {
         uds::configure(server);
         server.set_receive_fds(false);
+        server.__limit_unpaid_addresses(MAX_UNPAID_WATCHES);
         server.set_root(self.as_binder())?;
         server.set_reply_timeout(Some(SEND_TIMEOUT))?;
         Ok(())

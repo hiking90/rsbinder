@@ -460,7 +460,10 @@
 //!
 //! A hold lasts until the peer pays. A peer that does not pay a send of an address, a target send
 //! included, leaves that address's `remote_sends` and number-book entries until the session ends,
-//! as AOSP keeps `sentRef`.
+//! as AOSP keeps `sentRef`. A host of many peers bounds that with
+//! `RpcServer::__limit_unpaid_addresses`, which ends the session of a peer past it. No such limit
+//! holds by default: a peer's payment can wait for a read this end only does in a reply wait, so a
+//! count of unpaid addresses says nothing of a peer that is not known to pay where this end reads.
 //!
 //! The reaper does not keep the session alive. Between jobs it holds a `Weak`; a wait on a socket
 //! holds that `Weak`, the transport and its claim on the slot (`wait_without_the_session`), so the
@@ -3778,10 +3781,20 @@ impl RpcSessionInner {
         let counts_target = !addr.is_zero() && self.profile.counts_transaction_targets();
         let async_number = {
             let mut st = self.shared.state.lock().expect("rpc state poisoned");
-            if counts_target {
-                st.on_proxy_leaving(addr);
+            if counts_target && st.past_unpaid_limit(&addr) {
+                None
+            } else {
+                if counts_target {
+                    st.on_proxy_leaving(addr);
+                }
+                Some(st.next_send_async_number(addr))
             }
-            st.next_send_async_number(addr)
+        };
+        let Some(async_number) = async_number else {
+            log::warn!("RPC: a peer leaves too many addresses unpaid; ending the session");
+            data.rpc_end_send(false);
+            self.stop_for_the_reaper();
+            return Err(StatusCode::DeadObject);
         };
         let txn = WireTransactionRef {
             address: &addr,
@@ -5348,6 +5361,16 @@ impl RpcSession {
             .shared
             .fd_unix_supported
             .store(unix, Ordering::SeqCst);
+    }
+
+    /// `RpcServer::__limit_unpaid_addresses` for this session.
+    pub(crate) fn limit_unpaid_addresses(&self, limit: usize) {
+        self.inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state poisoned")
+            .limit_unpaid_addresses(limit);
     }
 
     /// `RpcServer::set_receive_fds(false)` for this session, before its first read.

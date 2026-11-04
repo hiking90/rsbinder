@@ -75,12 +75,22 @@ struct Fixture {
 
 impl Fixture {
     fn new(tag: &str, access: impl RegistryAccess + 'static) -> Self {
+        Self::with_server(tag, access, |_| {})
+    }
+
+    /// With `change` made to the server's settings after [`UdsRegistry::serve`] made its own.
+    fn with_server(
+        tag: &str,
+        access: impl RegistryAccess + 'static,
+        change: impl FnOnce(&RpcServer),
+    ) -> Self {
         let root = scratch(tag);
         let dir = SocketDir::open(&root.join("topic.d")).unwrap();
         let registry = UdsRegistry::new(dir, access);
         let path = root.join("topic.sock");
         let server = RpcServer::setup_unix_server(&path).unwrap();
         registry.serve(&server).unwrap();
+        change(&server);
         let handle = Some(server.run_background().unwrap());
         Self {
             path,
@@ -1342,6 +1352,52 @@ impl ITopicAddressWatcher for StoppedWatcher {
         let _ = self.0.lock().unwrap().recv();
         Ok(())
     }
+}
+
+/// A session past the limit of addresses it has not paid for ends, and takes only its own watches.
+#[test]
+fn a_session_past_the_limit_of_unpaid_notices_ends_and_no_other_does() {
+    let fixture = Fixture::with_server("unpaid", AllowAll, |server| {
+        server.__limit_unpaid_addresses(2);
+    });
+    let raw = fixture.raw();
+    let unpaying = fixture.raw();
+    let (release, released) = mpsc::channel();
+    let names = ["a.one", "a.two", "a.three"];
+    let stops = BnTopicAddressWatcher::new_binder(StoppedWatcher(Mutex::new(released)));
+    unpaying.registry.r#watch(names[0], &stops).unwrap();
+    let silent = [
+        BnTopicAddressWatcher::new_binder(Silent),
+        BnTopicAddressWatcher::new_binder(Silent),
+    ];
+    unpaying.registry.r#watch(names[1], &silent[0]).unwrap();
+    unpaying.registry.r#watch(names[2], &silent[1]).unwrap();
+    let told = Counted::default();
+    let listening = BnTopicAddressWatcher::new_binder(told.clone());
+    raw.registry.r#watch(names[2], &listening).unwrap();
+    assert_eq!(fixture.registry.stats().watchers, 4);
+
+    let (_publisher, topic) = topic();
+    let mut last = 0;
+    for name in names {
+        let allocation = raw.registry.r#allocate(name, &topic).unwrap();
+        last = raw
+            .registry
+            .r#commit(name, &topic, allocation.allocation)
+            .unwrap();
+    }
+    within(WAIT, "the unpaying session's watches gone", || {
+        fixture.registry.stats().watchers == 1
+    });
+    within(WAIT, "the other session's notice", || {
+        told.0.lock().unwrap().last() == Some(&last)
+    });
+    assert!(!raw.session.0.is_ended());
+    // Only now can it see the end: its one incoming thread was in the notice that stopped.
+    drop(release);
+    within(WAIT, "the unpaying session's end", || {
+        unpaying.session.0.is_ended()
+    });
 }
 
 /// Each step's 5 s is under the 10 s a send would wait, on the thread that makes the change.
