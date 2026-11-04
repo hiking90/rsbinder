@@ -362,7 +362,7 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   its session and skips generations of a name; reading slowly means taking a whole
   frame within the deadline, as a part of one does not show. No watcher holds up a
   change or another watcher: a send takes one system call, and a notice with no room
-  is owed and sent again with the name's topic by then, as on a binder device, under
+  is owed and sent again with the name's generation by then, as on a binder device, under
   one bound on how many are owed. A uid allowed to `subscribe` that stops reading can
   take that room, and a notice past it waits for the name's next change: the hub logs
   a warning, and the count is `owed_dropped` of `UdsRegistry::stats`, which `rsb_hub`

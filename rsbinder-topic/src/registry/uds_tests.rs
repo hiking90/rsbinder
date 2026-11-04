@@ -269,8 +269,8 @@ fn an_allocation_is_found_by_nobody_until_its_commit() {
     assert!(raw.registry.r#lookup("a.name").unwrap().socket.is_none());
     assert!(raw.registry.r#list("").unwrap().is_empty());
     let watcher = BnTopicAddressWatcher::new_binder(Silent);
-    let watched = raw.registry.r#watch("a.name", &watcher).unwrap();
-    assert!(watched.socket.is_none());
+    raw.registry.r#watch("a.name", &watcher).unwrap();
+    assert!(raw.registry.r#lookup("a.name").unwrap().socket.is_none());
 
     let generation = raw
         .registry
@@ -1230,6 +1230,12 @@ fn a_process_with_no_descriptor_free_keeps_its_session_and_connects_later() {
         while let Ok(next) = file.try_clone() {
             filling.push(next);
         }
+        // Another watch, as a process with none free can make, and a lookup of its own.
+        let other = resolver
+            .watch_resolved("a.other", Box::new(|_| {}))
+            .expect("a watch brings no descriptor");
+        let looked = other.lookup().expect("the watch's lookup")();
+        assert!(matches!(looked, Ok(None)), "{looked:?}");
         full.write_all(b"full").unwrap();
         // The notice comes, and the watch's rounds find no descriptor free.
         assert!(!subscriber.wait_connected(Duration::from_secs(2)));

@@ -52,10 +52,12 @@ interface ITopicUdsRegistry {
     /** The socket `name` is given to; none also when the caller may not subscribe. */
     TopicAddress lookup(String name);
     /**
-     * Tell `watcher` of every socket `name` is given from now on; the one it
-     * has now is the reply. A client passes one `watcher` for all its names.
+     * Tell `watcher` whenever `name` is given a socket from now on, which `lookup`
+     * gives. The name's generation is the reply. It brings no descriptor, so that
+     * a process with none free can watch. A client passes one `watcher` for all
+     * its names.
      */
-    TopicAddress watch(String name, ITopicAddressWatcher watcher);
+    long watch(String name, ITopicAddressWatcher watcher);
     /**
      * End the watch of `name` by `watcher`; nothing if there is none. Twoway: a
      * `watch` of the name after it returns cannot arrive before it.

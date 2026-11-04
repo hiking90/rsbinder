@@ -33,7 +33,7 @@
 //! then. A send here takes one system call that waits for no peer, so a watcher that stopped holds
 //! up no change and no other watcher. A notice with no room in the watcher's socket is owed, as one
 //! is on a kernel registry when the watcher's process has no room: it is sent again, under the same
-//! bounds, with the topic the name has by then, so a watcher that does not keep up skips
+//! bounds, with the generation the name has by then, so a watcher that does not keep up skips
 //! generations and never hears them out of order. The bound on how many are owed is the
 //! registry's, whichever uid owes them (plan 15 D13-e): a uid allowed to `Subscribe` that stops
 //! reading, or to `Advertise` and `Subscribe` as well and so change a name faster than it reads,
@@ -55,8 +55,8 @@
 //!
 //! Unlike a kernel registry, a process that stopped with its socket full loses its session after
 //! 10 s, which takes its names and watches away; one that goes on reading keeps it. A session that
-//! could not be told at all, with no incoming connection or no descriptors to take, is refused its
-//! watch with `InvalidOperation`.
+//! could not be told, with no incoming connection, or could not ask, as it takes no descriptors, is
+//! refused its watch with `InvalidOperation`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -596,7 +596,7 @@ impl Shared {
         caller: &Caller,
         name: &str,
         watcher: &Strong<dyn ITopicAddressWatcher>,
-    ) -> BinderResult<TopicAddress> {
+    ) -> BinderResult<i64> {
         local_ids(caller).ok_or_else(|| security("a caller with no uid"))?;
         if !is_valid_name(name) {
             return Err(bad_name());
@@ -606,7 +606,7 @@ impl Shared {
                 "the policy does not let the caller subscribe to the name",
             ));
         }
-        // Each notice would fail the same until the session ended, holding a place among the owed.
+        // It could not be told, or not take the descriptor a lookup replies with: refused now.
         let needed = TransportCaps::CALLBACKS | TransportCaps::FD_PASSING;
         let caps = rsbinder::calling_caps().unwrap_or(TransportCaps::NONE);
         caps.require(needed, "a watch of a topic's name")?;
@@ -624,7 +624,8 @@ impl Shared {
             }
             other => other,
         };
-        topic_address(watched.map_err(refused)?)
+        let (_, generation) = watched.map_err(refused)?;
+        Ok(generation as i64)
     }
 
     fn try_watch(
@@ -763,7 +764,7 @@ impl Shared {
         }
     }
 
-    /// One round of the retry thread: every owed notice that is due, with the name's topic by now.
+    /// One round of the retry thread: every owed notice due, with the name's generation by now.
     fn retry_round(&self) {
         #[cfg(test)]
         assert!(
@@ -992,11 +993,7 @@ impl ITopicUdsRegistry for Service {
         self.0.lookup(&caller()?, name)
     }
 
-    fn r#watch(
-        &self,
-        name: &str,
-        watcher: &Strong<dyn ITopicAddressWatcher>,
-    ) -> BinderResult<TopicAddress> {
+    fn r#watch(&self, name: &str, watcher: &Strong<dyn ITopicAddressWatcher>) -> BinderResult<i64> {
         self.0.watch(&caller()?, name, watcher)
     }
 
@@ -1301,20 +1298,14 @@ impl Resolver for UdsResolver {
         let order = host.watch_order();
         // Before the call: a notice can come ahead of its reply.
         host.watches.add(name, &reconciler);
-        let reply = host.registry.r#watch(name, &host.watcher);
-        let reply = match reply {
-            Ok(reply) => reply,
-            Err(status) => {
-                reconciler.end();
-                host.forget(name, &reconciler);
-                return Err(status);
-            }
-        };
-        drop(order);
-        // Its descriptor goes unused: the thread's lookup has what the name has by then.
-        if reply.socket.is_some() {
-            reconciler.heard();
+        if let Err(status) = host.registry.r#watch(name, &host.watcher) {
+            reconciler.end();
+            host.forget(name, &reconciler);
+            return Err(status);
         }
+        drop(order);
+        // A name may have its socket already, and no notice comes of that.
+        reconciler.heard();
         let asked = reconciler.clone();
         let watching = Watching {
             host: host.clone(),
@@ -1456,9 +1447,7 @@ fn may_connect_again(status: &Status) -> bool {
     status.exception_code() != ExceptionCode::Security && status.transaction_error() != refused
 }
 
-/// One watch: asks the host what the name has and connects to it, off the host session's thread,
-/// which all names share. Every way a name's connection can be missed comes back to a round of
-/// this: a notice, a failed lookup, a failed connect and a panic.
+/// One watch: rounds of asking the host and connecting, on a notice or after one that failed.
 pub(super) struct Reconciler {
     name: String,
     /// Weak: the host's session keeps its notices' binder, which reaches this.
@@ -1563,14 +1552,20 @@ impl Reconciler {
         }
     }
 
+    /// Whether a lookup may go: a reply's fd with no slot for it ends the session, and one dials.
+    fn descriptors_free(&self) -> bool {
+        match std::os::unix::net::UnixStream::pair() {
+            Ok(_) => true,
+            Err(error) => {
+                log::debug!("topic: no descriptors to ask for {:?}: {error}", self.name);
+                false
+            }
+        }
+    }
+
     /// Ask the host and connect; whether the name needs no other round until another notice.
     fn round(&self) -> bool {
-        // A reply's fd with no slot for it ends the session: wait for that and one to dial with.
-        if let Err(error) = std::os::unix::net::UnixStream::pair() {
-            log::debug!(
-                "topic: no descriptors to ask for {:?} yet: {error}",
-                self.name
-            );
+        if !self.descriptors_free() {
             return false;
         }
         let Some(host) = self.host.upgrade() else {
@@ -1616,6 +1611,10 @@ impl Reconciler {
 
     /// The watch's lookup, whose caller gives up on a failure: the thread goes on.
     fn lookup(self: &Arc<Self>) -> BinderResult<Option<Resolved>> {
+        if !self.descriptors_free() {
+            self.heard();
+            return Ok(None);
+        }
         let Some(host) = self.host.upgrade() else {
             return Ok(None);
         };
