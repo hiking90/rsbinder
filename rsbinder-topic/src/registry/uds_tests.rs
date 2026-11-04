@@ -1261,16 +1261,25 @@ fn a_panic_in_the_callback_leaves_the_watch_able_to_connect() {
     dialer.end();
 }
 
-/// A retry thread that panics leaves `retrying` clear, so a later send starts another.
+/// A round of the retry thread that panics loses nothing owed: no later change is needed.
 #[test]
-fn a_panic_in_the_retry_thread_lets_a_later_send_start_another() {
+fn a_panic_in_a_retry_round_loses_no_owed_notice() {
     let fixture = Fixture::new("panicking_retry", AllowAll);
-    let registry = &fixture.registry;
-    registry.start_a_panicking_retry();
-    eventually("the panicked thread's end", || !registry.retrying());
-    registry.start_a_panicking_retry();
-    eventually("another thread's round", || !registry.retry_round_armed());
-    eventually("its end", || !registry.retrying());
+    let raw = fixture.raw();
+    let told = Counted::default();
+    let watcher = BnTopicAddressWatcher::new_binder(told.clone());
+    raw.registry.r#watch("a.name", &watcher).unwrap();
+    let (_publisher, topic) = topic();
+    let allocation = raw.registry.r#allocate("a.name", &topic).unwrap();
+    fixture.registry.panic_in_the_next_retry_round();
+    fixture.registry.fail_duplicates(1);
+    let generation = raw
+        .registry
+        .r#commit("a.name", &topic, allocation.allocation)
+        .unwrap();
+    eventually("the owed notice", || !told.0.lock().unwrap().is_empty());
+    assert_eq!(*told.0.lock().unwrap(), [generation]);
+    eventually("the thread's end", || !fixture.registry.retrying());
 }
 
 /// A notice lost while a lookup for an earlier one is out asks again, for the newer generation.

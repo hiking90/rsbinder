@@ -804,33 +804,27 @@ impl Shared {
     }
 }
 
-/// Clears `retrying` when the retry thread panics: left set, no later send would start another.
-struct Ending(Weak<Shared>);
-
-impl Drop for Ending {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            return;
-        }
-        if let Some(shared) = self.0.upgrade() {
-            let mut inner = shared.inner.lock().unwrap_or_else(PoisonError::into_inner);
-            inner.retrying = false;
-        }
-    }
-}
-
 /// The retry thread: rounds until nothing is owed or the registry is gone.
 fn retry(shared: Weak<Shared>) {
-    let _ending = Ending(shared.clone());
     loop {
         let Some(registry) = shared.upgrade() else {
             return;
         };
-        registry.retry_round();
+        // A panic costs one round: what is owed stays owed, with this thread to send it.
+        let round = std::panic::AssertUnwindSafe(|| registry.retry_round());
+        let panicked = std::panic::catch_unwind(round).map_err(|payload| {
+            let panic = rsbinder::__panic_message(&payload);
+            log::error!("topic registry: a round of owed notices panicked ({panic})");
+        });
         let mut inner = registry.lock();
         let Some(due) = inner.table.next_due() else {
             inner.retrying = false;
             return;
+        };
+        // What the round did not reach is due at once: no spin on a panic that comes back.
+        let due = match panicked {
+            Ok(()) => due,
+            Err(()) => due.max(Instant::now() + FIRST_RETRY),
         };
         // Read under `inner`, as the failures that wake it count under it.
         let ticket = registry.sleep.ticket();
@@ -921,17 +915,10 @@ impl UdsRegistry {
         Ok(())
     }
 
-    /// Start a retry thread, as a send that owes does, whose first round panics, for a test.
+    /// Make the next round of the retry thread panic, for a test.
     #[cfg(test)]
-    pub(super) fn start_a_panicking_retry(&self) {
+    pub(super) fn panic_in_the_next_retry_round(&self) {
         self.shared.panicking_retry.store(true, Ordering::SeqCst);
-        self.shared.owe(self.shared.lock(), true);
-    }
-
-    /// Whether a retry thread has not run the round [`Self::start_a_panicking_retry`] armed.
-    #[cfg(test)]
-    pub(super) fn retry_round_armed(&self) -> bool {
-        self.shared.panicking_retry.load(Ordering::SeqCst)
     }
 
     /// Whether a retry thread counts as running, for a test.
