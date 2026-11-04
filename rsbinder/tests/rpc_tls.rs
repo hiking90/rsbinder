@@ -192,6 +192,53 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
+/// On a full socket a no-wait record is kept, not cut: the peer decrypts every frame in order.
+#[test]
+fn tls_no_wait_frames_on_a_full_socket_arrive_whole_and_in_order() {
+    let srv_cfg = server_config(SRV_CRT, SRV_KEY);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (tcp, _) = listener.accept().expect("accept");
+        TlsTransport::accept(tcp, srv_cfg).expect("server handshake")
+    });
+    let tcp = TcpStream::connect(addr).expect("tcp connect");
+    let sender = TlsTransport::connect(tcp, "localhost", client_config_trusting(CA))
+        .expect("client handshake");
+    let peer = server.join().expect("the server");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("peer timeout");
+
+    let started = std::time::Instant::now();
+    let mut frames = 0usize;
+    while sender
+        .__send_no_wait(&[frames as u8; 2048], &[])
+        .expect("a socket")
+        .expect("a send")
+    {
+        frames += 1;
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "a send waited");
+    let sender = Arc::new(sender);
+    let writer = {
+        let sender = sender.clone();
+        thread::spawn(move || sender.send_raw(b"tail"))
+    };
+    let mut read = vec![0u8; frames * 2048 + 4];
+    let mut got = 0;
+    while got < read.len() {
+        let n = peer.recv_raw(&mut read[got..]).expect("the peer's read");
+        assert!(n > 0, "the end of stream after {got} bytes");
+        got += n;
+    }
+    writer.join().expect("the writer").expect("the send");
+    for (n, frame) in read.chunks(2048).take(frames).enumerate() {
+        assert!(frame.iter().all(|b| *b == n as u8), "frame {n} is cut");
+    }
+    assert_eq!(&read[frames * 2048..], b"tail");
+    assert!(!sender.__carrying());
+}
+
 /// Valid cert: handshake + AIDL e2e over TLS; both ends see a `Certificate` peer identity.
 #[test]
 fn tls_valid_cert_e2e_and_peer_identity() {

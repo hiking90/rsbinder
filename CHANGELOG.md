@@ -259,9 +259,10 @@ says what a peer does with the 0.12.0 value.
   them as a clean end (`EndOfStream`). A `sendmsg` with fds that takes
   nothing is `WriteZero` on Apple too; 0.12.0 returned `EndOfStream`
   there.
-- The last drop of an RPC proxy does not wait for the peer on a plain Unix
-  socket (`UnixTransport`) on Linux and Android, and on no transport runs death
-  recipients on the dropping thread. With no room, a handler's own connection
+- The last drop of an RPC proxy does not wait for the peer on any transport, and
+  runs no death recipients on the dropping thread. A custom transport without
+  the hidden no-wait send leaves every release to the session's reaper thread, so
+  a release there can come after the next reply. With no room, a handler's own connection
   holds the `DEC_STRONG` for its next reply, and any other waits for the session's
   reaper thread, so it can come after the next reply. The frame's format and the
   amounts' sum are the same; the reaper's releases of one address can share a frame.
@@ -766,17 +767,18 @@ says what a peer does with the 0.12.0 value.
 
 ### Changed
 
-- **The last drop of an RPC proxy on a plain Unix socket waits for no peer**
-  (see *Migrating*). On Linux and Android a `DEC_STRONG` on a `UnixTransport` is
-  one `sendmsg` that puts the whole frame on the socket or nothing. With no room
+- **The last drop of an RPC proxy waits for no peer** (see *Migrating*). On Linux
+  and Android a `DEC_STRONG` on a `UnixTransport` is one `sendmsg` that puts the
+  whole frame on the socket or nothing. TCP, vsock, TLS and Apple's `UnixTransport`
+  send what the socket takes and keep the rest of the frame, which the next send
+  writes first, or the reaper thread when nothing else is to be written. With no room
   a handler's own connection holds it for its next reply, and for any other the
   session's reaper thread writes it once the peer reads, and a peer that takes
   nothing for the send deadline loses the session there; 0.12.0's drop waited in
   the write, for as long as a session with no deadline lasts. The reaper's wait
   keeps no session alive: with no incoming connection, the last handle and proxy
   close the connection. What the reaper owes is one sum per address, so no burst of
-  drops ends a session. Other transports (TLS over a Unix socket among them) and
-  Apple keep the write that waits. A write that fails on any transport stops the
+  drops ends a session. A write that fails on any transport stops the
   session at once, so nothing follows a frame it cut, and the reaper thread runs the
   death recipients, so a drop runs none. The frame format and the amounts' sum are
   unchanged; the reaper's releases of one address can share a frame.

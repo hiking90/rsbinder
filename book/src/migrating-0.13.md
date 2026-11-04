@@ -629,9 +629,10 @@ bytes, so only a peer that wrote something unusual sees a difference.
   that takes nothing is `WriteZero` on Apple too, where 0.12.0 returned
   `EndOfStream`. Code that matched `EndOfStream` for these cases matches
   the new codes.
-- **The last drop of an RPC proxy waits for no peer on a plain Unix socket
-  (`UnixTransport`) on Linux and Android, and on no transport runs death
-  recipients on the dropping thread.** With no room in the socket a handler's own
+- **The last drop of an RPC proxy waits for no peer on any transport, and runs no
+  death recipients on the dropping thread.** A custom `RpcTransport` leaves every
+  release to the session's reaper thread, so a release there can come after the
+  next reply. With no room in the socket a handler's own
   connection holds the `DEC_STRONG` for its next reply, and for any other the
   session's reaper thread writes it once the peer reads, where 0.12.0's drop
   waited in the write. The frame's format and the amounts' sum are the same; the

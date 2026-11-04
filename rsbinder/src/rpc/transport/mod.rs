@@ -108,11 +108,12 @@
 //!   read under `SO_RCVTIMEO`. While a read deadline is armed, each read
 //!   costs one `ioctl` to tell the two apart.
 //!
-//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG` on
-//!   Linux and Android's `UnixTransport`, a hub's notice) is judged by the
-//!   same rule apart from the send: the session's reaper waits on the slot in
-//!   `__wait_for_room`, a `SendWait` of its own, and ends the session when the
-//!   deadline passes (`session` module doc "Deferred `DEC_STRONG`").
+//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG`, a hub's
+//!   notice) is judged by the same rule apart from the send: the session's
+//!   reaper waits on the slot in `__wait_for_room`, a `SendWait` of its own, and
+//!   ends the session when the deadline passes, and what such a send left of a
+//!   frame goes out through a send that waits (`session` module doc
+//!   "Deferred `DEC_STRONG`").
 //!
 //! The `ioctl` runs only while a deadline is armed: a send or read without
 //! one has no verdict for it to change. A socket that refuses it once
@@ -559,10 +560,12 @@ pub trait RpcTransport: Send + Sync {
 
     /// Not part of the API: one small frame that waits for nothing.
     ///
-    /// `Ok(true)` is the whole of `buf` and `fds` sent; `Ok(false)` is none of them sent, for want
-    /// of room or of a kernel resource, with the stream as it was; any other failure is the
-    /// transport's, and a `buf` past the transport's limit is [`RpcError::FrameTooLarge`] before
-    /// anything is sent. `None`, the default, is a transport that cannot promise this.
+    /// `Ok(true)` is the whole of `buf` and `fds` taken: sent, or with what is not yet sent kept
+    /// for the next send, which writes it first ([`__carrying`](Self::__carrying)). `Ok(false)` is
+    /// none of them taken, for want of room or of a kernel resource, with the stream as it was; any
+    /// other failure is the transport's, and a `buf` past the transport's limit is
+    /// [`RpcError::FrameTooLarge`] before anything is sent. `None`, the default, is a transport
+    /// that cannot promise this: the session's reaper thread then writes its releases.
     #[doc(hidden)]
     fn __send_no_wait(
         &self,
@@ -570,6 +573,18 @@ pub trait RpcTransport: Send + Sync {
         _fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> Option<RpcResult<bool>> {
         None
+    }
+
+    /// Not part of the API: part of a frame `__send_no_wait` took is not yet sent.
+    #[doc(hidden)]
+    fn __carrying(&self) -> bool {
+        false
+    }
+
+    /// Not part of the API: write what `__carrying` reports, waiting as a send waits.
+    #[doc(hidden)]
+    fn __flush_carried(&self) -> RpcResult<()> {
+        Ok(())
     }
 
     /// Not part of the API: wait as a send that found no room waits. `Ok(true)` is room, or an

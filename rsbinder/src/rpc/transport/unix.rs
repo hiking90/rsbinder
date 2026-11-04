@@ -85,9 +85,16 @@
 //! same send can work later. (A send that waits has no "not sent": `send_stream`
 //! makes `ETOOMANYREFS` [`RpcError::Protocol`], a refusal of that frame alone.)
 //! A partial `sendmsg` cannot happen under that limit; if
-//! it did, it is a transport failure and ends the session. Apple keeps the trait's
-//! default: XNU's `AF_UNIX` was not read for this, and `MSG_DONTWAIT` means nothing
-//! there.
+//! it did, it is a transport failure and ends the session.
+//!
+//! A stream whose send can stop inside a small frame (TCP, vsock, TLS's socket, and Apple's
+//! `AF_UNIX`, whose kernel was not read for this) has a `Carry` instead. Its send takes what the
+//! socket takes, and the rest stays in the `Carry`: `Ok(true)` then means the frame is taken, and
+//! every later send on the stream writes the rest first, so the peer reads the frame whole and in
+//! order. With nothing to write next, the session's reaper or serve loop calls `__flush_carried`.
+//! A frame the socket takes none of is `Ok(false)`, and a `Carry` that holds bytes takes no
+//! other frame, so it holds at most one, of at most `NO_WAIT_FRAME_LIMIT`. Fds need the frame
+//! whole in one `sendmsg`, so Apple has no such send for a frame with fds.
 //!
 //! ## Tests
 //!
@@ -276,8 +283,161 @@ pub(crate) fn send_stream(
 }
 
 /// The most a `__send_no_wait` takes, which is one skb on any socket (module doc).
-#[cfg(any(target_os = "linux", target_os = "android"))]
 const NO_WAIT_FRAME_LIMIT: usize = 2048;
+
+/// A frame a `__send_no_wait` refuses before anything is sent.
+pub(crate) fn check_no_wait_frame(buf: &[u8]) -> RpcResult<()> {
+    if buf.len() > NO_WAIT_FRAME_LIMIT {
+        return Err(RpcError::FrameTooLarge {
+            declared: buf.len(),
+            max: NO_WAIT_FRAME_LIMIT,
+        });
+    }
+    if buf.is_empty() {
+        // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
+        return Err(RpcError::Protocol("an empty RPC frame"));
+    }
+    Ok(())
+}
+
+/// `__wait_for_room` on a socket: `Ok(false)` is the send deadline passed with no peer progress.
+pub(crate) fn wait_for_room(
+    sock: std::os::fd::BorrowedFd<'_>,
+    queue: &OutQueue,
+) -> RpcResult<bool> {
+    Ok(SendWait::new(sock, queue).wait(false)?.is_some())
+}
+
+/// What a no-wait send left of a frame, which every later send writes first (module doc).
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "android")),
+    feature = "rpc-tcp-debug",
+    feature = "rpc-tls",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+#[derive(Default)]
+pub(crate) struct Carry(std::sync::Mutex<Vec<u8>>);
+
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "android")),
+    feature = "rpc-tcp-debug",
+    feature = "rpc-tls",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+impl Carry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        // Bytes and a length, whole at every unlock: a panic cannot leave them inconsistent.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Send what fits of ciphertext that is already sequenced, and keep the rest, all of it if so.
+    #[cfg(feature = "rpc-tls")]
+    pub(crate) fn send_or_keep(
+        &self,
+        sock: std::os::fd::BorrowedFd<'_>,
+        bytes: &[u8],
+    ) -> RpcResult<()> {
+        let mut carried = self.lock();
+        let sent = send_what_fits(bytes, |rest| {
+            send_nonblocking(sock, |flags| rustix::net::send(sock, rest, flags))
+        })?;
+        carried.extend_from_slice(&bytes[sent..]);
+        Ok(())
+    }
+
+    /// What a socket would not have taken, for a test that cannot make one refuse.
+    #[cfg(all(test, feature = "rpc-tls"))]
+    pub(super) fn keep(&self, bytes: &[u8]) {
+        self.lock().extend_from_slice(bytes);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// The bytes to write before anything else, which leave the `Carry` for good.
+    pub(crate) fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.lock())
+    }
+}
+
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "android")),
+    feature = "rpc-tcp-debug",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+impl Carry {
+    /// `__send_no_wait` of a frame with no fds (module doc).
+    pub(crate) fn send_no_wait(
+        &self,
+        sock: std::os::fd::BorrowedFd<'_>,
+        buf: &[u8],
+    ) -> RpcResult<bool> {
+        check_no_wait_frame(buf)?;
+        self.take_frame(buf, |rest| {
+            send_nonblocking(sock, |flags| rustix::net::send(sock, rest, flags))
+        })
+    }
+
+    pub(super) fn take_frame(
+        &self,
+        buf: &[u8],
+        send: impl FnMut(&[u8]) -> rustix::io::Result<usize>,
+    ) -> RpcResult<bool> {
+        let mut carried = self.lock();
+        if !carried.is_empty() {
+            return Ok(false);
+        }
+        let sent = send_what_fits(buf, send)?;
+        if sent == 0 {
+            return Ok(false);
+        }
+        carried.extend_from_slice(&buf[sent..]);
+        Ok(true)
+    }
+
+    /// Write what is carried, waiting as a send waits.
+    pub(crate) fn flush<'a>(
+        &self,
+        sock: std::os::fd::BorrowedFd<'_>,
+        queue: &'a OutQueue,
+        drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
+    ) -> RpcResult<()> {
+        let carried = self.take();
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let slices = &mut [std::io::IoSlice::new(&carried)];
+        send_stream(sock, slices, &[], SendMode::of(queue, drain))
+    }
+}
+
+/// How much of `buf` a stream takes with no wait.
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "android")),
+    feature = "rpc-tcp-debug",
+    feature = "rpc-tls",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+fn send_what_fits(
+    buf: &[u8],
+    mut send: impl FnMut(&[u8]) -> rustix::io::Result<usize>,
+) -> RpcResult<usize> {
+    use rustix::io::Errno;
+    let mut sent = 0;
+    while sent < buf.len() {
+        match send(&buf[sent..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+            Ok(n) => sent += n,
+            Err(Errno::INTR) => continue,
+            Err(Errno::AGAIN | Errno::NOMEM | Errno::NOBUFS) => break,
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+    }
+    Ok(sent)
+}
 
 /// `__send_no_wait` on a Unix socket: `buf` and `fds` whole, or nothing (module doc).
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -290,18 +450,9 @@ fn send_whole_or_none(
     use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
     use std::mem::MaybeUninit;
 
-    if buf.len() > NO_WAIT_FRAME_LIMIT {
-        return Err(RpcError::FrameTooLarge {
-            declared: buf.len(),
-            max: NO_WAIT_FRAME_LIMIT,
-        });
-    }
+    check_no_wait_frame(buf)?;
     if fds.len() > MAX_FDS_PER_FRAME {
         return Err(RpcError::Protocol("too many fds in one RPC frame"));
-    }
-    if buf.is_empty() {
-        // No payload means no `sendmsg` to carry the fds; AOSP frames are never empty.
-        return Err(RpcError::Protocol("an empty RPC frame"));
     }
     let slices = [std::io::IoSlice::new(buf)];
     let mut space = [MaybeUninit::uninit(); FD_SPACE];
@@ -333,15 +484,37 @@ fn send_whole_or_none(
 pub(crate) fn send_raw_no_fds<'a>(
     sock: std::os::fd::BorrowedFd<'_>,
     queue: &'a OutQueue,
+    carry: &Carry,
     buf: &[u8],
     fds: &[std::os::fd::BorrowedFd<'_>],
-    drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
+    mut drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
 ) -> RpcResult<()> {
     if !fds.is_empty() {
         return Err(super::cannot_pass_fds());
     }
+    let first = drain
+        .as_mut()
+        .map(|d| &mut **d as &mut dyn FnMut() -> RpcResult<()>);
+    carry.flush(sock, queue, first)?;
     let slices = &mut [std::io::IoSlice::new(buf)];
     send_stream(sock, slices, &[], SendMode::of(queue, drain))
+}
+
+/// `__send_no_wait` of a socket transport that passes no fds (`tcp_debug`, `vsock`).
+#[cfg(any(
+    feature = "rpc-tcp-debug",
+    all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android"))
+))]
+pub(crate) fn send_no_wait_no_fds(
+    sock: std::os::fd::BorrowedFd<'_>,
+    carry: &Carry,
+    buf: &[u8],
+    fds: &[std::os::fd::BorrowedFd<'_>],
+) -> RpcResult<bool> {
+    if !fds.is_empty() {
+        return Err(super::cannot_pass_fds());
+    }
+    carry.send_no_wait(sock, buf)
 }
 
 /// The waits of one send: `SO_SNDTIMEO` counted from the last progress (`transport` "A slow peer").
@@ -455,6 +628,8 @@ pub struct UnixTransport {
     fd_recv_lock: std::sync::Mutex<()>,
     reads: ReadDeadline,
     queue: OutQueue,
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    carry: Carry,
 }
 
 impl std::fmt::Debug for UnixTransport {
@@ -467,6 +642,21 @@ impl std::fmt::Debug for UnixTransport {
 }
 
 impl UnixTransport {
+    /// What a no-wait send left goes before any other frame; here it never leaves any.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn carried_first(&self, _drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+        Ok(())
+    }
+
+    /// What a no-wait send left goes before any other frame, whose fds must not ride it.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn carried_first<'a>(
+        &'a self,
+        drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
+    ) -> RpcResult<()> {
+        self.carry.flush(self.stream.as_fd(), &self.queue, drain)
+    }
+
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
     ///
@@ -496,6 +686,8 @@ impl UnixTransport {
             fd_recv_lock: std::sync::Mutex::new(()),
             reads: ReadDeadline::default(),
             queue: OutQueue::default(),
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            carry: Carry::default(),
         })
     }
 
@@ -700,6 +892,7 @@ impl RpcTransport for UnixTransport {
     /// `sentFds |= ret > 0`); the rest (rare — fd transactions are
     /// tiny) follow without ancillary.
     fn send_raw_with_fds(&self, buf: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> RpcResult<()> {
+        self.carried_first(None)?;
         // No length check: raw bytes have no frame; `write_aosp_message_with_fds` caps the body.
         let slices = &mut [std::io::IoSlice::new(buf)];
         send_stream(
@@ -800,6 +993,7 @@ impl RpcTransport for UnixTransport {
         fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> RpcResult<()> {
         let header = super::frame_header(buf)?;
+        self.carried_first(None)?;
         let slices = &mut [std::io::IoSlice::new(&header), std::io::IoSlice::new(buf)];
         send_stream(
             self.stream.as_fd(),
@@ -815,6 +1009,7 @@ impl RpcTransport for UnixTransport {
         fds: &[std::os::fd::BorrowedFd<'_>],
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
+        self.carried_first(Some(&mut *drain))?;
         // No length check: raw bytes have no frame, and the caller caps the body.
         let slices = &mut [std::io::IoSlice::new(buf)];
         send_stream(
@@ -834,10 +1029,30 @@ impl RpcTransport for UnixTransport {
         Some(send_whole_or_none(self.stream.as_fd(), buf, fds))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn __send_no_wait(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        if !fds.is_empty() {
+            return None;
+        }
+        Some(self.carry.send_no_wait(self.stream.as_fd(), buf))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn __carrying(&self) -> bool {
+        !self.carry.is_empty()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn __flush_carried(&self) -> RpcResult<()> {
+        self.carried_first(None)
+    }
+
     fn __wait_for_room(&self) -> RpcResult<bool> {
-        let mut wait = SendWait::new(self.stream.as_fd(), &self.queue);
-        Ok(wait.wait(false)?.is_some())
+        wait_for_room(self.stream.as_fd(), &self.queue)
     }
 
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.
@@ -897,6 +1112,38 @@ mod tests {
     use super::*;
     use crate::rpc::RpcError;
     use std::sync::Arc;
+
+    /// A send that stops inside a frame keeps the rest, and the `Carry` takes no other frame.
+    #[cfg(feature = "rpc-tcp-debug")]
+    #[test]
+    fn a_carry_keeps_the_rest_of_a_frame_and_takes_no_other() {
+        use rustix::io::Errno;
+
+        let carry = Carry::default();
+        let mut sends = vec![Err(Errno::AGAIN), Ok(3)];
+        let taken = carry.take_frame(b"abcdefgh", |_| sends.pop().expect("a send"));
+        assert!(matches!(taken, Ok(true)));
+        assert!(!carry.is_empty());
+        let other = carry.take_frame(b"x", |_| panic!("a send past what is carried"));
+        assert!(matches!(other, Ok(false)));
+        assert_eq!(carry.take(), b"defgh");
+        assert!(carry.is_empty());
+    }
+
+    /// A socket that takes none of a frame leaves the `Carry` empty; a failure is the transport's.
+    #[cfg(feature = "rpc-tcp-debug")]
+    #[test]
+    fn a_carry_holds_nothing_of_a_frame_the_socket_took_none_of() {
+        use rustix::io::Errno;
+
+        let carry = Carry::default();
+        let none = carry.take_frame(b"abc", |_| Err(Errno::AGAIN));
+        assert!(matches!(none, Ok(false)));
+        assert!(carry.is_empty());
+        let failed = carry.take_frame(b"abc", |_| Err(Errno::IO));
+        assert!(matches!(failed, Err(RpcError::Io(_))));
+        assert!(carry.is_empty());
+    }
 
     /// On the smallest send buffer a socket can have: whole or nothing, fd included (module doc).
     #[cfg(any(target_os = "linux", target_os = "android"))]

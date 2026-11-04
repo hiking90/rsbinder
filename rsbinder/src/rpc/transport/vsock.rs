@@ -38,6 +38,7 @@ pub struct VsockTransport {
     desc: String,
     reads: ReadDeadline,
     queue: OutQueue,
+    carry: super::unix::Carry,
 }
 
 impl std::fmt::Debug for VsockTransport {
@@ -93,6 +94,7 @@ impl VsockTransport {
             desc,
             reads: ReadDeadline::default(),
             queue: OutQueue::default(),
+            carry: super::unix::Carry::default(),
         })
     }
 }
@@ -106,7 +108,8 @@ impl RpcTransport for VsockTransport {
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
         use std::os::fd::AsFd;
         // vsock is Linux and Android only, where every send waits in `poll`.
-        super::unix::send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, &[], None)
+        let sock = self.stream.as_fd();
+        super::unix::send_raw_no_fds(sock, &self.queue, &self.carry, buf, &[], None)
     }
 
     /// Raw, unframed read: `read_raw`, as `UnixTransport::recv_raw`.
@@ -125,7 +128,37 @@ impl RpcTransport for VsockTransport {
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
         use std::os::fd::AsFd;
-        super::unix::send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, fds, Some(drain))
+        let sock = self.stream.as_fd();
+        super::unix::send_raw_no_fds(sock, &self.queue, &self.carry, buf, fds, Some(drain))
+    }
+
+    fn __send_no_wait(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        use std::os::fd::AsFd;
+        let sock = self.stream.as_fd();
+        Some(super::unix::send_no_wait_no_fds(
+            sock,
+            &self.carry,
+            buf,
+            fds,
+        ))
+    }
+
+    fn __carrying(&self) -> bool {
+        !self.carry.is_empty()
+    }
+
+    fn __flush_carried(&self) -> RpcResult<()> {
+        use std::os::fd::AsFd;
+        self.carry.flush(self.stream.as_fd(), &self.queue, None)
+    }
+
+    fn __wait_for_room(&self) -> RpcResult<bool> {
+        use std::os::fd::AsFd;
+        super::unix::wait_for_room(self.stream.as_fd(), &self.queue)
     }
 
     fn peer_identity(&self) -> PeerIdentity {

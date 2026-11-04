@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::unix::send_raw_no_fds;
+use super::unix::{send_no_wait_no_fds, send_raw_no_fds, wait_for_room, Carry};
 use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
@@ -48,6 +48,7 @@ pub struct TcpDebugTransport {
     desc: String,
     reads: ReadDeadline,
     queue: OutQueue,
+    carry: Carry,
 }
 
 impl std::fmt::Debug for TcpDebugTransport {
@@ -80,6 +81,7 @@ impl TcpDebugTransport {
             desc,
             reads: ReadDeadline::default(),
             queue: OutQueue::default(),
+            carry: Carry::default(),
         })
     }
 
@@ -146,7 +148,33 @@ impl RpcTransport for TcpDebugTransport {
         fds: &[std::os::fd::BorrowedFd<'_>],
         drain: &mut dyn FnMut() -> RpcResult<()>,
     ) -> RpcResult<()> {
-        send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, fds, Some(drain))
+        let sock = self.stream.as_fd();
+        send_raw_no_fds(sock, &self.queue, &self.carry, buf, fds, Some(drain))
+    }
+
+    fn __send_no_wait(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        Some(send_no_wait_no_fds(
+            self.stream.as_fd(),
+            &self.carry,
+            buf,
+            fds,
+        ))
+    }
+
+    fn __carrying(&self) -> bool {
+        !self.carry.is_empty()
+    }
+
+    fn __flush_carried(&self) -> RpcResult<()> {
+        self.carry.flush(self.stream.as_fd(), &self.queue, None)
+    }
+
+    fn __wait_for_room(&self) -> RpcResult<bool> {
+        wait_for_room(self.stream.as_fd(), &self.queue)
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android
@@ -156,7 +184,14 @@ impl RpcTransport for TcpDebugTransport {
     /// wraps an `AF_INET` fd in this transport and goes straight into the
     /// android-13+ handshake, whose first byte is a raw write.
     fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-        send_raw_no_fds(self.stream.as_fd(), &self.queue, buf, &[], None)
+        send_raw_no_fds(
+            self.stream.as_fd(),
+            &self.queue,
+            &self.carry,
+            buf,
+            &[],
+            None,
+        )
     }
 
     /// Raw, unframed read: `read_raw`, shared by the stream backends.
@@ -270,6 +305,71 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = server.recv_raw(&mut buf).expect("recv_raw");
         assert_eq!(&buf[..n], b"\x01\x02\x03");
+    }
+
+    /// `len` bytes from `peer`, whatever the reads they take.
+    fn read_all(peer: &TcpDebugTransport, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        let mut read = 0;
+        while read < len {
+            let n = peer.recv_raw(&mut bytes[read..]).expect("the peer's read");
+            assert!(n > 0, "the end of stream after {read} of {len} bytes");
+            read += n;
+        }
+        bytes
+    }
+
+    /// A pair whose sender put 100 bytes of `FRAME` on the socket and carries the rest.
+    fn pair_carrying_part_of_a_frame() -> (TcpDebugTransport, TcpDebugTransport) {
+        let (sender, peer) = TcpDebugTransport::pair_loopback().expect("loopback pair");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer timeout");
+        let sock = sender.stream.as_fd();
+        let mut first = true;
+        let taken = sender.carry.take_frame(&FRAME, |rest| {
+            if std::mem::take(&mut first) {
+                rustix::net::send(sock, &rest[..100], super::super::unix::SEND_FLAGS)
+            } else {
+                Err(rustix::io::Errno::AGAIN)
+            }
+        });
+        assert!(matches!(taken, Ok(true)));
+        assert!(sender.__carrying());
+        (sender, peer)
+    }
+
+    const FRAME: [u8; 2048] = [5; 2048];
+
+    /// A later send writes what a no-wait send left first, so no frame is cut.
+    #[test]
+    fn a_later_send_writes_what_a_no_wait_send_left_first() {
+        let (sender, peer) = pair_carrying_part_of_a_frame();
+        sender.send_raw(b"tail").expect("the send");
+        let read = read_all(&peer, FRAME.len() + 4);
+        assert_eq!(read[..FRAME.len()], FRAME);
+        assert_eq!(&read[FRAME.len()..], b"tail");
+        assert!(!sender.__carrying());
+    }
+
+    /// `__flush_carried` alone finishes the frame, for a stream with nothing to write next.
+    #[test]
+    fn a_flush_finishes_what_a_no_wait_send_left() {
+        let (sender, peer) = pair_carrying_part_of_a_frame();
+        sender.__flush_carried().expect("the flush");
+        assert_eq!(read_all(&peer, FRAME.len()), FRAME);
+        assert!(!sender.__carrying());
+    }
+
+    /// While part of a frame is carried, a no-wait send takes no other frame.
+    #[test]
+    fn a_no_wait_send_takes_no_frame_while_part_of_one_is_carried() {
+        let (sender, peer) = pair_carrying_part_of_a_frame();
+        assert!(matches!(sender.__send_no_wait(b"x", &[]), Some(Ok(false))));
+        sender.__flush_carried().expect("the flush");
+        assert!(matches!(sender.__send_no_wait(b"x", &[]), Some(Ok(true))));
+        let read = read_all(&peer, FRAME.len() + 1);
+        assert_eq!(read[..FRAME.len()], FRAME);
+        assert_eq!(read[FRAME.len()], b'x');
     }
 
     #[test]

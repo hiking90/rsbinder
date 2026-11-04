@@ -222,6 +222,18 @@ impl RpcTransport for MemTransport {
         self.push(buf)
     }
 
+    /// An unbounded channel has room for every frame.
+    fn __send_no_wait(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        if !fds.is_empty() {
+            return Some(Err(super::cannot_pass_fds()));
+        }
+        Some(self.send_raw(buf).map(|()| true))
+    }
+
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         if buf.is_empty() {
             return Ok(0);
