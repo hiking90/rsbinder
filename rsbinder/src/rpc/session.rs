@@ -1930,7 +1930,7 @@ mod slot_pool {
         pub(super) role: SlotRole,
         /// AOSP `allowNested`: set only while a twoway dispatched here runs; the peer reads then.
         pub(super) allow_nested: bool,
-        /// Held by a serve loop (`find_conn_pinned`), which keeps it while the peer is quiet.
+        /// A serve loop runs on it, frame after frame, and keeps it while the peer is quiet.
         pub(super) serving: bool,
         /// `DEC_STRONG`s held for this slot's next `REPLY`; module doc "Deferred `DEC_STRONG`".
         pub(super) pending_dec: std::collections::HashMap<RpcAddress, u32>,
@@ -2138,7 +2138,6 @@ impl Drop for ConnGuard<'_> {
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
             if let Some(s) = st.slots.iter_mut().find(|s| s.id == self.slot_id) {
                 s.exclusive_tid = None;
-                s.serving = false;
             }
             drop(st);
             self.inner.slot_cv.notify_all();
@@ -2716,6 +2715,14 @@ impl RpcSessionInner {
         self.slot_cv.notify_all();
     }
 
+    /// A serve loop starts or ends on `slot_id`.
+    fn mark_slot_serving(&self, slot_id: u64, serving: bool) {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        if let Some(slot) = st.slots.iter_mut().find(|s| s.id == slot_id) {
+            slot.serving = serving;
+        }
+    }
+
     /// A worker's own slot, reentrant via `DRIVING`; `DeadObject` once the session ended.
     fn find_conn_pinned(&self, want_slot_id: u64) -> Result<ConnGuard<'_>> {
         let tid = current_tid();
@@ -2747,7 +2754,6 @@ impl RpcSessionInner {
                 return Err(StatusCode::DeadObject);
             };
             if slot.exclusive_tid.is_none() || slot.exclusive_tid == Some(tid) {
-                slot.serving = true;
                 return Ok(self.claim_slot(slot, tid));
             }
             #[cfg(test)]
@@ -5667,6 +5673,7 @@ impl RpcSession {
             return SessionEnd::new(EndReason::SessionEnded, ended_locally, false);
         }
         declared.fetch_add(1, Ordering::SeqCst);
+        self.inner.mark_slot_serving(slot_id, true);
         // Only an armed deadline of ours makes a `TimedOut` an idle eviction (`SessionEnd::new`).
         let baseline_deadline = self.inner.slot_baseline_read_deadline(slot_id).is_some();
         let (reason, deadline_armed) = {
@@ -5722,6 +5729,7 @@ impl RpcSession {
                 }
             }
         };
+        self.inner.mark_slot_serving(slot_id, false);
         // Read before this worker's own teardown below, which is never a local decision.
         let end = SessionEnd::new(
             reason,
@@ -8535,6 +8543,37 @@ mod tests {
             .map(|s| s.pending_dec.len());
         drop(st);
         assert_eq!(held, Some(1), "not held on the pin");
+        session.close_session();
+    }
+
+    /// A frame served does not end the mark: between two frames the loop is still on the slot.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_serve_loop_stays_marked_between_its_frames() {
+        use crate::rpc::transport::UnixTransport;
+        let (t0, peer) = UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = session.inner.clone();
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        inner.mark_slot_serving(slot_id, true);
+        let codec = Android13PlusCodec::android14_15();
+        let mut counter = 0;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        let (frame, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
+        peer.send_raw(&frame).expect("a frame for the serve loop");
+        assert!(matches!(
+            inner.serve_once_on_slot(slot_id),
+            ServeStep::Continue
+        ));
+        let st = inner.conn_state.lock().expect("conn_state");
+        assert!(st.slots.iter().all(|s| s.id != slot_id || s.serving));
+        drop(st);
         session.close_session();
     }
 
