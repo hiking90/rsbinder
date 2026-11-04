@@ -26,6 +26,15 @@ bad() {
 same() { # WHAT WANTED GOT
     if [ "$2" = "$3" ]; then ok "$1"; else bad "$1: wanted '$2', got '$3'"; fi
 }
+running_container() { # the name, once this run's one container is up; nothing after 10 s
+    local tries=0 name=
+    until name=$(docker ps --filter "label=$LABEL" --format '{{.Names}}'); [ -n "$name" ]; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 500 ] || break
+        sleep 0.02
+    done
+    echo "$name"
+}
 
 "$RUN" --no-binder -- true
 status=$?
@@ -56,12 +65,7 @@ same "the repository is read-only" 0 $?
 # Far longer than the wait below: only the trap can end this run in time, not the command.
 "$RUN" --no-binder -- sleep 300 >/dev/null 2>&1 &
 runner=$!
-tries=0
-until [ -n "$(docker ps --filter "label=$LABEL" --format '{{.Names}}')" ]; do
-    tries=$((tries + 1))
-    [ "$tries" -lt 500 ] || break
-    sleep 0.02
-done
+running_container >/dev/null
 kill -TERM "$runner"
 tries=0
 while kill -0 "$runner" 2>/dev/null && [ "$tries" -lt 3000 ]; do
@@ -82,6 +86,17 @@ same "no container left after a run that was signalled" "" \
 "$RUN" --no-binder --as-root -- sh -c 'exit 3'
 same "no container left after a failed command" "" \
     "$(docker ps -a --filter "label=$LABEL" --format '{{.Names}}')"
+
+# The command ends as a `sleep`, which reaps nothing: only a PID 1 above it can reap the orphan.
+"$RUN" --no-binder -- sh -c 'sh -c "sleep 0.1 >/dev/null 2>&1 &"; exec sleep 300' >/dev/null 2>&1 &
+runner=$!
+name=$(running_container)
+sleep 1
+out=$(docker exec "$name" sh -c 'grep -l "^State:[[:space:]]*Z" /proc/[0-9]*/status 2>/dev/null
+    echo done')
+same "an orphan does not stay a zombie" done "$out"
+kill -TERM "$runner"
+wait "$runner"
 
 if [ -x target/debug/rsb_device ] && grep -q binder /proc/filesystems; then
     device_mode=$(stat -c '%a %t:%T' /dev/binderfs/binder 2>/dev/null)

@@ -64,7 +64,6 @@ fi
 
 options=(
     --rm
-    --init
     --label "$LABEL"
     --label "$LABEL.run=${RSB_CONTAINER_RUN:-}"
     --tmpfs /tmp:mode=1777,exec

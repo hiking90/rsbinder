@@ -1,6 +1,6 @@
 #!/bin/sh
-# Inside the container of run.sh: prepare what the run asks for, then be COMMAND.
-# A failure here is 125, which run.sh documents as a setup failure.
+# Inside the container of run.sh: prepare what the run asks for, then run COMMAND and end with its
+# exit code. A failure in the preparing is 125, which run.sh documents as a setup failure.
 set -u
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -24,7 +24,10 @@ if [ "$RSB_CONTAINER_BINDER" = 1 ]; then
     [ -w /dev/binderfs/binder ] || setup_failed "no writable /dev/binderfs/binder"
 fi
 
+# No `exec`: PID 1 reaps orphans, and `--init`'s /sbin/docker-init is under the host's /usr here.
 if [ "$RSB_CONTAINER_USER" = 0 ]; then
-    exec "$@"
+    "$@"
+else
+    setpriv --reuid="$RSB_CONTAINER_USER" --regid="$RSB_CONTAINER_USER" --clear-groups -- "$@"
 fi
-exec setpriv --reuid="$RSB_CONTAINER_USER" --regid="$RSB_CONTAINER_USER" --clear-groups -- "$@"
+exit $?
