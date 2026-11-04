@@ -253,8 +253,7 @@ pub struct RpcState {
     remote_books: HashMap<RpcAddress, RemoteBook>,
     /// Sends of a peer address the peer has not paid back yet; present only while one is unpaid.
     remote_sends: HashMap<RpcAddress, RemoteSends>,
-    /// A release went nowhere ([`drop_receipts`](Self::drop_receipts)): a peer's node can outlive
-    /// its book from now on, so a book that numbered a oneway stays until the session ends.
+    /// A release went nowhere: "Send-side async numbers" says what that keeps.
     release_dropped: bool,
     /// How many addresses may have an unpaid send when a no-wait oneway adds one; `None`: any.
     unpaid_address_limit: Option<usize>,

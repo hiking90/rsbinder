@@ -868,10 +868,11 @@ fn t9_a_proxy_release_waits_for_the_owners_receipt() {
     }
 }
 
-/// T10: at v2 a proxy argument is a send too; below v2 the owner pays only what it reads.
+/// T10: a proxy argument is a send on every wire, so the target and it are two to pay.
 #[test]
 fn t10_a_proxy_argument_counts_on_every_wire() {
-    for (version, sends) in [(1, 2), (PROTOCOL_V2, 2)] {
+    let sends = 2;
+    for version in [1, PROTOCOL_V2] {
         let (client, mut raw, target, root) = raw_owner(version);
         let mut d = rpc_of(&root).request_parcel(DESC).expect("request");
         d.write(&Some(root.clone())).expect("argument");

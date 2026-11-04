@@ -397,8 +397,8 @@
 //!    keeps this handler out of a write that only the peer's next send could unblock. A peer
 //!    reads nothing there while it sends nothing, and some never drain: libbinder from
 //!    android-16.0.0_r4 with incoming threads, android-12. A serve loop back at its read has no
-//!    reply to come on the slot, so while the session has an `Outgoing` slot and the reaper owes
-//!    under the limit, it hands the hold to the reaper (step 4). A
+//!    reply to come on the slot, so while the session has an `Outgoing` slot no serve loop reads
+//!    and the reaper owes under the limit, it hands the hold to the reaper (step 4). A
 //!    peer that sends only oneways, with no callback connection, gets the held `DEC_STRONG`s
 //!    with its next twoway on that connection. A hold dies with its slot, which leaves the pool
 //!    only with the session, and a session end resets the peer's counts anyway. The peer picks
@@ -3398,7 +3398,7 @@ impl RpcSessionInner {
                         return Err(StatusCode::InvalidOperation);
                     }
                     let addr = rp.address();
-                    // AOSP `onBinderLeaving` on every wire: the release waits for the peer's payment.
+                    // AOSP `onBinderLeaving` on every wire: the release waits for the payment.
                     self.shared
                         .state
                         .lock()
@@ -4229,12 +4229,13 @@ impl RpcSessionInner {
         }
     }
 
-    /// Before a serve loop's read: no reply need follow on this slot, so the reaper writes the hold.
+    /// Before a serve loop's read: no reply need follow on this slot, so the reaper takes the hold.
     fn hand_held_to_reaper(&self, slot_id: u64) {
         let mut guard = self.conn_state.lock().expect("conn_state poisoned");
         let st = &mut *guard;
-        // Without an `Outgoing` slot the amount would be dropped, and the hold can still go out.
-        if !st.slots.iter().any(|s| s.role == SlotRole::Outgoing) {
+        // A serve loop's `Outgoing` slot waits for the peer's frame, and none drops the amount.
+        let writable = |s: &ConnSlot| s.role == SlotRole::Outgoing && !s.serving;
+        if !st.slots.iter().any(writable) {
             return;
         }
         let Some(slot) = st
@@ -4554,7 +4555,7 @@ impl RpcSessionInner {
         let _nested = AllowNestedGuard::arm(self, !oneway);
         let (mut reader, entered) = self.receive_parcel(t.data, t.object_positions, in_fds);
         if let Err(e) = entered {
-            // AOSP ends the session on most of these; this one keeps the connection, its frame read.
+            // AOSP ends the session on most of these; this keeps the connection, its frame read.
             log::error!("RPC: a transaction's objects failed validation ({e:?}); refused");
             return if oneway {
                 Ok(())
@@ -8502,7 +8503,25 @@ mod tests {
         assert_eq!(held(), Some(1), "the reaper would drop it with no slot");
 
         let (t, callback) = UnixTransport::pair().expect("socketpair");
-        session.add_callback_slot(Box::new(t), 2).expect("a slot");
+        let added = session.add_callback_slot(Box::new(t), 2).expect("a slot");
+        let mark_serving = |serving: bool| {
+            let mut st = inner.conn_state.lock().expect("conn_state");
+            let slot = st.slots.iter_mut().find(|s| s.id == added).expect("slot");
+            slot.serving = serving;
+        };
+        mark_serving(true);
+        peer.send_raw(&frame).expect("a frame for the serve loop");
+        assert!(matches!(
+            inner.serve_once_on_slot(slot_id),
+            ServeStep::Continue
+        ));
+        assert_eq!(
+            held(),
+            Some(1),
+            "the reaper would wait for the peer's frame"
+        );
+
+        mark_serving(false);
         peer.send_raw(&frame).expect("a frame for the serve loop");
         assert!(matches!(
             inner.serve_once_on_slot(slot_id),

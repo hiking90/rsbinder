@@ -1055,7 +1055,8 @@ fn a_holder_relay_is_refused_without_binder_positions() {
         assert_eq!(p.server.local_node_count(), 2, "{wire:?}: root + child");
         // The handler read no binder and these wires enter none: AOSP keeps `sentRef` the same way.
         drop(child);
-        thread::sleep(std::time::Duration::from_millis(200));
+        // A release would be on this one connection ahead of the ping, and read first.
+        assert_eq!(p.root.ping_binder(), Ok(()), "{wire:?}");
         assert_eq!(p.server.local_node_count(), 2, "{wire:?}: released unpaid");
         p.finish();
     }
