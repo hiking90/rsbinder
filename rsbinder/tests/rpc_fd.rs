@@ -374,6 +374,46 @@ fn fd_rejected_on_non_uds_transport() {
     let _ = h.join();
 }
 
+/// A server that takes no fds refuses a parcel naming one before any handler, and keeps serving.
+#[test]
+fn a_parcel_naming_an_fd_that_did_not_arrive_is_refused_before_the_handler() {
+    for ver in [1u32, 2u32] {
+        let path = tmp_sock(&format!("no_fds_v{ver}"));
+        let server = RpcServer::setup_unix_server(&path).expect("bind");
+        server.set_android13plus(ver);
+        server.set_supported_fd_modes(&[FdMode::Unix]);
+        server.set_receive_fds(false);
+        server
+            .set_root(Interface::as_binder(&Binder::new(BnFd(Box::new(FdSvc)))))
+            .expect("set_root");
+        let bg = server.run_background().expect("run_background");
+        wait_sock(&path);
+
+        let client = RpcSession::setup_unix_client_android13plus_fd(&path, ver, FdMode::Unix)
+            .expect("android-13+ fd connect");
+        let root = client.get_root().expect("get_root");
+        let pfd = ParcelFileDescriptor::new(tempfile());
+        let rp = rp_of(&root);
+        let mut d = rp.prepare_request(DESC).unwrap();
+        d.write(&pfd).unwrap();
+        assert_eq!(
+            rp.submit_transact(TX_LEN_OF, &d, 0).err(),
+            Some(StatusCode::BadValue),
+            "v{ver}"
+        );
+        assert_eq!(
+            root.ping_binder(),
+            Ok(()),
+            "v{ver}: the session still serves"
+        );
+
+        drop(root);
+        drop(client);
+        let _ = bg.stop_and_join();
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// v1 and v2 AOSP-framed fd round-trip, arg and reply; see module doc "v1+ AOSP-faithful path".
 #[test]
 fn fd_v1plus_aosp_roundtrip_both_directions() {

@@ -1294,9 +1294,11 @@ impl RpcServer {
     /// `true`.
     ///
     /// With `false` a session reads with no room for ancillary data, so the kernel closes what a
-    /// peer sent as the bytes it came with are read, and no such fd is ever in this process. An
-    /// fd a parcel names reads as one that was not sent: the read fails, and a handler that reads
-    /// none runs. What this server sends does not change: fds go out in the mode
+    /// peer sent as the bytes it came with are read, and no such fd is ever in this process. At
+    /// wire v1 and above a parcel that names an fd then names one that did not arrive, so the call
+    /// fails with [`BadValue`](crate::StatusCode::BadValue) and no handler runs. On the wires with
+    /// no object table (r34, v0) the fd's read fails instead, and a handler that reads none runs.
+    /// What this server sends does not change: fds go out in the mode
     /// [`set_supported_fd_modes`] agreed. `FD_PASSING` in `caps` and `calling_caps` speaks for
     /// that direction only, so it stays set, and the peer cannot tell that its fds were closed.
     ///

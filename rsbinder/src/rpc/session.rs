@@ -3552,12 +3552,13 @@ impl RpcSessionInner {
             self.fd_mode(),
             self.records_fd_positions(),
         );
+        let received_fds = in_fds.len();
         p.rpc_set_in_fds(in_fds);
         // After `configure_rpc` (RPC mode), so binder/FD reads validate positions.
         p.rpc_set_object_positions(object_positions);
         p.rpc_mark_received();
-        let entered = if self.profile.records_binder_positions() {
-            self.enter_every_binder(&mut p)
+        let entered = if self.profile.records_fd_positions() {
+            self.validate_objects(&mut p, received_fds)
         } else {
             Ok(())
         };
@@ -3566,23 +3567,27 @@ impl RpcSessionInner {
     }
 
     /// AOSP android-16.0.0_r4 `rpcSetDataReference` object loop, going on past a failure.
-    fn enter_every_binder(&self, p: &mut Parcel) -> Result<()> {
+    fn validate_objects(&self, p: &mut Parcel, received_fds: usize) -> Result<()> {
         use super::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
         const TYPE_BINDER: i32 = 1;
         let mut result = Ok(());
+        let mut named_fds = 0;
         // By index: reading a binder never changes the table, and `read_binder` looks it up.
         for i in 0..p.rpc_object_positions().len() {
             let pos = p.rpc_object_positions()[i];
             p.set_data_position(pos as usize);
             // A skipped position's `timesSent` would stay with the peer for the session's life.
             let entered = match p.read::<i32>() {
-                Ok(TYPE_BINDER) => {
+                Ok(TYPE_BINDER) if self.profile.records_binder_positions() => {
                     p.set_data_position(pos as usize);
                     self.read_binder(p).map(drop)
                 }
-                Ok(TYPE_NATIVE_FILE_DESCRIPTOR) => Ok(()),
+                Ok(TYPE_NATIVE_FILE_DESCRIPTOR) => {
+                    named_fds += 1;
+                    Ok(())
+                }
                 Ok(other) => {
-                    log::error!("RPC: object position {pos} holds unknown type {other}");
+                    log::error!("RPC: object position {pos} holds type {other}, not on this wire");
                     Err(StatusCode::BadValue)
                 }
                 Err(e) => Err(e),
@@ -3590,6 +3595,10 @@ impl RpcSessionInner {
             if let (Ok(()), Err(e)) = (&result, entered) {
                 result = Err(e);
             }
+        }
+        if result.is_ok() && named_fds != received_fds {
+            log::error!("RPC: a parcel names {named_fds} fds and came with {received_fds}");
+            result = Err(StatusCode::BadValue);
         }
         result
     }
@@ -4532,8 +4541,8 @@ impl RpcSessionInner {
         let _nested = AllowNestedGuard::arm(self, !oneway);
         let (mut reader, entered) = self.receive_parcel(t.data, t.object_positions, in_fds);
         if let Err(e) = entered {
-            // AOSP ends the session here; this one keeps the connection, whose frame was read.
-            log::error!("RPC: a transaction's binder could not be entered ({e:?}); refused");
+            // AOSP ends the session on most of these; this one keeps the connection, its frame read.
+            log::error!("RPC: a transaction's objects failed validation ({e:?}); refused");
             return if oneway {
                 Ok(())
             } else {
@@ -11672,6 +11681,39 @@ mod tests {
                 assert_eq!(sent_back, word, "{wire} {stability:?} word");
             }
         }
+    }
+
+    /// AOSP `rpcSetDataReference`: the fds a parcel names are the fds it came with, from v1 on.
+    #[test]
+    fn a_parcel_that_names_other_fds_than_it_came_with_is_refused() {
+        use crate::rpc::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
+        let fd = || -> OwnedFd { std::fs::File::open("/dev/null").expect("a file").into() };
+        let fd_object = || {
+            let mut data = TYPE_NATIVE_FILE_DESCRIPTOR.to_le_bytes().to_vec();
+            data.extend_from_slice(&0i32.to_le_bytes());
+            data
+        };
+        let session = parcel_session(WireProfile::Android13Plus(
+            Android13PlusCodec::android14_15(),
+        ));
+        let entered = |data: Vec<u8>, positions: Vec<u32>, fds: Vec<OwnedFd>| {
+            session.inner.receive_parcel(data, positions, fds).1
+        };
+        assert_eq!(entered(fd_object(), vec![0], vec![fd()]), Ok(()));
+        assert_eq!(entered(vec![0; 8], vec![], vec![]), Ok(()));
+        let refused = Err(StatusCode::BadValue);
+        assert_eq!(entered(fd_object(), vec![0], vec![]), refused, "none came");
+        assert_eq!(entered(vec![0; 8], vec![], vec![fd()]), refused, "unnamed");
+        let two = vec![fd(), fd()];
+        assert_eq!(entered(fd_object(), vec![0], two), refused, "one too many");
+
+        let binder = 1i32.to_le_bytes().to_vec();
+        assert_eq!(entered(binder, vec![0], vec![]), refused, "a binder at v1");
+
+        // No object table to count: an fd's read says what is missing.
+        let session = parcel_session(WireProfile::R34(R34Codec));
+        let received = session.inner.receive_parcel(vec![0; 8], vec![], vec![fd()]);
+        assert_eq!(received.1, Ok(()));
     }
 
     /// `UNDECLARED` and a re-read own word fill nothing: unset until a declared word arrives.

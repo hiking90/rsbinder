@@ -78,8 +78,8 @@
 //! - T5: drop the `rpc_received_at` branch in `read_binder` (R4: the spurious `DEC_STRONG`
 //!   frees the server's root and the next call is `DeadObject`), or the send-state check for
 //!   a proxy in `write_binder` (R6).
-//! - T6: skip `enter_every_binder` in `receive_parcel` (R3).
-//! - T7: stop `enter_every_binder` at the first failure.
+//! - T6: skip `validate_objects` in `receive_parcel` (R3).
+//! - T7: stop `validate_objects` at the first failure.
 //! - T8: let `dec_route` take an `Incoming` pin whatever its `allow_nested`; both halves fail:
 //!   the first reads `DEC_STRONG`s ahead of the reply, and in the second the pin still comes
 //!   first, so none comes over the callback connection.
