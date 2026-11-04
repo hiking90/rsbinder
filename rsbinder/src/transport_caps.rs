@@ -137,6 +137,19 @@ impl TransportCaps {
     /// every bit.
     pub const KERNEL: Self = Self(0b1_1111);
 
+    /// Not part of the API: what a call on `binder` has. An RPC proxy answers from its session;
+    /// anything else is local or kernel and always callable.
+    #[doc(hidden)]
+    pub fn __of_binder(binder: &crate::SIBinder) -> Self {
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            return proxy.session_caps();
+        }
+        #[cfg(not(feature = "rpc"))]
+        let _ = binder;
+        Self::KERNEL
+    }
+
     /// Whether every bit in `other` is set here. `contains(NONE)` is
     /// always true.
     pub const fn contains(self, other: Self) -> bool {

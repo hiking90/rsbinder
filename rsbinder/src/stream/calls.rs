@@ -521,7 +521,6 @@ impl<T: Serialize + ?Sized> Producer<T> {
             log::error!("Sink::open: the opening window must be 1..=i32::MAX batches");
             return Err(StatusCode::BadValue);
         };
-        super::peer_caps(sink).require(crate::TransportCaps::CALLBACKS, "a streaming sink")?;
         let peer = resolve_peer::<dyn IStreamSink>(
             sink,
             <BpStreamSink as crate::Proxy>::descriptor(),

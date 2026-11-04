@@ -289,7 +289,7 @@ way for a subscriber to know who listens there.
 A session of your own also works: `Subscriber::request` takes the root binder of
 a session opened with an incoming connection and `FileDescriptorTransportMode::Unix`,
 and refuses what cannot work: `InvalidOperation` for a session with no incoming
-connection, on which it would not hear of its publisher's death, and
+connection, on which the publisher could not tell it of an eviction, and
 `FdsNotAllowed` for one that passes no fds, TCP and vsock among them. Keep such
 a session open for as long as the subscriber.
 
