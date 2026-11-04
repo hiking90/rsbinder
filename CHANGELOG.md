@@ -22,7 +22,8 @@ observes. The book's
 [Migrating from 0.12 to 0.13](https://hiking90.github.io/rsbinder/migrating-0.13.html)
 says what to change for each, under the same headings. Items marked
 **wire** change bytes between peers; an rsbinder peer of either release
-accepts both the 0.12.0 bytes and the new ones.
+accepts both the 0.12.0 bytes and the new ones; the oneway number's entry
+says what a peer does with the 0.12.0 value.
 
 **Typed casts and interface descriptors**
 
@@ -258,6 +259,25 @@ accepts both the 0.12.0 bytes and the new ones.
   them as a clean end (`EndOfStream`). A `sendmsg` with fds that takes
   nothing is `WriteZero` on Apple too; 0.12.0 returned `EndOfStream`
   there.
+- The last drop of an RPC proxy does not wait for the peer on a plain Unix
+  socket (`UnixTransport`) on Linux and Android, and on no transport runs death
+  recipients on the dropping thread. With no room, a handler's own connection
+  holds the `DEC_STRONG` for its next reply, and any other waits for the session's
+  reaper thread, so it can come after the next reply.
+- A frame's fds refused for too many in flight for the uid (`ETOOMANYREFS`) are
+  `RpcError::Protocol` and fail that call with `StatusCode::RpcError`, and a reply
+  that had them fails the peer's call with `FAILED_TRANSACTION`, where 0.12.0 ended
+  the session on the transport error.
+- A oneway refused before any byte (`FrameTooLarge`, `Protocol`) ends the session
+  if another thread has already reserved the proxy's next async number, where
+  0.12.0 left a gap that held back later oneways to that address at the peer.
+- `RpcSession::new` and the session setups fail when the process cannot spawn
+  the session's thread, where 0.12.0 logged it and lost deferred `DEC_STRONG`s.
+- **wire**: a oneway on an RPC proxy of an address received again before the
+  last proxy's `DEC_STRONG` was written carries the number the peer's node
+  expects, not 0, and runs at the peer. The frame's format is the same. An
+  rsbinder peer of either release runs the new number and still drops a 0.12.0
+  sender's, as 0.12.0 did.
 
 **Streams and topics**
 
@@ -271,8 +291,6 @@ accepts both the 0.12.0 bytes and the new ones.
   for, instead of `BadType`.
 - A stream consumer accepts an `onStart` from a source of another interface
   nothing has asked for, instead of ending with `BadType`.
-- A topic registry accepts the `advertise` of a binder of another interface;
-  its subscribers get `BadType`.
 
 **Fast Message Queue (`rsbinder-fmq`)**
 
@@ -319,7 +337,8 @@ accepts both the 0.12.0 bytes and the new ones.
   not `DeadObject`.
 - `rsbinder-tools`: `config::Config`, `FileContents` and `ConfigError` are
   `#[non_exhaustive]` and have topic fields and variants; three messages
-  change wording.
+  change wording, and `rsb_service`'s hint after a denial begins "The hub's
+  policy denies this to uid" (0.12.0: "The service manager's policy").
 - `rsb_hub` treats a service as an accessor by its `[[service]]` `accessor`
   key, not by the `android.os.IAccessor` descriptor; under
   `--insecure-allow-all` no binder is an accessor.
@@ -335,6 +354,10 @@ accepts both the 0.12.0 bytes and the new ones.
   the program spawns itself, outside `config::SystemRunner`, inherits it.
 - `rsb_hub`'s filtered `dump` counts in `hidden by policy` every name the
   policy withholds from the caller, not only the names the filter matches.
+- `rsb_hub` answers a `dump` before the dump is written, so the call's return
+  is not the dump's end, and answers a `dump` during another `WOULD_BLOCK`.
+- A service `rsb_hub` starts runs with no signal blocked: a `SIGHUP`, `SIGINT`
+  or `SIGTERM` it has no handler for ends it.
 
 ### Added
 
@@ -452,7 +475,9 @@ accepts both the 0.12.0 bytes and the new ones.
   connects through an `O_PATH` descriptor of the socket's file, which may be
   unlinked: the session owns the descriptor, so all its connections go to one
   socket. `RpcSession::peer_identity` is who is at the other end of the
-  founding connection.
+  founding connection. `RpcServer::set_receive_fds(false)` has the kernel close
+  the fds a peer sends, for a server whose calls take none, while it goes on
+  sending fds.
 - **`rsbinder-topic`, a new crate (Experimental)**: one publisher and many
   subscribers over kernel binder, on Linux and Android. A binder call sets
   each subscription up; the records then travel through a ring in a sealed
@@ -466,8 +491,9 @@ accepts both the 0.12.0 bytes and the new ones.
     check who listens by `SO_PEERCRED`. `registry::uds::UdsResolver` finds a
     topic by name through a registry on a socket, `registry::uds::UdsRegistry`
     with a `SocketDir` to serve one. `Resolver::watch_resolved` and `Resolved`
-    carry what a binder needs kept alive; the default keeps nothing, so a
-    resolver of the application's own is unchanged.
+    carry what a binder needs kept alive, and a publisher given up on with no
+    binder; the default keeps nothing, so a resolver of the application's own
+    need not implement `watch_resolved`.
   - `Publisher<T>` and `Subscriber<T>` for any parcelable or `Bytes`
     (`Payload`). A publish never waits: a subscriber that falls a ring
     behind gets `RecvError::Lagged` with the number it lost. With
@@ -562,8 +588,14 @@ accepts both the 0.12.0 bytes and the new ones.
   and reloads. With the feature `rpc` too, `rsb_hub --topic-socket PATH` serves
   the registry on a Unix socket with no binder device, under the same rules,
   and warns of the `[[rule]]`, `[[service]]` and `[global] list` it does not
-  use; `rsb_service topics --topic-socket PATH` lists its names. In the library:
-  `config::TopicPolicy`, `TopicRule`, `TopicPermission` and
+  use; `rsb_service topics --topic-socket PATH` lists its names. The hub starts
+  only on a directory of its own for the socket's files (mode 0700, nothing in it
+  but what a crash of a hub left), and runs at most 1024 serve workers, one to a
+  session and five descriptors to each, fewer once half of `RLIMIT_NOFILE` does
+  not hold them (under 10 240), with a warning from under 15 152, which also holds
+  its names. In the library:
+  `config::TopicPolicy`, `TopicRule`, `TopicPermission`,
+  `config::registry_out_of_reach`, `config::unused_on_a_topic_socket` and
   `Enforcer::check_topic`.
 - **The unsynchronized FMQ flavor in `rsbinder-fmq`** (also `rsbinder::fmq`):
   `UnsyncWriter` and `UnsyncReader`, libfmq's
@@ -715,6 +747,20 @@ accepts both the 0.12.0 bytes and the new ones.
 
 ### Changed
 
+- **The last drop of an RPC proxy on a plain Unix socket waits for no peer**
+  (see *Migrating*). On Linux and Android a `DEC_STRONG` on a `UnixTransport` is
+  one `sendmsg` that puts the whole frame on the socket or nothing. With no room
+  a handler's own connection holds it for its next reply, and for any other the
+  session's reaper thread writes it once the peer reads, and a peer that takes
+  nothing for the send deadline loses the session there; 0.12.0's drop waited in
+  the write, for as long as a session with no deadline lasts. The reaper's wait
+  keeps no session alive: with no incoming connection, the last handle and proxy
+  close the connection. What the reaper owes is one sum per address, so no burst of
+  drops ends a session. Other transports (TLS over a Unix socket among them) and
+  Apple keep the write that waits. A write that fails on any transport stops the
+  session at once, so nothing follows a frame it cut, and the reaper thread runs the
+  death recipients, so a drop runs none. The frame format and the amounts' sum are
+  unchanged; the reaper's releases of one address can share a frame.
 - **An RPC handler that panics releases what its reply held before the
   reply.** The partial reply is discarded inside the handler step, so the
   `DEC_STRONG` of a proxy it held goes out ahead of the `Unknown` reply, the
@@ -957,6 +1003,15 @@ accepts both the 0.12.0 bytes and the new ones.
   queued, and the next `recv` or `recv_timeout` waited for it before reading:
   `recv_timeout` returned nothing with a record in the ring, and `recv` waited
   until a pool thread came free. The dropped future now takes such a wait back.
+- **A oneway on an RPC proxy of an address received again before the last
+  proxy's `DEC_STRONG` was written runs at the peer.** The drop of a proxy reset
+  the address's oneway number before that write, which can wait for a free
+  connection. A proxy made for the address meanwhile numbered from 0, below what
+  the peer's node, alive at that point, expects: the call returned `Ok`, and an
+  rsbinder peer dropped the oneway where a libbinder peer parked it. The number
+  now lasts until the address's last `DEC_STRONG` is on the wire. A peer that
+  sends the address again before reading that frame meets the same result, as
+  with libbinder on this side (android-17.0.0_r1 `RpcState.cpp:871-905`).
 
 ### Security
 

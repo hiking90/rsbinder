@@ -157,7 +157,7 @@ service manager does:
 | How a subscriber finds it | Starts the publisher? |
 |---|---|
 | `wait_for_interface` and the like (`getService`), then `Subscriber::request` | yes: [on-demand start](./service-manager.md#starting-a-service-on-demand) |
-| `NamedSubscriber` through the service manager | no: it uses `check_service` and registration notices |
+| `NamedSubscriber` through the service manager | `rsb_hub`: no, it uses `check_service` and registration notices; on Android 15 from `android-15.0.0_r6`, `check_service` is `getService` and can start a declared service |
 | `NamedSubscriber` through a kernel registry | no: `lookup` and `watch` start nothing |
 | `NamedSubscriber` through a hub on a socket | no, for the same reason; that hub starts no service at all |
 | `uds::subscribe` | no: a publisher has to be at the endpoint |
@@ -197,8 +197,9 @@ in [Service Manager](./service-manager.md#topic-names)):
 
 `RegistryResolver::find` fails with `NameNotFound` when the service manager
 has nothing under `rsbinder.topic.registry` or its policy does not let the
-caller find that name; the two cannot be told apart, so a hub whose `[[rule]]`
-lets nobody find the registry logs a warning as it loads. `list` returns the
+caller find that name; the two cannot be told apart, so a hub with `[[topic]]`
+rules whose `[[rule]]` lets nobody find the registry logs a warning as it loads.
+`list` returns the
 names under a prefix that the caller may subscribe to, sorted:
 
 ```rust,ignore
@@ -324,8 +325,9 @@ file and connects through `/proc/self/fd/<n>`. So:
 A name lasts until it is withdrawn, or until the `UdsResolver` that advertised
 it and all it made have dropped, which closes the session with the hub; a
 process that ends does both. `Publisher` holds one advertisement, so one
-publisher is not on a kernel registry and on a socket hub at once. Registering
-its binder with the service manager takes no advertisement and goes with either.
+publisher is not on a kernel registry and on a socket hub at once. `advertise_on`
+with any resolver, `ServiceManager` included, replaces the advertisement it has;
+`hub::add_service` of its binder takes none and goes with either.
 `rsb_service topics --topic-socket PATH` lists the names. When the hub ends, its
 names and watches end with it, as [a kernel registry's do](#when-the-hub-restarts).
 
@@ -337,26 +339,54 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   that one's calls look like its own.
 - **Resources grow per subscriber.** Kernel binder serves every peer with one
   descriptor and one thread pool. Here each subscriber's session is two sockets
-  and two threads at each end, for as long as it lasts, so a server given
-  `RpcServer::set_max_connections` needs room for two per subscriber. A process
-  using a hub has one more session with it.
-- **Sessions outlive a dropped publisher.** A dropped `Publisher` withdraws its
-  name and stops accepting, and leaves the sessions it has, so that their
-  subscribers read its end record. Each closes as its subscriber ends, or with
-  the publisher's process.
+  and two threads at each end, for as long as it lasts. The bound of
+  `RpcServer::set_max_connections`, and of the server of a `UdsResolver` given
+  `ResolverOptions::publisher_connections`, counts serve threads: one per
+  subscriber, plus one free while a subscriber's second socket attaches. A
+  process using a hub has one more session with it.
+- **Sessions outlive what ended them.** On a hub, a dropped `Publisher` withdraws
+  its name and refuses new connections, and leaves the sessions it has, so that
+  their subscribers read its end record. Each closes as its subscriber ends, or
+  with the publisher's process. In the plain form the server is yours: the handle
+  of `uds::serve` ends every session as it drops, so end the `Publisher` before the
+  handle, or its subscribers read `Closed::PublisherDied`.
 - **Death is the session's end.** The loss of any connection of a session is a
   death, and a deadline that runs out on a session ends it too, which reads as
   `Closed::PublisherDied`. The sessions topics make have a deadline while they
   are set up (`Options::timeout`, 10 s) and none afterwards; one you give
-  `Subscriber::request` keeps what you set.
+  `Subscriber::request` keeps what you set. A `NamedSubscriber`'s subscription call
+  has no deadline, so that a publisher that stopped in it is subscribed to once it
+  goes on; a new publisher of the name ends the wait. A hub keeps a 10 s deadline
+  on what it sends: a process that stopped with its socket full loses its session
+  with the hub, and the names and watches on it. A process that reads slowly keeps
+  its session and skips generations of a name; reading slowly means taking a whole
+  frame within the deadline, as a part of one does not show. No watcher holds up a
+  change or another watcher: a send takes one system call, and a notice with no room
+  is owed and sent again with the name's topic by then, as on a binder device, under
+  one bound on how many are owed. A uid allowed to `subscribe` that stops reading can
+  take that room, and a notice past it waits for the name's next change: the hub logs
+  a warning, and the count is `owed_dropped` of `UdsRegistry::stats`, which `rsb_hub`
+  on a socket does not show. Such a uid with enough stopped sessions can also pass the
+  kernel's count of descriptors in flight
+  ([Service Manager](./service-manager.md#a-hub-on-a-unix-socket)), and then every
+  notice has no room until they are read. A dropped subscriber's session closes, which
+  ends its subscription call.
+- **A publisher that stops is tried again.** A `NamedSubscriber` that cannot connect
+  to the publisher a name has connects again, once a second at first and at most
+  once in 30 seconds, until it can or the name has another publisher. A publisher
+  of another uid than `expect_publisher_uid` and a socket nobody listens on any more
+  are not tried again: the next publisher of the name ends that wait. The first is
+  told as a publisher's refusal is, by `Disconnected::Rejected` with `EX_SECURITY`
+  and `NamedState::Refused`.
 - **A full accept queue is out of reach of a deadline.** Linux has a connect into
   such a listener wait in `connect(2)` until the publisher accepts or ends. A
   stopped publisher with room in its queue is found out by the handshake instead.
 - **`uid` and `pid` depend on the namespaces.** Across user namespaces a uid with
   no mapping reads 65534 to `Authorize`, `Options::expect_uid` and a hub's policy,
-  and a pid outside this pid namespace reads 0.
+  and a pid outside this pid namespace reads -1 (`PeerIdentity::pid()` returns
+  `None`).
 - **`/proc` has to be mounted** for a hub and for `Endpoint::Fd`: a sandbox that
-  hides it can use only the plain form with a path.
+  hides it can use only the plain form, with a path or an abstract name.
 
 ## Losing records, and backpressure
 
