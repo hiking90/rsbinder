@@ -1222,7 +1222,7 @@ fn a_notice_with_no_descriptor_left_is_made_up_by_asking_the_host() {
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
 }
 
-/// A callback that panics stops one connect: later ones start, by a notice and by a lookup.
+/// A callback that panics stops one call: what was given meanwhile and later still connect.
 #[test]
 fn a_panic_in_the_callback_leaves_the_watch_able_to_connect() {
     let fixture = Fixture::new("panicking_callback", AllowAll);
@@ -1230,25 +1230,34 @@ fn a_panic_in_the_callback_leaves_the_watch_able_to_connect() {
     let (_publisher, _serving, address, generation) = served(&raw, "a.name");
     let told = Arc::new(Mutex::new(Vec::new()));
     let keep = told.clone();
+    let (in_the_callback, is_in_it) = mpsc::channel();
+    let (panic_now, panic_is_due) = mpsc::channel::<()>();
+    let waits = Mutex::new(Some((in_the_callback, panic_is_due)));
     let dialer = Arc::new(Dialer::new(
         Options::default(),
         Box::new(move |resolved: BinderResult<Resolved>| {
-            let binder = resolved.unwrap().into_binder();
-            let mut told = keep.lock().unwrap();
-            told.push(binder);
-            let first = told.len() == 1;
-            drop(told);
-            assert!(!first, "the callback's panic");
+            keep.lock().unwrap().push(resolved.unwrap().into_binder());
+            if let Some((in_the_callback, panic_is_due)) = waits.lock().unwrap().take() {
+                in_the_callback.send(()).unwrap();
+                let _ = panic_is_due.recv();
+                panic!("the callback's panic");
+            }
         }),
     ));
     let second = address.try_clone().unwrap();
+    let third = address.try_clone().unwrap();
     dialer.give(address, generation);
-    eventually("the panicked thread's end", || dialer.idle());
-    assert_eq!(told.lock().unwrap().len(), 1);
-
-    dialer.dial(&second, generation).unwrap().unwrap();
+    is_in_it.recv_timeout(WAIT).unwrap();
     dialer.give(second, generation);
-    eventually("a second call", || told.lock().unwrap().len() == 2);
+    drop(panic_now);
+    eventually("the notice given in the panicking call", || {
+        told.lock().unwrap().len() == 2
+    });
+
+    eventually("that thread's end", || dialer.idle());
+    dialer.dial(&third, generation).unwrap().unwrap();
+    dialer.give(third, generation);
+    eventually("a later notice", || told.lock().unwrap().len() == 3);
     dialer.end();
 }
 
@@ -1256,7 +1265,47 @@ fn a_panic_in_the_callback_leaves_the_watch_able_to_connect() {
 #[test]
 fn a_panic_in_the_retry_thread_lets_a_later_send_start_another() {
     let fixture = Fixture::new("panicking_retry", AllowAll);
-    assert!(!fixture.registry.retrying_after_a_panic());
+    let registry = &fixture.registry;
+    registry.start_a_panicking_retry();
+    eventually("the panicked thread's end", || !registry.retrying());
+    registry.start_a_panicking_retry();
+    eventually("another thread's round", || !registry.retry_round_armed());
+    eventually("its end", || !registry.retrying());
+}
+
+/// A notice lost while a lookup for an earlier one is out asks again, for the newer generation.
+#[test]
+fn a_notice_lost_during_the_lookup_for_another_is_not_lost() {
+    let name = "a.twice";
+    let fixture = Fixture::new("lost_twice", AllowAll);
+    let raw = fixture.raw();
+    let resolver = fixture.resolver();
+    let mut subscriber =
+        NamedSubscriber::<Bytes>::subscribe_with(name, &policy(), &resolver).unwrap();
+    assert!(!subscriber.wait_connected(Duration::from_millis(50)));
+
+    // The first asks in a second, so the second is lost with that lookup not yet answered.
+    *super::uds::FAILING_NOTICES.lock().unwrap() = Some(name.into());
+    let (first, _first_serving, _address, _generation) = served(&raw, name);
+    eventually("the first notice", || {
+        super::uds::FAILING_NOTICES.lock().unwrap().is_none()
+    });
+    drop(first);
+    *super::uds::FAILING_NOTICES.lock().unwrap() = Some(name.into());
+    let (second, _serving, _address, _generation) = served(&raw, name);
+    eventually("the second notice", || {
+        super::uds::FAILING_NOTICES.lock().unwrap().is_none()
+    });
+    assert!(subscriber.wait_connected(WAIT));
+    second.publish(&Bytes(vec![2])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+
+    let (_publisher, _kept, _address, _generation) = served(&raw, "a.asked");
+    assert_eq!(
+        resolver.answers_when_a_notice_is_lost_during_the_first("a.asked"),
+        2,
+        "the lookup after the one that notice came too late for"
+    );
 }
 
 /// A lookup reached this generation first: the notice still calls, with the lookup's binder.
@@ -1508,12 +1557,22 @@ fn a_session_past_the_limit_of_unpaid_notices_ends_and_no_other_does() {
     });
 }
 
-/// Each step's 5 s is under the 10 s a send would wait, on the thread that makes the change.
+/// A send deadline no test of a stopped session comes near, so that it ends none of them midway.
+const NO_SEND_DEADLINE: Duration = Duration::from_secs(600);
+
+/// A registry whose stopped sessions outlast the test, however slowly the machine runs it.
+fn with_no_send_deadline(tag: &str) -> Fixture {
+    Fixture::with_server(tag, AllowAll, |server| {
+        server.set_reply_timeout(Some(NO_SEND_DEADLINE)).unwrap();
+    })
+}
+
+/// Each step's 5 s is under the deadline a send would wait for, on the thread making the change.
 #[test]
 fn a_watcher_that_stopped_holds_up_no_commit_and_no_other_watcher() {
     /// Changes after the first notice with no room, so some are made with its socket full.
     const WITH_THE_SOCKET_FULL: usize = 50;
-    let fixture = Fixture::new("stopped_watcher", AllowAll);
+    let fixture = with_no_send_deadline("stopped_watcher");
     let raw = fixture.raw();
     let stopped = fixture.raw();
     let (release, released) = mpsc::channel();
@@ -1714,7 +1773,7 @@ fn addresses_held(dir: &std::path::Path) -> usize {
 #[test]
 fn a_stopped_watcher_costs_the_host_one_notice_owed_however_many_changes() {
     const CHANGES: usize = 400;
-    let fixture = Fixture::new("bounded", AllowAll);
+    let fixture = with_no_send_deadline("bounded");
     let dir = fixture.path.with_file_name("topic.d");
     let raw = fixture.raw();
     let stopped = fixture.raw();

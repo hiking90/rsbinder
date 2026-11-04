@@ -347,6 +347,9 @@ struct Shared {
     /// A copy of the last address made, for a test to connect through one nobody can look up.
     #[cfg(test)]
     last_address: Mutex<Option<OwnedFd>>,
+    /// The next retry round panics, for a test.
+    #[cfg(test)]
+    panicking_retry: AtomicBool,
 }
 
 impl Drop for Shared {
@@ -777,6 +780,11 @@ impl Shared {
 
     /// One round of the retry thread: every owed notice that is due, with the name's topic by now.
     fn retry_round(&self) {
+        #[cfg(test)]
+        assert!(
+            !self.panicking_retry.swap(false, Ordering::SeqCst),
+            "the retry round's panic"
+        );
         let due = self.lock().table.due(Instant::now());
         for (name, watcher, caller, generation) in due {
             if !self.judged(&name, &caller) {
@@ -865,6 +873,8 @@ impl UdsRegistry {
             sleep: Arc::new(Sleep::default()),
             this: this.clone(),
             #[cfg(test)]
+            panicking_retry: AtomicBool::new(false),
+            #[cfg(test)]
             failing_duplicates: AtomicU64::new(0),
             #[cfg(test)]
             last_address: Mutex::default(),
@@ -899,8 +909,9 @@ impl UdsRegistry {
     /// time, would have the registry keep an entry for each until its session ends. The session
     /// ends at 10 000 such addresses instead. A client paying for its notices stays far under
     /// that, as what it has not paid for is what its socket buffer holds, and an `rsbinder-topic`
-    /// client pays on the connection the registry reads. A libbinder client would pay on the
-    /// callback connection, which the registry does not read, and meet the limit.
+    /// client pays on the connection the registry reads. A libbinder client pays on an idle
+    /// outgoing connection too, and on the callback connection, which the registry does not read,
+    /// when it has none idle: such payments count toward the limit.
     pub fn serve(&self, server: &RpcServer) -> BinderResult<()> {
         uds::configure(server);
         server.set_receive_fds(false);
@@ -910,17 +921,22 @@ impl UdsRegistry {
         Ok(())
     }
 
-    /// Whether `retrying` is still set after a retry thread's panic, for a test.
+    /// Start a retry thread, as a send that owes does, whose first round panics, for a test.
     #[cfg(test)]
-    pub(super) fn retrying_after_a_panic(&self) -> bool {
-        self.shared.lock().retrying = true;
-        let ending = Ending(Arc::downgrade(&self.shared));
-        let unwound = std::thread::spawn(move || {
-            let _ending = ending;
-            panic!("the retry thread's panic");
-        })
-        .join();
-        assert!(unwound.is_err());
+    pub(super) fn start_a_panicking_retry(&self) {
+        self.shared.panicking_retry.store(true, Ordering::SeqCst);
+        self.shared.owe(self.shared.lock(), true);
+    }
+
+    /// Whether a retry thread has not run the round [`Self::start_a_panicking_retry`] armed.
+    #[cfg(test)]
+    pub(super) fn retry_round_armed(&self) -> bool {
+        self.shared.panicking_retry.load(Ordering::SeqCst)
+    }
+
+    /// Whether a retry thread counts as running, for a test.
+    #[cfg(test)]
+    pub(super) fn retrying(&self) -> bool {
         self.shared.lock().retrying
     }
 
@@ -1160,6 +1176,26 @@ impl UdsResolver {
         uds::subscribe_with(Endpoint::Fd(address), policy, &self.host.publisher)
     }
 
+    /// How many answers `name` gets when a notice is lost just after the first, for a test.
+    #[cfg(test)]
+    pub(super) fn answers_when_a_notice_is_lost_during_the_first(&self, name: &str) -> u64 {
+        let asking = Arc::new(Mutex::new(Asking {
+            running: true,
+            again: false,
+        }));
+        let answers = Arc::new(AtomicU64::new(0));
+        let (counted, losing) = (answers.clone(), asking.clone());
+        let newest = Newest::new(Box::new(move |_: (OwnedFd, i64)| {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                losing.lock().expect("lock poisoned").again = true;
+            }
+        }));
+        let dialer = Dialer::new(Options::default(), Box::new(|_| {}));
+        let host = Arc::downgrade(&self.host);
+        ask_until_answered(name, &newest, &dialer, &host, &asking);
+        answers.load(Ordering::SeqCst)
+    }
+
     fn serve(&self, socket: OwnedFd, topic: SIBinder) -> BinderResult<Serving> {
         let listener = socket.try_clone().map_err(StatusCode::from)?;
         let server = RpcServer::setup_unix_server_from_bound_fd(socket)?;
@@ -1296,7 +1332,7 @@ impl Resolver for UdsResolver {
             dialer: dialer.clone(),
             // Weak: the host's session keeps this watcher until the host pays for it.
             host: Arc::downgrade(&self.host),
-            asking_again: Arc::new(AtomicBool::new(false)),
+            asking: Arc::default(),
         });
         let registry = &self.host.registry;
         let reply = match registry.r#watch(name, &watcher) {
@@ -1368,8 +1404,15 @@ struct Notices {
     newest: Arc<Newest<(OwnedFd, i64)>>,
     dialer: Arc<Dialer>,
     host: Weak<Host>,
-    /// A thread asks the host again; one is enough, as it asks for the newest.
-    asking_again: Arc<AtomicBool>,
+    asking: Arc<Mutex<Asking>>,
+}
+
+/// The thread that asks the host for a notice whose descriptor could not be kept.
+#[derive(Default)]
+struct Asking {
+    running: bool,
+    /// Another notice was lost after what its call asks may have been answered: it asks again.
+    again: bool,
 }
 
 impl Interface for Notices {}
@@ -1407,38 +1450,64 @@ impl Notices {
 
     /// The oneway has no one to fail to, and the host counts it delivered: look the name up.
     fn ask_again(&self) {
-        if self.asking_again.swap(true, Ordering::SeqCst) {
+        let mut asking = self.asking.lock().expect("lock poisoned");
+        if asking.running {
+            asking.again = true;
             return;
         }
+        asking.running = true;
+        drop(asking);
         let name = self.name.clone();
         let newest = self.newest.clone();
         let dialer = self.dialer.clone();
         let host = self.host.clone();
-        let asking = self.asking_again.clone();
+        let asking = self.asking.clone();
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-host".into())
             .spawn(move || {
-                let mut delay = FIRST_RETRY;
-                while !dialer.ended_within(delay) {
-                    let Some(host) = host.upgrade() else {
-                        break;
-                    };
-                    match host.registry.r#lookup(&name) {
-                        Ok(reply) => {
-                            let (address, generation) = parts(reply);
-                            let address = address.map(|address| (address, generation));
-                            newest.heard(address, generation);
-                            break;
-                        }
-                        Err(status) => log::debug!("topic: asking for {name:?}: {status}"),
-                    }
-                    delay = (delay * 2).min(LAST_RETRY);
-                }
-                asking.store(false, Ordering::SeqCst);
+                ask_until_answered(&name, &newest, &dialer, &host, &asking);
+                asking.lock().expect("lock poisoned").running = false;
             });
         if let Err(error) = spawned {
             log::warn!("topic: no thread to ask for {:?} again: {error}", self.name);
-            self.asking_again.store(false, Ordering::SeqCst);
+            self.asking.lock().expect("lock poisoned").running = false;
+        }
+    }
+}
+
+/// Look `name` up until the last notice lost has its answer, or the watch or the host is gone.
+fn ask_until_answered(
+    name: &str,
+    newest: &Newest<(OwnedFd, i64)>,
+    dialer: &Dialer,
+    host: &Weak<Host>,
+    asking: &Mutex<Asking>,
+) {
+    let mut delay = FIRST_RETRY;
+    while !dialer.ended_within(delay) {
+        // A reply's fd with no slot for it ends the session: wait for that and one to dial with.
+        if let Err(error) = std::os::unix::net::UnixStream::pair() {
+            log::debug!("topic: no descriptors to ask for {name:?} yet: {error}");
+            delay = (delay * 2).min(LAST_RETRY);
+            continue;
+        }
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        asking.lock().expect("lock poisoned").again = false;
+        match host.registry.r#lookup(name) {
+            Ok(reply) => {
+                let (address, generation) = parts(reply);
+                newest.heard(address.map(|address| (address, generation)), generation);
+                if !asking.lock().expect("lock poisoned").again {
+                    return;
+                }
+                delay = FIRST_RETRY;
+            }
+            Err(status) => {
+                log::debug!("topic: asking for {name:?}: {status}");
+                delay = (delay * 2).min(LAST_RETRY);
+            }
         }
     }
 }
@@ -1473,16 +1542,28 @@ struct Again {
     at: Instant,
 }
 
-/// Clears `running` when the connecting thread unwinds: left set, no notice would start another.
-struct Dialing<'d>(&'d Dialer);
+/// Clears `running` when the connecting thread unwinds; starts another for a notice given since.
+struct Dialing<'d>(&'d Arc<Dialer>);
 
 impl Drop for Dialing<'_> {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             return;
         }
-        let queue = self.0.queue.lock();
-        queue.unwrap_or_else(PoisonError::into_inner).running = false;
+        // No caller code runs under this lock, so a poisoned one is no callback's: leave it.
+        let next = match self.0.queue.lock() {
+            Ok(mut queue) => {
+                queue.running = false;
+                queue.next.take()
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().running = false;
+                return;
+            }
+        };
+        if let Some((address, generation)) = next {
+            self.0.give(address, generation);
+        }
     }
 }
 

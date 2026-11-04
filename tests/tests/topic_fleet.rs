@@ -1062,7 +1062,7 @@ impl Snapshot {
             .collect();
         if self.hub_fds != earlier.hub_fds {
             changes.push(format!(
-                "rsb_hub fds: {:?} -> {:?}",
+                "the hub's fds: {:?} -> {:?}",
                 earlier.hub_fds, self.hub_fds
             ));
         }
@@ -1099,8 +1099,7 @@ fn memfd_counts(pid: i32) -> (usize, usize, usize) {
     (memfds, maps, threads)
 }
 
-/// The open files of what serves the fleet's names: the socket registry's node, or the `rsb_hub`
-/// this machine runs, if one.
+/// The open files of the fleet's socket registry node, or of this machine's `rsb_hub`, if one.
 fn hub_fds(fleet: &Fleet) -> Option<usize> {
     #[cfg(feature = "topic-uds")]
     if transport::sockets().is_some() {

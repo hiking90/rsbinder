@@ -383,8 +383,9 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
 - **A client that does not pay for its notices loses its session.** A registry on a
   socket ends a session with 10 000 watch addresses whose notices it has not paid for.
   An `rsbinder-topic` client pays as it reads, so what it owes is what its socket
-  buffer holds. A libbinder client would pay on the callback connection, which the
-  registry does not read, and meet this limit.
+  buffer holds. A libbinder client with no outgoing connection idle pays on the
+  callback connection, which the registry does not read, and those payments count
+  toward this limit.
 - **A full accept queue is out of reach of a deadline.** Linux has a connect into
   such a listener wait in `connect(2)` until the publisher accepts or ends. A
   stopped publisher with room in its queue is found out by the handshake instead.
