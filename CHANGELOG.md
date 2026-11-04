@@ -263,7 +263,8 @@ says what a peer does with the 0.12.0 value.
   socket (`UnixTransport`) on Linux and Android, and on no transport runs death
   recipients on the dropping thread. With no room, a handler's own connection
   holds the `DEC_STRONG` for its next reply, and any other waits for the session's
-  reaper thread, so it can come after the next reply.
+  reaper thread, so it can come after the next reply. The frame's format and the
+  amounts' sum are the same; the reaper's releases of one address can share a frame.
 - A frame's fds refused for too many in flight for the uid (`ETOOMANYREFS`) are
   `RpcError::Protocol` and fail that call with `StatusCode::RpcError`, and a reply
   that had them fails the peer's call with `FAILED_TRANSACTION`, where 0.12.0 ended
@@ -278,6 +279,20 @@ says what a peer does with the 0.12.0 value.
   expects, not 0, and runs at the peer. The frame's format is the same. An
   rsbinder peer of either release runs the new number and still drops a 0.12.0
   sender's, as 0.12.0 did.
+- **wire**: a `DEC_STRONG` a oneway handler holds for lack of a free connection
+  leaves through the reaper thread as soon as the serve loop is back at its read,
+  on another connection than the one the oneway came on, where 0.12.0 held it for
+  that connection's next reply. A session with no such connection still holds it.
+- Below wire v2 (r34, android-13 to android-15) a proxy flattened into a parcel
+  counts as a send, as libbinder counts it, where 0.12.0 counted only a
+  transaction's target. Its release waits for the peer to pay, so a binder argument
+  the peer never reads keeps the release, and the peer's node, until the session ends.
+- **wire**: from wire v1 on, a received parcel that names other fds than it came
+  with, or a binder below v2, is `BadValue`: a handler does not run, a reply's call
+  fails. 0.12.0 ran the handler, whose read of a missing fd failed.
+- **wire**: a session that dropped a `DEC_STRONG`, having no connection to write it
+  on, numbers on a later proxy's oneways after the peer attaches a connection, where
+  0.12.0 restarted at 0. The frame's format is the same.
 
 **Streams and topics**
 
@@ -1012,6 +1027,19 @@ says what a peer does with the 0.12.0 value.
   now lasts until the address's last `DEC_STRONG` is on the wire. A peer that
   sends the address again before reading that frame meets the same result, as
   with libbinder on this side (android-17.0.0_r1 `RpcState.cpp:871-905`).
+- **A oneway on an RPC proxy also sent as an argument is not overtaken by its
+  release.** Below wire v2 a peer's payment for a read argument could pay for a
+  oneway still waiting on another connection: the release went out, the peer
+  dropped the oneway, and the call had returned `Ok`.
+- **A `DEC_STRONG` held on a connection with no reply to come goes out.** A client
+  whose one outgoing connection was busy held it on a callback connection the peer
+  sends only oneways on, so the peer's entries and this end's service object stayed
+  until the session ended.
+- **A oneway after a peer's late attach runs at the peer.** A `DEC_STRONG` dropped
+  with no connection left the peer's node alive with no number here, so a later
+  proxy of the address could number from 0 below what the node expects.
+- **A frame that names fds it did not bring is refused**, as AOSP
+  `rpcSetDataReference` refuses it, before any handler runs.
 
 ### Security
 

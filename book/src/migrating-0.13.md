@@ -634,7 +634,8 @@ bytes, so only a peer that wrote something unusual sees a difference.
   recipients on the dropping thread.** With no room in the socket a handler's own
   connection holds the `DEC_STRONG` for its next reply, and for any other the
   session's reaper thread writes it once the peer reads, where 0.12.0's drop
-  waited in the write. A
+  waited in the write. The frame's format and the amounts' sum are the same; the
+  reaper's releases of one address can share a frame. A
   test that drops a proxy and then expects the peer's count to fall with the
   next reply keeps that order only while the socket has room; poll the count
   if it fills the socket first. A write that fails ends the session from the
@@ -657,6 +658,25 @@ bytes, so only a peer that wrote something unusual sees a difference.
   rsbinder peer dropped the oneway and a libbinder peer parked it. An rsbinder peer of
   either release runs the new number and still drops a 0.12.0 sender's. A handler that
   did not run in this case now runs; there is no code to change.
+- **A `DEC_STRONG` a oneway handler holds leaves by another connection.** With no
+  free connection it is handed to the reaper thread once the serve loop is back at
+  its read, where 0.12.0 held it for the next reply on that connection. A test that
+  reads the frame on the served connection reads it on the callback connection
+  instead. A session with no callback connection still holds it.
+- **Below wire v2 a proxy flattened into a parcel counts as a send**, as libbinder
+  counts it. A dropped proxy's `DEC_STRONG` waits until the peer has paid each send,
+  and a peer pays an argument only if it reads it. So a binder argument the peer never
+  reads keeps the release, and the peer's node, until the session ends, where 0.12.0
+  released it. A service that relies on the release should read its binder arguments,
+  or use wire v2, where the peer enters them on receipt.
+- **From wire v1 on, a parcel that names other fds than it came with is `BadValue`**,
+  and so is a binder in the object table below v2. A handler does not run and a reply's
+  call fails, where 0.12.0 ran the handler and failed only its read of a missing fd. A
+  server with `set_receive_fds(false)` therefore refuses a call that sends an fd.
+- **A session that dropped a `DEC_STRONG` numbers on after a late attach.** After the
+  peer attaches a connection, a later proxy's oneway keeps the number the peer's node
+  expects, where 0.12.0 restarted at 0 and the peer dropped or parked it. There is no
+  code to change.
 
 ## Streams and topics
 
