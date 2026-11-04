@@ -2250,7 +2250,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "rsb_hub: cannot serve topics on {}: {err}",
                 socket.display()
             );
-            eprintln!("A hub that is not root takes a path it can write to, for example");
+            eprintln!("If the path is what it cannot use, a hub that is not root takes one it can");
+            eprintln!("write to, for example");
             eprintln!("    --topic-socket $XDG_RUNTIME_DIR/rsbinder/topic.sock");
             std::process::exit(1);
         }
