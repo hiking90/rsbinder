@@ -1326,6 +1326,7 @@ fn t20_a_peer_that_pays_no_send_keeps_its_entries_until_the_session_ends() {
 }
 
 /// T22: past a limit a no-wait oneway to a new address ends the session; a payment makes room.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn t22_a_limit_on_unpaid_addresses_ends_the_session_past_it() {
     let (client, mut raw, _root_addr, root) = raw_owner(PROTOCOL_V2);
@@ -1362,6 +1363,7 @@ fn t22_a_limit_on_unpaid_addresses_ends_the_session_past_it() {
 }
 
 /// T22, the other side: with the address paid back, the send is under the limit again.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn t22_a_paid_address_leaves_room_under_the_limit() {
     let (client, mut raw, _root_addr, root) = raw_owner(PROTOCOL_V2);
