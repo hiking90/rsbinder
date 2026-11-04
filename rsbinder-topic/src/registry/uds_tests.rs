@@ -1151,6 +1151,57 @@ fn a_publisher_that_answers_only_later_is_reached_with_no_newer_generation() {
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
 }
 
+/// A payload of another type, which a publisher of `Bytes` refuses for good.
+#[derive(Debug, PartialEq)]
+struct Word;
+
+impl crate::Payload for Word {
+    fn type_name() -> &'static str {
+        "rsbinder.topic.test.Word"
+    }
+
+    fn encode(&self, _: &mut crate::Encoding<'_>) -> rsbinder::Result<()> {
+        Ok(())
+    }
+
+    fn decode(_: &mut crate::Record<'_>) -> rsbinder::Result<Self> {
+        Ok(Self)
+    }
+}
+
+/// A subscriber a publisher refuses holds none of the connections the publisher allows.
+#[test]
+fn a_refused_subscriber_leaves_the_publishers_connection_to_another() {
+    let fixture = Fixture::new("refused_lets_go", AllowAll);
+    let options = ResolverOptions {
+        publisher_connections: Some(2),
+        ..ResolverOptions::default()
+    };
+    let endpoint = Endpoint::Path(fixture.path.clone());
+    let advertising = UdsResolver::connect(endpoint, &options).unwrap();
+    let publisher =
+        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &advertising)
+            .unwrap();
+    let resolver = fixture.resolver();
+    let mut refused =
+        NamedSubscriber::<Word>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    let told = refused.recv_timeout(WAIT);
+    match told {
+        Err(RecvError::Disconnected(Disconnected::Rejected(status))) => {
+            assert_eq!(status.transaction_error(), StatusCode::BadType);
+        }
+        other => panic!("not told of the refusal: {other:?}"),
+    }
+    assert!(matches!(refused.state(), NamedState::Refused(_)));
+
+    let mut other =
+        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    assert!(other.wait_connected(WAIT), "the refused one holds the room");
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(other.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    assert!(matches!(refused.state(), NamedState::Refused(_)));
+}
+
 /// A notice whose descriptor could not be kept has no one to fail to: the watch asks the host.
 #[test]
 fn a_notice_with_no_descriptor_left_is_made_up_by_asking_the_host() {

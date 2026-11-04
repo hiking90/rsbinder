@@ -138,6 +138,13 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Close `session` now if a [`SessionGuard`], whatever else holds it; another's is left alone.
+pub(crate) fn close_if_ours(session: &(dyn std::any::Any + Send + Sync)) {
+    if let Some(guard) = session.downcast_ref::<SessionGuard>() {
+        guard.0.close_session();
+    }
+}
+
 impl std::fmt::Debug for SessionGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionGuard").finish_non_exhaustive()

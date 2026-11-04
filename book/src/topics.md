@@ -377,7 +377,9 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   of another uid than `expect_publisher_uid` and a socket nobody listens on any more
   are not tried again: the next publisher of the name ends that wait. The first is
   told as a publisher's refusal is, by `Disconnected::Rejected` with `EX_SECURITY`
-  and `NamedState::Refused`.
+  and `NamedState::Refused`. A subscriber a publisher refuses closes its connection,
+  so it takes none of `publisher_connections` from another; a notice of the same
+  generation sent again connects anew and asks once more.
 - **A full accept queue is out of reach of a deadline.** Linux has a connect into
   such a listener wait in `connect(2)` until the publisher accepts or ends. A
   stopped publisher with room in its queue is found out by the handshake instead.

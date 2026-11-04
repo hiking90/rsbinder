@@ -65,7 +65,9 @@ pub enum NamedState {
     Waiting,
     /// The publisher the name has, or the resolver's check of it, refused this subscriber with
     /// this status, one a retry cannot change ([`Disconnected::Rejected`] lists them). Nothing is
-    /// asked again until the name is given to another binder.
+    /// asked again until the name is given to another binder. Over a socket the connection is
+    /// closed, and each notice connects anew, so a notice of the same generation sent again gives
+    /// another binder: that asks once more, and tells again if refused.
     Refused(Status),
     /// The last connection ended at a check of the publisher's memory that failed
     /// ([`Closed::Corrupted`]), and the name still has that publisher. Nothing is asked again
@@ -1513,8 +1515,11 @@ impl<T: Payload + 'static> Named<T> {
                             (next, false)
                         }
                         None if tell || looked => {
+                            let in_use = state.connected.as_ref() == state.refused.as_ref();
+                            let session = (tell && !in_use).then(|| state.session.take()).flatten();
                             state.connecting = false;
                             drop(state);
+                            close_refused(session);
                             self.signal();
                             return;
                         }
@@ -1658,6 +1663,15 @@ impl<T: Payload> Drop for Connecting<'_, T> {
         drop(state);
         self.0.signal();
     }
+}
+
+/// End the session of a publisher that refused this subscriber, which holds one of its connections.
+fn close_refused(session: Option<Arc<dyn Any + Send + Sync>>) {
+    #[cfg(feature = "uds")]
+    if let Some(session) = &session {
+        crate::uds::close_if_ours(&**session);
+    }
+    drop(session);
 }
 
 /// Whether a connection thread may subscribe to `binder`: neither `ended` nor refused.
