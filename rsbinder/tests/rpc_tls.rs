@@ -192,9 +192,9 @@ fn ping_via(root: &SIBinder, msg: &str) -> Result<String> {
     r.read::<String>()
 }
 
-/// On a full socket a no-wait record is kept, not cut: the peer decrypts every frame in order.
+/// Records sent until `POLLOUT` goes off, then a send that waits: all arrive whole and in order.
 #[test]
-fn tls_no_wait_frames_on_a_full_socket_arrive_whole_and_in_order() {
+fn tls_no_wait_frames_until_no_room_arrive_whole_and_in_order() {
     let srv_cfg = server_config(SRV_CRT, SRV_KEY);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
@@ -219,6 +219,7 @@ fn tls_no_wait_frames_on_a_full_socket_arrive_whole_and_in_order() {
         frames += 1;
     }
     assert!(started.elapsed() < Duration::from_secs(5), "a send waited");
+    assert!(frames > 0, "no frame found room");
     let sender = Arc::new(sender);
     let writer = {
         let sender = sender.clone();
@@ -1374,7 +1375,7 @@ mod refusals {
         r
     }
 
-    /// A server certificate from an issuer the client does not trust: `EKEYREJECTED`, both versions.
+    /// A server certificate from an issuer the client distrusts: `EKEYREJECTED`, both versions.
     #[test]
     fn untrusted_server_certificate_is_key_rejected() {
         for version in [&TLS12, &TLS13] {
@@ -1407,7 +1408,7 @@ mod refusals {
         }
     }
 
-    /// The payload survives `RpcError` → `io::Error` → `RpcError`, as the framing adapters carry it.
+    /// The payload survives `RpcError` → `io::Error` → `RpcError`, as framing adapters carry it.
     #[test]
     fn the_rustls_payload_survives_the_io_round_trip() {
         let r = client_handshake(

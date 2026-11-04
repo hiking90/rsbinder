@@ -50,8 +50,9 @@
 //! `RLIMIT_NOFILE` the kernel refuses more unless the host has `CAP_SYS_RESOURCE` or
 //! `CAP_SYS_ADMIN`. A uid that can fill enough sockets can reach that: a reply with a descriptor
 //! then fails its call with `StatusCode::FailedTransaction`. Nothing waits and no other session
-//! ends. An `allocate` refused that way leaves its name pending, as its caller has no number to
-//! withdraw, until the session ends or allocates that name again.
+//! ends, and a watch whose lookup failed asks again. An `allocate` refused that way leaves its name
+//! pending, as its caller has no number to withdraw, until the session ends or allocates that name
+//! again.
 //!
 //! Unlike a kernel registry, a process that stopped with its socket full loses its session after
 //! 10 s, which takes its names and watches away; one that goes on reading keeps it. A session that
@@ -1552,7 +1553,7 @@ impl Reconciler {
         }
     }
 
-    /// Whether a lookup may go: a reply's fd with no slot for it ends the session, and one dials.
+    /// Whether a lookup may go: with no slot its reply's fd is lost, and a connect needs one too.
     fn descriptors_free(&self) -> bool {
         match std::os::unix::net::UnixStream::pair() {
             Ok(_) => true,
@@ -1609,8 +1610,20 @@ impl Reconciler {
         self.reach(address, generation)
     }
 
-    /// The watch's lookup, whose caller gives up on a failure: the thread goes on.
-    fn lookup(self: &Arc<Self>) -> BinderResult<Option<Resolved>> {
+    /// A failure with the session alive: no notice need follow, so a round asks again, as `round`.
+    pub(super) fn asks_again_unless_ended(
+        self: &Arc<Self>,
+        reply: BinderResult<TopicAddress>,
+    ) -> BinderResult<TopicAddress> {
+        let ended = |status: &Status| status.transaction_error() == StatusCode::DeadObject;
+        if reply.as_ref().err().is_some_and(|status| !ended(status)) {
+            self.heard();
+        }
+        reply
+    }
+
+    /// The watch's lookup, whose caller gives up on a failure: what can pass goes on in a round.
+    pub(super) fn lookup(self: &Arc<Self>) -> BinderResult<Option<Resolved>> {
         if !self.descriptors_free() {
             self.heard();
             return Ok(None);
@@ -1618,8 +1631,9 @@ impl Reconciler {
         let Some(host) = self.host.upgrade() else {
             return Ok(None);
         };
-        let (address, generation) = parts(host.registry.r#lookup(&self.name)?);
+        let reply = host.registry.r#lookup(&self.name);
         drop(host);
+        let (address, generation) = parts(self.asks_again_unless_ended(reply)?);
         let Some(address) = address else {
             return Ok(None);
         };

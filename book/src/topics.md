@@ -369,13 +369,14 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   on a socket does not show. Such a uid with enough stopped sessions can also pass the
   kernel's count of descriptors in flight
   ([Service Manager](./service-manager.md#a-hub-on-a-unix-socket)), and then a call
-  whose reply brings a descriptor fails until they are read. A dropped subscriber's
+  whose reply brings a descriptor fails until they are read, and a watch whose lookup
+  failed asks again. A dropped subscriber's
   session closes, which ends its subscription call.
 - **A notice brings no descriptor.** It says that the name changed, and the watch asks
   the hub what the name has now. A process with no descriptor free takes the notice,
   keeps its session and asks once it has one. That asking can still lose to another
-  thread taking the last one, and a frame that brings a descriptor to a process with
-  none free ends its session, as the kernel cannot deliver it.
+  thread taking the last one: that reply fails alone, the session stays, and the watch
+  asks again.
 - **A publisher that stops is tried again.** A `NamedSubscriber` that cannot connect
   to the publisher a name has connects again, once a second at first and at most
   once in 30 seconds, until it can or the name has another publisher. A publisher

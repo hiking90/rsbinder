@@ -253,7 +253,11 @@ pub trait TlsStream: Send + Sync {
     /// `O_NONBLOCK` on the socket for the duration of each `send`) and `poll`s it, so the
     /// socket must carry exactly the bytes `read` and `write` do. The
     /// default is `None`: such a send then blocks without reading, and a
-    /// peer that writes on the connection meanwhile can stall it. The
+    /// peer that writes on the connection meanwhile can stall it. With no
+    /// socket to look at there is also no send that waits for nothing, so
+    /// every release of a remote binder finds no room: a handler's own
+    /// connection holds it for its next reply, and any other leaves it to the
+    /// session's reaper thread, so it can come after the next reply. The
     /// bundled streams return their socket.
     ///
     /// On Linux and Android a `Some` socket carries more than that send:
@@ -499,12 +503,6 @@ fn rustls_payload(io: &std::io::Error) -> Option<&rustls::Error> {
 }
 
 /// After a failed server handshake: FIN behind the alert, then read until the client closes.
-///
-/// Closing at once with the client's bytes unread makes the kernel answer
-/// with RST, and the client loses the alert (TLS 1.3 clients write right
-/// after their `Finished`, before the server has judged their certificate).
-/// Bounded by `REJECT_LINGER` and `REJECT_LINGER_BYTES`: a client that does
-/// not close gets the cut it would have got anyway.
 fn linger_for_alert(conn: &mut Connection, stream: &dyn TlsStream) {
     let Some(sock) = stream.socket() else {
         return;
@@ -951,6 +949,30 @@ impl TlsTransport {
         self.write_socket_locked(&cipher)
     }
 
+    /// Before a socket read: what a no-wait send left goes out as it waits (`unix` module doc).
+    fn carried_for_read(&self) -> RpcResult<()> {
+        let Some(sock) = self.stream.socket().filter(|_| !self.carry.is_empty()) else {
+            return Ok(());
+        };
+        // Parked ciphertext is input `poll` cannot see, and needs no socket read.
+        if !self
+            .pending_in
+            .lock()
+            .expect("tls pending_in poisoned")
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.carry.write_for_read(sock, &self.queue).map_err(|e| {
+            // Our shutdown broke the write half: a close, as in `recv_raw`.
+            if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+                RpcError::EndOfStream
+            } else {
+                e
+            }
+        })
+    }
+
     /// Feeds parked `pending_in`, else one socket read (no `conn`/`wlock`); `false` = EOF.
     fn pump_incoming(&self) -> RpcResult<bool> {
         let mut pending = self.pending_in.lock().expect("tls pending_in poisoned");
@@ -1086,6 +1108,7 @@ impl RpcTransport for TlsTransport {
                 return Err(RpcError::UncleanEndOfStream);
             }
             // 3. Parked ciphertext, else block on the socket; on EOF rustls knows, step 1 decides.
+            self.carried_for_read()?;
             self.pump_incoming()?;
         }
     }
@@ -1237,6 +1260,24 @@ mod tests {
         sender.__flush_carried().expect("the flush");
         assert_eq!(read_all(&peer, FRAME.len()), FRAME);
         assert!(!sender.__carrying());
+    }
+
+    /// A read writes the record's rest as it waits: a peer reading for it has nothing to send yet.
+    #[test]
+    fn a_read_writes_what_a_no_wait_send_left() {
+        let (sender, peer) = pair();
+        sender
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the deadline");
+        carry_part_of_a_record(&sender);
+        let answering = std::thread::spawn(move || {
+            assert_eq!(read_all(&peer, FRAME.len()), FRAME);
+            peer.send_raw(b"tail").expect("the peer's send");
+            peer
+        });
+        assert_eq!(read_all(&sender, 4), b"tail");
+        assert!(!sender.__carrying());
+        drop(answering.join().expect("the peer"));
     }
 
     /// `close_notify` follows the whole record, so the peer sees a clean end after the frame.

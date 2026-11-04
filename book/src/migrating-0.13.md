@@ -630,13 +630,16 @@ bytes, so only a peer that wrote something unusual sees a difference.
   `EndOfStream`. Code that matched `EndOfStream` for these cases matches
   the new codes.
 - **The last drop of an RPC proxy waits for no peer on any transport, and runs no
-  death recipients on the dropping thread.** A custom `RpcTransport` leaves every
-  release to the session's reaper thread, so a release there can come after the
-  next reply. With no room in the socket a handler's own
+  death recipients on the dropping thread.** With no room in the socket a handler's own
   connection holds the `DEC_STRONG` for its next reply, and for any other the
   session's reaper thread writes it once the peer reads, where 0.12.0's drop
-  waited in the write. The frame's format and the amounts' sum are the same; the
-  reaper's releases of one address can share a frame. A
+  waited in the write. A transport that cannot send without waiting finds no room on
+  every release, so a release there can come after the next reply: a custom
+  `RpcTransport` without the hidden no-wait send, and TLS over a `TlsStream` with no
+  `socket`. Where every outgoing connection is in a
+  serve loop's read, the reaper waits for the peer's next frame, so a peer that sends
+  nothing more keeps its node until the session ends. The frame's format and the
+  amounts' sum are the same; the reaper's releases of one address can share a frame. A
   test that drops a proxy and then expects the peer's count to fall with the
   next reply keeps that order only while the socket has room; poll the count
   if it fills the socket first. A write that fails ends the session from the
@@ -647,9 +650,21 @@ bytes, so only a peer that wrote something unusual sees a difference.
   peer's call with `FAILED_TRANSACTION`. Both leave the session up, where 0.12.0
   ended the session on the transport error; the item after next is the one
   exception.
-- **A frame whose fds a process has no free descriptor for fails alone** with
-  `BadValue`, and the session stays up, where 0.12.0 and AOSP end the session. A
-  frame with more fds than the ancillary buffer holds still ends it.
+- **A frame whose fds a process could not take all of fails alone**, and the session
+  stays up, where 0.12.0 and AOSP end the session. The causes are a full fd table,
+  which clears when a descriptor is free, and a security module's refusal of an fd,
+  which does not. From wire v1 no handler runs: a call whose reply lost fds gets
+  `BadValue`, an incoming twoway replies `BadValue`, so its caller sees that status
+  and this end only a log, and an incoming oneway is dropped with its sender told
+  nothing. Code that counted on the session's end to learn of a lost oneway has to
+  learn it another way. Below wire v1 (r34) a handler runs and a reply returns, and
+  only a read of an fd that did not come is `BadValue`: a handler may have acted on
+  what came before, and replies with success if it reads none of those lost. A frame
+  past the limit of 64 fds ends the session when the process can take a whole frame's
+  fds, and otherwise fails as above. A direct call of `RpcTransport::recv_raw_with_fds`
+  or `recv_frame_with_fds` does not fail: it returns `Ok` with the fds that came, where
+  0.12.0 returned `RpcError::Protocol`, so code that calls them compares that count
+  with the one its frame names. This is measured on Linux and Android only.
 - **A oneway refused before any byte (`FrameTooLarge`, `Protocol`) ends the session
   if another thread has already reserved the proxy's next async number**, where
   0.12.0 left a gap that held back later oneways to that address at the peer. The

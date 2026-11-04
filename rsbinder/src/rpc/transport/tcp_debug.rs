@@ -139,6 +139,43 @@ impl TcpDebugTransport {
         let server = Self::from_stream(server_stream)?;
         Ok((client, server))
     }
+
+    /// Fill the socket until it has stayed full, then carry half of a frame the socket did not
+    /// begin; the bytes the peer reads through the end of it, counted and not framed.
+    #[cfg(test)]
+    pub(crate) fn fill_and_carry(&self) -> usize {
+        let sock = self.stream.as_fd();
+        let chunk = [7u8; 16 * 1024];
+        let mut total = 0;
+        // What was queued can still move to the peer's buffer after the first `EAGAIN`.
+        let mut refused = 0;
+        while refused < 10 {
+            match super::unix::send_nonblocking(sock, |flags| {
+                rustix::net::send(sock, &chunk, flags)
+            }) {
+                Ok(n) => {
+                    total += n;
+                    refused = 0;
+                }
+                Err(rustix::io::Errno::AGAIN) => {
+                    refused += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("filling the socket: {e}"),
+            }
+        }
+        let frame = [7u8; 2048];
+        let mut first = true;
+        let taken = self.carry.take_frame(&frame, |rest| {
+            if std::mem::take(&mut first) {
+                Ok(rest.len() / 2)
+            } else {
+                Err(rustix::io::Errno::AGAIN)
+            }
+        });
+        assert!(matches!(taken, Ok(true)));
+        total + frame.len() / 2
+    }
 }
 
 impl RpcTransport for TcpDebugTransport {
@@ -196,6 +233,8 @@ impl RpcTransport for TcpDebugTransport {
 
     /// Raw, unframed read: `read_raw`, shared by the stream backends.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+        self.carry
+            .write_for_read(self.stream.as_fd(), &self.queue)?;
         let sock = Some(self.stream.as_fd());
         self.reads.read(sock, &self.queue, || {
             super::read_raw(&mut &self.stream, buf)
@@ -247,6 +286,7 @@ impl RpcTransport for TcpDebugTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::RpcError;
     use std::sync::Arc;
 
     #[test]
@@ -370,6 +410,86 @@ mod tests {
         let read = read_all(&peer, FRAME.len() + 1);
         assert_eq!(read[..FRAME.len()], FRAME);
         assert_eq!(read[FRAME.len()], b'x');
+    }
+
+    /// A pair whose sender's socket takes no more and whose `Carry` holds bytes.
+    fn full_socket_with_part_of_a_frame() -> (TcpDebugTransport, TcpDebugTransport, usize) {
+        let (sender, peer) = TcpDebugTransport::pair_loopback().expect("loopback pair");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer timeout");
+        let total = sender.fill_and_carry();
+        (sender, peer, total)
+    }
+
+    /// Input for a read with no room to write: a peer writing with no read of its own goes on.
+    #[test]
+    fn a_read_with_input_waits_for_no_room() {
+        let (sender, peer, _) = full_socket_with_part_of_a_frame();
+        sender
+            .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("send deadline");
+        sender
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read deadline");
+        peer.send_raw(b"x").expect("the peer's send");
+        let mut byte = [0u8; 8];
+        assert!(matches!(sender.recv_raw(&mut byte), Ok(1)));
+        assert!(sender.__carrying(), "nothing read, so no room");
+    }
+
+    /// A peer in a drain reads for the rest of this end's frame: a read goes on to write it.
+    #[test]
+    fn a_read_writes_the_rest_of_a_frame_with_part_of_the_peers_read() {
+        let (sender, peer, total) = full_socket_with_part_of_a_frame();
+        sender
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read deadline");
+        let peer = Arc::new(peer);
+        let draining = {
+            let peer = peer.clone();
+            std::thread::spawn(move || {
+                peer.send_raw(b"head").expect("the peer's send");
+                read_all(&peer, total);
+                peer.send_raw(b"tail").expect("the peer's send");
+            })
+        };
+        let mut input = [0u8; 8];
+        let mut read = 0;
+        while read < input.len() {
+            read += sender.recv_raw(&mut input[read..]).expect("the read");
+        }
+        assert_eq!(&input, b"headtail");
+        assert!(!sender.__carrying());
+        draining.join().expect("the peer");
+    }
+
+    /// The send deadline holds in a read too, and it reports the frame it cut.
+    #[test]
+    fn a_read_past_the_send_deadline_is_a_cut_frame() {
+        let (sender, _peer, _) = full_socket_with_part_of_a_frame();
+        sender
+            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
+            .expect("send deadline");
+        sender
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read deadline");
+        let mut byte = [0u8; 8];
+        let read = sender.recv_raw(&mut byte);
+        assert!(matches!(read, Err(RpcError::DeadlineMidFrame)), "{read:?}");
+    }
+
+    /// A flush past the send deadline stops a frame whose head went out: not a boundary `Timeout`.
+    #[test]
+    fn a_flush_past_the_send_deadline_is_not_a_boundary_timeout() {
+        let (sender, _peer, _) = full_socket_with_part_of_a_frame();
+        sender
+            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
+            .expect("send deadline");
+        let flushed = sender.__flush_carried();
+        assert!(
+            matches!(&flushed, Err(RpcError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{flushed:?}"
+        );
     }
 
     #[test]

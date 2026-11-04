@@ -260,20 +260,32 @@ says what a peer does with the 0.12.0 value.
   nothing is `WriteZero` on Apple too; 0.12.0 returned `EndOfStream`
   there.
 - The last drop of an RPC proxy does not wait for the peer on any transport, and
-  runs no death recipients on the dropping thread. A custom transport without
-  the hidden no-wait send leaves every release to the session's reaper thread, so
-  a release there can come after the next reply. With no room, a handler's own connection
+  runs no death recipients on the dropping thread. With no room, a handler's own connection
   holds the `DEC_STRONG` for its next reply, and any other waits for the session's
-  reaper thread, so it can come after the next reply. The frame's format and the
-  amounts' sum are the same; the reaper's releases of one address can share a frame.
+  reaper thread, so it can come after the next reply. A transport that cannot send
+  without waiting finds no room on every release: a custom `RpcTransport` without the
+  hidden no-wait send, and TLS over a `TlsStream` with no `socket`. Where every outgoing
+  connection is in a serve loop's read, the reaper waits for the peer's next frame, so a
+  peer that sends nothing more keeps its node until the session ends. The frame's format
+  and the amounts' sum are the same; the reaper's releases of one address can share a
+  frame.
 - A frame's fds refused for too many in flight for the uid (`ETOOMANYREFS`) are
   `RpcError::Protocol` and fail that call with `StatusCode::RpcError`, and a reply
   that had them fails the peer's call with `FAILED_TRANSACTION`, where 0.12.0 ended
   the session on the transport error.
-- A frame whose fds a process has no free descriptor for (`MSG_CTRUNC` with fewer
-  fds than the ancillary buffer holds) fails alone with `BadValue`, where 0.12.0
-  and AOSP `OS_unix_base.cpp` end the session. A frame with more fds than the
-  buffer holds still ends it.
+- A frame whose fds a process could not take all of (`MSG_CTRUNC` for a full fd
+  table or a security module's refusal, with fewer than `MAX_FDS_PER_FRAME` of them
+  taken) fails alone, where 0.12.0 and AOSP `OS_unix_base.cpp` end the session. From
+  wire v1 no handler runs: a call whose reply lost fds gets `BadValue`, an incoming
+  twoway gets `BadValue` as its reply, so its caller sees that status and this end
+  only a log, and an incoming oneway is dropped with no word to its sender. Below v1
+  (r34) a handler runs and a reply returns, and only a read of an fd that did not come
+  is `BadValue`: a handler may have acted on what came before, and replies with success
+  if it reads none of those lost. A frame past the limit of 64 ends the session when
+  the process can take a whole frame's fds, and otherwise fails as above. A direct call
+  of `RpcTransport::recv_raw_with_fds` or `recv_frame_with_fds` returns `Ok` with the
+  fds that came, where 0.12.0 returned `RpcError::Protocol`, so code that calls them
+  compares that count with the one its frame names.
 - A oneway refused before any byte (`FrameTooLarge`, `Protocol`) ends the session
   if another thread has already reserved the proxy's next async number, where
   0.12.0 left a gap that held back later oneways to that address at the peer.
@@ -773,9 +785,11 @@ says what a peer does with the 0.12.0 value.
 
 - **The last drop of an RPC proxy waits for no peer** (see *Migrating*). On Linux
   and Android a `DEC_STRONG` on a `UnixTransport` is one `sendmsg` that puts the
-  whole frame on the socket or nothing. TCP, vsock, TLS and Apple's `UnixTransport`
-  send what the socket takes and keep the rest of the frame, which the next send
-  writes first, or the reaper thread when nothing else is to be written. With no room
+  whole frame on the socket or nothing. TCP, vsock, TLS over a `TlsStream` with a
+  `socket` and Apple's `UnixTransport` send what the socket takes and keep the rest
+  of the frame, which the next send
+  writes first, or, with nothing to write next, whatever next reads the connection,
+  or the reaper thread on a free one. With no room
   a handler's own connection holds it for its next reply, and for any other the
   session's reaper thread writes it once the peer reads, and a peer that takes
   nothing for the send deadline loses the session there; 0.12.0's drop waited in
@@ -1053,9 +1067,10 @@ says what a peer does with the 0.12.0 value.
 - **A frame that names fds it did not bring is refused**, as AOSP
   `rpcSetDataReference` refuses it, before any handler runs. An object the table
   cannot back ends the session, as there.
-- **A process that runs out of descriptors keeps its RPC sessions.** The kernel
-  delivers a frame's bytes with as many of its fds as fit; the frame fails alone,
-  and the next call works once a descriptor is free.
+- **A process that runs out of descriptors keeps its RPC sessions.** On Linux and
+  Android the kernel delivers a frame's bytes with the fds it could install, short
+  of a full table or a security module's refusal; the frame fails alone, and after a
+  full table the next call works once a descriptor is free.
 
 ### Security
 

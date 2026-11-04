@@ -112,8 +112,8 @@
 //!   notice) is judged by the same rule apart from the send: the session's
 //!   reaper waits on the slot in `__wait_for_room`, a `SendWait` of its own, and
 //!   ends the session when the deadline passes, and what such a send left of a
-//!   frame goes out through a send that waits (`session` module doc
-//!   "Deferred `DEC_STRONG`").
+//!   frame goes out through a send that waits, or through a read that waits for
+//!   input under the send deadline (`session` module doc "Deferred `DEC_STRONG`").
 //!
 //! The `ioctl` runs only while a deadline is armed: a send or read without
 //! one has no verdict for it to change. A socket that refuses it once
@@ -502,6 +502,10 @@ pub trait RpcTransport: Send + Sync {
     /// Receive one frame plus any out-of-band file descriptors.
     /// Default: never yields fds (the plain framed recv); only `unix`
     /// overrides with `SCM_RIGHTS`.
+    ///
+    /// A process that cannot take all of a frame's fds (`MSG_CTRUNC`) gets
+    /// `Ok` with those that came, as in
+    /// [`recv_raw_with_fds`](RpcTransport::recv_raw_with_fds).
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_frame()?, Vec::new()))
     }
@@ -554,6 +558,12 @@ pub trait RpcTransport: Send + Sync {
     /// (`RpcTransportRaw::interruptableReadFully`), so the caller
     /// gathers fds across the header+body reads. Default: never yields
     /// fds (plain [`RpcTransport::recv_raw`]); only `unix` overrides.
+    ///
+    /// A process that cannot take all of a frame's fds (`MSG_CTRUNC`, for a
+    /// full fd table or a security module's refusal) gets `Ok` with those that
+    /// came and no other sign, so the caller compares their count with the one
+    /// its frame names. A whole frame's fds (64) with more behind them are
+    /// [`RpcError::Protocol`]: the peer sent past the limit.
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_raw(buf)?, Vec::new()))
     }
@@ -565,7 +575,8 @@ pub trait RpcTransport: Send + Sync {
     /// none of them taken, for want of room or of a kernel resource, with the stream as it was; any
     /// other failure is the transport's, and a `buf` past the transport's limit is
     /// [`RpcError::FrameTooLarge`] before anything is sent. `None`, the default, is a transport
-    /// that cannot promise this: the session's reaper thread then writes its releases.
+    /// that cannot promise this, which finds no room on every release: a handler's own connection
+    /// holds it for its next reply, and any other leaves it to the session's reaper thread.
     #[doc(hidden)]
     fn __send_no_wait(
         &self,
@@ -575,7 +586,8 @@ pub trait RpcTransport: Send + Sync {
         None
     }
 
-    /// Not part of the API: part of a frame `__send_no_wait` took is not yet sent.
+    /// Not part of the API: part of a frame `__send_no_wait` took is not yet sent. A transport
+    /// that leaves any writes it in `recv_raw` too, whenever that read would otherwise wait.
     #[doc(hidden)]
     fn __carrying(&self) -> bool {
         false

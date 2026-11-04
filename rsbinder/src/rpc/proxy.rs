@@ -214,7 +214,8 @@ impl RpcProxy {
     /// [`prepare_request`](crate::RemoteProxy::prepare_request), which waits for nothing and runs
     /// no death sequence on this thread.
     ///
-    /// `Ok` is sent; [`StatusCode::WouldBlock`] is not sent, with the session as it was. Anything
+    /// `Ok` is taken: whole on the stream unless the session ends first.
+    /// [`StatusCode::WouldBlock`] is not sent, with the session as it was. Anything
     /// else is a session that ended or a send that no retry can make. A caller sends one at a
     /// time per proxy, in frames up to the transport's limit; `rsbinder-topic`'s hub is the one
     /// caller (session doc "Deferred `DEC_STRONG`").
@@ -296,7 +297,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
 
 impl Drop for RpcProxy {
     fn drop(&mut self) {
-        // Identity-checked; on Linux and Android's Unix socket it waits for nothing (session doc).
+        // Identity-checked; on a transport with a no-wait send it waits for nothing (session doc).
         self.session
             .release_proxy(self.addr, self as *const RpcProxy as *const ());
     }

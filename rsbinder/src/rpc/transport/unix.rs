@@ -70,13 +70,16 @@
 //! on the socket; std sets it only on sockets std itself creates, not on a
 //! `socketpair` from `pair` or an fd adopted by `from_owned_fd`.
 //!
-//! `MSG_CTRUNC` has two causes, told apart by how many fds came. Fds filling the ancillary
-//! buffer mean a peer sent more than a frame may have, which is `RpcError::Protocol` and ends the
-//! session, as AOSP `OS_unix_base.cpp` ends it for either. Fewer mean this process has no
-//! descriptor free: on Linux `recvmsg` still returns the data, with as many fds as fit. The stream
-//! is intact, so the read succeeds and only that frame fails, where the fds its parcel names and
-//! the fds it came with differ (`RpcSessionInner::validate_objects`), or a read of a missing fd
-//! fails below wire v1. A process that runs out of descriptors keeps its session.
+//! `MSG_CTRUNC` has two causes, told apart by how many fds came. `MAX_FDS_PER_FRAME` or more mean
+//! a peer sent more than a frame may have, which is `RpcError::Protocol` and ends the session, as
+//! AOSP `OS_unix_base.cpp` ends it for either. Fewer mean this process could not take them all,
+//! which is also how such a peer's frame looks when fewer than that can be taken: on Linux
+//! `recvmsg` still returns the data, with the fds the kernel's `receive_fd` (`fs/file.c`) installed
+//! before it failed, for a table with no slot free or a security module's refusal
+//! (`security_file_receive`). The stream is intact, so the read succeeds and only that frame fails,
+//! where the fds its parcel names and the fds it came with differ
+//! (`RpcSessionInner::validate_objects`), or a read of a missing fd fails below wire v1. A process
+//! that cannot take a frame's fds keeps its session, and only a full table can clear by itself.
 //!
 //! ## A send that does not wait
 //!
@@ -99,7 +102,16 @@
 //! `AF_UNIX`, whose kernel was not read for this) has a `Carry` instead. Its send takes what the
 //! socket takes, and the rest stays in the `Carry`: `Ok(true)` then means the frame is taken, and
 //! every later send on the stream writes the rest first, so the peer reads the frame whole and in
-//! order. With nothing to write next, the session's reaper or serve loop calls `__flush_carried`.
+//! order, unless the session ends first: only TLS's `shutdown` writes the rest then, and the peer
+//! of another stream reads the cut as `Truncated`. With nothing to write next, the session's reaper
+//! calls `__flush_carried` on a free slot, and every read writes the rest while it waits
+//! (`Carry::write_for_read`): each byte it reads has been seen by `poll` first, so it never waits
+//! in a read with bytes kept nor for room with input unread. The peer may be reading for the rest
+//! of the frame, in a drain with part of a frame of its own sent, or writing a `REPLY` it does not
+//! read during (`write_reply`), and neither can stop this end, as the read goes on a read at a time
+//! with no frame boundary to reach first. Only a slot's holder writes to its `Carry`, so none
+//! appears during a read. A send deadline there is `RpcError::DeadlineMidFrame`, and any other
+//! failure `RpcError::UncleanEndOfStream`: the frame is cut and the stream is lost.
 //! A frame the socket takes none of is `Ok(false)`, and a `Carry` that holds bytes takes no
 //! other frame, so it holds at most one, of at most `NO_WAIT_FRAME_LIMIT`. Fds need the frame
 //! whole in one `sendmsg`, so Apple has no such send for a frame with fds.
@@ -152,7 +164,7 @@ const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::CMSG_CLOEXEC;
 #[cfg(target_vendor = "apple")]
 const RECV_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
 
-/// Ancillary space for one `sendmsg`/`recvmsg` of a frame: `MAX_FDS_PER_FRAME` fds.
+/// Ancillary space for one `sendmsg`/`recvmsg` of a frame: at least `MAX_FDS_PER_FRAME` fds.
 const FD_SPACE: usize = rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME));
 
 /// How a [`send_stream`] waits for room in the socket's send buffer.
@@ -347,10 +359,19 @@ impl Carry {
         sock: std::os::fd::BorrowedFd<'_>,
         bytes: &[u8],
     ) -> RpcResult<()> {
-        let mut carried = self.lock();
-        let sent = send_what_fits(bytes, |rest| {
+        self.keep_unsent(bytes, |rest| {
             send_nonblocking(sock, |flags| rustix::net::send(sock, rest, flags))
-        })?;
+        })
+    }
+
+    #[cfg(feature = "rpc-tls")]
+    fn keep_unsent(
+        &self,
+        bytes: &[u8],
+        send: impl FnMut(&[u8]) -> rustix::io::Result<usize>,
+    ) -> RpcResult<()> {
+        let mut carried = self.lock();
+        let sent = send_what_fits(bytes, send)?;
         carried.extend_from_slice(&bytes[sent..]);
         Ok(())
     }
@@ -368,6 +389,48 @@ impl Carry {
     /// The bytes to write before anything else, which leave the `Carry` for good.
     pub(crate) fn take(&self) -> Vec<u8> {
         std::mem::take(&mut *self.lock())
+    }
+
+    /// For a read: write what is carried until none is left or input waits (module doc).
+    pub(crate) fn write_for_read(
+        &self,
+        sock: std::os::fd::BorrowedFd<'_>,
+        queue: &OutQueue,
+    ) -> RpcResult<()> {
+        use rustix::io::Errno;
+        let lost = |e: std::io::Error| {
+            log::debug!("RPC: writing the rest of a frame failed ({e})");
+            RpcError::UncleanEndOfStream
+        };
+        let mut waiting = SendWait::new(sock, queue);
+        loop {
+            {
+                // Held over the send: a `take` then finds the bytes this send did not write.
+                let mut carried = self.lock();
+                if carried.is_empty() {
+                    return Ok(());
+                }
+                match send_nonblocking(sock, |flags| rustix::net::send(sock, &carried, flags)) {
+                    Ok(0) => return Err(lost(std::io::ErrorKind::WriteZero.into())),
+                    Ok(n) => {
+                        carried.drain(..n);
+                        waiting.progressed();
+                        continue;
+                    }
+                    Err(Errno::INTR) => continue,
+                    Err(Errno::AGAIN) => {}
+                    Err(e) => return Err(lost(e.into())),
+                }
+            }
+            match waiting.wait(true) {
+                Ok(Some(true)) => return Ok(()),
+                Ok(Some(false)) => {}
+                // This end's deadline stopped a frame it had begun.
+                Ok(None) => return Err(RpcError::DeadlineMidFrame),
+                Err(RpcError::Io(e)) => return Err(lost(e)),
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -418,7 +481,11 @@ impl Carry {
             return Ok(());
         }
         let slices = &mut [std::io::IoSlice::new(&carried)];
-        send_stream(sock, slices, &[], SendMode::of(queue, drain))
+        // The frame's head went out with the no-wait send: `Timeout` would say none of it did.
+        send_stream(sock, slices, &[], SendMode::of(queue, drain)).map_err(|e| match e {
+            RpcError::Timeout => RpcError::Io(std::io::ErrorKind::WouldBlock.into()),
+            e => e,
+        })
     }
 }
 
@@ -665,6 +732,18 @@ impl UnixTransport {
         self.carry.flush(self.stream.as_fd(), &self.queue, drain)
     }
 
+    /// What a no-wait send left goes out as a read waits; here it never leaves any.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn carried_for_read(&self) -> RpcResult<()> {
+        Ok(())
+    }
+
+    /// What a no-wait send left goes out as a read waits (module doc).
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn carried_for_read(&self) -> RpcResult<()> {
+        self.carry.write_for_read(self.stream.as_fd(), &self.queue)
+    }
+
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
     ///
@@ -886,6 +965,7 @@ impl RpcTransport for UnixTransport {
     /// android-13+ profile drives `RpcWireHeader`-based framing on top
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+        self.carried_for_read()?;
         let sock = Some(self.stream.as_fd());
         self.reads.read(sock, &self.queue, || {
             super::read_raw(&mut &self.stream, buf)
@@ -924,6 +1004,7 @@ impl RpcTransport for UnixTransport {
         use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
+        self.carried_for_read()?;
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
         let mut space =
             vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];
@@ -1108,15 +1189,13 @@ fn take_scm_rights(
         }
     }
     if flags.contains(ReturnFlags::CTRUNC) {
-        // Our buffer's whole room: the peer sent more than a frame has (module doc "fd passing").
+        // A whole frame's fds and more behind them: the peer sent past the limit (module doc).
         if fds.len() - before >= MAX_FDS_PER_FRAME {
             return Err(RpcError::Protocol(
                 "SCM_RIGHTS control message truncated (too many fds in one message)",
             ));
         }
-        log::warn!(
-            "RPC: this process has no descriptor free for a frame's fds; that frame fails alone"
-        );
+        log::warn!("RPC: this process could not take all of a frame's fds; that frame fails alone");
     }
     Ok(())
 }
@@ -1142,6 +1221,23 @@ mod tests {
         assert!(matches!(other, Ok(false)));
         assert_eq!(carry.take(), b"defgh");
         assert!(carry.is_empty());
+    }
+
+    /// A record is sequenced: what a send stops short of stays, all of it if the send took nothing.
+    #[cfg(feature = "rpc-tls")]
+    #[test]
+    fn a_carry_keeps_what_a_record_left() {
+        use rustix::io::Errno;
+
+        let carry = Carry::default();
+        let mut sends = vec![Err(Errno::AGAIN), Ok(3)];
+        let kept = carry.keep_unsent(b"abcdefgh", |_| sends.pop().expect("a send"));
+        assert!(kept.is_ok());
+        assert_eq!(carry.take(), b"defgh");
+
+        let kept = carry.keep_unsent(b"abc", |_| Err(Errno::AGAIN));
+        assert!(kept.is_ok());
+        assert_eq!(carry.take(), b"abc");
     }
 
     /// A socket that takes none of a frame leaves the `Carry` empty; a failure is the transport's.
@@ -1366,6 +1462,8 @@ mod tests {
 
         if std::env::var_os(CHILD).is_some() {
             let (a, b) = UnixTransport::pair().expect("socketpair");
+            let (raw, wrapped) = UnixStream::pair().expect("socketpair");
+            let wrapped = UnixTransport::wrap(wrapped).expect("a transport");
             let file = std::fs::File::open("/dev/null").expect("/dev/null");
             let limit = rustix::process::Rlimit {
                 current: Some(512),
@@ -1394,6 +1492,21 @@ mod tests {
                 .expect("a send");
             let (n, fds) = b.recv_raw_with_fds(&mut buf).expect("the stream goes on");
             assert_eq!((&buf[..n], fds.len()), (&b"both"[..], 2));
+
+            // Slots for a whole frame's fds: a frame past the limit is told from a whole one.
+            filling.truncate(filling.len() - MAX_FDS_PER_FRAME);
+            let mut space = [std::mem::MaybeUninit::uninit(); 512];
+            let mut anc = rustix::net::SendAncillaryBuffer::new(&mut space);
+            let past = vec![file.as_fd(); MAX_FDS_PER_FRAME + 1];
+            assert!(anc.push(rustix::net::SendAncillaryMessage::ScmRights(&past)));
+            let slices = [std::io::IoSlice::new(b"past")];
+            rustix::net::sendmsg(&raw, &slices, &mut anc, SEND_FLAGS).expect("a raw send");
+            let read = wrapped.recv_raw_with_fds(&mut buf);
+            assert!(matches!(read, Err(RpcError::Protocol(_))), "{read:?}");
+
+            a.send_raw_with_fds(b"room", &past[1..]).expect("a send");
+            let (n, fds) = b.recv_raw_with_fds(&mut buf).expect("the stream goes on");
+            assert_eq!((&buf[..n], fds.len()), (&b"room"[..], MAX_FDS_PER_FRAME));
             return;
         }
         let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
@@ -1645,7 +1758,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
 
-        let d = Duration::from_millis(400);
+        let d = Duration::from_secs(2);
         let (ours, theirs) = UnixStream::pair().expect("socketpair");
         ours.set_write_timeout(Some(d)).expect("SO_SNDTIMEO");
         // Fill the send buffer one 4 KiB skb at a time, so each peer read frees one.
@@ -1660,8 +1773,8 @@ mod tests {
                         return;
                     }
                     let _ = send(&theirs, b"x", SendFlags::DONTWAIT);
-                    // A slow reader: 4 KiB every 40 ms, so the socket stays unwritable for seconds.
-                    if i % 8 == 0 {
+                    // A slow reader: 4 KiB every `d` / 10, so the socket stays unwritable past `d`.
+                    if i % 40 == 0 {
                         let _ = recv(&theirs, &mut buf, RecvFlags::DONTWAIT);
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -1687,7 +1800,7 @@ mod tests {
         peer.join().expect("peer");
         assert!(
             matches!(verdict, Ok(Some(_))),
-            "a peer taking bytes every 40 ms expired a {d:?} wait after {:?}: {verdict:?}",
+            "a peer taking bytes every 200 ms expired a {d:?} wait after {:?}: {verdict:?}",
             t0.elapsed()
         );
     }
