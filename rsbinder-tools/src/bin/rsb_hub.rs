@@ -2035,6 +2035,33 @@ fn bind_topic_socket(
     Ok((server, registry))
 }
 
+/// Whether `error` says this process cannot use the socket's path, which another path can change.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn cannot_use_the_path(error: &(dyn std::error::Error + 'static)) -> bool {
+    const ERRNOS: [i32; 4] = [libc::EACCES, libc::EPERM, libc::EROFS, libc::ENOENT];
+    let status = |status: rsbinder::StatusCode| {
+        ERRNOS.iter().any(|errno| {
+            status == rsbinder::StatusCode::from(std::io::Error::from_raw_os_error(*errno))
+        })
+    };
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return error
+            .raw_os_error()
+            .is_some_and(|raw| ERRNOS.contains(&raw));
+    }
+    if let Some(error) = error.downcast_ref::<rsbinder::StatusCode>() {
+        return status(*error);
+    }
+    if let Some(error) = error.downcast_ref::<rsbinder::Status>() {
+        return status(error.transaction_error());
+    }
+    false
+}
+
 /// Serve the topic registry on a Unix socket, without kernel binder: the hub's `--topic-socket`.
 #[cfg(all(
     feature = "topic",
@@ -2250,9 +2277,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 "rsb_hub: cannot serve topics on {}: {err}",
                 socket.display()
             );
-            eprintln!("If the path is what it cannot use, a hub that is not root takes one it can");
-            eprintln!("write to, for example");
-            eprintln!("    --topic-socket $XDG_RUNTIME_DIR/rsbinder/topic.sock");
+            // Once the socket's mode is set the path is in use: a later failure is not the path's.
+            if TOPIC_SOCKET.get().is_none() && cannot_use_the_path(&*err) {
+                eprintln!("A hub that is not root takes a path it can write to, for example");
+                eprintln!("    --topic-socket $XDG_RUNTIME_DIR/rsbinder/topic.sock");
+            }
             std::process::exit(1);
         }
         return Ok(());
@@ -2323,6 +2352,29 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hint goes with what another path can change, in each shape the bind's errors take.
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn the_path_hint_goes_with_an_errno_a_path_can_change() {
+        use rsbinder::{Status, StatusCode};
+        let io = |errno| std::io::Error::from_raw_os_error(errno);
+        for errno in [libc::EACCES, libc::EPERM, libc::EROFS, libc::ENOENT] {
+            assert!(cannot_use_the_path(&io(errno)), "io {errno}");
+            let status = StatusCode::from(io(errno));
+            assert!(cannot_use_the_path(&status), "status {errno}");
+            assert!(cannot_use_the_path(&Status::from(status)), "{errno}");
+        }
+        assert!(!cannot_use_the_path(&io(libc::EADDRINUSE)));
+        assert!(!cannot_use_the_path(&StatusCode::from(io(
+            libc::EADDRINUSE
+        ))));
+        assert!(!cannot_use_the_path(&std::io::Error::other("not an errno")));
+    }
 
     #[cfg(all(
         feature = "topic",
