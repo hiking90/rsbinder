@@ -307,9 +307,7 @@ fn main() -> BoxResult<()> {
     drop(root);
     drop(session);
 
-    // (B12) server killed during a call. No death link: an r34 client reads
-    // its one connection only while it waits for a reply, so rsbinder refuses
-    // `link_to_death` there.
+    // (B12) server killed during a call: the failed call itself ends the session.
     let session = RpcSession::setup_unix_client(&sock)?;
     let root = session.get_root()?;
     let rp = proxy(&root);

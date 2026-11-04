@@ -258,7 +258,7 @@ tier_hermetic() {
         --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants \
         --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
     run "rsbinder tls targets" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
-        --test rpc_tls --test rpc_transport_conformance
+        --test rpc_tls --test rpc_transport_conformance --test rpc_release_order
     # Skips (and still passes) where unprivileged user namespaces are off; CI sets REQUIRED.
     linux_run "rpc_link_break (network namespace)" tpass cargo test -p rsbinder \
         --features rpc-tls,rpc-tcp-debug --test rpc_link_break

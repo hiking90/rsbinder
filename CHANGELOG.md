@@ -261,14 +261,25 @@ says what a peer does with the 0.12.0 value.
   there.
 - The last drop of an RPC proxy does not wait for the peer on any transport, and
   runs no death recipients on the dropping thread. With no room, a handler's own connection
-  holds the `DEC_STRONG` for its next reply, and any other waits for the session's
-  reaper thread, so it can come after the next reply. A transport that cannot send
+  holds the `DEC_STRONG` for its next reply or nested call, and any other waits for the
+  session's reaper thread, so it can come after the next reply. A transport that cannot send
   without waiting finds no room on every release: a custom `RpcTransport` without the
-  hidden no-wait send, and TLS over a `TlsStream` with no `socket`. Where every outgoing
+  hidden no-wait send, and TLS over a `TlsStream` with no `socket`. On vsock and Apple
+  platforms a handler's `drop` and a `drop` in a reply wait hold the release until the next
+  frame there or the connection goes back: a handler that waits for what the peer does on
+  that release waits for its own reply. Where every outgoing
   connection is in a serve loop's read, the reaper waits for the peer's next frame, so a
   peer that sends nothing more keeps its node until the session ends. The frame's format
   and the amounts' sum are the same; the reaper's releases of one address can share a
   frame.
+- `link_to_death` on an RPC proxy of a session nothing reads is accepted on Linux and
+  Android, where 0.12.0 refused it with `InvalidOperation`: the first link starts a thread
+  that watches the outgoing connections' sockets until the session ends, with two
+  descriptors and one per connection. Elsewhere, and on a transport with no
+  `RpcTransport::peer_close_fd`, it is refused as before.
+- `Receiver` and a ring's `Sink::open` over RPC, and `Subscriber::request`, ask for
+  `TransportCaps::CALLBACKS` first. A session served only by `spawn_serve`, or with no
+  callback connection, gets `InvalidOperation` from them in its own process.
 - A frame's fds refused for too many in flight for the uid (`ETOOMANYREFS`) are
   `RpcError::Protocol` and fail that call with `StatusCode::RpcError`, and a reply
   that had them fails the peer's call with `FAILED_TRANSACTION`, where 0.12.0 ended

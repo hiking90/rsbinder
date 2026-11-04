@@ -283,6 +283,10 @@ impl RpcTransport for TcpDebugTransport {
     fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
         super::socket_shutdown_handle(self.stream.as_fd())
     }
+
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        cfg!(any(target_os = "linux", target_os = "android")).then(|| self.stream.as_fd())
+    }
 }
 
 #[cfg(test)]

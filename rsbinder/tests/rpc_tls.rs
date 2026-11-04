@@ -1143,6 +1143,41 @@ fn client_config_tls_constructor_opens_a_fan_out_session() {
     let _ = bg.stop_and_join();
 }
 
+/// A TLS session nothing reads between its calls hears of the server's end with no call to fail.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_tls_session_nothing_reads_runs_its_recipient_when_the_server_ends() {
+    use rsbinder::rpc::RpcClientConfig;
+
+    struct Told(Mutex<std::sync::mpsc::Sender<()>>);
+    impl rsbinder::DeathRecipient for Told {
+        fn binder_died(&self, _: &rsbinder::WIBinder) {
+            let _ = self.0.lock().expect("told").send(());
+        }
+    }
+
+    let (server, addr) = tls_ping_server();
+    let bg = server.run_background().expect("run_background");
+    let session = RpcSession::setup_client_android13plus_with_config(RpcClientConfig::tls(
+        "127.0.0.1",
+        addr.port(),
+        "localhost",
+        client_config_trusting(CA),
+        2,
+    ))
+    .expect("connect");
+    let root = session.get_root().expect("get_root");
+    let (tx, died) = std::sync::mpsc::channel();
+    let told = Arc::new(Told(Mutex::new(tx)));
+    root.link_to_death(Arc::downgrade(&told) as _)
+        .expect("the link");
+    server.terminate();
+    died.recv_timeout(Duration::from_secs(5))
+        .expect("the recipient");
+    assert!(session.is_ended());
+    let _ = bg.stop_and_join();
+}
+
 /// Unix fd mode needs a Unix socket; `RpcClientConfig::tls` refuses it on the founding connection.
 #[test]
 fn fd_mode_unix_over_tls_is_refused_at_setup() {

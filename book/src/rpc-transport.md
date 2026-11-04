@@ -673,11 +673,15 @@ can be added later, one at a time, with
 
 Two consequences worth knowing:
 
-- **Death can be observed at all.** The serving thread sees the server's
-  connection drop and fires the linked death recipients immediately. A
-  client session without incoming connections has nobody reading its
-  connection, so `link_to_death` is refused there with `InvalidOperation`
-  (AOSP refuses it the same way). The other way to get notified is
+- **Death is observed at once, and frames are read as they come.** The
+  serving thread sees the server's connection drop and fires the linked
+  death recipients immediately. A client session without incoming
+  connections has nobody reading its connection. On Linux and Android
+  `link_to_death` starts a thread there that watches the sockets and reads
+  nothing: a call in flight when the peer closes keeps its reply, and the
+  recipients run after it returns. Off those platforms, and on a transport
+  with no socket to watch, the link is refused with `InvalidOperation`, as
+  AOSP refuses it on every such session; the other way to get notified is
   `RpcSession::spawn_serve`, which dedicates the founding connection to a
   serve loop: the session then makes no calls of its own, only nested ones
   from inside a handler.

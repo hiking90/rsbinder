@@ -193,4 +193,9 @@ impl RpcTransport for VsockTransport {
         use std::os::fd::AsFd;
         super::socket_shutdown_handle(self.stream.as_fd())
     }
+
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        Some(self.stream.as_fd())
+    }
 }

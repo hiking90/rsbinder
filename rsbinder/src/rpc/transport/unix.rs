@@ -1016,6 +1016,11 @@ impl RpcTransport for UnixTransport {
         super::socket_shutdown_handle(self.stream.as_fd())
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        Some(self.stream.as_fd())
+    }
+
     fn supports_fd_passing(&self) -> bool {
         true
     }

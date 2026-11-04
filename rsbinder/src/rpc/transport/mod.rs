@@ -383,6 +383,22 @@ pub trait RpcTransport: Send + Sync {
         None
     }
 
+    /// The socket that tells of the peer's close on Linux and Android: `poll` for `POLLRDHUP`
+    /// reports `POLLRDHUP`, `POLLHUP` or `POLLERR` once the peer has closed its end, or shut it
+    /// for writing, or the connection is lost, and frames arriving do not wake it. `None`, the
+    /// default, is a transport with no such socket.
+    ///
+    /// A [`link_to_death`](crate::IBinder::link_to_death) on a session that nothing reads between
+    /// its calls polls a duplicate of this on a thread of its own, and is refused when a
+    /// connection returns `None`. The bundled socket transports return their socket on Linux and
+    /// Android and `None` elsewhere, where a blocking `poll` of this kind has not been measured:
+    /// XNU registers a read filter for `POLLHUP`, so what wakes it there is not known. TLS returns
+    /// the socket of a [`TlsStream`] that has one; a peer that sends `close_notify` and keeps the
+    /// socket open is not seen here, nor by [`peer_closed`](Self::peer_closed).
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
+
     /// A function that cuts this connection from another thread, as
     /// [`shutdown`](Self::shutdown) does, without a reference to the
     /// transport. `None` (the default) when the transport has none.

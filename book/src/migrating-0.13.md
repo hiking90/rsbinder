@@ -529,8 +529,26 @@ bytes, so only a peer that wrote something unusual sees a difference.
   up only after a frame from the peer. A nested call from inside a handler
   still uses the serve loop's connection. A client that keeps calling opens
   incoming connections (`RpcClientConfig::incoming_connections`,
-  `ClientOptions::incoming_connections`); the `link_to_death` refusal
-  message now says when `spawn_serve` fits.
+  `ClientOptions::incoming_connections`).
+- **`link_to_death` on an RPC proxy of a session nothing reads is accepted on
+  Linux and Android**, where 0.12.0 refused it with `InvalidOperation` as AOSP
+  does. The first link starts a thread that watches the sockets of the outgoing
+  connections until the session ends: it takes two descriptors and one per
+  outgoing connection, and it delays the peer's sight of the close after the last
+  handle drops by that thread's wake-up. Code that fell back to `spawn_serve` on the
+  refusal no longer takes that path and goes on working. Off Linux and Android, and on
+  a transport with no `peer_close_fd`, the link is refused as before; a custom
+  transport returns its socket from `peer_close_fd` to take part. `is_ended` turns
+  `true` on such a session with no call. The recipient runs on the session's reaper
+  thread.
+- **`Receiver` and a ring's `Sink::open` over RPC ask for `TransportCaps::CALLBACKS`
+  before anything else.** A client served only by `spawn_serve` and a server session
+  with no callback connection get `InvalidOperation` from `Receiver::new` in their own
+  process; 0.12.0 opened the `Receiver` and the other end's `Sink::open` failed.
+- **`Subscriber::request` asks for `TransportCaps::CALLBACKS` too**: the publisher's
+  word of an eviction is a call on the token. A session with `spawn_serve` and a second
+  outgoing connection, accepted by the 0.12.0 link, is refused; open an incoming
+  connection.
 - **On an Android SDK 31/32 host the stability word after a binder on the
   android-13+ RPC wire changed** (CHANGELOG *Fixed*). It is the bare level
   (`0x0c` for a system binder), as on every other host; 0.12.0 wrote the
@@ -603,7 +621,7 @@ bytes, so only a peer that wrote something unusual sees a difference.
   reference left** with `BadValue`, as a kernel proxy always has: such a
   recipient could never be notified. 0.12.0 returned `Ok` and dropped it at
   the obituary. The checks run in the order `InvalidOperation` (a session
-  that would not notice the loss), `DeadObject`, `BadValue`. Keep a strong
+  that neither reads nor can be watched), `DeadObject`, `BadValue`. Keep a strong
   `Arc` of the recipient for as long as the link should last.
 - An RPC session on the android-13+ wire takes a null binder's stability
   from the low 16 bits of the word, as libbinder 13+ does, and accepts a

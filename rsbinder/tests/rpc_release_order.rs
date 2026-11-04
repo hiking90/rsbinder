@@ -237,6 +237,9 @@ impl RpcTransport for HoldsOnPins {
     fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
         self.0.shutdown_handle()
     }
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.0.peer_close_fd()
+    }
     fn shutdown(&self) -> std::result::Result<(), RpcError> {
         self.0.shutdown()
     }

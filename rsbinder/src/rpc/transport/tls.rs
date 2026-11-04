@@ -1131,6 +1131,12 @@ impl RpcTransport for TlsTransport {
         self.stream.socket().and_then(super::socket_shutdown_handle)
     }
 
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        cfg!(any(target_os = "linux", target_os = "android"))
+            .then(|| self.stream.socket())
+            .flatten()
+    }
+
     fn shutdown(&self) -> RpcResult<()> {
         // Refuse new sends; only the one already holding `wlock` remains to wait for.
         self.shut.store(true, std::sync::atomic::Ordering::SeqCst);

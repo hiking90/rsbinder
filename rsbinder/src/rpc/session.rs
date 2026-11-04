@@ -599,6 +599,39 @@
 //! early is safe: this is the only place a served slot leaves the pool, and a dead pool is
 //! read only by paths that already answer `DeadObject` on `is_torn_down`. Nothing here sends.
 //!
+//! # A peer's close
+//!
+//! What reads a connection sees the peer's end of stream. A client session with no incoming
+//! connection and no serve loop reads only in its calls, so a peer that closes between them goes
+//! unnoticed until the next call fails. A `link_to_death` there starts a watcher thread on Linux
+//! and Android (`peer_watch`): AOSP refuses such a link (`BpBinder::linkToDeath`,
+//! `getMaxIncomingThreads() < 1`), so this is rsbinder's. `notices_connection_loss` keeps saying
+//! whether something reads, which the reconnect helper's choice of watch reads too. The thread
+//! starts under the pool lock, whose critical section also holds the copy of the socket list, its
+//! flag (`ConnState::watcher`), a later slot's push, and the taking of the watcher at the session's
+//! end, so no slot goes unwatched and no watcher outlives the session on a `shutdown` that does
+//! nothing. The lock is held across a `dup` and a `clone`, neither of which waits for a peer.
+//!
+//! The watcher's signal queues `ReaperJob::PeerClosed` and the thread ends. The job records the
+//! `Outgoing` slots held at that moment in `holder_wait`, and each holder's `ConnGuard::drop` takes
+//! its slot out of the list in the critical section of its release; the one that empties it queues
+//! `ReaperJob::PeerClosedReady`, and that job, or the first if none was held, ends the session
+//! (`fail_session`). So the reaper waits for no slot and its other jobs go on, a later claim does
+//! not hold the end back, and a release cannot be missed as a free moment could be. A session end
+//! at the signal would lose a `REPLY` the peer wrote before it closed: a binder in it enters a
+//! torn-down session as `DeadObject`, and vsock reads nothing past its own `RCV_SHUTDOWN`. That
+//! holds of the watcher's end only: a failed write ends a session at once, as on any session
+//! ("Failed sends"), and the call in flight may lose its `REPLY` to that. A call that starts after
+//! the signal is cut by the end.
+//!
+//! The reaper reads no frame there. A free `Outgoing` slot holds at most the `DEC_STRONG`s of a
+//! peer: the frames of a call are read by that call, a oneway does not take a peer's `Incoming`
+//! pin (`find_conn_impl`; libbinder's `ExclusiveConnection::find`), and `clear_local` releases what
+//! they would. Reading would run a handler or a `Drop` on the reaper, and a local `Drop` there comes
+//! after the obituary instead of before it. If either job finds something reading by then, it
+//! leaves the end to that. A loop whose thread cannot start takes its declared count back and
+//! looks again (`after_a_failed_serve_spawn`), since a signal may have gone while it counted.
+//!
 //! # Interface token
 //!
 //! On an RPC parcel (`isForRpc()`, no `kernelFields`) AOSP `Parcel::writeInterfaceToken` skips
@@ -1910,6 +1943,10 @@ enum ReaperJob {
     Carried,
     /// Run the death sequence of the session `stop_for_the_reaper` stopped.
     End,
+    /// A peer's close was seen on a connection nothing reads: module doc "A peer's close".
+    PeerClosed,
+    /// The last holder that `PeerClosed` recorded let its slot go.
+    PeerClosedReady,
 }
 
 /// What `DEC_STRONG`s read during a send released, settled once the frame is whole.
@@ -1942,12 +1979,18 @@ fn current_tid() -> Tid {
     std::thread::current().id()
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::peer_watch::PeerWatch;
+/// Only Linux and Android watch ("A peer's close"), so this is never made elsewhere.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+enum PeerWatch {}
+
 /// The pool's types; a child module, so its private items keep the slot vector unreachable.
 mod slot_pool {
     use std::ops::{Index, IndexMut};
     use std::sync::Arc;
 
-    use super::{ConnTraits, RpcAddress, RpcTransport, SlotRole, Tid};
+    use super::{ConnTraits, PeerWatch, RpcAddress, RpcTransport, SlotRole, Tid};
 
     /// One connection of the pool: AOSP `RpcSession::RpcConnection`.
     pub(super) struct ConnSlot {
@@ -1981,6 +2024,10 @@ mod slot_pool {
         pub(super) reaper_owed: std::collections::HashMap<RpcAddress, u32>,
         /// A `ReaperJob::Dec` is queued or running: one is enough for a session.
         pub(super) reaper_dec_queued: bool,
+        /// The peer-close watcher, from the first link that needs it to the session's end.
+        pub(super) watcher: Option<PeerWatch>,
+        /// `Outgoing` holders when the peer's close was seen, until each lets go ("A peer's close").
+        pub(super) holder_wait: Vec<u64>,
     }
 
     impl ConnState {
@@ -1998,6 +2045,8 @@ mod slot_pool {
                 traits,
                 reaper_owed: std::collections::HashMap::new(),
                 reaper_dec_queued: false,
+                watcher: None,
+                holder_wait: Vec::new(),
             }
         }
     }
@@ -2167,7 +2216,7 @@ impl Drop for ConnGuard<'_> {
         }
         let key = (self.inner as *const _ as usize, self.slot_id);
         stack_remove_last(&DRIVING, |&k| k == key);
-        let held = {
+        let (held, last_awaited) = {
             // `notify_all`: `notify_one` may wake only a waiter pinned to another slot.
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
             let mut held = std::collections::HashMap::new();
@@ -2178,12 +2227,18 @@ impl Drop for ConnGuard<'_> {
                     held = std::mem::take(&mut s.pending_dec);
                 }
             }
+            let awaited = !st.holder_wait.is_empty();
+            st.holder_wait.retain(|id| *id != self.slot_id);
+            let last_awaited = awaited && st.holder_wait.is_empty();
             drop(st);
             self.inner.slot_cv.notify_all();
-            held
+            (held, last_awaited)
         };
         for (addr, amount) in held {
             self.inner.send_dec_strong(addr, amount);
+        }
+        if last_awaited {
+            let _ = self.inner.reaper_tx.send(ReaperJob::PeerClosedReady);
         }
         // After the release: `ReaperJob::Carried` skips a slot that is held and waits for no one.
         self.inner.queue_carried(self.transport());
@@ -2354,9 +2409,9 @@ pub(crate) struct SharedSession {
     /// Test hook: a serve loop signals here once it recorded `seen`, before its first read.
     #[cfg(test)]
     serve_wait_hook: Mutex<Option<mpsc::Sender<()>>>,
-    /// Test hook: `spawn_incoming` fails instead of spawning.
+    /// Test hook: `spawn_thread` fails instead of spawning.
     #[cfg(test)]
-    fail_incoming_spawn: AtomicBool,
+    fail_spawn: AtomicBool,
 }
 
 impl SharedSession {
@@ -2408,14 +2463,14 @@ impl SharedSession {
         }
     }
 
-    /// `Builder::spawn` for an incoming connection's serve thread; tests can make it fail.
-    fn spawn_incoming(
+    /// `Builder::spawn` for an incoming connection's serve thread or a watcher; tests make it fail.
+    fn spawn_thread(
         &self,
         builder: std::thread::Builder,
         f: impl FnOnce() + Send + 'static,
     ) -> std::io::Result<std::thread::JoinHandle<()>> {
         #[cfg(test)]
-        if self.fail_incoming_spawn.load(Ordering::SeqCst) {
+        if self.fail_spawn.load(Ordering::SeqCst) {
             return Err(std::io::ErrorKind::OutOfMemory.into());
         }
         builder.spawn(f)
@@ -2904,6 +2959,9 @@ impl RpcSessionInner {
         st.next_slot_id += 1;
         let armed = Arc::clone(&transport);
         st.slots.push(transport, id, role, None);
+        if role == SlotRole::Outgoing {
+            Self::watch_added_slot(&st, &*armed);
+        }
         self.wake_reaper_for_owed(st);
         self.arm_liveness(&*armed);
         self.slot_cv.notify_all();
@@ -3074,6 +3132,9 @@ impl RpcSessionInner {
         {
             let mut st = self.conn_state.lock().expect("conn_state poisoned");
             st.slots.clear_at_session_end();
+            st.holder_wait.clear();
+            // A `shutdown` that does nothing leaves it no signal: this closes its duplicates.
+            st.watcher = None;
         }
         self.slot_cv.notify_all();
         self.send_session_obituaries();
@@ -3359,6 +3420,101 @@ impl RpcSessionInner {
         self.shared.space() == AddressSpace::Acceptor
             || self.shared.serve_declared.load(Ordering::SeqCst) > 0
             || self.incoming_slot_count() > 0
+    }
+
+    /// `ReaperJob::PeerClosed`: end the session once the holders of now have let go; waits for none.
+    fn end_at_peers_close(&self) {
+        // What reads a connection ends the session at its end of stream, with its value.
+        if self.notices_connection_loss() {
+            return;
+        }
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        if self.shared.lifecycle.is_torn_down() {
+            return;
+        }
+        st.holder_wait = st
+            .slots
+            .iter()
+            .filter(|s| s.role == SlotRole::Outgoing && s.exclusive_tid.is_some())
+            .map(|s| s.id)
+            .collect();
+        let none_held = st.holder_wait.is_empty();
+        drop(st);
+        if none_held {
+            self.fail_session();
+        }
+    }
+
+    /// What a `link_to_death` needs of this session, so that the link's recipient can ever run.
+    pub(crate) fn watch_for_death_link(&self) -> Result<()> {
+        // A torn-down session's own latch answers the link.
+        if self.shared.lifecycle.is_torn_down() || self.notices_connection_loss() {
+            return Ok(());
+        }
+        self.start_watcher()
+    }
+
+    /// One watcher per session, of every `Outgoing` slot; module doc "A peer's close".
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn start_watcher(&self) -> Result<()> {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        // Under the lock: the session's end takes the watcher here, and would not take a later one.
+        if st.watcher.is_some() || self.shared.lifecycle.is_torn_down() {
+            return Ok(());
+        }
+        let mut sockets = Vec::new();
+        for s in st.slots.iter().filter(|s| s.role == SlotRole::Outgoing) {
+            let Some(socket) = s.transport.peer_close_fd() else {
+                return Err(StatusCode::InvalidOperation);
+            };
+            sockets.push(socket.try_clone_to_owned().map_err(StatusCode::from)?);
+        }
+        let tell = self.reaper_tx.clone();
+        let signal = move || {
+            let _ = tell.send(ReaperJob::PeerClosed);
+        };
+        let (watch, body) = PeerWatch::new(sockets, signal).map_err(StatusCode::from)?;
+        // Under the lock, so a link that finds the watcher here knows its thread began.
+        let builder = std::thread::Builder::new().name("rsbinder-rpc-watch".into());
+        drop(self.shared.spawn_thread(builder, body).map_err(|e| {
+            log::error!("RPC: cannot start a session's watcher: {e}");
+            StatusCode::from(e)
+        })?);
+        st.watcher = Some(watch);
+        Ok(())
+    }
+
+    /// Only Linux and Android watch: module doc "A peer's close".
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn start_watcher(&self) -> Result<()> {
+        Err(StatusCode::InvalidOperation)
+    }
+
+    /// A slot pushed under `st`, for the watcher if the session has one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn watch_added_slot(st: &ConnState, transport: &dyn RpcTransport) {
+        let Some(watch) = &st.watcher else {
+            return;
+        };
+        match transport.peer_close_fd().map(|s| s.try_clone_to_owned()) {
+            Some(Ok(socket)) => watch.add(socket),
+            Some(Err(e)) => log::warn!("RPC: a new connection goes unwatched: {e}"),
+            None => log::warn!("RPC: a new connection has no socket to watch"),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn watch_added_slot(_: &ConnState, _: &dyn RpcTransport) {}
+
+    /// A `spawn_serve` that found no thread: its loop no longer reads, so nothing else may notice.
+    fn after_a_failed_serve_spawn(&self) {
+        if let Err(e) = self.watch_for_death_link() {
+            log::debug!("RPC: no watcher in place of a serve loop: {e:?}");
+        }
+        // Its signal may have gone while the loop still counted: the watcher ended on it.
+        if self.peer_closed() {
+            let _ = self.reaper_tx.send(ReaperJob::PeerClosed);
+        }
     }
 
     fn incoming_slot_count(&self) -> usize {
@@ -5112,7 +5268,7 @@ impl RpcSession {
             #[cfg(test)]
             serve_wait_hook: Mutex::new(None),
             #[cfg(test)]
-            fail_incoming_spawn: AtomicBool::new(false),
+            fail_spawn: AtomicBool::new(false),
         }))
     }
 
@@ -5709,11 +5865,7 @@ impl RpcSession {
     /// When the loop ends — for either reason — the session ends with it:
     /// every remote object reachable over it is dead, so registered death
     /// recipients are fired here (AOSP `RpcState::sendObituaries` when a
-    /// session's incoming threads end). This is the rsbinder
-    /// death-detection point: a peer that linked a `DeathRecipient` (e.g. a
-    /// client wanting to learn the server died) must be running this serve
-    /// loop — faithful to AOSP's `getMaxIncomingThreads() >= 1`
-    /// requirement for an RPC `linkToDeath`. Any loop's end ends the whole
+    /// session's incoming threads end). Any loop's end ends the whole
     /// session, whichever of its connections the loop served, as a fault on
     /// any one connection does (AOSP `RpcState::handleRpcError`); a loop
     /// that finds the session already ended stops with
@@ -5736,10 +5888,13 @@ impl RpcSession {
     /// [`serve_blocking`](Self::serve_blocking) on a new thread, with the
     /// serve loop recorded on the session **before** the thread starts.
     ///
-    /// This is the way to make a session without incoming connections
-    /// notice a connection loss, so that
-    /// [`link_to_death`](crate::IBinder::link_to_death) on its proxies is
-    /// accepted: a `link_to_death` made after this returns never races the
+    /// This makes a session without incoming connections read its founding
+    /// connection, so that it notices a connection loss by reading it.
+    /// [`link_to_death`](crate::IBinder::link_to_death) needs this only where
+    /// the session cannot be watched without reading: off Linux and Android,
+    /// and on a transport with no
+    /// [`peer_close_fd`](super::transport::RpcTransport::peer_close_fd).
+    /// There a `link_to_death` made after this returns never races the
     /// thread's start. A thread spawned by hand that calls `serve_blocking`
     /// records the loop only once it runs, so a `link_to_death` issued right
     /// after the spawn can still be refused.
@@ -5778,6 +5933,7 @@ impl RpcSession {
                 log::error!("RpcSession::spawn_serve: cannot start the serve thread: {e}");
                 if serves {
                     declared.fetch_sub(1, Ordering::SeqCst);
+                    self.inner.after_a_failed_serve_spawn();
                 }
                 StatusCode::from(e)
             })
@@ -5962,7 +6118,9 @@ impl RpcSession {
     ///
     /// This reads state; it does not probe the connection. A session whose
     /// peer has gone while this end has not read from or written to it since
-    /// (no incoming connection, no serve loop, no call) still reads `false`.
+    /// (no incoming connection, no serve loop, no call, and no
+    /// [`link_to_death`](crate::IBinder::link_to_death), whose thread watches
+    /// on Linux and Android) still reads `false`.
     /// It reads `true` from the moment the session starts ending, before its
     /// recipients have all run.
     pub fn is_ended(&self) -> bool {
@@ -6713,7 +6871,7 @@ impl RpcSession {
         // Bumped before the spawn, so the counter is never observed low.
         self.inner.incoming_live.fetch_add(1, Ordering::SeqCst);
         let builder = std::thread::Builder::new().name(format!("rsbinder-rpc-in-{slot_id}"));
-        let spawned = self.inner.shared.spawn_incoming(builder, move || {
+        let spawned = self.inner.shared.spawn_thread(builder, move || {
             let session = RpcSession::wrap_inner(inner);
             session
                 .serve_blocking_on(slot_id)
@@ -6970,6 +7128,12 @@ fn reaper_loop(weak: Weak<RpcSessionInner>, rx: mpsc::Receiver<ReaperJob>) {
             ReaperJob::Carried => flush_carried(&weak, inner),
             // Whoever queued this took the session to `Dying` and left the sequence to us.
             ReaperJob::End => inner.on_session_dead(),
+            ReaperJob::PeerClosed => inner.end_at_peers_close(),
+            ReaperJob::PeerClosedReady => {
+                if !inner.notices_connection_loss() {
+                    inner.fail_session();
+                }
+            }
         }
     }
 }
@@ -10053,7 +10217,7 @@ mod tests {
         session
             .inner
             .shared
-            .fail_incoming_spawn
+            .fail_spawn
             .store(true, Ordering::SeqCst);
         let added = session.add_incoming_connection_android13plus_transport(
             move || Ok(Box::new(attach) as Box<dyn RpcTransport>),
@@ -12889,3 +13053,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ref_accounting_tests.rs"]
 mod ref_accounting_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[path = "peer_watch_tests.rs"]
+mod peer_watch_tests;

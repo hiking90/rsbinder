@@ -50,7 +50,7 @@
 //! Death state mirrors the kernel `ProxyHandle`. RPC has no death wire
 //! message (AOSP `RpcState::sendObituaries`): an RPC object dies when its
 //! session connection drops, so the session fires every cached proxy's
-//! obituary when its serve loop ends
+//! obituary when the session ends, whatever noticed that
 //! (`RpcSessionInner::send_session_obituaries`). The recipient list and its
 //! `obituary_sent` latch are the kernel proxy's type (`death::DeathRecipients`),
 //! with nothing run under its lock: RPC has no
@@ -316,27 +316,24 @@ impl std::fmt::Debug for RpcProxy {
 /// Why an RPC `link_to_death` was refused; logged each time (the RPC stack keeps no globals).
 fn unwatched_session_link() {
     log::error!(
-        "link_to_death over RPC refused: nothing reads this session's connections, so its \
-         loss would go unnoticed. Open incoming connections \
-         (RpcClientConfig::incoming_connections / ClientOptions::incoming_connections), \
-         or start a serve loop with RpcSession::spawn_serve first if this session makes no \
-         further calls of its own: the loop holds the only connection."
+        "link_to_death over RPC refused: nothing reads this session's connections, and they \
+         have no socket a thread could watch, on this platform or this transport. Open incoming \
+         connections (RpcClientConfig::incoming_connections / \
+         ClientOptions::incoming_connections), or start a serve loop with \
+         RpcSession::spawn_serve first if this session makes no further calls of its own: the \
+         loop holds the only connection."
     );
 }
 
 impl IBinder for RpcProxy {
     /// Register a death recipient. Death over RPC = the **session
     /// connection dropping** (AOSP `RpcState::sendObituaries`): the
-    /// recipient fires when the session's serve loop ends. Mirrors the
+    /// recipient fires when the session ends. Mirrors the
     /// kernel [`ProxyHandle::link_to_death`](crate::proxy::ProxyHandle)
     /// minus the kernel `requestDeathNotification` IPC (RPC has no
     /// death wire message).
     ///
-    /// **Refused with [`StatusCode::InvalidOperation`] on a session that
-    /// would not notice the loss** — AOSP `BpBinder::linkToDeath` refuses an
-    /// RPC binder the same way unless its session has incoming threads. A
-    /// session notices a connection loss when something reads its
-    /// connections at all times:
+    /// A session notices a connection loss by reading the connection:
     ///
     /// - the server side of a session (its workers serve every connection);
     /// - a client with incoming connections
@@ -347,21 +344,43 @@ impl IBinder for RpcProxy {
     ///   or a call already inside
     ///   [`serve_blocking`](super::session::RpcSession::serve_blocking).
     ///
-    /// Anywhere else a recipient would hear nothing until a later call
-    /// happened to fail, so it is not registered. A call that fails on a
-    /// lost connection still runs the session's death sequence, which is
-    /// what fires the recipients registered on a session that qualifies.
+    /// On any other session of Linux or Android the first link starts one
+    /// thread that watches the sockets of the outgoing connections, and reads
+    /// nothing from them, until the session ends; AOSP `BpBinder::linkToDeath`
+    /// refuses an RPC binder there. It is what wakes the recipient of a peer
+    /// that closes between calls. A call in flight when the peer closes gets
+    /// the reply the peer wrote before it did, and the recipient runs after
+    /// that call returns, on the session's reaper thread. So it runs late while
+    /// such a call's thread is in a nested handler, or, with no send deadline,
+    /// while the reaper writes to a peer that shut only its writing side and
+    /// stopped reading. A peer whose host vanishes is noticed as the transport's
+    /// own liveness check allows ([`set_liveness`][liveness]), which a session
+    /// with no deadline leaves at the system's defaults, and vsock has none. A
+    /// TLS peer that sends `close_notify` and keeps its socket open is not seen.
+    /// The thread takes two descriptors, and one more per outgoing connection.
     ///
-    /// The checks run in this order: `InvalidOperation` above, then
+    /// **Refused with [`StatusCode::InvalidOperation`]** where the session
+    /// neither reads nor can watch: on other platforms, Apple's included, and on
+    /// a connection with no socket to watch
+    /// ([`peer_close_fd`][fd]: a `MemTransport`, a `TlsStream` with no `socket`,
+    /// a transport of the caller's own). A failure to start the thread is
+    /// returned as what caused it, and the recipient is not registered, so a
+    /// later link can try again.
+    ///
+    /// The checks run in this order: those above, then
     /// [`StatusCode::DeadObject`] after the obituary, then
     /// [`StatusCode::BadValue`] for a recipient with no strong reference left.
     ///
     /// [incoming]: super::session::RpcClientConfig::incoming_connections
+    /// [liveness]: super::transport::RpcTransport::set_liveness
+    /// [fd]: super::transport::RpcTransport::peer_close_fd
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
-        if !self.session.notices_connection_loss() {
-            unwatched_session_link();
-            return Err(StatusCode::InvalidOperation);
-        }
+        self.session
+            .watch_for_death_link()
+            .inspect_err(|e| match e {
+                StatusCode::InvalidOperation => unwatched_session_link(),
+                e => log::error!("link_to_death over RPC failed: {e:?}"),
+            })?;
         // No kernel registration: nothing runs under the lock.
         self.death.link(recipient, || Ok(()))
     }

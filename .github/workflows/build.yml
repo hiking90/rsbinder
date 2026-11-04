@@ -340,7 +340,7 @@ jobs:
           bash scripts/ci_rsbinder_lib_tests.sh
           t cargo test -p rsbinder --features rpc --doc
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
-          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
+          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance --test rpc_release_order
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- drains_past_the_hold_android13plus_tcp_debug tls_flood::
@@ -566,7 +566,7 @@ jobs:
           bash scripts/ci_rsbinder_lib_tests.sh
           t cargo test -p rsbinder --features rpc --doc
           cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
-          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance --test rpc_slow_peer
+          cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance --test rpc_slow_peer --test rpc_release_order
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_e2e -- drains_past_the_hold_android13plus_tcp_debug tls_flood::

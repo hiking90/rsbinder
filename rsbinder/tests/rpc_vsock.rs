@@ -204,7 +204,6 @@ fn vsock_session_shutdown_ends_serve_thread() {
     assert_eq!(ping_via(&root, "pre").unwrap(), "pong:pre");
     let (tx, rx) = mpsc::sync_channel::<()>(1);
     let flag: Arc<Flag> = Arc::new(Flag(tx));
-    // Served before the link: a session nothing reads refuses it.
     let serve = client.spawn_serve().expect("spawn_serve");
     root.link_to_death(Arc::downgrade(&flag) as _)
         .expect("link_to_death");

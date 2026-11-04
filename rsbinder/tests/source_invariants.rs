@@ -281,7 +281,7 @@ fn slot_unpush_has_exactly_one_path() {
     let lines: Vec<&str> = session_src.lines().map(code_only).collect();
     let mut failures = Vec::new();
     let children = out_of_file_children(&lines);
-    if children != ["ref_accounting_tests.rs"] {
+    if children != ["ref_accounting_tests.rs", "peer_watch_tests.rs"] {
         failures.push(format!("`session`'s out-of-file children: {children:?}"));
     }
     let child_srcs: Vec<(String, String)> = children
@@ -718,6 +718,21 @@ fn drop_impls(lines: &[&str]) -> Vec<String> {
                 .collect()
         })
         .collect()
+}
+
+/// `rpc/peer_watch.rs` names no session: what its thread holds cannot keep one alive.
+#[test]
+fn the_peer_watch_refers_to_no_session() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rpc/peer_watch.rs");
+    let Ok(src) = fs::read_to_string(&path) else {
+        eprintln!("skipping: {} is not reachable", path.display());
+        return;
+    };
+    for line in src.lines().map(code_only) {
+        for word in ["RpcSession", "SharedSession", "Weak"] {
+            assert!(!line.contains(word), "`{word}` in {line}");
+        }
+    }
 }
 
 /// Pins the library's panicking thread creations; see module doc "Thread creation".

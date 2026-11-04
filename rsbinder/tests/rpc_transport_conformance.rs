@@ -402,6 +402,50 @@ fn mem_peer_closed_is_unknown() {
     peer_closed_tracks_the_peer("mem", &local, peer, None);
 }
 
+/// A frame leaves a `poll` of `peer_close_fd` waiting, and the peer's close ends it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_close_fd_tells_of_the_close_alone(name: &str, local: &Shared, peer: Shared) {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let fd = local.peer_close_fd().expect("a socket to watch");
+    let polled = |secs: i64, nanos: i64| {
+        let mut set = [PollFd::from_borrowed_fd(fd, PollFlags::RDHUP)];
+        let wait = Timespec {
+            tv_sec: secs,
+            tv_nsec: nanos,
+        };
+        poll(&mut set, Some(&wait)).expect("poll");
+        set[0].revents()
+    };
+    peer.send_frame(b"unread").expect("peer send");
+    assert!(polled(0, 200_000_000).is_empty(), "{name}: a frame woke it");
+    drop(peer);
+    assert!(
+        !polled(5, 0).is_empty(),
+        "{name}: the close did not wake it"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn unix_peer_close_fd_tells_of_the_close_alone() {
+    let (local, peer) = unix_pair();
+    peer_close_fd_tells_of_the_close_alone("unix", &local, peer);
+}
+
+/// A blocking `poll` of this kind is not measured off Linux and Android: a link there is refused.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[test]
+fn unix_has_no_peer_close_fd_here() {
+    let (local, _peer) = unix_pair();
+    assert!(local.peer_close_fd().is_none());
+}
+
+#[test]
+fn mem_has_no_peer_close_fd() {
+    let (local, _peer) = mem_pair();
+    assert!(local.peer_close_fd().is_none());
+}
+
 #[test]
 fn mem_queued_frame_then_shutdown() {
     let (local, peer) = mem_pair();
@@ -461,6 +505,20 @@ mod tcp {
     fn tcp_pair() -> (Shared, Shared) {
         let (client, server) = TcpDebugTransport::pair_loopback().expect("loopback pair");
         armed((Arc::new(client), Arc::new(server)))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn tcp_peer_close_fd_tells_of_the_close_alone() {
+        let (local, peer) = tcp_pair();
+        peer_close_fd_tells_of_the_close_alone("tcp", &local, peer);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn tcp_has_no_peer_close_fd_here() {
+        let (local, _peer) = tcp_pair();
+        assert!(local.peer_close_fd().is_none());
     }
 
     /// [`tcp_pair`], plus a second handle on the local socket to see what it has received.
@@ -534,6 +592,20 @@ mod tls {
         CertificateDer::pem_slice_iter(pem.as_bytes())
             .collect::<Result<_, _>>()
             .expect("parse certs")
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn tls_peer_close_fd_tells_of_the_close_alone() {
+        let (local, peer) = tls_pair();
+        peer_close_fd_tells_of_the_close_alone("tls", &local, peer);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn tls_has_no_peer_close_fd_here() {
+        let (local, _peer) = tls_pair();
+        assert!(local.peer_close_fd().is_none());
     }
 
     /// TLS pair with both handshakes done, so no post-handshake write is pending at shutdown.
