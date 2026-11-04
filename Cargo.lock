@@ -1317,6 +1317,7 @@ version = "0.13.0"
 dependencies = [
  "async-trait",
  "env_logger",
+ "libc",
  "log",
  "rsbinder",
  "rsbinder-aidl",

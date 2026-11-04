@@ -25,16 +25,14 @@
 //!   Holder → root proxy → Arc<client inner>`. The server dies; the client's
 //!   next call fails, which must run the same death sequence (clear) so the
 //!   client graph is reclaimed once the user's own handles are gone.
-//! - `argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`:
-//!   below wire v2, the `DEC_STRONG` for a proxy a handler received as an
-//!   argument goes out after the reply and on the same connection, even when
-//!   the session has an idle callback slot (a real-libbinder peer's incoming
-//!   connection) that a free-slot scan would pick first. Sent there it races
-//!   the reply on the serving connection, and a peer that handles the DEC
-//!   first frees the node the reply names. At v2 the reply's send is counted
-//!   and the release waits for the peer to pay it back instead
-//!   (`ref_accounting_tests` T12). Only the raw handshake helper can open a
-//!   callback connection, so the test is in-crate.
+//! - `argument_proxy_dec_strong_goes_out_on_the_serving_connection`: the
+//!   `DEC_STRONG` for a proxy a handler received as an argument and sent nowhere
+//!   goes out on the connection the handler serves, even when the session has an
+//!   idle callback slot (a real-libbinder peer's incoming connection) that a
+//!   free-slot scan would pick first: the peer is reading there, for the reply.
+//!   A proxy the handler sends on is counted, and its release waits for the
+//!   peer to pay it back instead (`ref_accounting_tests` T12). Only the raw
+//!   handshake helper can open a callback connection, so the test is in-crate.
 
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -51,7 +49,7 @@ use crate::{
 const DESC: &str = "rsbinder.test.IHolder";
 const TX_ECHO: TransactionCode = FIRST_CALL_TRANSACTION;
 const TX_SET_CB: TransactionCode = FIRST_CALL_TRANSACTION + 1;
-const TX_REPEAT: TransactionCode = FIRST_CALL_TRANSACTION + 2;
+const TX_READ: TransactionCode = FIRST_CALL_TRANSACTION + 2;
 
 /// Stores whatever binder it gets: the `session → local node → service → proxy → session` shape.
 #[derive(Default)]
@@ -80,10 +78,9 @@ impl Remotable for Holder {
                 *self.cb.lock().unwrap() = Some(b);
                 reply.write(&Status::from(StatusCode::Ok))
             }
-            TX_REPEAT => {
-                let b: Option<SIBinder> = reader.read()?;
-                reply.write(&Status::from(StatusCode::Ok))?;
-                reply.write(&b)
+            TX_READ => {
+                let _: Option<SIBinder> = reader.read()?;
+                reply.write(&Status::from(StatusCode::Ok))
             }
             _ => Err(StatusCode::UnknownTransaction),
         }
@@ -107,20 +104,6 @@ fn echo(b: &SIBinder, s: &str) -> Result<String> {
         return Err(StatusCode::from(st));
     }
     r.read::<String>()
-}
-
-fn repeat(b: &SIBinder, arg: &SIBinder) -> Result<Option<SIBinder>> {
-    let rp = rpc_of(b);
-    let mut d = rp.request_parcel(DESC)?;
-    d.write(&Some(arg.clone()))?;
-    let mut r = rp
-        .send(TX_REPEAT, &d, 0)?
-        .ok_or(StatusCode::UnexpectedNull)?;
-    let st: Status = r.read()?;
-    if !st.is_ok() {
-        return Err(StatusCode::from(st));
-    }
-    r.read::<Option<SIBinder>>()
 }
 
 fn set_cb(b: &SIBinder, cb: &SIBinder) -> Result<()> {
@@ -272,9 +255,9 @@ fn client_side_callback_cycle_reclaimed_on_server_death() {
     );
 }
 
-/// An argument proxy's `DEC_STRONG` follows the reply on the serving connection; see module doc.
+/// An argument proxy's `DEC_STRONG` goes out on the serving connection; see module doc.
 #[test]
-fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
+fn argument_proxy_dec_strong_goes_out_on_the_serving_connection() {
     use crate::rpc::wire_android13::{client_connect_with_id, FD_MODE_NONE};
     use crate::rpc::RpcServer;
     use std::io::Read;
@@ -289,7 +272,6 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
             .as_nanos()
     ));
     let server = RpcServer::setup_unix_server(&path).expect("bind");
-    // v1: at v2 the release is ordered by the count, not by the connection (module doc).
     server.set_android13plus(1);
     server
         .set_root(Interface::as_binder(&Binder::new(Holder::default())))
@@ -320,16 +302,18 @@ fn argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection() {
 
     let root = client.get_root().expect("root");
     let cb: SIBinder = Interface::as_binder(&Binder::new(Holder::default()));
-    for i in 0..100 {
-        let back = repeat(&root, &cb).expect("repeat");
-        assert_eq!(
-            back.as_ref(),
-            Some(&cb),
-            "iteration {i}: not the same local object"
-        );
+    for _ in 0..100 {
+        let rp = rpc_of(&root);
+        let mut d = rp.request_parcel(DESC).expect("request");
+        d.write(&Some(cb.clone())).expect("argument");
+        let mut r = rp
+            .send(TX_READ, &d, 0)
+            .expect("read")
+            .expect("twoway reply");
+        assert!(r.read::<Status>().expect("status").is_ok());
     }
 
-    // Nothing on the callback connection: every DEC went behind its reply on the serving one.
+    // Nothing on the callback connection: every DEC went out on the serving one.
     callback_conn
         .set_read_timeout(Some(Duration::from_millis(300)))
         .expect("read timeout");

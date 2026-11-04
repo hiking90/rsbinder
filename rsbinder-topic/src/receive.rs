@@ -67,8 +67,9 @@ pub enum Disconnected {
     /// name is registered anew, to the same binder or another: while that publisher holds the
     /// name, a receive waits with nothing more to report.
     Ended(Closed),
-    /// The publisher refused the subscription with this status. Refusals that a retry cannot
-    /// change (`EX_SECURITY`, `EX_UNSUPPORTED_OPERATION`, `BadType`, `InvalidOperation`,
+    /// The publisher, or the resolver's check of it, refused the subscription with this status;
+    /// a connection the subscriber has to an earlier publisher goes on. Refusals that a retry
+    /// cannot change (`EX_SECURITY`, `EX_UNSUPPORTED_OPERATION`, `BadType`, `InvalidOperation`,
     /// [`ITopic::ERROR_VERSION`]) wait for another publisher to take the name;
     /// [`ITopic::ERROR_FULL`], the other transaction errors and the other exceptions are retried
     /// on the same publisher, at intervals from 1 to 30 seconds, and reported once. `DeadObject`

@@ -221,6 +221,14 @@ tier_hermetic() {
     run "rsbinder-fmq loom (EventFlag, Bytes order, unsync reader)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-fmq --lib --release loom
     run "rsbinder-topic" tpass cargo test -p rsbinder-topic
+    run "rsbinder-topic (uds)" tpass cargo test -p rsbinder-topic --features uds
+    if [ "$(uname -s)" = Linux ] && docker info >/dev/null 2>&1; then
+        run "container runner" bash -c 'cargo build -p rsbinder-tools && tests/container/ac_run.sh'
+        run "topics in a container with no binder" tests/container/topic_uds.sh
+    else
+        skip "container runner" "needs Linux and a running docker"
+        skip "topics in a container with no binder" "needs Linux and a running docker"
+    fi
     run "rsbinder-topic loom (ring writer and reader, wait and wake)" tpass env CARGO_TARGET_DIR=target/loom \
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder-topic --lib --release loom
     # CI does not run Miri either.
@@ -240,6 +248,7 @@ tier_hermetic() {
         RUSTFLAGS="--cfg loom" cargo test -p rsbinder --test loom_cache_pin --release
     run "rsbinder-tools" tpass cargo test -p rsbinder-tools
     run "rsbinder-tools (topic)" tpass cargo test -p rsbinder-tools --features topic
+    run "rsbinder-tools (topic, rpc)" tpass cargo test -p rsbinder-tools --features topic,rpc
 
     run "rpc build matrix" rpc_build_matrix
     run "rsbinder lib (no binder device)" bash scripts/ci_rsbinder_lib_tests.sh
@@ -247,7 +256,7 @@ tier_hermetic() {
     run "rsbinder rpc targets" tpass cargo test -p rsbinder --features rpc --test rpc_e2e \
         --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory \
         --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants \
-        --test blob_rpc --test pipe_rpc --test parcel_alloc
+        --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
     run "rsbinder tls targets" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
         --test rpc_tls --test rpc_transport_conformance
     # Skips (and still passes) where unprivileged user namespaces are off; CI sets REQUIRED.
@@ -396,6 +405,11 @@ tier_kernel() {
     # Debug, as the other kernel steps: its nodes take about three cores (CI runs it in release).
     run "topic fleet" tpass cargo test -p tests --test topic_fleet \
         -- --ignored --test-threads=1 --skip hub_restarts
+    if docker info >/dev/null 2>&1; then
+        run "topic fleet over sockets (a container with no binder)" tests/container/topic_fleet_uds.sh
+    else
+        skip "topic fleet over sockets (a container with no binder)" "needs a running docker"
+    fi
     run "reconnect_kernel" tpass cargo test -p tests --features rpc \
         --test reconnect_kernel -- --ignored --test-threads=1
     run "freeze_kernel" tpass cargo test -p tests --features rpc \

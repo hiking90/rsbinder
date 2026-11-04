@@ -12,6 +12,7 @@
 //! A receive that waits looks at the ring, spins a little (`rsbinder::fmq::shm::spin`), and
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
 
+use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -175,6 +176,9 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     dead: Arc<Dead>,
     /// A look read the topic's end record: the publisher refuses every later subscription.
     read_end: bool,
+    /// What keeps the session of an RPC binder open; dropped after the death link it serves.
+    session: Option<Arc<dyn Any + Send + Sync>>,
+    ring: RingId,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -200,6 +204,10 @@ pub(crate) struct Trace {
     pub(crate) parks: Vec<(Slept, Duration, u32)>,
 }
 
+/// Which memory a topic's ring is: its memfd's device and inode, the same however the publisher
+/// was reached, through whichever binder or socket.
+pub(crate) type RingId = (u64, u64);
+
 /// The control page, marked `CLOSED` when dropped. A wait left on the pool shares it.
 struct Closing(Arc<ControlPage>);
 
@@ -210,13 +218,16 @@ impl Drop for Closing {
 }
 
 impl<T: Payload> Subscriber<T> {
-    /// Subscribe to the topic behind `topic`, an `ITopic` binder: a kernel binder proxy, or a
-    /// binder of this process. The subscriber does not vouch for the publisher ([`Untrusted`]).
+    /// Subscribe to the topic behind `topic`, an `ITopic` binder: a kernel binder proxy, a binder
+    /// of this process, or an RPC binder of a Unix-socket session that passes fds and has an
+    /// incoming connection. The subscriber does not vouch for the publisher ([`Untrusted`]).
     ///
     /// One twoway call; after it, receiving makes none. The refusals of the publisher come back
     /// as it sent them ([`Acceptor::accept`](crate::Acceptor::accept) lists them, and an
     /// application's `ITopic` may refuse with `EX_SECURITY`). Of its own, `request` returns
-    /// `InvalidOperation` for an RPC binder, `EX_UNSUPPORTED_OPERATION` where topics cannot work
+    /// `InvalidOperation` for an RPC binder of a session with no incoming connection, which would
+    /// not learn of its publisher's death, what the parcel answers to the fds of a session that
+    /// passes none, `EX_UNSUPPORTED_OPERATION` where topics cannot work
     /// (off Linux and Android, or on a kernel without `F_SEAL_FUTURE_WRITE`),
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
     /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
@@ -228,12 +239,21 @@ impl<T: Payload> Subscriber<T> {
     /// **The process has to run the binder thread pool**
     /// (`rsbinder::ProcessState::start_thread_pool`) for a publisher in another process: the
     /// notice of its death arrives on a pool thread, and without it a subscriber never learns
-    /// that its publisher died, and a wait for a record never ends.
+    /// that its publisher died, and a wait for a record never ends. Over RPC the notice arrives
+    /// through the session's incoming connection instead, and the caller keeps the session open
+    /// for as long as the subscriber.
     pub fn request(topic: &SIBinder, policy: &SubscriberPolicy) -> BinderResult<Self> {
+        Self::request_starting(topic, policy, |_| policy.start)
+    }
+
+    /// [`request`](Self::request), with where it starts chosen once the reply says which topic
+    /// it is. Nothing of the subscription call depends on it: the start is this side's to apply.
+    pub(crate) fn request_starting(
+        topic: &SIBinder,
+        policy: &SubscriberPolicy,
+        start: impl FnOnce(RingId) -> Start,
+    ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
-        if topic.as_proxy().is_none() && topic.is_remote() {
-            return Err(StatusCode::InvalidOperation.into());
-        }
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
         let local = Arc::new(Local::new());
@@ -277,7 +297,7 @@ impl<T: Payload> Subscriber<T> {
         };
         // The publisher holds its own fds now; this side keeps the mapping and a duplicate.
         drop(request);
-        let memory = map_endpoint(&endpoint, policy.max_ring_bytes)?;
+        let (memory, ring) = map_endpoint(&endpoint, policy.max_ring_bytes)?;
         let pool = match &endpoint.pool {
             Some(pool) => {
                 let pool = map_pool(pool, policy.max_pool_bytes)?;
@@ -290,7 +310,7 @@ impl<T: Payload> Subscriber<T> {
             control: control.0.clone(),
             fd: fd_wake,
         });
-        let start = match policy.start {
+        let start = match start(ring) {
             // The bits of the position and the index, as the publisher wrote them.
             Start::Latest => ring::Start::Latest {
                 at: endpoint.start as u64,
@@ -322,6 +342,8 @@ impl<T: Payload> Subscriber<T> {
             _death: death,
             dead,
             read_end: false,
+            session: None,
+            ring,
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -331,9 +353,26 @@ impl<T: Payload> Subscriber<T> {
             _trust: PhantomData,
         })
     }
+
+    /// This subscriber, keeping `session` until it drops.
+    pub(crate) fn with_session(mut self, session: Arc<dyn Any + Send + Sync>) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// What [`with_session`](Self::with_session) gave it, for a test.
+    #[cfg(all(test, feature = "uds"))]
+    pub(crate) fn session_guard<G: Any + Send + Sync>(&self) -> Option<&G> {
+        self.session.as_ref()?.downcast_ref()
+    }
 }
 
 impl<T: Payload, M: Trust> Subscriber<T, M> {
+    /// Which memory this subscription reads.
+    pub(crate) fn ring(&self) -> RingId {
+        self.ring
+    }
+
     /// The next value, without waiting.
     ///
     /// [`RecvError::Empty`] when no record is unread. After the publisher's process died, every
@@ -845,6 +884,8 @@ impl<T: Payload> Subscriber<T> {
             _death,
             dead,
             read_end,
+            session,
+            ring,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -870,6 +911,8 @@ impl<T: Payload> Subscriber<T> {
             _death,
             dead,
             read_end,
+            session,
+            ring,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1176,7 +1219,7 @@ impl fmt::Debug for Interrupter {
 }
 
 /// SUB6 and SUB7: the reply's version and descriptor, then the topic memory it names, mapped.
-fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loaded> {
+fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<(Loaded, RingId)> {
     if endpoint.version != VERSION as i32 {
         return Err(refuse(ERROR_VERSION, "publisher of another layout version"));
     }
@@ -1195,7 +1238,9 @@ fn map_endpoint(endpoint: &TopicEndpoint, max_ring: usize) -> BinderResult<Loade
     if ring.grantors != layout::grantors(memory.capacity()) {
         return Err(bad_value());
     }
-    Ok(memory)
+    let stat = rustix::fs::fstat(fd.as_fd())
+        .map_err(|errno| StatusCode::from(std::io::Error::from(errno)))?;
+    Ok((memory, (stat.st_dev as u64, stat.st_ino as u64)))
 }
 
 /// Map the pool an endpoint names, no larger than `max_pool`.

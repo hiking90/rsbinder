@@ -1665,24 +1665,34 @@ impl IServiceManager for ServiceManager {
 const DEFAULT_CONFIG_DIR: &str = "/etc/rsbinder/hub.d";
 
 /// No permissive fallback: a config typo must not silently drop access control.
-fn exit_without_config(path: &Path, err: &config::ConfigError) -> ! {
+fn exit_without_config(path: &Path, err: &config::ConfigError, on_a_socket: bool) -> ! {
     eprintln!("rsb_hub: cannot load its configuration");
     eprintln!("  {err}");
     eprintln!();
     eprintln!("rsb_hub denies every request its configuration does not allow. Create a");
     eprintln!("file, for example {}/10-local.toml:", path.display());
     eprintln!();
-    eprintln!("    [global]");
-    eprintln!("    list = {{ group = [\"binder-admin\"] }}");
-    eprintln!();
-    eprintln!("    [[rule]]");
-    eprintln!("    name = \"com.example.*\"");
-    eprintln!("    add  = {{ user = [\"exampled\"] }}");
-    eprintln!("    find = {{ group = [\"binder-clients\"] }}");
-    eprintln!();
-    eprintln!("    [[service]]");
-    eprintln!("    name = \"com.example.IFoo/default\"");
-    eprintln!("    start = {{ systemd = \"example-foo.service\" }}");
+    if on_a_socket {
+        eprintln!("    [global]");
+        eprintln!("    topics = {{ group = [\"binder-admin\"] }}");
+        eprintln!();
+        eprintln!("    [[topic]]");
+        eprintln!("    name = \"com.example.*\"");
+        eprintln!("    advertise = {{ user = [\"exampled\"] }}");
+        eprintln!("    subscribe = {{ group = [\"binder-clients\"] }}");
+    } else {
+        eprintln!("    [global]");
+        eprintln!("    list = {{ group = [\"binder-admin\"] }}");
+        eprintln!();
+        eprintln!("    [[rule]]");
+        eprintln!("    name = \"com.example.*\"");
+        eprintln!("    add  = {{ user = [\"exampled\"] }}");
+        eprintln!("    find = {{ group = [\"binder-clients\"] }}");
+        eprintln!();
+        eprintln!("    [[service]]");
+        eprintln!("    name = \"com.example.IFoo/default\"");
+        eprintln!("    start = {{ systemd = \"example-foo.service\" }}");
+    }
     eprintln!();
     eprintln!("It and every directory above it must be owned by root or by rsb_hub's user, and");
     eprintln!("writable by no one else (so not under /tmp): a start entry runs with rsb_hub's");
@@ -1729,8 +1739,27 @@ struct Reloadable {
     path: PathBuf,
 }
 
+/// What the configuration holds that this hub cannot use: logged, as one file serves both kinds.
+#[cfg_attr(
+    not(feature = "topic"),
+    expect(unused_variables, reason = "only `topic` warns")
+)]
+fn warn_of_config(config: &config::Config, on_a_socket: bool) {
+    #[cfg(feature = "topic")]
+    {
+        let warning = if on_a_socket {
+            config::unused_on_a_topic_socket(config)
+        } else {
+            config::registry_out_of_reach(config)
+        };
+        if let Some(warning) = warning {
+            log::warn!("rsb_hub: {warning}");
+        }
+    }
+}
+
 /// A failed reload keeps the config in force: deny-all breaks IPC, permissive opens it.
-fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) {
+fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifier: Arc<Notifier>) {
     let spawn_result = std::thread::Builder::new()
         .name("rsb_hub:signals".to_owned())
         .spawn(move || {
@@ -1754,7 +1783,7 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
                     std::process::exit(1);
                 }
                 match signo {
-                    libc::SIGHUP => reload(reloadable.as_ref(), &notifier),
+                    libc::SIGHUP => reload(reloadable.as_ref(), on_a_socket, &notifier),
                     // SIGTERM (`systemctl stop`) or SIGINT (Ctrl-C): same intent.
                     _ => {
                         let name = if signo == libc::SIGINT {
@@ -1764,7 +1793,13 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, notifier: Arc<Notifier>) 
                         };
                         log::info!("rsb_hub: {name} received, shutting down");
                         notifier.stopping("shutting down");
-                        // Nothing to flush: the registry is in memory, as in AOSP.
+                        // The registry is in memory, as in AOSP: a socket's file is all to clear.
+                        #[cfg(all(
+                            feature = "topic",
+                            feature = "rpc",
+                            any(target_os = "linux", target_os = "android")
+                        ))]
+                        remove_topic_socket();
                         std::process::exit(0);
                     }
                 }
@@ -1791,7 +1826,7 @@ fn summary(config: &config::Config) -> String {
 }
 
 /// One SIGHUP's worth of work.
-fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
+fn reload(reloadable: Option<&Reloadable>, on_a_socket: bool, notifier: &Notifier) {
     let Some(Reloadable { enforcer, path }) = reloadable else {
         log::warn!("rsb_hub: SIGHUP ignored; running with --insecure-allow-all, no configuration");
         return;
@@ -1799,6 +1834,7 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
     match config::load(path, &SystemResolver) {
         Ok(loaded) => {
             let summary = summary(&loaded);
+            warn_of_config(&loaded, on_a_socket);
             enforcer.replace(loaded);
             log::info!("rsb_hub: SIGHUP reloaded {summary} from {}", path.display());
             notifier.status(&format!("serving; {summary}"));
@@ -1809,6 +1845,240 @@ fn reload(reloadable: Option<&Reloadable>, notifier: &Notifier) {
             path.display()
         ),
     }
+}
+
+/// A topic socket's directory: beside it, its name with `.sock` replaced by `.d`, or `.d` added.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn socket_dir_of(socket: &Path) -> PathBuf {
+    let sock = socket.extension().is_some_and(|ext| ext == "sock");
+    let stem = if sock {
+        socket.file_stem()
+    } else {
+        socket.file_name()
+    };
+    let mut name = stem.unwrap_or(socket.as_os_str()).to_os_string();
+    name.push(".d");
+    socket.with_file_name(name)
+}
+
+/// What `set_max_connections` counts: serve workers, one to a session, none to a callback socket.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+const MAX_SERVE_WORKERS: u64 = 1024;
+
+/// A session's most: its socket, an allocation's socket and file, `2 * max_threads` callback ones.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+const DESCRIPTORS_PER_WORKER: u64 = 5;
+
+/// All but names and sessions: stdio, listener, directory, reloads, the notice being sent.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+const OTHER_DESCRIPTORS: u64 = 32;
+
+/// The serve workers half of `descriptors` hold, up to the hub's size.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn topic_workers(descriptors: u64) -> usize {
+    (descriptors / 2 / DESCRIPTORS_PER_WORKER).min(MAX_SERVE_WORKERS) as usize
+}
+
+/// Raised to the hard limit, as a systemd service's soft 1024 is short of the registry's bounds.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn raise_descriptor_limit() -> u64 {
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let raised = Rlimit {
+        current: limit.maximum,
+        maximum: limit.maximum,
+    };
+    if let Err(error) = setrlimit(Resource::Nofile, raised) {
+        log::warn!("rsb_hub: cannot raise the descriptor limit: {error}");
+    }
+    let names = rsbinder_topic::registry::MAX_NAMES as u64;
+    let wanted = names + OTHER_DESCRIPTORS + DESCRIPTORS_PER_WORKER * MAX_SERVE_WORKERS;
+    let held = getrlimit(Resource::Nofile).current.unwrap_or(u64::MAX);
+    if held < wanted {
+        log::warn!(
+            "rsb_hub: {held} descriptors are too few for {names} topic names and \
+             {MAX_SERVE_WORKERS} sessions, which take {wanted}: it takes {} sessions at \
+             once; raise LimitNOFILE",
+            topic_workers(held)
+        );
+    }
+    held
+}
+
+/// Set `mode` on what `path` names only if it is this process's own `is_kind`, and no symlink.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn set_own_file_mode(
+    path: &Path,
+    is_kind: fn(&std::fs::FileType) -> bool,
+    mode: u32,
+) -> std::io::Result<std::fs::Metadata> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let file = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
+    let found = file.metadata()?;
+    if !is_kind(&found.file_type()) || found.uid() != rustix::process::geteuid().as_raw() {
+        let why = format!("{}: not what this process made there", path.display());
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
+    }
+    // `fchmod` refuses `O_PATH`; this name reaches the descriptor's file, whatever the path is now.
+    let held = format!("/proc/self/fd/{}", file.as_raw_fd());
+    std::fs::set_permissions(held, std::fs::Permissions::from_mode(mode))?;
+    Ok(found)
+}
+
+/// Make the socket's parent, with the mode any uid needs to reach the socket, whatever the umask.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn make_socket_parent(socket: &Path) -> std::io::Result<()> {
+    let Some(parent) = socket.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    // The mode at `mkdir`, so a crash leaves no parent a later hub takes as made and would not fix.
+    let umask = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+    let made = std::fs::create_dir_all(parent);
+    rustix::process::umask(umask);
+    made
+}
+
+/// The socket this hub bound, with what tells that file from one a later hub bound at its path.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+static TOPIC_SOCKET: std::sync::OnceLock<(PathBuf, (u64, u64))> = std::sync::OnceLock::new();
+
+/// At the end of a hub: a file left behind answers `ECONNREFUSED`, where none says `NameNotFound`.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn remove_topic_socket() {
+    use std::os::unix::fs::MetadataExt;
+    let Some((path, file)) = TOPIC_SOCKET.get() else {
+        return;
+    };
+    let same = std::fs::symlink_metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == *file);
+    if same {
+        if let Err(error) = std::fs::remove_file(path) {
+            log::warn!("rsb_hub: cannot remove {}: {error}", path.display());
+        }
+    }
+}
+
+/// `serve_topic_socket` up to its run: every refusal of the hub comes from here, and none waits.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn bind_topic_socket(
+    socket: &Path,
+    enforcer: Arc<Enforcer>,
+    allow_cross_uid_overwrite: bool,
+) -> std::result::Result<
+    (
+        Arc<rsbinder::rpc::RpcServer>,
+        rsbinder_topic::registry::uds::UdsRegistry,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use rsbinder_topic::registry::uds::{SocketDir, UdsRegistry};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let descriptors = raise_descriptor_limit();
+    make_socket_parent(socket)?;
+    // Its `flock` picks the one hub for this path, until the process ends: no other touches it.
+    let dir = SocketDir::open(&socket_dir_of(socket))?;
+    let server = rsbinder::rpc::RpcServer::setup_unix_server(socket)?;
+    // Who connects is the policy's to judge; left to the umask, systemd's default keeps others out.
+    let bound = set_own_file_mode(socket, std::fs::FileType::is_socket, 0o666)?;
+    let _ = TOPIC_SOCKET.set((socket.to_owned(), (bound.dev(), bound.ino())));
+    server.set_max_connections(topic_workers(descriptors));
+    let registry = UdsRegistry::new(dir, TopicAccess(enforcer))
+        .allow_cross_uid_overwrite(allow_cross_uid_overwrite);
+    registry.serve(&server)?;
+    Ok((server, registry))
+}
+
+/// Whether `error` says this process cannot use the socket's path, which another path can change.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn cannot_use_the_path(error: &(dyn std::error::Error + 'static)) -> bool {
+    const ERRNOS: [i32; 4] = [libc::EACCES, libc::EPERM, libc::EROFS, libc::ENOENT];
+    let status = |status: rsbinder::StatusCode| {
+        ERRNOS.iter().any(|errno| {
+            status == rsbinder::StatusCode::from(std::io::Error::from_raw_os_error(*errno))
+        })
+    };
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        return error
+            .raw_os_error()
+            .is_some_and(|raw| ERRNOS.contains(&raw));
+    }
+    if let Some(error) = error.downcast_ref::<rsbinder::StatusCode>() {
+        return status(*error);
+    }
+    if let Some(error) = error.downcast_ref::<rsbinder::Status>() {
+        return status(error.transaction_error());
+    }
+    false
+}
+
+/// Serve the topic registry on a Unix socket, without kernel binder: the hub's `--topic-socket`.
+#[cfg(all(
+    feature = "topic",
+    feature = "rpc",
+    any(target_os = "linux", target_os = "android")
+))]
+fn serve_topic_socket(
+    socket: &Path,
+    enforcer: Arc<Enforcer>,
+    allow_cross_uid_overwrite: bool,
+    notifier: &Notifier,
+    ready_status: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (server, _registry) = bind_topic_socket(socket, enforcer, allow_cross_uid_overwrite)?;
+    log::info!("rsb_hub: serving topics on {}", socket.display());
+    notifier.ready(ready_status);
+    Ok(server.run()?)
 }
 
 /// Aborts on a panic off `main` and start threads, like AOSP's FATAL_IF_NOT_ONEWAY (plan 16 Q3).
@@ -1875,6 +2145,24 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                      this flag is set.",
                 ),
         )
+        // Also without the features, hidden: a usage error would say nothing of why.
+        .arg(
+            clap::Arg::new("topic-socket")
+                .long("topic-socket")
+                .value_name("PATH")
+                .conflicts_with("device")
+                .hide(!cfg!(all(
+                    feature = "topic",
+                    feature = "rpc",
+                    any(target_os = "linux", target_os = "android")
+                )))
+                .help(
+                    "Serve only the topic registry, on this Unix socket, without kernel binder \
+                     (e.g. /run/rsbinder/topic.sock, or $XDG_RUNTIME_DIR/rsbinder/topic.sock). \
+                     No service manager runs; of the configuration only [[topic]] and \
+                     [global] topics apply",
+                ),
+        )
         .after_help(
             "Examples:\n    \
             Run with the default binder device:\n    \
@@ -1885,14 +2173,18 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Run with configuration from somewhere other than /etc/rsbinder/hub.d:\n    \
             $ rsb_hub --config /usr/local/etc/rsbinder/hub.d\n\n    \
             Run with no access control (development only):\n    \
-            $ rsb_hub --insecure-allow-all\n\n\
+            $ rsb_hub --insecure-allow-all\n\n    \
+            Serve only the topic registry, with no binder device (features topic, rpc):\n    \
+            $ rsb_hub --topic-socket /run/rsbinder/topic.sock\n\n\
             Signals:\n    \
             SIGHUP           reload the configuration (a failed reload keeps the\n                     \
             one already in force)\n    \
             SIGTERM, SIGINT  stop, reporting a clean exit to the supervisor\n\n\
             Under systemd, use Type=notify: rsb_hub reports READY=1 only once it\n\
-            holds handle 0, so units ordered After= it never race the registry.\n\n    \
-            Note: The binder device must be created first using rsb_device.\n    \
+            holds handle 0, or with --topic-socket once its socket is set up, so units\n\
+            ordered After= it never race the registry.\n\n    \
+            Note: The binder device must be created first using rsb_device, except for\n    \
+            --topic-socket, which opens none.\n    \
             rsb_hub denies every request that its policy does not allow, and \n    \
             refuses to start when no policy can be loaded.",
         )
@@ -1900,6 +2192,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
     abort_on_a_background_panic();
+
+    let topic_socket = matches.get_one::<String>("topic-socket").map(PathBuf::from);
+    #[cfg(not(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    )))]
+    if topic_socket.is_some() {
+        eprintln!(
+            "rsb_hub: --topic-socket takes the features `topic` and `rpc`, on Linux; \
+             this build is not that"
+        );
+        std::process::exit(1);
+    }
+    let on_a_socket = topic_socket.is_some();
 
     let device_name = matches
         .get_one::<String>("device")
@@ -1939,9 +2246,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Ok(loaded) => {
                 let summary = summary(&loaded);
                 log::info!("rsb_hub: loaded {summary} from {}", path.display());
+                warn_of_config(&loaded, on_a_socket);
                 (Arc::new(Enforcer::enforcing(loaded)), summary)
             }
-            Err(err) => exit_without_config(&path, &err),
+            Err(err) => exit_without_config(&path, &err, on_a_socket),
         };
         (
             Arc::clone(&enforcer),
@@ -1949,7 +2257,35 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             format!("serving; {summary}"),
         )
     };
-    spawn_signal_thread(reloadable, Arc::clone(&notifier));
+    spawn_signal_thread(reloadable, on_a_socket, Arc::clone(&notifier));
+
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    if let Some(socket) = &topic_socket {
+        let served = serve_topic_socket(
+            socket,
+            enforcer,
+            allow_cross_uid_overwrite,
+            &notifier,
+            &ready_status,
+        );
+        if let Err(err) = served {
+            eprintln!(
+                "rsb_hub: cannot serve topics on {}: {err}",
+                socket.display()
+            );
+            // Once the socket's mode is set the path is in use: a later failure is not the path's.
+            if TOPIC_SOCKET.get().is_none() && cannot_use_the_path(&*err) {
+                eprintln!("A hub that is not root takes a path it can write to, for example");
+                eprintln!("    --topic-socket $XDG_RUNTIME_DIR/rsbinder/topic.sock");
+            }
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
@@ -2016,6 +2352,150 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hint goes with what another path can change, in each shape the bind's errors take.
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn the_path_hint_goes_with_an_errno_a_path_can_change() {
+        use rsbinder::{Status, StatusCode};
+        let io = |errno| std::io::Error::from_raw_os_error(errno);
+        for errno in [libc::EACCES, libc::EPERM, libc::EROFS, libc::ENOENT] {
+            assert!(cannot_use_the_path(&io(errno)), "io {errno}");
+            let status = StatusCode::from(io(errno));
+            assert!(cannot_use_the_path(&status), "status {errno}");
+            assert!(cannot_use_the_path(&Status::from(status)), "{errno}");
+        }
+        assert!(!cannot_use_the_path(&io(libc::EADDRINUSE)));
+        assert!(!cannot_use_the_path(&StatusCode::from(io(
+            libc::EADDRINUSE
+        ))));
+        assert!(!cannot_use_the_path(&std::io::Error::other("not an errno")));
+    }
+
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn a_topic_sockets_directory_is_told_by_the_sockets_whole_name() {
+        let dir_of = |socket: &str| socket_dir_of(Path::new(socket));
+        assert_eq!(
+            dir_of("/run/rsbinder/topic.sock"),
+            Path::new("/run/rsbinder/topic.d")
+        );
+        assert_eq!(dir_of("/run/a.x"), Path::new("/run/a.x.d"));
+        assert_eq!(dir_of("/run/a.y"), Path::new("/run/a.y.d"));
+        assert_eq!(dir_of("/run/topic.d"), Path::new("/run/topic.d.d"));
+        assert_eq!(dir_of("/run/topic"), Path::new("/run/topic.d"));
+    }
+
+    /// A systemd service's hard limit, just enough for all, and two too low for every name.
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn topic_workers_leave_descriptors_for_every_name_and_call() {
+        assert_eq!(topic_workers(524_288), 1024);
+        assert_eq!(topic_workers(15_152), 1024);
+        assert_eq!(topic_workers(4096), 409);
+        assert_eq!(topic_workers(512), 51);
+    }
+
+    /// A hub that lost the directory's lock touches no path: what is there is the winner's.
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn a_hub_refused_its_directory_leaves_the_sockets_path_alone() {
+        use rsbinder_topic::registry::uds::SocketDir;
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("rsb-hub-loser-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let socket = base.join("topic.sock");
+        let holder = SocketDir::open(&socket_dir_of(&socket)).unwrap();
+        // A listener's drop leaves its file: the stale socket a crash leaves, which a bind removes.
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let file = std::fs::symlink_metadata(&socket).unwrap().ino();
+        let Err(refused) = bind_topic_socket(&socket, Arc::new(Enforcer::allow_all()), false)
+        else {
+            panic!("the hub with no lock went on to bind");
+        };
+        let at_the_path = std::fs::symlink_metadata(&socket).map(|meta| meta.ino());
+        drop(holder);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            refused.to_string().contains("in use by another host"),
+            "{refused}"
+        );
+        assert_eq!(at_the_path.ok(), Some(file), "the loser touched the path");
+    }
+
+    /// What another writer of the parent can put at the path keeps its mode, or takes none.
+    #[cfg(all(
+        feature = "topic",
+        feature = "rpc",
+        any(target_os = "linux", target_os = "android")
+    ))]
+    #[test]
+    fn a_mode_goes_only_on_this_processs_own_file_of_that_kind_at_the_path() {
+        use std::fs::{set_permissions, FileType, Permissions};
+        use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, PermissionsExt};
+        let base = std::env::temp_dir().join(format!("rsb-hub-mode-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        let mode_of = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+        let refused = |path: &Path, is_kind: fn(&FileType) -> bool| {
+            let error = set_own_file_mode(path, is_kind, 0o666).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{path:?}");
+        };
+
+        let socket = base.join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        set_permissions(&socket, Permissions::from_mode(0o600)).unwrap();
+        let to_socket = base.join("to_socket");
+        symlink(&socket, &to_socket).unwrap();
+        refused(&to_socket, FileType::is_socket);
+        assert_eq!(mode_of(&socket), 0o600);
+
+        let file = base.join("file");
+        std::fs::write(&file, "").unwrap();
+        set_permissions(&file, Permissions::from_mode(0o600)).unwrap();
+        let to_file = base.join("to_file");
+        symlink(&file, &to_file).unwrap();
+        refused(&to_file, FileType::is_socket);
+        refused(&file, FileType::is_socket);
+        assert_eq!(mode_of(&file), 0o600);
+
+        let dir = base.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        set_permissions(&dir, Permissions::from_mode(0o700)).unwrap();
+        let to_dir = base.join("to_dir");
+        symlink(&dir, &to_dir).unwrap();
+        refused(&to_dir, FileType::is_dir);
+        assert_eq!(mode_of(&dir), 0o700);
+
+        // `/` is root's, so to a root process it is its own.
+        if !rustix::process::geteuid().is_root() {
+            refused(Path::new("/"), FileType::is_dir);
+        }
+
+        let found = set_own_file_mode(&socket, FileType::is_socket, 0o666).unwrap();
+        assert_eq!(mode_of(&socket), 0o666);
+        let at_path = std::fs::symlink_metadata(&socket).unwrap();
+        assert_eq!((found.dev(), found.ino()), (at_path.dev(), at_path.ino()));
+        set_own_file_mode(&dir, FileType::is_dir, 0o755).unwrap();
+        assert_eq!(mode_of(&dir), 0o755);
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     /// Each `fake_binder()` is its own allocation, so its own `WIBinder` identity.
     struct FakeBinder;

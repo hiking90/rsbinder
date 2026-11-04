@@ -35,7 +35,6 @@ mod node {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use rsbinder::ProcessState;
     use rustix::process::{Pid, Resource, Rlimit, Signal};
     use tests::topic_fleet::event::{Event, Kind};
     use tests::topic_fleet::record::Incarnation;
@@ -336,8 +335,7 @@ mod node {
         let (node, start, roles) = args();
         limit_core();
         die_with_controller();
-        ProcessState::init_default().expect("a binder device");
-        ProcessState::start_thread_pool();
+        tests::topic_fleet::transport::init();
 
         let (events, lines) = mpsc::channel();
         let writer = thread::spawn(move || write_lines(lines));

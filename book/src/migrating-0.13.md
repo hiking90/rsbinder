@@ -2,12 +2,13 @@
 
 Every change in 0.13.0 that can break a program built against 0.12.0: a
 compile error, a different value on the wire, or behavior a running program
-can observe. Entries are grouped by area. Four of them change the bytes
+can observe. Entries are grouped by area. Five of them change the bytes
 between peers and say so: two under *Binder objects and process state*
 (the stability word of a `Stability::Local` binder and of a relayed kernel
-proxy) and two under *RPC transport*. An rsbinder peer of either release
+proxy) and three under *RPC transport*. An rsbinder peer of either release
 accepts both the 0.12.0 bytes and the new ones, so none needs both ends
-upgraded together.
+upgraded together; of the three, the oneway number's entry says what a peer
+does with the 0.12.0 value.
 
 The additions and fixes themselves are listed in
 [`CHANGELOG.md`](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md);
@@ -628,6 +629,61 @@ bytes, so only a peer that wrote something unusual sees a difference.
   that takes nothing is `WriteZero` on Apple too, where 0.12.0 returned
   `EndOfStream`. Code that matched `EndOfStream` for these cases matches
   the new codes.
+- **The last drop of an RPC proxy waits for no peer on a plain Unix socket
+  (`UnixTransport`) on Linux and Android, and on no transport runs death
+  recipients on the dropping thread.** With no room in the socket a handler's own
+  connection holds the `DEC_STRONG` for its next reply, and for any other the
+  session's reaper thread writes it once the peer reads, where 0.12.0's drop
+  waited in the write. The frame's format and the amounts' sum are the same; the
+  reaper's releases of one address can share a frame. A
+  test that drops a proxy and then expects the peer's count to fall with the
+  next reply keeps that order only while the socket has room; poll the count
+  if it fills the socket first. A write that fails ends the session from the
+  reaper thread, where 0.12.0 ended it in the drop: a recipient that expected
+  to run before the drop returned, or on its thread, waits for the obituary.
+- **A frame's fds refused for too many in flight for the uid** (`ETOOMANYREFS`)
+  fail that call with `StatusCode::RpcError`, and a reply that had them fails the
+  peer's call with `FAILED_TRANSACTION`. Both leave the session up, where 0.12.0
+  ended the session on the transport error; the next item is the one exception.
+- **A oneway refused before any byte (`FrameTooLarge`, `Protocol`) ends the session
+  if another thread has already reserved the proxy's next async number**, where
+  0.12.0 left a gap that held back later oneways to that address at the peer. The
+  call still returns the refusal; `is_ended` tells the session went with it.
+- **`RpcSession::new` and the session setups fail when the process cannot spawn the
+  session's thread**, where 0.12.0 logged it and lost deferred `DEC_STRONG`s.
+- **A oneway on an RPC proxy of an address received again before the last proxy's
+  `DEC_STRONG` was written carries another number, and runs at the peer** (CHANGELOG
+  *Fixed*). The frame's format is the same. The number goes on from the one the
+  peer's node expects, where 0.12.0 restarted it at 0: the call returned `Ok`, an
+  rsbinder peer dropped the oneway and a libbinder peer parked it. An rsbinder peer of
+  either release runs the new number and still drops a 0.12.0 sender's. A handler that
+  did not run in this case now runs; there is no code to change.
+- **A `DEC_STRONG` a oneway handler holds leaves by another connection.** With no
+  free connection it is handed to the reaper thread once the serve loop is back at
+  its read, where 0.12.0 held it for the next reply on that connection. A test that
+  reads the frame on the served connection reads it on the callback connection
+  instead. A session with no callback connection still holds it.
+- **Below wire v2 a proxy flattened into a parcel counts as a send**, as libbinder
+  counts it. A dropped proxy's `DEC_STRONG` waits until the peer has paid each send,
+  and a peer pays an argument only if it reads it. So a binder argument the peer never
+  reads keeps the release, and the peer's node, until the session ends, where 0.12.0
+  released it. A service that relies on the release should read its binder arguments,
+  or use wire v2, where the peer enters them on receipt.
+- **From wire v1 on, a parcel that names other fds than it came with is `BadValue`.** A
+  handler does not run and a reply's call fails, where 0.12.0 ran the handler and failed
+  only its read of a missing fd. A server with `set_receive_fds(false)` therefore
+  refuses a call that sends an fd.
+- **An object a parcel's table cannot back ends the session**, as libbinder ends it: a
+  type this wire does not have, a binder in the table below v2, or a binder that fails
+  to enter. The call fails with `BadValue` and `is_ended` is true, where 0.12.0 entered
+  the rest of the parcel, failed the call and kept the connection.
+- **A `DEC_STRONG` with no connection to go on is written later, not dropped.** A
+  session with no outgoing connection writes it before a later reply on a connection
+  the peer has called on, or on the peer's attach, where 0.12.0 dropped it and the
+  peer's node stayed until the session ended. A test that reads the frames of a reply
+  on such a session reads the `DEC_STRONG` first. A later proxy's oneway keeps the
+  number the peer's node expects, where 0.12.0 could restart at 0 and the peer dropped
+  or parked it.
 
 ## Streams and topics
 
@@ -661,9 +717,6 @@ bytes, so only a peer that wrote something unusual sees a difference.
   `BadType` for a kernel source of another interface, having asked for its
   descriptor when the source was read, and for an RPC source a typed cast
   had taken for another interface.
-- A topic registry (`rsbinder_topic::registry::Registry`) lists a binder of
-  another interface that a client advertises; a subscriber of that name is
-  refused with `BadType`. 0.12.0 refused the `advertise`.
 
 ## Fast Message Queue (`rsbinder-fmq`)
 
@@ -842,6 +895,8 @@ bytes, so only a peer that wrote something unusual sees a difference.
   declaration(s)" (0.12.0: "N rule(s) and M service declaration(s)"), and
   its supervisor's status line reads "serving; N rule(s), M service
   declaration(s)" (0.12.0: "serving; N rule(s), M declaration(s)").
+  `rsb_service`'s hint after a denial begins "The hub's policy denies this to
+  uid" (0.12.0: "The service manager's policy denies this to uid").
 - **`rsb_hub` tells an accessor by a declaration, not by its descriptor.**
   `getService2` and `checkService2` answer with the `Service::Accessor` arm
   for an instance whose `[[service]]` entry has an `accessor` key, and with
@@ -933,3 +988,14 @@ bytes, so only a peer that wrote something unusual sees a difference.
   that read the filtered count as the number of hidden names under that
   substring now reads the total; an unfiltered `dump` prints the same count
   as 0.12.0.
+- **The return of a `dump` of `rsb_hub` is not the dump's end** (CHANGELOG
+  *Fixed*). 0.12.0 wrote the dump before it replied. The hub now replies and
+  writes on a thread of its own, and the dump ends when that thread closes
+  the fd, so read to end of file: after `rsb_service dump manager > f`, `f`
+  can still be growing. A `dump` during another is answered `WOULD_BLOCK`
+  with nothing written, and `rsb_service` exits with `exit::ERR`; try again.
+- **A service `rsb_hub` starts runs with no signal blocked** (CHANGELOG
+  *Fixed*). 0.12.0's `exec` services started with `SIGHUP`, `SIGINT` and
+  `SIGTERM` blocked, so one with no handler for them went on running through
+  them. Now each of them ends it. A service that has to outlive one of them
+  sets its own disposition for it.

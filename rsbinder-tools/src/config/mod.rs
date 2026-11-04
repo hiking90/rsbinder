@@ -51,6 +51,8 @@ mod declaration;
 mod enforcer;
 mod parse;
 mod policy;
+#[cfg(feature = "topic")]
+mod topic_mode;
 mod trust;
 
 pub use activation::{ActivationRunner, Activator, SystemRunner, START_THREAD_NAME};
@@ -66,4 +68,6 @@ pub use policy::{
     NamePattern, Permission, Policy, PolicyError, Rule, Subject, Subjects, TopicPermission,
     TopicPolicy, TopicRule,
 };
+#[cfg(feature = "topic")]
+pub use topic_mode::{registry_out_of_reach, unused_on_a_topic_socket};
 pub use trust::{trust_problem, TrustProblem, Untrusted};

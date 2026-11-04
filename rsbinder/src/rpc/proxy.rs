@@ -210,6 +210,27 @@ impl RpcProxy {
         self.send(code, data, flags)
     }
 
+    /// Not part of the API: a oneway of a parcel from
+    /// [`prepare_request`](crate::RemoteProxy::prepare_request), which waits for nothing and runs
+    /// no death sequence on this thread.
+    ///
+    /// `Ok` is sent; [`StatusCode::WouldBlock`] is not sent, with the session as it was. Anything
+    /// else is a session that ended or a send that no retry can make. A caller sends one at a
+    /// time per proxy, in frames up to the transport's limit; `rsbinder-topic`'s hub is the one
+    /// caller (session doc "Deferred `DEC_STRONG`").
+    #[doc(hidden)]
+    pub fn __try_oneway(
+        &self,
+        code: TransactionCode,
+        data: &Parcel,
+        flags: TransactionFlags,
+    ) -> Result<()> {
+        if data.rpc_session_id().is_none() {
+            return Err(StatusCode::BadType);
+        }
+        self.session.try_oneway(self.addr, code, data, flags)
+    }
+
     /// `submit_transact`'s body, for the crate's own callers.
     pub(crate) fn send(
         &self,
@@ -275,7 +296,7 @@ impl crate::binder::RemoteProxy for RpcProxy {
 
 impl Drop for RpcProxy {
     fn drop(&mut self) {
-        // Identity-checked; never waits on a slot (session doc "Deferred `DEC_STRONG`").
+        // Identity-checked; on Linux and Android's Unix socket it waits for nothing (session doc).
         self.session
             .release_proxy(self.addr, self as *const RpcProxy as *const ());
     }
@@ -318,8 +339,8 @@ impl IBinder for RpcProxy {
     ///
     /// - the server side of a session (its workers serve every connection);
     /// - a client with incoming connections
-    ///   ([`RpcClientConfig::incoming_connections`](super::session::RpcClientConfig::incoming_connections)
-    ///   `≥ 1`), whose threads observe the drop at once;
+    ///   ([`RpcClientConfig::incoming_connections`][incoming] `≥ 1`), whose threads observe the
+    ///   drop at once;
     /// - a session whose serve loop has been started —
     ///   [`RpcSession::spawn_serve`](super::session::RpcSession::spawn_serve),
     ///   or a call already inside
@@ -333,6 +354,8 @@ impl IBinder for RpcProxy {
     /// The checks run in this order: `InvalidOperation` above, then
     /// [`StatusCode::DeadObject`] after the obituary, then
     /// [`StatusCode::BadValue`] for a recipient with no strong reference left.
+    ///
+    /// [incoming]: super::session::RpcClientConfig::incoming_connections
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()> {
         if !self.session.notices_connection_loss() {
             unwatched_session_link();

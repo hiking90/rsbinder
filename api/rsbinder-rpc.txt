@@ -3305,6 +3305,7 @@ pub fn rsbinder::rpc::RpcClientConfig::session_id(self, &[u8]) -> Self
 pub fn rsbinder::rpc::RpcClientConfig::timeout(self, core::time::Duration) -> Self
 pub fn rsbinder::rpc::RpcClientConfig::unix(impl core::convert::AsRef<std::path::Path>, u32) -> Self
 pub fn rsbinder::rpc::RpcClientConfig::unix_abstract(impl core::convert::AsRef<[u8]>, u32) -> Self
+pub fn rsbinder::rpc::RpcClientConfig::unix_fd(std::os::fd::owned::OwnedFd, u32) -> Self
 impl core::fmt::Debug for rsbinder::rpc::RpcClientConfig
 pub fn rsbinder::rpc::RpcClientConfig::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::rpc::RpcClientConfig
@@ -3372,11 +3373,13 @@ pub fn rsbinder::rpc::RpcServer::set_handshake_timeout(&self, core::option::Opti
 pub fn rsbinder::rpc::RpcServer::set_idle_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcServer::set_max_connections(&self, usize)
 pub fn rsbinder::rpc::RpcServer::set_max_threads(&self, u32) -> rsbinder::Result<()>
+pub fn rsbinder::rpc::RpcServer::set_receive_fds(&self, bool)
 pub fn rsbinder::rpc::RpcServer::set_reply_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcServer::set_root(&self, rsbinder::SIBinder) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcServer::set_supported_fd_modes(&self, &[rsbinder::rpc::FileDescriptorTransportMode])
 pub fn rsbinder::rpc::RpcServer::setup_unix_server(impl core::convert::Into<std::path::PathBuf>) -> rsbinder::Result<alloc::sync::Arc<rsbinder::rpc::RpcServer>>
 pub fn rsbinder::rpc::RpcServer::setup_unix_server_abstract(&[u8]) -> rsbinder::Result<alloc::sync::Arc<rsbinder::rpc::RpcServer>>
+pub fn rsbinder::rpc::RpcServer::setup_unix_server_from_bound_fd(std::os::fd::owned::OwnedFd) -> rsbinder::Result<alloc::sync::Arc<rsbinder::rpc::RpcServer>>
 pub fn rsbinder::rpc::RpcServer::stop_accepting(&self)
 pub fn rsbinder::rpc::RpcServer::terminate(&self)
 impl core::fmt::Debug for rsbinder::rpc::RpcServer
@@ -3425,6 +3428,7 @@ pub fn rsbinder::rpc::RpcSession::negotiate(&self, u32) -> rsbinder::Result<u32>
 pub fn rsbinder::rpc::RpcSession::negotiate_fd_transport(&self, rsbinder::rpc::FileDescriptorTransportMode) -> rsbinder::Result<rsbinder::rpc::FileDescriptorTransportMode>
 pub fn rsbinder::rpc::RpcSession::negotiated_max_threads(&self) -> u32
 pub fn rsbinder::rpc::RpcSession::new(alloc::boxed::Box<dyn rsbinder::rpc::transport::RpcTransport>, rsbinder::rpc::AddressSpace) -> rsbinder::Result<rsbinder::rpc::RpcSession>
+pub fn rsbinder::rpc::RpcSession::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::RpcSession::serve_blocking(&self) -> rsbinder::rpc::SessionEnd
 pub fn rsbinder::rpc::RpcSession::set_reply_timeout(&self, core::option::Option<core::time::Duration>) -> rsbinder::Result<()>
 pub fn rsbinder::rpc::RpcSession::set_root(&self, rsbinder::SIBinder) -> rsbinder::Result<()>

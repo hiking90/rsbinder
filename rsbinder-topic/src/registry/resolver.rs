@@ -46,7 +46,9 @@ pub struct RegistryResolver {
 
 impl RegistryResolver {
     /// The registry the service manager has under [`SERVICE_NAME`]: `NameNotFound` when it has
-    /// none, or its policy does not let this process find it.
+    /// none, or its policy does not let this process find it, which the answer cannot tell
+    /// apart. A hub whose `[[topic]]` rules have no `[[rule]]` letting anyone find it logs a
+    /// warning as it loads.
     ///
     /// [`SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
     pub fn find() -> BinderResult<Self> {
@@ -56,10 +58,15 @@ impl RegistryResolver {
 
     /// The registry `binder` is, found by other means than [`find`](Self::find). A registry of
     /// this process is `BadValue`: its calls would come from no transaction, which it refuses.
-    /// Another interface's binder is `BadType`.
+    /// An RPC binder is `InvalidOperation`: the registry refuses a caller over RPC, and a topic
+    /// binder cannot cross from one RPC session to another. Another interface's binder is
+    /// `BadType`.
     pub fn new(binder: SIBinder) -> BinderResult<Self> {
-        if binder.as_proxy().is_none() {
+        if !binder.is_remote() {
             return Err(StatusCode::BadValue.into());
+        }
+        if binder.as_proxy().is_none() {
+            return Err(StatusCode::InvalidOperation.into());
         }
         Ok(Self {
             registry: binder.into_interface_checked()?,
@@ -244,7 +251,7 @@ impl<T> Newest<T> {
     }
 
     /// Pass nothing on from now, without the lock: a running call, the caller's own too, goes on.
-    fn end(&self) {
+    pub(super) fn end(&self) {
         self.ended.store(true, Ordering::Release);
     }
 }

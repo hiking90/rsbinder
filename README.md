@@ -20,7 +20,7 @@ If you'd rather use C++ on Linux, see [binder-linux](https://github.com/hiking90
 * **[rsbinder-aidl][rsbinder-aidl-readme]** — AIDL → Rust code generator.
 * **[rsbinder-macros][rsbinder-macros-readme]** — `#[rsbinder::interface]`: declare an interface as a Rust trait, without `.aidl`.
 * **[rsbinder-fmq][rsbinder-fmq-readme]** — Android's Fast Message Queue (`libfmq`), independent of binder, and the shared-memory primitives under it.
-* **[rsbinder-topic][rsbinder-topic-readme]** — one publisher, many subscribers over kernel binder, records in shared memory (experimental).
+* **[rsbinder-topic][rsbinder-topic-readme]** — one publisher, many subscribers over kernel binder or a Unix socket, records in shared memory (experimental).
 * **[rsbinder-tools][rsbinder-tools-readme]** — `rsb_hub` (service manager for Linux), `rsb_device`, `rsb_service`.
 
 [rsbinder-aidl-readme]: https://github.com/hiking90/rsbinder/blob/master/rsbinder-aidl/README.md

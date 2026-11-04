@@ -227,6 +227,8 @@ enum BindAddress {
     },
     #[cfg(any(target_os = "linux", target_os = "android"))]
     UnixAbstract,
+    /// A socket another process bound: its file is not this server's to remove.
+    UnixFd,
     #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
     Vsock { cid: u32, port: u32 },
     #[cfg(feature = "rpc-tls")]
@@ -447,6 +449,10 @@ pub struct RpcServer {
     max_threads: AtomicU32,
     /// Whether sessions advertise `Unix` FD support (default false ⇒ every FD refused).
     fd_unix_supported: AtomicBool,
+    /// `set_receive_fds(false)`: its sessions read with no room for the fds a peer sends.
+    discard_peer_fds: AtomicBool,
+    /// `__limit_unpaid_addresses`, for the sessions made from then on; `None`: no limit.
+    unpaid_address_limit: Mutex<Option<usize>>,
     /// `None` ⇒ android-12 r34 wire; `Some(max)` ⇒ AOSP handshake negotiating `min(max, client)`.
     wire_max_version: Mutex<Option<u32>>,
     /// Cap on live connection workers (`None` = none); see module doc "Admission and deadlines".
@@ -606,6 +612,39 @@ impl RpcServer {
         Ok(Self::wrap(listener, BindAddress::UnixAbstract))
     }
 
+    /// Serve on a Unix stream socket that is already bound, typically received from the process
+    /// that made it (AOSP `RpcServer::setupRawSocketServer`). This call makes the socket listen,
+    /// so a client's `SO_PEERCRED` names this process and not the one that bound it; one already
+    /// listening keeps listening and takes this process's credentials likewise.
+    ///
+    /// [`StatusCode::BadValue`] when `fd` is not a socket, not a Unix one, not a stream one, or
+    /// has no address. The server has no path ([`path`](Self::path) is `None`) and its `Drop`
+    /// leaves the file system alone: the socket's file, if it still has one, belongs to whoever
+    /// bound it.
+    pub fn setup_unix_server_from_bound_fd(fd: std::os::fd::OwnedFd) -> Result<Arc<RpcServer>> {
+        let refused = |why: &str| {
+            log::error!("RpcServer::setup_unix_server_from_bound_fd: {why}");
+            StatusCode::BadValue
+        };
+        let kind = rustix::net::sockopt::socket_type(&fd);
+        let kind = kind.map_err(|_| refused("the descriptor is not a socket"))?;
+        if kind != rustix::net::SocketType::STREAM {
+            return Err(refused("the socket is not a stream socket"));
+        }
+        let listener = UnixListener::from(fd);
+        // std refuses an address of another family.
+        let address = listener.local_addr();
+        let address = address.map_err(|_| refused("the socket is not a Unix one"))?;
+        if address.is_unnamed() {
+            return Err(refused("the socket is not bound"));
+        }
+        // The backlog std's `UnixListener::bind` asks for on Linux: the kernel's `somaxconn`.
+        rustix::net::listen(&listener, -1).map_err(crate::error::errno_status)?;
+        let listener = ServerListener::Unix(listener);
+        listener.set_nonblocking(true)?;
+        Ok(Self::wrap(listener, BindAddress::UnixFd))
+    }
+
     /// Bind + listen on a vsock `(cid, port)`. The
     /// returned `RpcServer` is otherwise identical to one built by
     /// [`setup_unix_server`](RpcServer::setup_unix_server): accept loop,
@@ -651,6 +690,8 @@ impl RpcServer {
             directory,
             max_threads: AtomicU32::new(1),
             fd_unix_supported: AtomicBool::new(false),
+            discard_peer_fds: AtomicBool::new(false),
+            unpaid_address_limit: Mutex::new(None),
             wire_max_version: Mutex::new(None),
             max_connections: Mutex::new(None),
             handshake_timeout: Mutex::new(Some(DEFAULT_HANDSHAKE_TIMEOUT)),
@@ -889,11 +930,14 @@ impl RpcServer {
     /// listen backlog and are served as workers finish (no client is
     /// dropped, `shutdown` is still polled). `n` is clamped to ≥ 1.
     ///
-    /// rsbinder is 1-connection = 1-session = 1-worker, so the bounded
-    /// resource is the worker count; this is the rsbinder analogue of
+    /// The bounded resource is the worker count: one worker for each
+    /// connection a client calls on. A session's callback (incoming)
+    /// connection takes one only while it attaches and then has no thread
+    /// of its own, so it counts against `n` for that long and no longer, and
+    /// a session whose client opens one needs a free place at that moment.
+    /// This is the rsbinder analogue of
     /// AOSP `RpcServer`'s bounded server limits, **not** a wire/semantic
-    /// port. It does not (and structurally cannot, without I/O
-    /// multiplexing) make workers fewer than connections.
+    /// port.
     ///
     /// **Slot exhaustion**: each worker holds its admission slot until it
     /// exits, so a connected-but-silent peer, or one that sends its
@@ -1249,6 +1293,43 @@ impl RpcServer {
         self.fd_unix_supported.store(unix, Ordering::SeqCst);
     }
 
+    /// Whether the sessions this server makes from now on take the fds a peer sends. Default
+    /// `true`.
+    ///
+    /// With `false` a session reads with no room for ancillary data, so the kernel closes what a
+    /// peer sent as the bytes it came with are read, and no such fd is ever in this process. At
+    /// wire v1 and above a parcel that names an fd then names one that did not arrive, so the call
+    /// fails with [`BadValue`](crate::StatusCode::BadValue) and no handler runs. On the wires with
+    /// no object table (r34, v0) the fd's read fails instead, and a handler that reads none runs.
+    /// What this server sends does not change: fds go out in the mode
+    /// [`set_supported_fd_modes`] agreed. `FD_PASSING` in `caps` and `calling_caps` speaks for
+    /// that direction only, so it stays set, and the peer cannot tell that its fds were closed.
+    ///
+    /// For a server none of whose calls takes an fd, on a socket a peer it does not trust can
+    /// reach. A session that takes fds keeps those of a frame until the frame is whole, and a
+    /// peer can send up to 64 with the first byte of one and never send the rest, on each
+    /// connection, where only the peer's closing or
+    /// [`set_idle_timeout`](Self::set_idle_timeout) ends the wait.
+    ///
+    /// [`set_supported_fd_modes`]: Self::set_supported_fd_modes
+    pub fn set_receive_fds(&self, receive: bool) {
+        self.discard_peer_fds.store(!receive, Ordering::SeqCst);
+    }
+
+    /// Not part of the API: in the sessions this server makes from now on, a
+    /// [`RpcProxy::__try_oneway`](crate::rpc::RpcProxy::__try_oneway) that would leave more than
+    /// `limit` addresses with an unpaid send ends the session instead, with
+    /// [`StatusCode::DeadObject`](crate::StatusCode::DeadObject). For a host that reads every
+    /// connection its clients pay on: `rsbinder-topic`'s hub is the one caller (session doc
+    /// "Deferred `DEC_STRONG`").
+    #[doc(hidden)]
+    pub fn __limit_unpaid_addresses(&self, limit: usize) {
+        *self
+            .unpaid_address_limit
+            .lock()
+            .expect("unpaid_address_limit poisoned") = Some(limit);
+    }
+
     /// Opt in to the **android-13+ versioned RPC wire**.
     /// `max_version` is the highest `RPC_WIRE_PROTOCOL_VERSION`
     /// this server offers (`0` = android-13, `1` = android-14/15,
@@ -1303,6 +1384,16 @@ impl RpcServer {
         session.store_reply_timeout(reply_timeout);
         if self.fd_unix_supported.load(Ordering::SeqCst) {
             session.set_supported_fd_modes(&[crate::rpc::FileDescriptorTransportMode::Unix]);
+        }
+        if self.discard_peer_fds.load(Ordering::SeqCst) {
+            session.discard_peer_fds();
+        }
+        let unpaid = *self
+            .unpaid_address_limit
+            .lock()
+            .expect("unpaid_address_limit poisoned");
+        if let Some(limit) = unpaid {
+            session.limit_unpaid_addresses(limit);
         }
     }
 
@@ -2219,6 +2310,7 @@ impl RpcServer {
             BindAddress::Unix { path, .. } => Some(path.as_path()),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
+            BindAddress::UnixFd => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
             #[cfg(feature = "rpc-tls")]
@@ -2235,6 +2327,7 @@ impl RpcServer {
             BindAddress::Vsock { cid, port } => Some((*cid, *port)),
             BindAddress::Unix { .. } => None,
             BindAddress::UnixAbstract => None,
+            BindAddress::UnixFd => None,
             #[cfg(feature = "rpc-tls")]
             BindAddress::Tcp(_) => None,
         }
@@ -2251,6 +2344,7 @@ impl RpcServer {
             BindAddress::Unix { .. } => None,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => None,
+            BindAddress::UnixFd => None,
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => None,
         }
@@ -2302,6 +2396,7 @@ impl Drop for RpcServer {
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => {}
+            BindAddress::UnixFd => {}
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { .. } => {
                 // No filesystem entry; closing the listener fd releases the (cid, port).
@@ -2321,6 +2416,7 @@ impl std::fmt::Debug for RpcServer {
             BindAddress::Unix { path, .. } => d.field("bind", path),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             BindAddress::UnixAbstract => d.field("bind", &"unix-abstract"),
+            BindAddress::UnixFd => d.field("bind", &"unix-fd"),
             #[cfg(all(feature = "rpc-vsock", any(target_os = "linux", target_os = "android")))]
             BindAddress::Vsock { cid, port } => {
                 d.field("bind", &format_args!("vsock {cid}:{port}"))

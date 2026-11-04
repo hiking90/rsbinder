@@ -32,9 +32,10 @@ rustix = { workspace = true, features = ["mount"] }
 
 [features]
 # Teach the policy enforcer about RPC callers (`Caller::Rpc`). Off by
-# default: `rsb_hub` serves kernel binder only, so nothing in this crate
-# needs the RPC stack unless a downstream hub reuses `policy`.
-rpc = ["rsbinder/rpc"]
+# default: `rsb_hub` serves kernel binder unless it is built with this and
+# `topic` too, which adds its `--topic-socket` mode and `rsb_service topics
+# --topic-socket`: a registry of topic names over a Unix socket, with no binder.
+rpc = ["rsbinder/rpc", "rsbinder-topic?/uds"]
 # Serve a registry of topic names (plan 15 §12) beside the service names, and
 # read the `[[topic]]` rules and `[global] topics` that govern it. Off by
 # default while `rsbinder-topic` is experimental: without it a configuration

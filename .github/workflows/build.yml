@@ -262,20 +262,35 @@ jobs:
         # over two mappings of one memfd, forged memory images, the layout of
         # the two memory objects, and the subscription call between a
         # publisher and a subscriber of one process, which reach each other
-        # without binder (and an RPC binder, refused). The two-process tests
+        # without binder (and the RPC sessions it refuses: no fds, no incoming
+        # connection). The two-process tests
         # are `#[ignore]`d and run in integration-test.yml. Its loom models
         # and its run under Miri are in `scripts/local_gate.sh`, as
-        # `rsbinder-fmq`'s are.
-        run: cargo test -p rsbinder-topic
+        # `rsbinder-fmq`'s are. With `uds`, the same over a Unix socket
+        # between two processes, which needs no binder device.
+        run: |
+          cargo test -p rsbinder-topic
+          cargo test -p rsbinder-topic --features uds
+      - name: Topics in a container with no binder (plan 15-pubsub-uds)
+        # Docker's default profiles and no device: it shows that the socket
+        # transport works where binder cannot, between real uids.
+        env:
+          RSB_CONTAINER_REQUIRED: 1
+        run: |
+          cargo build -p rsbinder-tools
+          tests/container/ac_run.sh
+          tests/container/topic_uds.sh
       - name: rsbinder-tools unit tests (hermetic)
         # The `rsb_hub` configuration parser, policy and enforcer, the NSS
         # and notify helpers, and the three binaries' own tests: none opens
         # the binder device, so the whole package runs here. Once more with
         # `topic`: its `[[topic]]` parse, the reserved registry name and the
         # name rule shared with `rsbinder-topic` are tested under that feature.
+        # With `rpc` too: `rsb_hub --topic-socket`'s own files and limits.
         run: |
           cargo test -p rsbinder-tools
           cargo test -p rsbinder-tools --features topic
+          cargo test -p rsbinder-tools --features topic,rpc
 
   rpc-suite:
     name: RPC Transport Suite
@@ -324,7 +339,7 @@ jobs:
           t() { "$@" 2>&1 | tee /tmp/rpc_filter.out; grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/rpc_filter.out; }
           bash scripts/ci_rsbinder_lib_tests.sh
           t cargo test -p rsbinder --features rpc --doc
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug
@@ -550,7 +565,7 @@ jobs:
           t() { "$@" 2>&1 | tee "$RUNNER_TEMP/rpc_filter.out"; grep -qE 'test result: ok\. [1-9][0-9]* passed' "$RUNNER_TEMP/rpc_filter.out"; }
           bash scripts/ci_rsbinder_lib_tests.sh
           t cargo test -p rsbinder --features rpc --doc
-          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc
+          cargo test -p rsbinder --features rpc --test rpc_e2e --test rpc_scenarios --test rpc_server --test rpc_fd --test rpc_shared_memory --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
           cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_tls --test rpc_transport_conformance --test rpc_slow_peer
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact tls_android13plus_nested_callback_e2e
           t cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug --test rpc_server -- --exact preconnected_inet_fd_handshakes_over_tcp_debug

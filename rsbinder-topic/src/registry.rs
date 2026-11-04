@@ -24,6 +24,9 @@
 //! A [`RegistryResolver`] is the client side: [`Publisher::advertise_with`] and
 //! [`NamedSubscriber::subscribe_with`] take it in place of the service manager.
 //!
+//! The module `uds` (feature `uds`, Linux and Android) is the same registry on a Unix socket, for
+//! a host with no binder device: `rsb_hub --topic-socket`.
+//!
 //! [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
 //! [`Publisher::advertise_with`]: crate::Publisher::advertise_with
 //! [`NamedSubscriber::subscribe_with`]: crate::NamedSubscriber::subscribe_with
@@ -32,8 +35,19 @@ mod resolver;
 mod table;
 #[cfg(test)]
 mod tests;
+#[cfg(all(feature = "uds", any(target_os = "linux", target_os = "android")))]
+pub mod uds;
+#[cfg(all(
+    test,
+    feature = "uds",
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android")
+))]
+mod uds_tests;
 
 pub use resolver::RegistryResolver;
+pub use table::MAX_NAMES;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -60,15 +74,17 @@ pub trait RegistryAccess: Send + Sync {
     /// Whether `caller` may do `action` on `name` (`""` for [`Action::List`]). An action the
     /// implementation does not know is refused.
     ///
-    /// It must not call the registry. When it judges the watchers of a change it runs while the
-    /// registry holds the lock that orders its notices, so its cost holds up the registry's other
-    /// advertises and the sends of owed notices; a withdraw, a watch and a death go on. Every
-    /// other judgement, those of notices sent again among them, runs with no lock of the
-    /// registry held.
+    /// It must not call the registry. When a registry judges the watchers of a change it runs
+    /// while the registry holds the lock that orders its notices, so its cost holds up the
+    /// registry's other changes and the sends of owed notices; a withdraw, a watch and a death
+    /// go on. Every other judgement, those of notices sent again among them, runs with no lock of
+    /// the registry held.
     ///
     /// A panic in it ends the call that asked, and the registry goes on: a change keeps its new
-    /// state, and those of its notices not sent by then are not sent; a notice the retry thread
-    /// was judging stays owed, and the next send starts another thread for it.
+    /// state, and the notice being judged is not sent. On a [`Registry`] those of a change not
+    /// sent by then are not sent either; a notice the retry thread was judging stays owed, and
+    /// the next send starts another thread for it. On a registry on a socket a notice's judgement
+    /// ends no call: the change's other notices go on, and it no longer owes the one judged.
     fn allows(&self, action: Action, name: &str, caller: &Caller) -> bool;
 }
 
@@ -114,6 +130,8 @@ pub struct RegistryStats {
     pub notices_retried: u64,
     /// Failed notices not kept to send again, as 256 were owed already.
     pub owed_dropped: u64,
+    /// Allocations of a registry over a socket not committed yet.
+    pub pending: usize,
 }
 
 /// One name with a topic, as [`RegistryResolver::list`] returns it.
@@ -214,6 +232,7 @@ impl Registry {
             owed: counts.owed,
             notices_retried: counts.retried,
             owed_dropped: counts.dropped,
+            pending: counts.pending,
         }
     }
 }
@@ -243,7 +262,7 @@ struct Shared {
 struct Inner {
     table: Table<TopicKey, WatcherKey>,
     /// The death link of each handle the table uses; dropping one unlinks it.
-    linked: BTreeMap<u32, DeathLink>,
+    linked: BTreeMap<u64, DeathLink>,
     /// A retry thread runs: it ends once nothing is owed.
     retrying: bool,
 }
@@ -295,7 +314,7 @@ impl PartialEq for TopicKey {
 }
 
 impl Key for TopicKey {
-    fn handle(&self) -> Option<u32> {
+    fn handle(&self) -> Option<u64> {
         handle_of(&self.0.as_binder())
     }
 }
@@ -310,23 +329,23 @@ impl PartialEq for WatcherKey {
 }
 
 impl Key for WatcherKey {
-    fn handle(&self) -> Option<u32> {
+    fn handle(&self) -> Option<u64> {
         handle_of(&self.0.as_binder())
     }
 }
 
-fn handle_of(binder: &SIBinder) -> Option<u32> {
-    binder.as_proxy().map(|proxy| proxy.handle())
+fn handle_of(binder: &SIBinder) -> Option<u64> {
+    binder.as_proxy().map(|proxy| u64::from(proxy.handle()))
 }
 
 /// The links of a change, made under `inner`: `link_to_death` waits for no answer.
 struct ShellLinks<'a> {
-    linked: &'a mut BTreeMap<u32, DeathLink>,
+    linked: &'a mut BTreeMap<u64, DeathLink>,
     this: &'a Weak<Shared>,
 }
 
 impl ShellLinks<'_> {
-    fn link(&mut self, handle: u32, binder: SIBinder) -> BinderResult<()> {
+    fn link(&mut self, handle: u64, binder: SIBinder) -> BinderResult<()> {
         let obituary = Arc::new(Obituary {
             handle,
             shared: self.this.clone(),
@@ -339,15 +358,15 @@ impl ShellLinks<'_> {
 }
 
 impl Links<TopicKey, WatcherKey> for ShellLinks<'_> {
-    fn link_topic(&mut self, handle: u32, topic: &TopicKey) -> BinderResult<()> {
+    fn link_topic(&mut self, handle: u64, topic: &TopicKey) -> BinderResult<()> {
         self.link(handle, topic.0.as_binder())
     }
 
-    fn link_watcher(&mut self, handle: u32, watcher: &WatcherKey) -> BinderResult<()> {
+    fn link_watcher(&mut self, handle: u64, watcher: &WatcherKey) -> BinderResult<()> {
         self.link(handle, watcher.0.as_binder())
     }
 
-    fn unlink(&mut self, handle: u32) {
+    fn unlink(&mut self, handle: u64) {
         // A binder that died meanwhile answers `DeadObject`, which the link logs at debug.
         self.linked.remove(&handle);
     }
@@ -355,7 +374,7 @@ impl Links<TopicKey, WatcherKey> for ShellLinks<'_> {
 
 /// The death of one handle the registry uses: its topics and watches go.
 struct Obituary {
-    handle: u32,
+    handle: u64,
     shared: Weak<Shared>,
 }
 
@@ -394,7 +413,14 @@ fn refused(refused: Refused) -> Status {
             refuse(ERROR_LIMIT, "the registry holds as many as it takes")
         }
         Refused::Link(status) => link_failed(&status),
+        Refused::NoAllocation => no_allocation(),
     }
+}
+
+/// A commit of an allocation that is gone: a name is given again from a new one.
+fn no_allocation() -> Status {
+    let why = "the allocation was replaced or withdrawn";
+    Status::from((ExceptionCode::IllegalState, why))
 }
 
 /// A binder whose death cannot be linked; `DeadObject` would read as the registry's own death.

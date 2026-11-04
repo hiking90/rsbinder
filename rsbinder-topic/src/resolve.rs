@@ -16,7 +16,7 @@ use rsbinder::{BinderResult, SIBinder};
 ///
 /// [`ServiceManager`] is the implementation [`Publisher::advertise`] and
 /// [`NamedSubscriber::subscribe`] use; [`RegistryResolver`] is a registry of topic names, apart
-/// from service names.
+/// from service names; `registry::uds::UdsResolver` (feature `uds`) is one on a Unix socket.
 ///
 /// [`RegistryResolver`]: crate::registry::RegistryResolver
 /// [`Publisher::advertise`]: crate::Publisher::advertise
@@ -28,9 +28,9 @@ pub trait Resolver: Send + Sync {
     /// dropped.
     ///
     /// A [`Publisher`](crate::Publisher) holds the advertisement and drops it as it ends, before
-    /// it writes the topic's end record, so a resolver that takes the name back on the drop has
-    /// been asked to before any subscriber can read that end. A resolver that keeps the name, as
-    /// the service manager does, returns [`Advertisement::none`].
+    /// it writes the topic's end record, so a drop that waits holds that record back from every
+    /// subscriber: taking the name back must not wait for the resolver's host. A resolver that
+    /// keeps the name, as the service manager does, returns [`Advertisement::none`].
     fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<Advertisement>;
 
     /// Call `on_registered` with every binder `name` is given from now on, and at once with the
@@ -48,6 +48,22 @@ pub trait Resolver: Send + Sync {
         name: &str,
         on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
     ) -> BinderResult<Watch>;
+
+    /// [`watch`](Self::watch) for a resolver whose binders need something kept alive while they
+    /// are used, as the RPC session of one over a socket: each call brings it along in a
+    /// [`Resolved`], and a [`NamedSubscriber`](crate::NamedSubscriber), which calls this method,
+    /// keeps it for as long as it uses the binder. By default the calls of `watch`, with nothing
+    /// to keep.
+    ///
+    /// An `Err` says that the resolver gave up on the publisher the name was given, with no
+    /// binder to show for it, and that asking again would not change that: the subscriber
+    /// reports it as a refusal by that publisher, until the next `Ok`.
+    fn watch_resolved(&self, name: &str, on_resolved: OnResolved) -> BinderResult<Watch> {
+        self.watch(
+            name,
+            Box::new(move |binder| on_resolved(Ok(Resolved::new(binder)))),
+        )
+    }
 
     /// The binder of the process that holds the names and the watches, if the resolver knows
     /// one; `None` by default.
@@ -68,6 +84,9 @@ pub trait Resolver: Send + Sync {
         None
     }
 }
+
+/// What [`Resolver::watch_resolved`] calls with each binder the name is given.
+pub type OnResolved = Box<dyn Fn(BinderResult<Resolved>) + Send + Sync>;
 
 /// A name [`Resolver::advertise`] gave: dropping it takes the name back, as far as the resolver
 /// does.
@@ -97,8 +116,58 @@ impl fmt::Debug for Advertisement {
     }
 }
 
+/// A binder a name was given, with what has to stay alive while it is used.
+#[derive(Clone)]
+pub struct Resolved {
+    binder: SIBinder,
+    session: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl Resolved {
+    /// `binder`, with nothing to keep alive.
+    pub fn new(binder: SIBinder) -> Self {
+        Self {
+            binder,
+            session: None,
+        }
+    }
+
+    /// `binder`, with `session` kept alive by whoever uses it. Dropping the last clone of
+    /// `session` can end the binder's session: a connection in use keeps a clone, so a
+    /// resolver that has moved on to another publisher ends none that still drains.
+    pub fn with_session(binder: SIBinder, session: Arc<dyn Any + Send + Sync>) -> Self {
+        Self {
+            binder,
+            session: Some(session),
+        }
+    }
+
+    /// The binder.
+    pub fn binder(&self) -> &SIBinder {
+        &self.binder
+    }
+
+    /// The binder, on its own: its session is no longer kept alive by this value.
+    pub fn into_binder(self) -> SIBinder {
+        self.binder
+    }
+
+    pub(crate) fn into_parts(self) -> (SIBinder, Option<Arc<dyn Any + Send + Sync>>) {
+        (self.binder, self.session)
+    }
+}
+
+impl fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resolved")
+            .field("binder", &self.binder)
+            .field("session", &self.session.is_some())
+            .finish()
+    }
+}
+
 /// The binder a name has now, or `None` when it has none; what [`Watch::with_lookup`] holds.
-pub(crate) type Lookup = Arc<dyn Fn() -> BinderResult<Option<SIBinder>> + Send + Sync>;
+pub(crate) type Lookup = Arc<dyn Fn() -> BinderResult<Option<Resolved>> + Send + Sync>;
 
 /// The calls of one [`Resolver::watch`]: dropping it ends them.
 #[must_use = "dropping the watch at once ends its calls at once"]
@@ -139,6 +208,15 @@ impl Watch {
     pub fn with_lookup(
         guard: impl Any + Send + Sync,
         lookup: impl Fn() -> BinderResult<Option<SIBinder>> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_resolved_lookup(guard, move || Ok(lookup()?.map(Resolved::new)))
+    }
+
+    /// [`with_lookup`](Self::with_lookup) for a resolver of [`Resolved`] binders
+    /// ([`Resolver::watch_resolved`]).
+    pub fn with_resolved_lookup(
+        guard: impl Any + Send + Sync,
+        lookup: impl Fn() -> BinderResult<Option<Resolved>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             _guard: Box::new(guard),
