@@ -1035,9 +1035,11 @@ says what a peer does with the 0.12.0 value.
   whose one outgoing connection was busy held it on a callback connection the peer
   sends only oneways on, so the peer's entries and this end's service object stayed
   until the session ended.
-- **A oneway after a peer's late attach runs at the peer.** A `DEC_STRONG` dropped
-  with no connection left the peer's node alive with no number here, so a later
-  proxy of the address could number from 0 below what the node expects.
+- **A `DEC_STRONG` with no connection to go on is kept for one.** A session with no
+  outgoing connection dropped it, which kept the peer's node until the session
+  ended, and after a late attach a later proxy could number its oneways from 0 below
+  what the node expects. It now goes out before the next reply on any connection, or
+  on the attach, and the number lasts until then.
 - **A frame that names fds it did not bring is refused**, as AOSP
   `rpcSetDataReference` refuses it, before any handler runs.
 

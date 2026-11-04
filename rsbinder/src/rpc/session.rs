@@ -423,17 +423,13 @@
 //!    from an `Incoming` pin the amount is held instead, which step 3 limits; on an `Outgoing` pin,
 //!    whose slot the reaper may be waiting for, the loop that reads the slot writes what the
 //!    session owes past the limit itself before it reads the next frame. An amount is never
-//!    dropped from a session that can still send: the peer's node would keep its count until the
-//!    session ends. A session with no `Outgoing` slot at all (a server whose client opened no
-//!    callback connection) has sent no oneway and has nowhere to write: it drops the amount, which
-//!    pays the receipts as a write does, and the node is released at session end. The dropped
-//!    amount keeps the peer's node alive past the book, so a session that gains an `Outgoing` slot
-//!    later from the peer's attach must not number from 0 once a later proxy of the address has
-//!    numbered oneways and its release closed the book. From the first drop on, then, a book that
-//!    has numbered a oneway stays until the session ends (`RpcState::drop_receipts`), at one entry
-//!    per address such a oneway went to. libbinder opens its incoming connections at setup, so only
-//!    an rsbinder client gets there. Keeping each dropped amount for the attach instead would cost
-//!    an entry per address the peer picked.
+//!    dropped: the peer's node would keep its count until the session ends. A session with no
+//!    `Outgoing` slot at all (a server whose client opened no callback connection) keeps what it
+//!    owes, and its book, until the next `REPLY` on any connection, which the peer is waiting to
+//!    read, or the peer's attach, which wakes the reaper. AOSP keeps the count there too: its
+//!    `ExclusiveConnection::find` fails before `RpcState::sendDecStrongToTarget` takes the amount
+//!    off `timesRecd` (android-17.0.0_r1 `RpcSession.cpp:293-297`). That costs an entry per address
+//!    released, and the loop reading an `Incoming` slot writes what is past the limit there.
 //!    A serve loop keeps its `Outgoing` slot through each read, so where every such slot is in a
 //!    serve loop's read the reaper waits until the peer's next frame lets one go: a quiet peer gets
 //!    the amount then or not before the session ends, with its node and this end's book open
@@ -453,8 +449,8 @@
 //! `timesSent`, and a later send of the same address adds to that count, so the sum never passes
 //! what this end received (AOSP `processDecStrong`), and the node stays while either is
 //! outstanding, at its next async number. So this end keeps that number until the address's last
-//! amount is on the wire, on every route: each write, and the drop in step 4, pays the receipts it
-//! covers (`RpcState::pay_receipts`, "Send-side async numbers"). A proxy made for the address
+//! amount is on the wire, on every route: each write pays the receipts it covers
+//! (`RpcState::pay_receipts`, "Send-side async numbers"). A proxy made for the address
 //! before then numbers on. The peer's abort on a binder it never sent is the hold's to prevent,
 //! which `RpcState::release_proxy` decides before any route.
 //!
@@ -2039,6 +2035,13 @@ mod slot_pool {
     }
 }
 
+impl ConnState {
+    /// Whether any slot can carry what the reaper owes.
+    fn has_outgoing(&self) -> bool {
+        self.slots.iter().any(|s| s.role == SlotRole::Outgoing)
+    }
+}
+
 use slot_pool::{ConnSlot, ConnState};
 
 /// The peer a slot's transport reports, reduced to what a later slot must share (module doc).
@@ -2854,7 +2857,7 @@ impl RpcSessionInner {
         st.next_slot_id += 1;
         let armed = Arc::clone(&transport);
         st.slots.push(transport, id, role, None);
-        drop(st);
+        self.wake_reaper_for_owed(st);
         self.arm_liveness(&*armed);
         self.slot_cv.notify_all();
         Ok(id)
@@ -2952,7 +2955,7 @@ impl RpcSessionInner {
         let armed = Arc::clone(&transport);
         st.slots
             .push(transport, id, SlotRole::Outgoing, claimed.then(current_tid));
-        drop(st);
+        self.wake_reaper_for_owed(st);
         self.arm_liveness(&*armed);
         self.slot_cv.notify_all();
         Ok((id, armed))
@@ -4108,9 +4111,15 @@ impl RpcSessionInner {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
         let owed = st.reaper_owed.entry(addr).or_insert(0);
         *owed = owed.saturating_add(amount);
-        let queued = std::mem::replace(&mut st.reaper_dec_queued, true);
+        self.wake_reaper_for_owed(st);
+    }
+
+    /// Queue a `ReaperJob::Dec` if the session owes, none is queued and a slot could carry it.
+    fn wake_reaper_for_owed(&self, mut st: std::sync::MutexGuard<'_, ConnState>) {
+        let wake = !st.reaper_dec_queued && !st.reaper_owed.is_empty() && st.has_outgoing();
+        st.reaper_dec_queued |= wake;
         drop(st);
-        if !queued {
+        if wake {
             let _ = self.reaper_tx.send(ReaperJob::Dec);
         }
     }
@@ -4118,7 +4127,8 @@ impl RpcSessionInner {
     /// What the reaper is to write next, as a whole; `None` ends its `ReaperJob::Dec`.
     fn take_reaper_owed(&self) -> Option<std::collections::HashMap<RpcAddress, u32>> {
         let mut st = self.conn_state.lock().expect("conn_state poisoned");
-        if st.reaper_owed.is_empty() {
+        // Each is why `find_conn_for_reaper` finds nothing: asking again would spin.
+        if st.reaper_owed.is_empty() || !st.has_outgoing() || self.shared.lifecycle.is_torn_down() {
             st.reaper_dec_queued = false;
             return None;
         }
@@ -4215,8 +4225,9 @@ impl RpcSessionInner {
                 return;
             };
             let mut past = past_limit(&mut slot.pending_dec);
-            // The reaper may be waiting for this very slot, and no frame is read meanwhile.
-            if slot.role == SlotRole::Outgoing {
+            let outgoing = slot.role == SlotRole::Outgoing;
+            // The reaper may be waiting for this very slot, or have no slot to write on at all.
+            if outgoing || !st.has_outgoing() {
                 past.extend(past_limit(&mut st.reaper_owed));
             }
             past
@@ -4233,7 +4244,7 @@ impl RpcSessionInner {
     fn hand_held_to_reaper(&self, slot_id: u64) {
         let mut guard = self.conn_state.lock().expect("conn_state poisoned");
         let st = &mut *guard;
-        // A serve loop's `Outgoing` slot waits for the peer's frame, and none drops the amount.
+        // A serve loop's `Outgoing` slot waits for the peer's frame: the hold is no later here.
         let writable = |s: &ConnSlot| s.role == SlotRole::Outgoing && !s.serving;
         if !st.slots.iter().any(writable) {
             return;
@@ -4256,21 +4267,27 @@ impl RpcSessionInner {
                 *owed = owed.saturating_add(amount);
             }
         }
-        let queued = std::mem::replace(&mut st.reaper_dec_queued, true);
-        drop(guard);
-        if !queued {
-            let _ = self.reaper_tx.send(ReaperJob::Dec);
-        }
+        self.wake_reaper_for_owed(guard);
     }
 
-    /// The `DEC_STRONG`s held for `slot_id`, emptied: its `REPLY` is about to go out.
+    /// The `DEC_STRONG`s to write before `slot_id`'s `REPLY`, emptied: the peer reads them there.
     fn take_held_dec_strongs(&self, slot_id: u64) -> std::collections::HashMap<RpcAddress, u32> {
-        let mut st = self.conn_state.lock().expect("conn_state poisoned");
-        st.slots
+        let mut guard = self.conn_state.lock().expect("conn_state poisoned");
+        let st = &mut *guard;
+        let mut held = st
+            .slots
             .iter_mut()
             .find(|s| s.id == slot_id)
             .map(|s| std::mem::take(&mut s.pending_dec))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // With an `Outgoing` slot they are the reaper's; without one this is their way out.
+        if !st.has_outgoing() {
+            for (addr, amount) in std::mem::take(&mut st.reaper_owed) {
+                let owed = held.entry(addr).or_insert(0);
+                *owed = owed.saturating_add(amount);
+            }
+        }
+        held
     }
 
     /// Fire each cached proxy's `binder_died` (AOSP `sendObituaries`) unlocked; idempotent.
@@ -6843,13 +6860,11 @@ fn reap_dec(
     };
     // Waits only on this thread, and gives up on teardown or drain.
     let Some((slot_id, transport)) = inner.find_conn_for_reaper() else {
-        // Step 4's drop: the peer's node stays alive, at the number a later `Outgoing` must use.
-        inner
-            .shared
-            .state
-            .lock()
-            .expect("rpc state poisoned")
-            .drop_receipts(&addr, amount);
+        // Owed still, as `take_reaper_owed` ends this job: an attach or a `REPLY` writes it.
+        let mut st = inner.conn_state.lock().expect("conn_state poisoned");
+        let owed = st.reaper_owed.entry(addr).or_insert(0);
+        *owed = owed.saturating_add(amount);
+        drop(st);
         return Some(inner);
     };
     let sent = wait_without_the_session(weak, inner, &*transport, |shared| {
@@ -8312,9 +8327,9 @@ mod tests {
         assert!(!inner.shared.lifecycle.is_torn_down());
     }
 
-    /// With no `Outgoing` slot what the reaper owes has nowhere to go: dropped, with no end.
+    /// With no `Outgoing` slot what the reaper owes waits for a way out, and its book with it.
     #[test]
-    fn a_session_with_nothing_to_write_on_drops_what_the_reaper_owes() {
+    fn a_session_with_nothing_to_write_on_keeps_what_the_reaper_owes() {
         use crate::rpc::transport::MemTransport;
         let (a, _peer) = MemTransport::pair();
         let session = RpcSession::from_android13plus(
@@ -8328,19 +8343,10 @@ mod tests {
         let mut counter = 0;
         let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
         drop(inner.enter_binder(addr).expect("a receipt"));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while inner
-            .conn_state
-            .lock()
-            .expect("conn_state")
-            .reaper_dec_queued
-        {
-            assert!(
-                Instant::now() < deadline,
-                "the reaper stayed with what it owes"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(reaper_owed_len(inner), 1);
+        let st = inner.conn_state.lock().expect("conn_state");
+        assert!(!st.reaper_dec_queued, "no job: no slot could carry it");
+        drop(st);
         assert!(!inner.shared.lifecycle.is_torn_down());
         let books = inner
             .shared
@@ -8348,7 +8354,74 @@ mod tests {
             .lock()
             .expect("state")
             .remote_book_count();
-        assert_eq!(books, 0, "a dropped amount pays the receipts it covers");
+        assert_eq!(books, 1, "the amount is not on the wire");
+    }
+
+    /// With no `Outgoing` slot a `REPLY` is the way out of what the reaper owes: the peer reads it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn what_the_reaper_owes_with_no_slot_goes_out_before_a_reply() {
+        use crate::rpc::transport::UnixTransport;
+        let (t0, peer) = UnixTransport::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = session.inner.clone();
+        let codec = Android13PlusCodec::android14_15();
+        let mut counter = 0;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        inner.reap_dec_strong(addr, 2);
+
+        let key = (
+            &*inner as *const RpcSessionInner as usize,
+            RpcSession::FOUNDING_SLOT_ID,
+        );
+        DRIVING.with(|d| d.borrow_mut().push(key));
+        assert!(inner.write_reply(0, &[], &[], &[]).is_ok());
+        DRIVING.with(|d| d.borrow_mut().pop());
+
+        let (paid, _) = codec.encode_dec_strong(&addr, 2).expect("a frame");
+        assert_eq!(read_bytes(&peer, paid.len()), paid);
+        assert_eq!(reaper_owed_len(&inner), 0);
+        session.close_session();
+    }
+
+    /// With no `Outgoing` slot the loop reading an `Incoming` one writes what is past the limit.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_serve_loop_with_no_slot_for_the_reaper_writes_what_is_past_the_limit() {
+        use crate::rpc::transport::UnixTransport;
+        const EXCESS: usize = 3;
+        let (t0, peer) = UnixTransport::pair().expect("socketpair");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = session.inner.clone();
+        let codec = Android13PlusCodec::android14_15();
+        let mut counter = 0;
+        for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
+            let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+            inner.reap_dec_strong(addr, 1);
+        }
+        let other = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        let (frame, _) = codec.encode_dec_strong(&other, 1).expect("a frame");
+        peer.send_raw(&frame).expect("a frame for the serve loop");
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Continue
+        ));
+        assert_eq!(reaper_owed_len(&inner), HELD_DEC_STRONG_LIMIT);
+        session.close_session();
     }
 
     /// An `Outgoing` pin's frames add to what the reaper owes: its reader writes what is past it.
@@ -8500,7 +8573,7 @@ mod tests {
             inner.serve_once_on_slot(slot_id),
             ServeStep::Continue
         ));
-        assert_eq!(held(), Some(1), "the reaper would drop it with no slot");
+        assert_eq!(held(), Some(1), "the reaper has no slot to write it on");
 
         let (t, callback) = UnixTransport::pair().expect("socketpair");
         let added = session.add_callback_slot(Box::new(t), 2).expect("a slot");

@@ -673,10 +673,12 @@ bytes, so only a peer that wrote something unusual sees a difference.
   and so is a binder in the object table below v2. A handler does not run and a reply's
   call fails, where 0.12.0 ran the handler and failed only its read of a missing fd. A
   server with `set_receive_fds(false)` therefore refuses a call that sends an fd.
-- **A session that dropped a `DEC_STRONG` numbers on after a late attach.** After the
-  peer attaches a connection, a later proxy's oneway keeps the number the peer's node
-  expects, where 0.12.0 restarted at 0 and the peer dropped or parked it. There is no
-  code to change.
+- **A `DEC_STRONG` with no connection to go on is written later, not dropped.** A
+  session with no outgoing connection writes it before its next reply, or on the
+  peer's attach, where 0.12.0 dropped it and the peer's node stayed until the session
+  ended. A test that reads the frames of a reply on such a session reads the
+  `DEC_STRONG` first. A later proxy's oneway keeps the number the peer's node expects,
+  where 0.12.0 could restart at 0 and the peer dropped or parked it.
 
 ## Streams and topics
 

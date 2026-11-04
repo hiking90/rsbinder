@@ -61,8 +61,8 @@
 //! - `t20_a_peer_that_pays_no_send_keeps_its_entries_until_the_session_ends`: a raw owner that
 //!   reads every oneway and pays none gets no release, its count of addresses does not end the
 //!   session, and the session's end takes the books.
-//! - `t21_a_dropped_release_keeps_the_numbers_for_a_late_attach`: a release with no connection is
-//!   dropped, the peer attaches, and each later proxy of the address numbers on from the last.
+//! - `t21_a_release_with_no_connection_goes_out_on_a_late_attach`: a release with no connection
+//!   stays owed with its book, and the peer's attach writes it and closes the book.
 //! - `t22_a_limit_on_unpaid_addresses_ends_the_session_past_it`,
 //!   `t22_a_paid_address_leaves_room_under_the_limit`: `RpcServer::__limit_unpaid_addresses`
 //!   counts addresses, not sends, and only what is still unpaid.
@@ -94,7 +94,7 @@
 //! - T19: drop the `pay_receipts` call in `write_dec_no_wait` (the free slot), `reap_dec` (the
 //!   reaper) or `write_dec_strong` (the pin).
 //! - T20: drop the clear of `remote_books` in `RpcState::clear_remote_counts`.
-//! - T21: set `release_dropped` nowhere in `RpcState::drop_receipts`.
+//! - T21: drop the `wake_reaper_for_owed` call in `push_outgoing_capped`.
 //!
 //! Outside this file,
 //! `strong_session_tests::argument_proxy_dec_strong_goes_out_on_the_serving_connection`
@@ -1407,20 +1407,16 @@ fn t22_a_paid_address_leaves_room_under_the_limit() {
     drop((first_proxy, second_proxy, root));
 }
 
-/// T21: a release dropped with no connection leaves the peer's node, so a late attach numbers on.
+/// T21: a release with no connection stays owed with its book, and the peer's attach writes it.
 #[test]
-fn t21_a_dropped_release_keeps_the_numbers_for_a_late_attach() {
+fn t21_a_release_with_no_connection_goes_out_on_a_late_attach() {
     let (a, _b) = UnixStream::pair().expect("socketpair");
     let server = session(a, AddressSpace::Acceptor, Wire::V(PROTOCOL_V2));
     let inner = server.inner.clone();
     let mut ctr = 0u64;
     let addr = RpcAddress::unique(&mut ctr, AddressSpace::Initiator);
     drop(inner.enter_binder(addr).expect("a receipt"));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while open_books(&inner) != 0 {
-        assert!(Instant::now() < deadline, "the reaper dropped nothing");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    assert_eq!(open_books(&inner), 1, "the amount is not on the wire");
 
     let (c, d) = UnixStream::pair().expect("socketpair");
     d.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -1432,22 +1428,15 @@ fn t21_a_dropped_release_keeps_the_numbers_for_a_late_attach() {
         stream: d,
         codec: Android13PlusCodec::with_version(PROTOCOL_V2).unwrap(),
     };
-    for number in [0, 1] {
-        let proxy = inner.enter_binder(addr).expect("a receipt");
-        let body = rpc_of(&proxy).request_parcel(CARRIER).expect("request");
-        rpc_of(&proxy)
-            .send(FIRST_CALL_TRANSACTION, &body, FLAG_ONEWAY)
-            .expect("oneway");
-        match raw.recv() {
-            WireMessage::Transact(t) => assert_eq!(t.async_number, number),
-            other => panic!("expected the oneway, got {other:?}"),
-        }
-        drop(body);
-        inner.apply_dec_strong(addr, 1);
-        drop(proxy);
-        assert!(matches!(raw.recv(), WireMessage::DecStrong(a, 1) if a == addr));
+    assert!(matches!(raw.recv(), WireMessage::DecStrong(a, 1) if a == addr));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while open_books(&inner) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "written, and the book still open"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(open_books(&inner), 1, "the number outlives the receipts");
     server.close_session();
 }
 
