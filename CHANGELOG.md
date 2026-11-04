@@ -505,7 +505,9 @@ says what a peer does with the 0.12.0 value.
     `uds::subscribe` and `uds::serve`, with `uds::Options::expect_uid` to
     check who listens by `SO_PEERCRED`. `registry::uds::UdsResolver` finds a
     topic by name through a registry on a socket, `registry::uds::UdsRegistry`
-    with a `SocketDir` to serve one. `Resolver::watch_resolved` and `Resolved`
+    with a `SocketDir` to serve one. A notice says that a name changed and
+    brings no descriptor, the watch asks the registry what the name has, and a
+    client has one watcher binder for all its names. `Resolver::watch_resolved` and `Resolved`
     carry what a binder needs kept alive, and a publisher given up on with no
     binder; the default keeps nothing, so a resolver of the application's own
     need not implement `watch_resolved`.

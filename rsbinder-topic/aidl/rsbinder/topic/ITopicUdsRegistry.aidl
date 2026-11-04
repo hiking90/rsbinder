@@ -53,11 +53,14 @@ interface ITopicUdsRegistry {
     TopicAddress lookup(String name);
     /**
      * Tell `watcher` of every socket `name` is given from now on; the one it
-     * has now is the reply.
+     * has now is the reply. A client passes one `watcher` for all its names.
      */
     TopicAddress watch(String name, ITopicAddressWatcher watcher);
-    /** End the watch of `name` by `watcher`; nothing if there is none. */
-    oneway void unwatch(String name, ITopicAddressWatcher watcher);
+    /**
+     * End the watch of `name` by `watcher`; nothing if there is none. Twoway: a
+     * `watch` of the name after it returns cannot arrive before it.
+     */
+    void unwatch(String name, ITopicAddressWatcher watcher);
     /** The names under `prefix` the caller may subscribe to, sorted. */
     TopicInfo[] list(String prefix);
 }

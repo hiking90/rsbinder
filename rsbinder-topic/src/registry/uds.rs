@@ -40,13 +40,18 @@
 //! can take that room, and a notice past the bound goes unsent until the name's next change
 //! (`owed_dropped`).
 //!
-//! The descriptors in notices and replies nobody has read count against the host's uid, and past
+//! A notice says that a name changed and the watch asks for what it has now, with `lookup`, so a
+//! notice carries no descriptor. A process with no descriptor free takes it and asks later, once
+//! it has one: a frame that brings a descriptor to such a process ends its session, as the kernel
+//! cannot deliver it (`MSG_CTRUNC`). The watch's asking can still lose that race to another thread
+//! of the process, as a call can whose reply brings a descriptor.
+//!
+//! The descriptors in replies nobody has read count against the host's uid, and past
 //! `RLIMIT_NOFILE` the kernel refuses more unless the host has `CAP_SYS_RESOURCE` or
-//! `CAP_SYS_ADMIN`. A uid that can fill enough sockets can reach that: then every watcher's notice
-//! has no room and is owed as above, and a reply with a descriptor fails its call with
-//! `StatusCode::FailedTransaction`. Nothing waits and no other session ends. An `allocate` refused
-//! that way leaves its name pending, as its caller has no number to withdraw, until the session
-//! ends or allocates that name again.
+//! `CAP_SYS_ADMIN`. A uid that can fill enough sockets can reach that: a reply with a descriptor
+//! then fails its call with `StatusCode::FailedTransaction`. Nothing waits and no other session
+//! ends. An `allocate` refused that way leaves its name pending, as its caller has no number to
+//! withdraw, until the session ends or allocates that name again.
 //!
 //! Unlike a kernel registry, a process that stopped with its socket full loses its session after
 //! 10 s, which takes its names and watches away; one that goes on reading keeps it. A session that
@@ -72,7 +77,6 @@ use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, Shutdown, SocketAddrUnix, SocketFlags, SocketType};
 
-use super::resolver::Newest;
 use super::table::{Key, Links, Notice, Refused, Sent, Table};
 use super::{
     is_valid_name, link_failed, no_allocation, Action, RegistryAccess, RegistryStats, Sleep,
@@ -341,9 +345,9 @@ struct Shared {
     /// Where the retry thread sleeps between rounds.
     sleep: Arc<Sleep>,
     this: Weak<Shared>,
-    /// Duplicates of an address the host fails from now on, as with no descriptor left.
+    /// Notices the host finds no room for from now on.
     #[cfg(test)]
-    failing_duplicates: AtomicU64,
+    failing_sends: AtomicU64,
     /// A copy of the last address made, for a test to connect through one nobody can look up.
     #[cfg(test)]
     last_address: Mutex<Option<OwnedFd>>,
@@ -410,7 +414,6 @@ fn topic_address((topic, generation): (Option<TopicKey>, u64)) -> BinderResult<T
 pub(super) fn try_notice(
     watcher: &Strong<dyn ITopicAddressWatcher>,
     name: &str,
-    address: &ParcelFileDescriptor,
     generation: u64,
 ) -> rsbinder::Result<()> {
     let binder = watcher.as_binder();
@@ -420,7 +423,6 @@ pub(super) fn try_notice(
     let mut data =
         proxy.prepare_request(<BpTopicAddressWatcher as ITopicAddressWatcher>::descriptor())?;
     data.write(name)?;
-    data.write(address)?;
     data.write(&(generation as i64))?;
     let flags = rsbinder::FLAG_ONEWAY | rsbinder::FLAG_CLEAR_BUF | rsbinder::FLAG_PRIVATE_LOCAL;
     proxy.__try_oneway(transactions::r#onAdvertised, &data, flags)
@@ -690,12 +692,7 @@ impl Shared {
             if !self.judged(&notice.name, &notice.caller) {
                 continue;
             }
-            let sent = self.send(
-                &notice.watcher,
-                &notice.name,
-                &notice.topic,
-                notice.generation,
-            );
+            let sent = self.send(&notice.watcher, &notice.name, notice.generation);
             let mut inner = self.lock();
             let now = Instant::now();
             let owed =
@@ -726,29 +723,17 @@ impl Shared {
     }
 
     /// One send: final if it would fail the same while the session lives, or the session ended.
-    fn send(&self, watcher: &WatcherKey, name: &str, topic: &TopicKey, generation: u64) -> Sent {
-        let Some(address) = topic.address.as_deref() else {
-            return Sent::Failed;
-        };
-        let address = parcel_address(address);
+    fn send(&self, watcher: &WatcherKey, name: &str, generation: u64) -> Sent {
         #[cfg(test)]
-        let address = if self.failing_duplicates.load(Ordering::Relaxed) > 0 {
-            self.failing_duplicates.fetch_sub(1, Ordering::Relaxed);
-            Err(StatusCode::from(io::Error::from_raw_os_error(libc::EMFILE)).into())
-        } else {
-            address
-        };
-        let Ok(address) = address else {
+        if self.failing_sends.load(Ordering::Relaxed) > 0 {
+            self.failing_sends.fetch_sub(1, Ordering::Relaxed);
             return Sent::Busy;
-        };
-        match try_notice(&watcher.0, name, &address, generation) {
+        }
+        match try_notice(&watcher.0, name, generation) {
             Ok(()) => Sent::Delivered,
-            Err(
-                StatusCode::DeadObject
-                | StatusCode::FdsNotAllowed
-                | StatusCode::InvalidOperation
-                | StatusCode::BadValue,
-            ) => Sent::Failed,
+            Err(StatusCode::DeadObject | StatusCode::InvalidOperation | StatusCode::BadValue) => {
+                Sent::Failed
+            }
             Err(_) => Sent::Busy,
         }
     }
@@ -793,8 +778,8 @@ impl Shared {
             }
             let order = self.order();
             let target = self.lock().table.retry_target(&name, &watcher);
-            if let Some((topic, generation)) = target {
-                let sent = self.send(&watcher, &name, &topic, generation);
+            if let Some((_, generation)) = target {
+                let sent = self.send(&watcher, &name, generation);
                 self.lock()
                     .table
                     .retried(&name, &watcher, generation, sent, Instant::now());
@@ -846,8 +831,8 @@ pub struct UdsRegistry {
 /// How long a send to a watcher may go without progress: `RpcServer`'s default handshake deadline.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Watch addresses of one session with an unpaid notice: past what a socket buffer of 12 MB queues.
-const MAX_UNPAID_WATCHES: usize = 10_000;
+/// A [`UdsResolver`] has one watcher binder, so its notices have one address to pay for.
+const WATCH_ADDRESSES: usize = 1;
 
 impl UdsRegistry {
     /// A registry whose callers `access` judges and whose sockets are made in `dir`.
@@ -869,7 +854,7 @@ impl UdsRegistry {
             #[cfg(test)]
             panicking_retry: AtomicBool::new(false),
             #[cfg(test)]
-            failing_duplicates: AtomicU64::new(0),
+            failing_sends: AtomicU64::new(0),
             #[cfg(test)]
             last_address: Mutex::default(),
         });
@@ -900,16 +885,13 @@ impl UdsRegistry {
     /// free.
     ///
     /// A client that takes its notices and does not pay them back, watching a new address each
-    /// time, would have the registry keep an entry for each until its session ends. The session
-    /// ends at 10 000 such addresses instead. A client paying for its notices stays far under
-    /// that, as what it has not paid for is what its socket buffer holds, and an `rsbinder-topic`
-    /// client pays on the connection the registry reads. A libbinder client pays on an idle
-    /// outgoing connection too, and on the callback connection, which the registry does not read,
-    /// when it has none idle: such payments count toward the limit.
+    /// time, would have the registry keep an entry for each until its session ends. A client has
+    /// one watcher binder for all its names, as [`UdsResolver`] does, so a session ends at a notice
+    /// to a second address while the first has one unpaid, however it pays.
     pub fn serve(&self, server: &RpcServer) -> BinderResult<()> {
         uds::configure(server);
         server.set_receive_fds(false);
-        server.__limit_unpaid_addresses(MAX_UNPAID_WATCHES);
+        server.__limit_unpaid_addresses(WATCH_ADDRESSES);
         server.set_root(self.as_binder())?;
         server.set_reply_timeout(Some(SEND_TIMEOUT))?;
         Ok(())
@@ -927,12 +909,10 @@ impl UdsRegistry {
         self.shared.lock().retrying
     }
 
-    /// Fail the next `count` duplicates of an address, as with no descriptor left, for a test.
+    /// Find no room for the next `count` notices, for a test.
     #[cfg(test)]
-    pub(super) fn fail_duplicates(&self, count: u64) {
-        self.shared
-            .failing_duplicates
-            .store(count, Ordering::Relaxed);
+    pub(super) fn fail_sends(&self, count: u64) {
+        self.shared.failing_sends.store(count, Ordering::Relaxed);
     }
 
     /// What asks the registry's state from another thread than a fixture's, for a test.
@@ -1077,6 +1057,11 @@ impl Default for ResolverOptions {
 /// The session with the host, closed once the resolver and all it made have let go of it.
 struct Host {
     registry: Strong<dyn ITopicUdsRegistry>,
+    /// The one binder the host tells of every name this resolver watches.
+    watcher: Strong<dyn ITopicAddressWatcher>,
+    watches: Arc<Watches>,
+    /// Across a `watch` and an `unwatch`: the host's watch of a name is all of its watches here.
+    watch_order: Mutex<()>,
     _session: SessionGuard,
     /// How a connection to a publisher goes.
     publisher: Options,
@@ -1095,7 +1080,10 @@ struct Host {
 /// at a time, kernel or over a socket. `advertise_on` with any resolver replaces the one it has;
 /// `rsbinder::hub::add_service` of its binder takes none and goes with it.
 ///
-/// `watch` makes one session for each generation of the name, on a thread of the watch's, so one
+/// The host tells this resolver when a name changes, and a thread of the watch's asks it what the
+/// name has now. That thread runs while there is something to ask, one a watch at most.
+///
+/// `watch` makes one session for each generation of the name, on that thread, so one
 /// publisher that is slow to accept holds up only its own name's watch. A connect into a publisher
 /// whose accept queue is full waits in `connect(2)` until it accepts or ends: that thread is held
 /// that long, and [`ResolverOptions::timeout`] does not reach it.
@@ -1130,9 +1118,13 @@ impl UdsResolver {
         let registry = session.0.get_root()?.into_interface_checked()?;
         // A name lasts as long as this session, which a deadline running out would end.
         session.0.set_reply_timeout(None)?;
+        let watches = Arc::new(Watches::default());
         Ok(Self {
             host: Arc::new(Host {
                 registry,
+                watcher: BnTopicAddressWatcher::new_binder(Notices(watches.clone())),
+                watches,
+                watch_order: Mutex::default(),
                 _session: session,
                 publisher: Options {
                     timeout: options.timeout,
@@ -1163,24 +1155,15 @@ impl UdsResolver {
         uds::subscribe_with(Endpoint::Fd(address), policy, &self.host.publisher)
     }
 
-    /// How many answers `name` gets when a notice is lost just after the first, for a test.
+    /// A watch the host knows nothing of: a test tells it of a notice with `heard`.
     #[cfg(test)]
-    pub(super) fn answers_when_a_notice_is_lost_during_the_first(&self, name: &str) -> u64 {
-        let asking = Arc::new(Mutex::new(Asking {
-            running: true,
-            again: false,
-        }));
-        let answers = Arc::new(AtomicU64::new(0));
-        let (counted, losing) = (answers.clone(), asking.clone());
-        let newest = Newest::new(Box::new(move |_: (OwnedFd, i64)| {
-            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
-                losing.lock().expect("lock poisoned").again = true;
-            }
-        }));
-        let dialer = Dialer::new(Options::default(), Box::new(|_| {}));
-        let host = Arc::downgrade(&self.host);
-        ask_until_answered(name, &newest, &dialer, &host, &asking);
-        answers.load(Ordering::SeqCst)
+    pub(super) fn reconciler(&self, name: &str, on_resolved: OnResolved) -> Arc<Reconciler> {
+        Arc::new(Reconciler::new(
+            name,
+            Arc::downgrade(&self.host),
+            self.host.publisher.clone(),
+            on_resolved,
+        ))
     }
 
     fn serve(&self, socket: OwnedFd, topic: SIBinder) -> BinderResult<Serving> {
@@ -1308,51 +1291,39 @@ impl Resolver for UdsResolver {
     }
 
     fn watch_resolved(&self, name: &str, on_resolved: OnResolved) -> BinderResult<Watch> {
-        let dialer = Arc::new(Dialer::new(self.host.publisher.clone(), on_resolved));
-        let dialing = dialer.clone();
-        let newest = Arc::new(Newest::new(Box::new(
-            move |(address, generation): (OwnedFd, i64)| dialing.give(address, generation),
-        )));
-        let watcher = BnTopicAddressWatcher::new_binder(Notices {
-            name: name.to_owned(),
-            newest: newest.clone(),
-            dialer: dialer.clone(),
-            // Weak: the host's session keeps this watcher until the host pays for it.
-            host: Arc::downgrade(&self.host),
-            asking: Arc::default(),
-        });
-        let registry = &self.host.registry;
-        let reply = match registry.r#watch(name, &watcher) {
+        let host = &self.host;
+        let reconciler = Arc::new(Reconciler::new(
+            name,
+            Arc::downgrade(host),
+            host.publisher.clone(),
+            on_resolved,
+        ));
+        let order = host.watch_order();
+        // Before the call: a notice can come ahead of its reply.
+        host.watches.add(name, &reconciler);
+        let reply = host.registry.r#watch(name, &host.watcher);
+        let reply = match reply {
             Ok(reply) => reply,
             Err(status) => {
-                newest.end();
-                dialer.end();
-                let _ = registry.r#unwatch(name, &watcher);
+                reconciler.end();
+                host.forget(name, &reconciler);
                 return Err(status);
             }
         };
-        let (address, generation) = parts(reply);
-        newest.heard(address.map(|address| (address, generation)), generation);
-        let host = self.host.clone();
-        let looked_up = name.to_owned();
-        let answers = newest.clone();
-        let asked = dialer.clone();
-        let lookup = move || {
-            let (address, generation) = parts(host.registry.r#lookup(&looked_up)?);
-            let found = answers.answer(address.map(|address| (address, generation)), generation);
-            match found {
-                Some((address, generation)) => asked.dial_for_lookup(address, generation),
-                None => Ok(None),
-            }
-        };
+        drop(order);
+        // Its descriptor goes unused: the thread's lookup has what the name has by then.
+        if reply.socket.is_some() {
+            reconciler.heard();
+        }
+        let asked = reconciler.clone();
         let watching = Watching {
-            host: self.host.clone(),
+            host: host.clone(),
             name: name.to_owned(),
-            watcher,
-            newest,
-            dialer,
+            reconciler,
         };
-        Ok(Watch::with_resolved_lookup(watching, lookup))
+        Ok(Watch::with_resolved_lookup(watching, move || {
+            asked.lookup()
+        }))
     }
 
     fn host(&self) -> Option<SIBinder> {
@@ -1364,144 +1335,87 @@ fn parts(address: TopicAddress) -> (Option<OwnedFd>, i64) {
     (address.socket.map(OwnedFd::from), address.generation)
 }
 
-/// Ends the watch when it is dropped: the host's, and the calls of notices still on their way.
+impl Host {
+    /// `watch_order` guards no data: a panic under it leaves nothing to repair.
+    fn watch_order(&self) -> MutexGuard<'_, ()> {
+        self.watch_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take a watch off its name, and the host's watch with the name's last; under the order.
+    fn forget(&self, name: &str, watch: &Arc<Reconciler>) {
+        if self.watches.remove(name, watch) {
+            let _ = self.registry.r#unwatch(name, &self.watcher);
+        }
+    }
+}
+
+/// Ends the watch when it is dropped: the host's, and what it was asking.
 struct Watching {
     host: Arc<Host>,
     name: String,
-    watcher: Strong<dyn ITopicAddressWatcher>,
-    newest: Arc<Newest<(OwnedFd, i64)>>,
-    dialer: Arc<Dialer>,
+    reconciler: Arc<Reconciler>,
 }
 
 impl Drop for Watching {
     fn drop(&mut self) {
-        self.newest.end();
-        self.dialer.end();
+        self.reconciler.end();
         let name = std::mem::take(&mut self.name);
-        let watcher = self.watcher.clone();
+        let reconciler = self.reconciler.clone();
         off_this_thread(&self.host, move |host| {
-            let _ = host.registry.r#unwatch(&name, &watcher);
+            let _order = host.watch_order();
+            host.forget(&name, &reconciler);
         });
     }
 }
 
-/// The watcher binder of one watch.
-struct Notices {
-    name: String,
-    newest: Arc<Newest<(OwnedFd, i64)>>,
-    dialer: Arc<Dialer>,
-    host: Weak<Host>,
-    asking: Arc<Mutex<Asking>>,
+/// The watches of one resolver, by name.
+#[derive(Default)]
+struct Watches(Mutex<BTreeMap<String, Vec<Weak<Reconciler>>>>);
+
+impl Watches {
+    fn add(&self, name: &str, watch: &Arc<Reconciler>) {
+        let mut names = self.0.lock().expect("lock poisoned");
+        let watches = names.entry(name.to_owned()).or_default();
+        watches.push(Arc::downgrade(watch));
+    }
+
+    /// Take `watch` off `name`; whether the name has none left.
+    fn remove(&self, name: &str, watch: &Arc<Reconciler>) -> bool {
+        let mut names = self.0.lock().expect("lock poisoned");
+        let Some(watches) = names.get_mut(name) else {
+            return true;
+        };
+        // One whose `Watching` found no thread to take it off is gone with its `Weak` alone.
+        watches.retain(|held| held.strong_count() > 0 && !held.ptr_eq(&Arc::downgrade(watch)));
+        let none_left = watches.is_empty();
+        if none_left {
+            names.remove(name);
+        }
+        none_left
+    }
+
+    fn of(&self, name: &str) -> Vec<Arc<Reconciler>> {
+        let names = self.0.lock().expect("lock poisoned");
+        let watches = names.get(name).into_iter().flatten();
+        watches.filter_map(Weak::upgrade).collect()
+    }
 }
 
-/// The thread that asks the host for a notice whose descriptor could not be kept.
-#[derive(Default)]
-struct Asking {
-    running: bool,
-    /// Another notice was lost after what its call asks may have been answered: it asks again.
-    again: bool,
-}
+/// The watcher binder of one resolver. The host's session keeps it until the host pays for it.
+struct Notices(Arc<Watches>);
 
 impl Interface for Notices {}
 
 impl ITopicAddressWatcher for Notices {
-    fn r#onAdvertised(
-        &self,
-        name: &str,
-        socket: &ParcelFileDescriptor,
-        generation: i64,
-    ) -> BinderResult<()> {
-        if name != self.name {
-            return Ok(());
-        }
-        match self.duplicate(socket) {
-            Ok(address) => self.newest.heard(Some((address, generation)), generation),
-            Err(error) => {
-                log::warn!("topic: no descriptor for a notice of {name:?}, asking again: {error}");
-                self.ask_again();
-            }
+    fn r#onAdvertised(&self, name: &str, _generation: i64) -> BinderResult<()> {
+        for watch in self.0.of(name) {
+            watch.heard();
         }
         Ok(())
     }
 }
-
-impl Notices {
-    fn duplicate(&self, socket: &ParcelFileDescriptor) -> std::io::Result<OwnedFd> {
-        #[cfg(test)]
-        if FAILING_NOTICES.lock().expect("lock poisoned").as_deref() == Some(self.name.as_str()) {
-            *FAILING_NOTICES.lock().expect("lock poisoned") = None;
-            return Err(Errno::MFILE.into());
-        }
-        socket.as_ref().try_clone()
-    }
-
-    /// The oneway has no one to fail to, and the host counts it delivered: look the name up.
-    fn ask_again(&self) {
-        let mut asking = self.asking.lock().expect("lock poisoned");
-        if asking.running {
-            asking.again = true;
-            return;
-        }
-        asking.running = true;
-        drop(asking);
-        let name = self.name.clone();
-        let newest = self.newest.clone();
-        let dialer = self.dialer.clone();
-        let host = self.host.clone();
-        let asking = self.asking.clone();
-        let spawned = std::thread::Builder::new()
-            .name("rsbinder-topic-host".into())
-            .spawn(move || {
-                ask_until_answered(&name, &newest, &dialer, &host, &asking);
-                asking.lock().expect("lock poisoned").running = false;
-            });
-        if let Err(error) = spawned {
-            log::warn!("topic: no thread to ask for {:?} again: {error}", self.name);
-            self.asking.lock().expect("lock poisoned").running = false;
-        }
-    }
-}
-
-/// Look `name` up until the last notice lost has its answer, or the watch or the host is gone.
-fn ask_until_answered(
-    name: &str,
-    newest: &Newest<(OwnedFd, i64)>,
-    dialer: &Dialer,
-    host: &Weak<Host>,
-    asking: &Mutex<Asking>,
-) {
-    let mut delay = FIRST_RETRY;
-    while !dialer.ended_within(delay) {
-        // A reply's fd with no slot for it ends the session: wait for that and one to dial with.
-        if let Err(error) = std::os::unix::net::UnixStream::pair() {
-            log::debug!("topic: no descriptors to ask for {name:?} yet: {error}");
-            delay = (delay * 2).min(LAST_RETRY);
-            continue;
-        }
-        let Some(host) = host.upgrade() else {
-            return;
-        };
-        asking.lock().expect("lock poisoned").again = false;
-        match host.registry.r#lookup(name) {
-            Ok(reply) => {
-                let (address, generation) = parts(reply);
-                newest.heard(address.map(|address| (address, generation)), generation);
-                if !asking.lock().expect("lock poisoned").again {
-                    return;
-                }
-                delay = FIRST_RETRY;
-            }
-            Err(status) => {
-                log::debug!("topic: asking for {name:?}: {status}");
-                delay = (delay * 2).min(LAST_RETRY);
-            }
-        }
-    }
-}
-
-/// The name whose next notice fails its duplicate, as with no descriptor left, for a test.
-#[cfg(test)]
-pub(super) static FAILING_NOTICES: Mutex<Option<String>> = Mutex::new(None);
 
 /// The connection of the newest generation one watch has reached.
 struct Reached {
@@ -1512,44 +1426,26 @@ struct Reached {
 }
 
 #[derive(Default)]
-struct DialQueue {
-    next: Option<(OwnedFd, i64)>,
-    /// The newest generation given: one older, a lookup's overtaken by a notice, goes unused.
-    given: Option<i64>,
+struct WatchState {
+    /// A notice came since the last lookup began: the name may have more than that one said.
+    asked: bool,
     running: bool,
     ended: bool,
     /// The connection of the newest generation reached, for the repeats of it, until the end.
     reached: Option<Reached>,
 }
 
-/// A generation to connect to again.
-struct Again {
-    address: OwnedFd,
-    generation: i64,
-    at: Instant,
+/// When a failed round goes again.
+struct Retry {
+    at: Option<Instant>,
+    delay: Duration,
 }
 
-/// Clears `running` when the connecting thread unwinds; starts another for a notice given since.
-struct Dialing<'d>(&'d Arc<Dialer>);
-
-impl Drop for Dialing<'_> {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            return;
-        }
-        // No caller code runs under this lock, so a poisoned one is no callback's: leave it.
-        let next = match self.0.queue.lock() {
-            Ok(mut queue) => {
-                queue.running = false;
-                queue.next.take()
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().running = false;
-                return;
-            }
-        };
-        if let Some((address, generation)) = next {
-            self.0.give(address, generation);
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            at: None,
+            delay: FIRST_RETRY,
         }
     }
 }
@@ -1560,74 +1456,81 @@ fn may_connect_again(status: &Status) -> bool {
     status.exception_code() != ExceptionCode::Security && status.transaction_error() != refused
 }
 
-/// One watch's descriptors to connections, off the host session's thread, which all names share.
-pub(super) struct Dialer {
+/// One watch: asks the host what the name has and connects to it, off the host session's thread,
+/// which all names share. Every way a name's connection can be missed comes back to a round of
+/// this: a notice, a failed lookup, a failed connect and a panic.
+pub(super) struct Reconciler {
+    name: String,
+    /// Weak: the host's session keeps its notices' binder, which reaches this.
+    host: Weak<Host>,
     options: Options,
     on_resolved: OnResolved,
-    queue: Mutex<DialQueue>,
-    /// Wakes a thread waiting to connect again.
+    state: Mutex<WatchState>,
+    /// Wakes a thread waiting to go round again.
     changed: Condvar,
     /// Held across a connect and its call, so lookups and notices keep the generations' order.
     order: Mutex<()>,
 }
 
-impl Dialer {
-    pub(super) fn new(options: Options, on_resolved: OnResolved) -> Self {
+impl Reconciler {
+    fn new(name: &str, host: Weak<Host>, options: Options, on_resolved: OnResolved) -> Self {
         Self {
+            name: name.to_owned(),
+            host,
             options,
             on_resolved,
-            queue: Mutex::default(),
+            state: Mutex::default(),
             changed: Condvar::new(),
             order: Mutex::default(),
         }
     }
 
-    /// A notice or the watch's reply: connect to the newest of them, the older go unused.
-    pub(super) fn give(self: &Arc<Self>, address: OwnedFd, generation: i64) {
-        let mut queue = self.queue.lock().expect("lock poisoned");
-        if queue.ended || queue.given.is_some_and(|given| given > generation) {
+    /// The name changed, or may have: ask again. Takes no lock a round holds across a call.
+    pub(super) fn heard(self: &Arc<Self>) {
+        let mut state = self.state.lock().expect("lock poisoned");
+        if state.ended {
             return;
         }
-        queue.given = Some(generation);
-        queue.next = Some((address, generation));
+        state.asked = true;
         self.changed.notify_all();
-        if queue.running {
+        if state.running {
             return;
         }
-        queue.running = true;
-        drop(queue);
-        let dialer = self.clone();
+        state.running = true;
+        drop(state);
+        let reconciler = self.clone();
         let spawned = std::thread::Builder::new()
             .name("rsbinder-topic-dial".into())
-            .spawn(move || dialer.run());
+            .spawn(move || reconciler.run());
         if let Err(error) = spawned {
-            log::warn!("topic: no thread to connect to the name's publisher: {error}");
-            self.queue.lock().expect("lock poisoned").running = false;
+            log::warn!("topic: no thread to ask for {:?}: {error}", self.name);
+            self.state.lock().expect("lock poisoned").running = false;
         }
     }
 
-    /// What to connect to: a generation given since, or `again` once its time comes.
-    fn next(&self, again: &mut Option<Again>) -> Option<(OwnedFd, i64)> {
-        let mut queue = self.queue.lock().expect("lock poisoned");
+    /// Whether to go round again; a no and the thread's end are one hold of the lock `heard` takes.
+    fn go_round(&self, retry: &mut Retry) -> bool {
+        let mut state = self.state.lock().expect("lock poisoned");
         loop {
-            if queue.ended {
-                queue.running = false;
-                return None;
+            if state.ended {
+                state.running = false;
+                return false;
             }
-            if let Some(next) = queue.next.take() {
-                *again = None;
-                return Some(next);
+            if std::mem::take(&mut state.asked) {
+                *retry = Retry::default();
+                return true;
             }
-            let Some(at) = again.as_ref().map(|again| again.at) else {
-                queue.running = false;
-                return None;
+            let Some(at) = retry.at else {
+                state.running = false;
+                return false;
             };
             let Some(wait) = at.checked_duration_since(Instant::now()) else {
-                return again.take().map(|again| (again.address, again.generation));
+                retry.at = None;
+                return true;
             };
-            queue = self
+            state = self
                 .changed
-                .wait_timeout(queue, wait)
+                .wait_timeout(state, wait)
                 .expect("lock poisoned")
                 .0;
         }
@@ -1639,35 +1542,64 @@ impl Dialer {
     }
 
     fn run(self: Arc<Self>) {
-        let _dialing = Dialing(&self);
-        let mut again = None;
-        let mut tried = None;
-        let mut delay = FIRST_RETRY;
-        while let Some((address, generation)) = self.next(&mut again) {
-            if tried != Some(generation) {
-                tried = Some(generation);
-                delay = FIRST_RETRY;
+        let mut retry = Retry::default();
+        while self.go_round(&mut retry) {
+            let round = std::panic::AssertUnwindSafe(|| self.round());
+            // A panic ends the round alone; a notice that came meanwhile is `asked`, for the next.
+            let settled = std::panic::catch_unwind(round).unwrap_or_else(|payload| {
+                let panic = rsbinder::__panic_message(&payload);
+                log::error!(
+                    "topic: a watch's call of {:?} panicked ({panic})",
+                    self.name
+                );
+                true
+            });
+            if settled {
+                retry = Retry::default();
+            } else {
+                retry.at = Some(Instant::now() + retry.delay);
+                retry.delay = (retry.delay * 2).min(LAST_RETRY);
             }
-            let _order = self.order();
-            match self.reach(&address, generation) {
-                Ok(Some(resolved)) => {
-                    if !self.queue.lock().expect("lock poisoned").ended {
-                        (self.on_resolved)(Ok(resolved));
-                    }
+        }
+    }
+
+    /// Ask the host and connect; whether the name needs no other round until another notice.
+    fn round(&self) -> bool {
+        // A reply's fd with no slot for it ends the session: wait for that and one to dial with.
+        if let Err(error) = std::os::unix::net::UnixStream::pair() {
+            log::debug!(
+                "topic: no descriptors to ask for {:?} yet: {error}",
+                self.name
+            );
+            return false;
+        }
+        let Some(host) = self.host.upgrade() else {
+            return true;
+        };
+        let reply = host.registry.r#lookup(&self.name);
+        drop(host);
+        let (address, generation) = match reply {
+            Ok(reply) => parts(reply),
+            Err(status) => {
+                log::debug!("topic: asking for {:?}: {status}", self.name);
+                return status.transaction_error() == StatusCode::DeadObject;
+            }
+        };
+        let Some(address) = address else {
+            return true;
+        };
+        let _order = self.order();
+        match self.reach(&address, generation) {
+            Ok(Some(resolved)) => {
+                if !self.state.lock().expect("lock poisoned").ended {
+                    (self.on_resolved)(Ok(resolved));
                 }
-                Ok(None) => {}
-                Err(status) => {
-                    log::debug!("topic: cannot reach the name's publisher: {status}");
-                    if may_connect_again(&status) {
-                        let at = Instant::now() + delay;
-                        delay = (delay * 2).min(LAST_RETRY);
-                        again = Some(Again {
-                            address,
-                            generation,
-                            at,
-                        });
-                    }
-                }
+                true
+            }
+            Ok(None) => true,
+            Err(status) => {
+                log::debug!("topic: cannot reach the name's publisher: {status}");
+                !may_connect_again(&status)
             }
         }
     }
@@ -1682,37 +1614,31 @@ impl Dialer {
         self.reach(address, generation)
     }
 
-    /// Until `delay` passes or the dialer ends; whether it ended.
-    fn ended_within(&self, delay: Duration) -> bool {
-        let queue = self.queue.lock().expect("lock poisoned");
-        let (queue, _) = self
-            .changed
-            .wait_timeout_while(queue, delay, |queue| !queue.ended)
-            .expect("lock poisoned");
-        queue.ended
-    }
-
-    /// [`dial`](Self::dial) for a lookup, whose caller gives up on a failure: the thread goes on.
-    fn dial_for_lookup(
-        self: &Arc<Self>,
-        address: OwnedFd,
-        generation: i64,
-    ) -> BinderResult<Option<Resolved>> {
+    /// The watch's lookup, whose caller gives up on a failure: the thread goes on.
+    fn lookup(self: &Arc<Self>) -> BinderResult<Option<Resolved>> {
+        let Some(host) = self.host.upgrade() else {
+            return Ok(None);
+        };
+        let (address, generation) = parts(host.registry.r#lookup(&self.name)?);
+        drop(host);
+        let Some(address) = address else {
+            return Ok(None);
+        };
         let reached = self.dial(&address, generation);
         if reached.as_ref().is_err_and(may_connect_again) {
-            self.give(address, generation);
+            self.heard();
         }
         reached
     }
 
-    /// Under `order`; the queue's lock only between the steps, as [`Self::end`] waits for it.
+    /// Under `order`; the state's lock only between the steps, as [`Self::end`] waits for it.
     fn reach(&self, address: &OwnedFd, generation: i64) -> BinderResult<Option<Resolved>> {
         {
-            let queue = self.queue.lock().expect("lock poisoned");
-            if queue.ended {
+            let state = self.state.lock().expect("lock poisoned");
+            if state.ended {
                 return Ok(None);
             }
-            match queue.reached.as_ref() {
+            match state.reached.as_ref() {
                 Some(reached) if reached.generation > generation => return Ok(None),
                 Some(reached)
                     if reached.generation == generation && !reached.session.0.is_ended() =>
@@ -1729,17 +1655,17 @@ impl Dialer {
         session.0.set_reply_timeout(None)?;
         let session = Arc::new(session);
         let resolved = Resolved::with_session(binder, session.clone());
-        let mut queue = self.queue.lock().expect("lock poisoned");
-        if queue.ended {
-            drop(queue);
+        let mut state = self.state.lock().expect("lock poisoned");
+        if state.ended {
+            drop(state);
             return Ok(None);
         }
-        let replaced = queue.reached.replace(Reached {
+        let replaced = state.reached.replace(Reached {
             generation,
             resolved: resolved.clone(),
             session,
         });
-        drop(queue);
+        drop(state);
         drop(replaced);
         Ok(Some(resolved))
     }
@@ -1750,26 +1676,25 @@ impl Dialer {
             return;
         }
         log::warn!("topic: the name's publisher is refused: {status}");
-        if !self.queue.lock().expect("lock poisoned").ended {
+        if !self.state.lock().expect("lock poisoned").ended {
             (self.on_resolved)(Err(status.clone()));
         }
     }
 
     /// Stop connecting, and let go of the connection, which a call in it may be held in for good.
     pub(super) fn end(&self) {
-        let mut queue = self.queue.lock().expect("lock poisoned");
-        queue.ended = true;
-        queue.next = None;
-        let reached = queue.reached.take();
+        let mut state = self.state.lock().expect("lock poisoned");
+        state.ended = true;
+        let reached = state.reached.take();
         self.changed.notify_all();
-        drop(queue);
+        drop(state);
         drop(reached);
     }
 
-    /// No thread of this dialer runs and none is to, for a test.
+    /// No thread of this watch runs and none is to, for a test.
     #[cfg(test)]
     pub(super) fn idle(&self) -> bool {
-        let queue = self.queue.lock().expect("lock poisoned");
-        !queue.running && queue.next.is_none()
+        let state = self.state.lock().expect("lock poisoned");
+        !state.running && !state.asked
     }
 }

@@ -5,12 +5,16 @@
 
 package rsbinder.topic;
 
-/** Where `ITopicUdsRegistry` tells a watcher of the sockets a name is given. */
+/**
+ * Where `ITopicUdsRegistry` tells a watcher that a name was given a socket. A
+ * client has one of these for all its names: the registry ends a session that
+ * has not paid for the notices of one watcher and would owe for another.
+ */
 oneway interface ITopicAddressWatcher {
     /**
-     * `socket` is an `O_PATH` descriptor of the socket's file. `generation`
-     * grows with every change of any name: a lower one than seen for `name` is
-     * older and is dropped by the receiver.
+     * `name` has a new socket, which `lookup` gives. `generation` grows with
+     * every change of any name. A notice carries no descriptor, so that one a
+     * client has no room for costs it a call, not the session.
      */
-    void onAdvertised(String name, in ParcelFileDescriptor socket, long generation);
+    void onAdvertised(String name, long generation);
 }

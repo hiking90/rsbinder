@@ -368,9 +368,14 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   a warning, and the count is `owed_dropped` of `UdsRegistry::stats`, which `rsb_hub`
   on a socket does not show. Such a uid with enough stopped sessions can also pass the
   kernel's count of descriptors in flight
-  ([Service Manager](./service-manager.md#a-hub-on-a-unix-socket)), and then every
-  notice has no room until they are read. A dropped subscriber's session closes, which
-  ends its subscription call.
+  ([Service Manager](./service-manager.md#a-hub-on-a-unix-socket)), and then a call
+  whose reply brings a descriptor fails until they are read. A dropped subscriber's
+  session closes, which ends its subscription call.
+- **A notice brings no descriptor.** It says that the name changed, and the watch asks
+  the hub what the name has now. A process with no descriptor free takes the notice,
+  keeps its session and asks once it has one. That asking can still lose to another
+  thread taking the last one, and a frame that brings a descriptor to a process with
+  none free ends its session, as the kernel cannot deliver it.
 - **A publisher that stops is tried again.** A `NamedSubscriber` that cannot connect
   to the publisher a name has connects again, once a second at first and at most
   once in 30 seconds, until it can or the name has another publisher. A publisher
@@ -380,12 +385,10 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   and `NamedState::Refused`. A subscriber a publisher refuses closes its connection,
   so it takes none of `publisher_connections` from another; a notice of the same
   generation sent again connects anew and asks once more.
-- **A client that does not pay for its notices loses its session.** A registry on a
-  socket ends a session with 10 000 watch addresses whose notices it has not paid for.
-  An `rsbinder-topic` client pays as it reads, so what it owes is what its socket
-  buffer holds. A libbinder client with no outgoing connection idle pays on the
-  callback connection, which the registry does not read, and those payments count
-  toward this limit.
+- **A client has one watcher for all its names.** A `UdsResolver` passes one binder
+  to every `watch`. A registry on a socket ends a session at a notice to a second
+  address while the first has one unpaid, so that it keeps no entry per address a
+  client makes up. A client of its own makes one binder too.
 - **A full accept queue is out of reach of a deadline.** Linux has a connect into
   such a listener wait in `connect(2)` until the publisher accepts or ends. A
   stopped publisher with room in its queue is found out by the handshake instead.
