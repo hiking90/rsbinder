@@ -237,6 +237,11 @@ struct LocalNode {
 /// `RpcState.cpp:871-905`). Below wire v2 a receipt counts when a parcel is read, so a binder in a
 /// parcel not read yet is in that window too. Keeping every book until the session ends would close
 /// it, at one entry for each address a oneway ever went to.
+///
+/// A session that once dropped a release, with no connection to write it on, does keep them
+/// ([`drop_receipts`](Self::drop_receipts)): the dropped amount leaves the peer's node alive with
+/// no book here, and that is no window that closes. The entries are for oneways sent after the
+/// peer attached a connection, which is the only way such a session can send any.
 pub struct RpcState {
     /// Objects we exposed to the peer, keyed by assigned address.
     local_nodes: HashMap<RpcAddress, LocalNode>,
@@ -248,6 +253,9 @@ pub struct RpcState {
     remote_books: HashMap<RpcAddress, RemoteBook>,
     /// Sends of a peer address the peer has not paid back yet; present only while one is unpaid.
     remote_sends: HashMap<RpcAddress, RemoteSends>,
+    /// A release went nowhere ([`drop_receipts`](Self::drop_receipts)): a peer's node can outlive
+    /// its book from now on, so a book that numbered a oneway stays until the session ends.
+    release_dropped: bool,
     /// Monotonic address allocator (per-session).
     addr_counter: u64,
     /// This endpoint's address subspace (initiator vs acceptor): the two peers never collide.
@@ -271,6 +279,7 @@ impl RpcState {
             remote_proxies: HashMap::new(),
             remote_books: HashMap::new(),
             remote_sends: HashMap::new(),
+            release_dropped: false,
             addr_counter: 0,
             space,
             #[cfg(test)]
@@ -510,17 +519,23 @@ impl RpcState {
         }
     }
 
-    /// `amount` of `addr`'s `DEC_STRONG` reached the wire, or goes nowhere because no connection
-    /// has ever been able to carry it, or a oneway number with it. The book closes with the last
-    /// receipt: "Send-side async numbers". An address that was not received has no book.
+    /// `amount` of `addr`'s `DEC_STRONG` reached the wire. The book closes with the last receipt:
+    /// "Send-side async numbers". An address that was not received has no book.
     pub fn pay_receipts(&mut self, addr: &RpcAddress, amount: u32) {
         let Some(book) = self.remote_books.get_mut(addr) else {
             return;
         };
         book.times_recd = book.times_recd.saturating_sub(u64::from(amount));
-        if book.times_recd == 0 {
+        if book.times_recd == 0 && !(self.release_dropped && book.next_async_number > 0) {
             self.remote_books.remove(addr);
         }
+    }
+
+    /// `amount` of `addr`'s `DEC_STRONG` goes nowhere, as no connection has been able to carry it:
+    /// the receipts are settled, and the peer's node stays at whatever number it has reached.
+    pub fn drop_receipts(&mut self, addr: &RpcAddress, amount: u32) {
+        self.release_dropped = true;
+        self.pay_receipts(addr, amount);
     }
 
     /// The peer paid back `amount` sends of its `addr` (an inbound `DEC_STRONG` naming a peer

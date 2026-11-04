@@ -428,11 +428,12 @@
 //!    callback connection) has sent no oneway and has nowhere to write: it drops the amount, which
 //!    pays the receipts as a write does, and the node is released at session end. The dropped
 //!    amount keeps the peer's node alive past the book, so a session that gains an `Outgoing` slot
-//!    later from the peer's attach can send a oneway a number the peer refuses: once a later proxy
-//!    of the address has numbered oneways and its release closed the book, the next proxy numbers
-//!    from 0, below what the node expects, and an rsbinder peer's `Drop(StaleAsyncNumber)` drops
-//!    it. libbinder opens its incoming connections at setup, so only an rsbinder client gets there.
-//!    Keeping each dropped amount for the attach would cost an entry per address the peer picked.
+//!    later from the peer's attach must not number from 0 once a later proxy of the address has
+//!    numbered oneways and its release closed the book. From the first drop on, then, a book that
+//!    has numbered a oneway stays until the session ends (`RpcState::drop_receipts`), at one entry
+//!    per address such a oneway went to. libbinder opens its incoming connections at setup, so only
+//!    an rsbinder client gets there. Keeping each dropped amount for the attach instead would cost
+//!    an entry per address the peer picked.
 //!    A serve loop keeps its `Outgoing` slot through each read, so where every such slot is in a
 //!    serve loop's read the reaper waits until the peer's next frame lets one go: a quiet peer gets
 //!    the amount then or not before the session ends, with its node and this end's book open
@@ -6809,8 +6810,13 @@ fn reap_dec(
     };
     // Waits only on this thread, and gives up on teardown or drain.
     let Some((slot_id, transport)) = inner.find_conn_for_reaper() else {
-        // Step 4's drop: the peer's node stays alive, so a later `Outgoing` can misnumber a oneway.
-        inner.pay_receipts(&addr, amount);
+        // Step 4's drop: the peer's node stays alive, at the number a later `Outgoing` must use.
+        inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state poisoned")
+            .drop_receipts(&addr, amount);
         return Some(inner);
     };
     let sent = wait_without_the_session(weak, inner, &*transport, |shared| {
