@@ -1640,6 +1640,12 @@ impl Reconciler {
             }
             match state.reached.as_ref() {
                 Some(reached) if reached.generation > generation => return Ok(None),
+                // Its refusal holds for the generation: a new binder would only hide that.
+                Some(reached)
+                    if reached.generation == generation && reached.session.was_refused() =>
+                {
+                    return Ok(None);
+                }
                 Some(reached)
                     if reached.generation == generation && !reached.session.0.is_ended() =>
                 {

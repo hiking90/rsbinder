@@ -1020,7 +1020,7 @@ fn a_watch_of_a_session_that_cannot_be_told_is_refused() {
     let no_fds = config().incoming_connections(1);
     for config in [no_incoming, no_fds] {
         let session = RpcSession::setup_client_android13plus_with_config(config).unwrap();
-        let session = SessionGuard(session);
+        let session = SessionGuard::new(session);
         let registry: Strong<dyn ITopicUdsRegistry> =
             session.0.get_root().unwrap().into_interface().unwrap();
         let watcher = BnTopicAddressWatcher::new_binder(Silent);
@@ -1190,6 +1190,22 @@ fn a_refused_subscriber_leaves_the_publishers_connection_to_another() {
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(other.recv_timeout(WAIT), Ok(Bytes(vec![1])));
     assert!(matches!(refused.state(), NamedState::Refused(_)));
+}
+
+/// A refusal lasts for the generation: a second round makes no new binder to ask again.
+#[test]
+fn a_session_closed_for_a_refusal_is_not_made_again_for_its_generation() {
+    let fixture = Fixture::new("refused_once", AllowAll);
+    let raw = fixture.raw();
+    let (_publisher, _serving, address, generation) = served(&raw, "a.name");
+    let resolver = fixture.resolver();
+    let watch = resolver.reconciler("a.name", Box::new(|_| {}));
+    let reached = watch.dial(&address, generation).unwrap().unwrap();
+    let (_binder, session) = reached.into_parts();
+    uds::close_refused(&*session.unwrap());
+    assert!(watch.dial(&address, generation).unwrap().is_none());
+    assert!(watch.dial(&address, generation + 1).unwrap().is_some());
+    watch.end();
 }
 
 /// A notice brings no descriptor: with none free the session lives, and the watch asks once one is.

@@ -58,6 +58,7 @@
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -130,7 +131,18 @@ impl Default for Options {
 
 /// Closes its session when dropped: the threads of its incoming connections hold it open
 /// otherwise, whatever else lets go of it.
-pub(crate) struct SessionGuard(pub(crate) RpcSession);
+pub(crate) struct SessionGuard(pub(crate) RpcSession, AtomicBool);
+
+impl SessionGuard {
+    pub(crate) fn new(session: RpcSession) -> Self {
+        Self(session, AtomicBool::new(false))
+    }
+
+    /// Closed because its publisher refused this subscriber, for good while it has the name.
+    pub(crate) fn was_refused(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
+    }
+}
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
@@ -138,9 +150,10 @@ impl Drop for SessionGuard {
     }
 }
 
-/// Close `session` now if a [`SessionGuard`], whatever else holds it; another's is left alone.
-pub(crate) fn close_if_ours(session: &(dyn std::any::Any + Send + Sync)) {
+/// Close a refusing publisher's `session` now if a [`SessionGuard`]; another's is left alone.
+pub(crate) fn close_refused(session: &(dyn std::any::Any + Send + Sync)) {
     if let Some(guard) = session.downcast_ref::<SessionGuard>() {
+        guard.1.store(true, Ordering::Relaxed);
         guard.0.close_session();
     }
 }
@@ -171,7 +184,7 @@ pub(crate) fn connect(endpoint: Endpoint, options: &Options) -> BinderResult<Ses
     if let Some(timeout) = options.timeout {
         config = config.timeout(timeout);
     }
-    let session = SessionGuard(RpcSession::setup_client_android13plus_with_config(config)?);
+    let session = SessionGuard::new(RpcSession::setup_client_android13plus_with_config(config)?);
     check_uid(&session.0, options.expect_uid)?;
     Ok(session)
 }

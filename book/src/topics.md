@@ -383,8 +383,8 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   are not tried again: the next publisher of the name ends that wait. The first is
   told as a publisher's refusal is, by `Disconnected::Rejected` with `EX_SECURITY`
   and `NamedState::Refused`. A subscriber a publisher refuses closes its connection,
-  so it takes none of `publisher_connections` from another; a notice of the same
-  generation sent again connects anew and asks once more.
+  so it takes none of `publisher_connections` from another, and does not connect to
+  that publisher again until the name has a new generation.
 - **A client has one watcher for all its names.** A `UdsResolver` passes one binder
   to every `watch`. A registry on a socket ends a session at a notice to a second
   address while the first has one unpaid, so that it keeps no entry per address a
