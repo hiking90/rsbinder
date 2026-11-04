@@ -115,8 +115,6 @@ impl RpcTransport for VsockTransport {
     /// Raw, unframed read: `read_raw`, as `UnixTransport::recv_raw`.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         use std::os::fd::AsFd;
-        self.carry
-            .write_for_read(self.stream.as_fd(), &self.queue)?;
         let sock = Some(self.stream.as_fd());
         self.reads.read(sock, &self.queue, || {
             super::read_raw(&mut &self.stream, buf)

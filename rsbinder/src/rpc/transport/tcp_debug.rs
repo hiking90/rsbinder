@@ -237,8 +237,6 @@ impl RpcTransport for TcpDebugTransport {
 
     /// Raw, unframed read: `read_raw`, shared by the stream backends.
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        self.carry
-            .write_for_read(self.stream.as_fd(), &self.queue)?;
         let sock = Some(self.stream.as_fd());
         self.reads.read(sock, &self.queue, || {
             super::read_raw(&mut &self.stream, buf)
@@ -425,61 +423,44 @@ mod tests {
         (sender, peer, total)
     }
 
-    /// Input for a read with no room to write: a peer writing with no read of its own goes on.
+    /// A read leaves what is carried alone: writing is for a send or a flush, which know their wait.
     #[test]
-    fn a_read_with_input_waits_for_no_room() {
-        let (sender, peer, _) = full_socket_with_part_of_a_frame();
-        sender
-            .set_write_timeout(Some(std::time::Duration::from_secs(1)))
-            .expect("send deadline");
-        sender
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .expect("read deadline");
+    fn a_read_writes_nothing_of_what_is_carried() {
+        let (sender, peer) = pair_carrying_part_of_a_frame();
         peer.send_raw(b"x").expect("the peer's send");
         let mut byte = [0u8; 8];
         assert!(matches!(sender.recv_raw(&mut byte), Ok(1)));
-        assert!(sender.__carrying(), "nothing read, so no room");
+        assert!(sender.__carrying());
     }
 
-    /// A peer in a drain reads for the rest of this end's frame: a read goes on to write it.
+    /// A flush that drains reads while it waits for room: the peer writes before it reads.
     #[test]
-    fn a_read_writes_the_rest_of_a_frame_with_part_of_the_peers_read() {
+    fn a_draining_flush_hands_input_to_its_drain() {
         let (sender, peer, total) = full_socket_with_part_of_a_frame();
         sender
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .expect("read deadline");
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("send deadline");
         let peer = Arc::new(peer);
-        let draining = {
+        let (drained, was_drained) = std::sync::mpsc::channel();
+        let reading = {
             let peer = peer.clone();
             std::thread::spawn(move || {
-                peer.send_raw(b"head").expect("the peer's send");
+                peer.send_raw(b"x").expect("the peer's send");
+                was_drained
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the drain");
                 read_all(&peer, total);
-                peer.send_raw(b"tail").expect("the peer's send");
             })
         };
-        let mut input = [0u8; 8];
-        let mut read = 0;
-        while read < input.len() {
-            read += sender.recv_raw(&mut input[read..]).expect("the read");
-        }
-        assert_eq!(&input, b"headtail");
+        let mut drain = || {
+            let mut byte = [0u8; 1];
+            assert!(matches!(sender.recv_raw(&mut byte), Ok(1)));
+            drained.send(()).expect("the peer");
+            Ok(())
+        };
+        sender.__flush_carried(Some(&mut drain)).expect("the flush");
         assert!(!sender.__carrying());
-        draining.join().expect("the peer");
-    }
-
-    /// The send deadline holds in a read too, and it reports the frame it cut.
-    #[test]
-    fn a_read_past_the_send_deadline_is_a_cut_frame() {
-        let (sender, _peer, _) = full_socket_with_part_of_a_frame();
-        sender
-            .set_write_timeout(Some(std::time::Duration::from_millis(100)))
-            .expect("send deadline");
-        sender
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .expect("read deadline");
-        let mut byte = [0u8; 8];
-        let read = sender.recv_raw(&mut byte);
-        assert!(matches!(read, Err(RpcError::DeadlineMidFrame)), "{read:?}");
+        reading.join().expect("the peer");
     }
 
     /// A flush past the send deadline stops a frame whose head went out: not a boundary `Timeout`.

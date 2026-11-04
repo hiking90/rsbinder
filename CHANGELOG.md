@@ -787,11 +787,13 @@ says what a peer does with the 0.12.0 value.
   and Android a `DEC_STRONG` on a `UnixTransport` is one `sendmsg` that puts the
   whole frame on the socket or nothing. TCP, vsock, TLS over a `TlsStream` with a
   `socket` and Apple's `UnixTransport` send what the socket takes and keep the rest
-  of the frame, which the next send
-  writes first, or, with nothing to write next, whatever next reads the connection,
-  or the reaper thread on a free one. With no room
-  a handler's own connection holds it for its next reply, and for any other the
-  session's reaper thread writes it once the peer reads, and a peer that takes
+  of the frame on a free connection, which the next send writes first, or a serve
+  loop before it reads, or the reaper thread. No read writes it: a connection its
+  thread is about to read keeps no part of a frame. It writes only where the frame
+  goes whole, on TCP and TLS by `POLLOUT` on Linux and Android, and otherwise holds
+  the release for its next frame or until the thread gives the connection back. With
+  no room a handler's own connection holds it for its next reply or nested call, and
+  for any other the session's reaper thread writes it once the peer reads, and a peer that takes
   nothing for the send deadline loses the session there; 0.12.0's drop waited in
   the write, for as long as a session with no deadline lasts. The reaper's wait
   keeps no session alive: with no incoming connection, the last handle and proxy

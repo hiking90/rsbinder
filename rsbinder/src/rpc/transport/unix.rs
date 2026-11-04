@@ -103,18 +103,12 @@
 //! socket takes, and the rest stays in the `Carry`: `Ok(true)` then means the frame is taken, and
 //! every later send on the stream writes the rest first, so the peer reads the frame whole and in
 //! order, unless the session ends first: only TLS's `shutdown` writes the rest then, and the peer
-//! of another stream reads the cut as `Truncated`. With nothing to write next, the session's reaper
-//! calls `__flush_carried` on a free slot, and every read writes the rest while it waits
-//! (`Carry::write_for_read`): each byte it reads has been seen by `poll` first, so it never waits
-//! in a read with bytes kept nor for room with input unread. The peer may be reading for the rest
-//! of the frame, in a drain with part of a frame of its own sent, or writing a `REPLY` it does not
-//! read during (`write_reply`), and neither can stop this end, as the read goes on a read at a time
-//! with no frame boundary to reach first. Only a slot's holder writes to its `Carry`, so none
-//! appears during a read. A send deadline there is `RpcError::DeadlineMidFrame`, and any other
-//! failure `RpcError::UncleanEndOfStream`: the frame is cut and the stream is lost.
-//! A frame the socket takes none of is `Ok(false)`, and a `Carry` that holds bytes takes no
-//! other frame, so it holds at most one, of at most `NO_WAIT_FRAME_LIMIT`. Fds need the frame
-//! whole in one `sendmsg`, so Apple has no such send for a frame with fds.
+//! of another stream reads the cut as `Truncated`. A read writes nothing of it. The session keeps
+//! the rest off every slot that is about to be read: only a free slot has any, and what next holds
+//! that slot writes it first, its reaper included (`__flush_carried`, `session` module doc
+//! "Deferred `DEC_STRONG`"). A frame the socket takes none of is `Ok(false)`, and a `Carry` that
+//! holds bytes takes no other frame, so it holds at most one, of at most `NO_WAIT_FRAME_LIMIT`.
+//! Fds need the frame whole in one `sendmsg`, so Apple has no such send for a frame with fds.
 //!
 //! ## Tests
 //!
@@ -401,48 +395,6 @@ impl Carry {
     /// The bytes to write before anything else, which leave the `Carry` for good.
     pub(crate) fn take(&self) -> Vec<u8> {
         std::mem::take(&mut *self.lock())
-    }
-
-    /// For a read: write what is carried until none is left or input waits (module doc).
-    pub(crate) fn write_for_read(
-        &self,
-        sock: std::os::fd::BorrowedFd<'_>,
-        queue: &OutQueue,
-    ) -> RpcResult<()> {
-        use rustix::io::Errno;
-        let lost = |e: std::io::Error| {
-            log::debug!("RPC: writing the rest of a frame failed ({e})");
-            RpcError::UncleanEndOfStream
-        };
-        let mut waiting = SendWait::new(sock, queue);
-        loop {
-            {
-                // Held over the send: a `take` then finds the bytes this send did not write.
-                let mut carried = self.lock();
-                if carried.is_empty() {
-                    return Ok(());
-                }
-                match send_nonblocking(sock, |flags| rustix::net::send(sock, &carried, flags)) {
-                    Ok(0) => return Err(lost(std::io::ErrorKind::WriteZero.into())),
-                    Ok(n) => {
-                        carried.drain(..n);
-                        waiting.progressed();
-                        continue;
-                    }
-                    Err(Errno::INTR) => continue,
-                    Err(Errno::AGAIN) => {}
-                    Err(e) => return Err(lost(e.into())),
-                }
-            }
-            match waiting.wait(true) {
-                Ok(Some(true)) => return Ok(()),
-                Ok(Some(false)) => {}
-                // This end's deadline stopped a frame it had begun.
-                Ok(None) => return Err(RpcError::DeadlineMidFrame),
-                Err(RpcError::Io(e)) => return Err(lost(e)),
-                Err(e) => return Err(e),
-            }
-        }
     }
 }
 
@@ -742,18 +694,6 @@ impl UnixTransport {
         self.carry.flush(self.stream.as_fd(), &self.queue, drain)
     }
 
-    /// What a no-wait send left goes out as a read waits; here it never leaves any.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn carried_for_read(&self) -> RpcResult<()> {
-        Ok(())
-    }
-
-    /// What a no-wait send left goes out as a read waits (module doc).
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn carried_for_read(&self) -> RpcResult<()> {
-        self.carry.write_for_read(self.stream.as_fd(), &self.queue)
-    }
-
     /// Wrap an already-connected `UnixStream`. Peer identity is
     /// resolved once, here, from the socket.
     ///
@@ -975,7 +915,6 @@ impl RpcTransport for UnixTransport {
     /// android-13+ profile drives `RpcWireHeader`-based framing on top
     /// of this (`wire_android13::read_aosp_message`).
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-        self.carried_for_read()?;
         let sock = Some(self.stream.as_fd());
         self.reads.read(sock, &self.queue, || {
             super::read_raw(&mut &self.stream, buf)
@@ -1014,7 +953,6 @@ impl RpcTransport for UnixTransport {
         use std::io::IoSliceMut;
         use std::mem::MaybeUninit;
 
-        self.carried_for_read()?;
         let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
         let mut space =
             vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS_PER_FRAME))];

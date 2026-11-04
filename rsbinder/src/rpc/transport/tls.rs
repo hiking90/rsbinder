@@ -942,35 +942,11 @@ impl TlsTransport {
             if !c.wants_write() {
                 return Ok(());
             }
-            let mut v = self.carry.take();
+            let mut v = Vec::new();
             c.write_tls(&mut v)?;
             v
         };
         self.write_socket_locked(&cipher)
-    }
-
-    /// Before a socket read: what a no-wait send left goes out as it waits (`unix` module doc).
-    fn carried_for_read(&self) -> RpcResult<()> {
-        let Some(sock) = self.stream.socket().filter(|_| !self.carry.is_empty()) else {
-            return Ok(());
-        };
-        // Parked ciphertext is input `poll` cannot see, and needs no socket read.
-        if !self
-            .pending_in
-            .lock()
-            .expect("tls pending_in poisoned")
-            .is_empty()
-        {
-            return Ok(());
-        }
-        self.carry.write_for_read(sock, &self.queue).map_err(|e| {
-            // Our shutdown broke the write half: a close, as in `recv_raw`.
-            if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
-                RpcError::EndOfStream
-            } else {
-                e
-            }
-        })
     }
 
     /// Feeds parked `pending_in`, else one socket read (no `conn`/`wlock`); `false` = EOF.
@@ -1117,7 +1093,6 @@ impl RpcTransport for TlsTransport {
                 return Err(RpcError::UncleanEndOfStream);
             }
             // 3. Parked ciphertext, else block on the socket; on EOF rustls knows, step 1 decides.
-            self.carried_for_read()?;
             self.pump_incoming()?;
         }
     }
@@ -1271,22 +1246,14 @@ mod tests {
         assert!(!sender.__carrying());
     }
 
-    /// A read writes the record's rest as it waits: a peer reading for it has nothing to send yet.
+    /// A flush with room leaves its drain alone and finishes the record.
     #[test]
-    fn a_read_writes_what_a_no_wait_send_left() {
+    fn a_flush_with_room_never_calls_its_drain() {
         let (sender, peer) = pair();
-        sender
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("the deadline");
         carry_part_of_a_record(&sender);
-        let answering = std::thread::spawn(move || {
-            assert_eq!(read_all(&peer, FRAME.len()), FRAME);
-            peer.send_raw(b"tail").expect("the peer's send");
-            peer
-        });
-        assert_eq!(read_all(&sender, 4), b"tail");
-        assert!(!sender.__carrying());
-        drop(answering.join().expect("the peer"));
+        let mut drain = || panic!("a drain with room to write");
+        sender.__flush_carried(Some(&mut drain)).expect("the flush");
+        assert_eq!(read_all(&peer, FRAME.len()), FRAME);
     }
 
     /// `close_notify` follows the whole record, so the peer sees a clean end after the frame.

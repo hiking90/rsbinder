@@ -112,8 +112,8 @@
 //!   notice) is judged by the same rule apart from the send: the session's
 //!   reaper waits on the slot in `__wait_for_room`, a `SendWait` of its own, and
 //!   ends the session when the deadline passes, and what such a send left of a
-//!   frame goes out through a send that waits, or through a read that waits for
-//!   input under the send deadline (`session` module doc "Deferred `DEC_STRONG`").
+//!   frame goes out through a send that waits (`session` module doc "Deferred
+//!   `DEC_STRONG`").
 //!
 //! The `ioctl` runs only while a deadline is armed: a send or read without
 //! one has no verdict for it to change. A socket that refuses it once

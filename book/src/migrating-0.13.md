@@ -631,12 +631,17 @@ bytes, so only a peer that wrote something unusual sees a difference.
   the new codes.
 - **The last drop of an RPC proxy waits for no peer on any transport, and runs no
   death recipients on the dropping thread.** With no room in the socket a handler's own
-  connection holds the `DEC_STRONG` for its next reply, and for any other the
-  session's reaper thread writes it once the peer reads, where 0.12.0's drop
+  connection holds the `DEC_STRONG` for its next reply or nested call, and for any other
+  the session's reaper thread writes it once the peer reads, where 0.12.0's drop
   waited in the write. A transport that cannot send without waiting finds no room on
   every release, so a release there can come after the next reply: a custom
   `RpcTransport` without the hidden no-wait send, and TLS over a `TlsStream` with no
-  `socket`. Where every outgoing connection is in a
+  `socket`. A connection its thread is about to read keeps no part of a frame, so on
+  vsock and Apple platforms a handler's `drop`, and a `drop` in a reply wait, holds the
+  release until the next frame there or the connection goes back. A handler that
+  drops a proxy and then waits for what the peer does on that release waits for
+  its own reply there, as it does on a full socket anywhere: wake it some other way.
+  Where every outgoing connection is in a
   serve loop's read, the reaper waits for the peer's next frame, so a peer that sends
   nothing more keeps its node until the session ends. The frame's format and the
   amounts' sum are the same; the reaper's releases of one address can share a frame. A

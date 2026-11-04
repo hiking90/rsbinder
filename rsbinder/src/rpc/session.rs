@@ -365,14 +365,20 @@
 //!
 //! `RpcProxy::drop` runs on arbitrary user threads, under whatever locks they hold, so a
 //! `DEC_STRONG` never waits for a slot, and its write waits for no peer. A transport with a send
-//! that does not wait (`__send_no_wait`) has the frame taken whole or not at all, and part of a
-//! taken frame can stay in the transport for the next send, or, when nothing else is to be written,
-//! for what next holds or reads the slot: a serve loop's or a reply wait's read, which writes it
-//! while it waits for input, and the reaper on a free slot, which never waits for one, since the
-//! holder's guard queues it again ("A send that does not wait" in `transport::unix`). A transport
-//! that cannot send without waiting finds no room on every release, so all of them take step 3 or
-//! 4: a custom transport without that send, and TLS over a `TlsStream` with no `socket`. On every
-//! transport a failed write runs no death sequence on this thread ("Failed sends").
+//! that does not wait (`__send_no_wait`) has the frame taken whole or not at all. On a free slot
+//! part of a taken frame can stay in the transport for what next holds the slot: a send writes it
+//! first, a serve loop before it reads, and the reaper, which never waits for a holder, since the
+//! holder's guard queues it again ("A send that does not wait" in `transport::unix`). A slot's
+//! holder reads it next and a read writes nothing, so a pin keeps no part of a frame: it writes
+//! only where `__whole_small_frame_now` says a small frame goes whole, which the kernel promises on
+//! Linux and Android `AF_UNIX`, and which `POLLOUT` tells on their TCP and TLS. There only a kernel
+//! short of memory stops a small send, and the holder finishes what that left on the spot, the one
+//! wait on this path, bounded by the send deadline. vsock's `POLLOUT` means one byte of the peer's
+//! credit, so a peer could cut a frame there, and Apple's kernels were not read for this: a pin
+//! holds on both. A transport that cannot send without waiting finds no room on every release, so
+//! a pin holds and the others take step 4: a custom transport without that send, and TLS over a
+//! `TlsStream` with no `socket`. On every transport a failed write runs no death sequence on this
+//! thread ("Failed sends").
 //!
 //! It writes only where the peer is reading. A peer reads a connection none of its serve loops
 //! drives inside its reply wait, and, if it drains, while a send of its own there waits for room
@@ -385,7 +391,12 @@
 //!    the twoway being handled. That covers a twoway handler, the arguments it received (the
 //!    request parcel drops before the reply, as AOSP destroys `data` before it, so their
 //!    `DEC_STRONG`s precede it), and every binder entered while a reply is read. What finds no
-//!    room goes to the reaper from an `Outgoing` pin, and is held from an `Incoming` one (step 3).
+//!    room, or all of it where the transport cannot say (above), is held on the pin: step 3 for an
+//!    `Incoming` one. An `Outgoing` pin's hold goes before the slot's next request or `REPLY` and,
+//!    whichever comes first, as its holder gives the slot back, on whatever route the thread then
+//!    has. A serve loop keeps its slot, so it writes the hold before its next read. A handler that
+//!    waits for what its `drop` does at the peer waits past a hold until its reply (AOSP writes
+//!    at once): on a full socket anywhere, and always where the pin cannot write.
 //! 2. **A free `Outgoing` slot**, one with no `exclusive_tid` at all (claiming one this thread
 //!    already drives would, on the guard's drop, clear an `exclusive_tid` the outer frame still
 //!    owns). The peer's serve loop reads it. This pays for an `Incoming` pin without
@@ -394,8 +405,9 @@
 //!    owes `HELD_DEC_STRONG_LIMIT` addresses, is held there (step 4 says why).
 //! 3. **Held on that `Incoming` pin**, when no `Outgoing` slot is free: added to the slot's
 //!    `pending_dec`, one entry per address with the amounts summed, and written just before the
-//!    next `REPLY` on the slot, which the peer is waiting to read. `write_reply` writes every
-//!    `REPLY`, so it is the one flush. AOSP `ExclusiveConnection::find` writes a
+//!    next `REPLY` or nested request on the slot, which the peer is waiting to read. `write_reply`
+//!    writes every `REPLY` and `client_transact` every request, so they are the two flushes. AOSP
+//!    `ExclusiveConnection::find` writes a
 //!    `CLIENT_REFCOUNT` on the incoming connection here at once and relies on the peer's
 //!    `drainCommands` (android-17.0.0_r1 `RpcSession.cpp:933-942`). The hold is rsbinder's: it
 //!    keeps this handler out of a write that only the peer's next send could unblock. A peer
@@ -442,8 +454,9 @@
 //!    the amount then or not before the session ends, with its node and this end's book open
 //!    meanwhile. That loop writes only what is past the limit itself.
 //!
-//! On the android-13+ wire the target of a twoway is held (step 3's mechanism), so it goes out
-//! right before its `REPLY`, where AOSP `flushExcessBinderRefs` sends it; it stays its own frame,
+//! On the android-13+ wire the target of a twoway is held (step 3's mechanism) from every exit that
+//! replies to a target it found, whatever the status, so it goes out right before its `REPLY`, past
+//! any nested call, where AOSP `flushExcessBinderRefs` sends it; it stays its own frame,
 //! since a reply's fds ride its first `sendmsg` and AOSP `processDecStrong` takes none
 //! (android-17.0.0_r1 `RpcState.cpp:948-983`). A oneway drain pays its targets once, after the
 //! drain, as one `DEC_STRONG` with the summed amount (AOSP `RpcState.cpp:1284`); a transaction
@@ -557,9 +570,13 @@
 //! the one being written (and `tls` holds its write lock throughout). When the send failed, the
 //! session ends first ("Failed sends"), as AOSP's `rpcSend` shuts the session down before it
 //! returns (`handleRpcError`, `RpcState.cpp:403-438`); the releases then drop with the peer's
-//! counts instead of being written after a cut frame. A `REPLY` and a `DEC_STRONG` are written
-//! without draining, as AOSP's are (`rpcSend` with no `altPoll`, `RpcState.cpp:904` and
-//! `:1385`).
+//! counts instead of being written after a cut frame. A `REPLY` and a `DEC_STRONG` of its own are
+//! written without draining, as AOSP's are (`rpcSend` with no `altPoll`, `RpcState.cpp:904` and
+//! `:1385`). What a slot holds is written in front of a request through that request's drain, and
+//! by a serve loop on an `Outgoing` slot through one of its own, since two ends that only write
+//! would wait for the send deadline: those are rsbinder's. r34 has no such loop drain: an
+//! android-12 oneway handler can nest a `TRANSACT` there (`RpcSession.cpp:336-338`), which a drain
+//! would refuse.
 //!
 //! AOSP drains on every transaction from android-13.0.0_r1 to android-16.0.0_r3, and from
 //! android-16.0.0_r4 only while `getMaxIncomingThreads() == 0` (17_r1 `RpcState.cpp:709`).
@@ -3135,7 +3152,7 @@ impl RpcSessionInner {
         }
     }
 
-    /// The slots the reaper finishes a frame on; a serve loop's own read does that on its slot.
+    /// The slots the reaper finishes a frame on; a serve loop does that on its slot before it reads.
     fn slots_carrying(&self) -> Vec<u64> {
         let st = self.conn_state.lock().expect("conn_state poisoned");
         st.slots
@@ -3143,16 +3160,6 @@ impl RpcSessionInner {
             .filter(|s| s.role == SlotRole::Outgoing && !s.serving && s.transport.__carrying())
             .map(|s| s.id)
             .collect()
-    }
-
-    /// One frame for a loop that reads this slot, whose reads write what a no-wait send left.
-    fn recv_msg_on(&self, conn: &ConnGuard<'_>) -> RpcResult<(Vec<u8>, Vec<OwnedFd>)> {
-        let transport = conn.transport();
-        // A frame on its way out is activity until its write returns ("Idle").
-        let _sending = transport
-            .__carrying()
-            .then(|| OpenCall::enter(&self.shared));
-        self.recv_msg(transport)
     }
 
     /// AOSP `drainCommands(CONTROL_ONLY)` for one message; module doc "Draining sends".
@@ -4051,7 +4058,7 @@ impl RpcSessionInner {
         };
         loop {
             self.write_held_past_limit(&conn);
-            let (frame, in_fds) = match self.recv_msg_on(&conn) {
+            let (frame, in_fds) = match self.recv_msg(transport) {
                 Ok(v) => v,
                 Err(e) => return fail(e.into()),
             };
@@ -4323,6 +4330,60 @@ impl RpcSessionInner {
                 return;
             }
         }
+    }
+
+    /// Before a serve loop's read on an `Outgoing` slot: what no one else writes while it reads.
+    fn write_before_serve_read(&self, conn: &ConnGuard<'_>) {
+        let transport = conn.transport();
+        let slot = conn.slot_id;
+        // android-12's oneway handler nests a `TRANSACT` here, which a drain would refuse.
+        let drains = self.profile.wire_version().is_some();
+        loop {
+            let carrying = transport.__carrying();
+            let held = self.take_held_for_serve_read(slot);
+            let idle = !carrying && held.is_empty();
+            if idle || self.shared.lifecycle.is_torn_down() {
+                return;
+            }
+            let mut drained = DrainedReleases::default();
+            let mut deadline = None;
+            let fault = std::cell::Cell::new(None);
+            let mut drain = || self.drain_one(transport, slot, &mut deadline, &mut drained, &fault);
+            let mut written = Ok(());
+            if carrying {
+                // A frame on its way out is activity until its write returns ("Idle").
+                let _sending = OpenCall::enter(&self.shared);
+                written = transport.__flush_carried(drains.then_some(&mut drain));
+            }
+            if written.is_ok() {
+                written = held.into_iter().try_for_each(|(addr, amount)| {
+                    self.send_dec_frames(conn, addr, amount, drains.then_some(&mut drain))
+                });
+            }
+            drop(deadline);
+            let DrainedReleases { released, releases } = drained;
+            // First: a release written now on this slot would follow a cut frame.
+            if let Err(e) = &written {
+                self.end_after_failed_send(e);
+            }
+            drop(released);
+            self.send_held_releases(releases);
+            // A failure ended the session, and the read ends with it. A release may add a hold.
+            if written.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// What this `Outgoing` slot holds, emptied; an `Incoming` slot's waits for its next `REPLY`.
+    fn take_held_for_serve_read(&self, slot_id: u64) -> std::collections::HashMap<RpcAddress, u32> {
+        let mut st = self.conn_state.lock().expect("conn_state poisoned");
+        let slot = st
+            .slots
+            .iter_mut()
+            .find(|s| s.id == slot_id && s.role == SlotRole::Outgoing);
+        slot.map(|s| std::mem::take(&mut s.pending_dec))
+            .unwrap_or_default()
     }
 
     /// Before a serve loop's read: no reply need follow on this slot, so the reaper takes the hold.
@@ -4766,9 +4827,10 @@ impl RpcSessionInner {
                 Err(e) => return ServeStep::Ended(recv_end_reason(e)),
             }
         }
+        self.write_before_serve_read(&conn);
         self.hand_held_to_reaper(slot_id);
         self.write_held_past_limit(&conn);
-        let (frame, in_fds) = match self.recv_msg_on(&conn) {
+        let (frame, in_fds) = match self.recv_msg(transport) {
             Ok(f) => f,
             Err(e) => return ServeStep::Ended(recv_end_reason(e)),
         };
@@ -7148,12 +7210,13 @@ mod tests {
     //!   `write_dec_no_wait` fall back to `send_msg` and the drop waits for the send deadline.
     //! * `the_reaper_finishes_what_a_no_wait_send_left`: queue no `ReaperJob::Carried` and the rest
     //!   of the frame stays in the transport.
-    //! * `a_reply_wait_writes_what_a_no_wait_send_left_while_the_peer_reads_it`: drop the
-    //!   `write_for_read` from `TcpDebugTransport::recv_raw` and the two ends only read.
-    //!   `a_reply_wait_reads_a_reply_past_the_buffers_with_part_of_a_frame_left`: have
-    //!   `recv_msg_on` call `__flush_carried` first, and the two ends only write.
-    //! * `a_serve_loops_read_with_part_of_a_frame_left_is_activity`: drop the `OpenCall` from
-    //!   `recv_msg_on`.
+    //! * `a_serve_loop_finishes_what_a_no_wait_send_left_before_it_reads`: drop the flush from
+    //!   `write_before_serve_read` and the read has part of a frame left; drop its `OpenCall` and
+    //!   the write to a slow reader is not activity.
+    //! * `a_serve_loop_writes_what_its_outgoing_slot_holds_before_it_reads`: drop `!s.serving` from
+    //!   `ConnGuard::drop` and the hold goes to the reaper, which a loop in its read keeps waiting.
+    //!   `a_serve_loops_write_reads_while_it_waits_for_room`: write with no drain and both ends
+    //!   only write until the send deadline.
     //! * `the_reaper_waits_for_no_slot_to_finish_a_frame`: have `flush_carried` wait for a slot's
     //!   holder. `the_reaper_waits_for_no_slot_to_judge_its_room`: the same in `await_room`.
     //!   `a_slot_given_back_with_a_frame_left_queues_the_reaper`: drop the `queue_carried` from
@@ -8210,9 +8273,10 @@ mod tests {
     struct Carries {
         carrying: Arc<AtomicBool>,
         flushed_on: Arc<Mutex<Option<std::thread::ThreadId>>>,
-        /// The session, for what its `open` says during a read that writes.
+        /// The session, for what its `open` says during a flush.
         shared: Arc<Mutex<Option<Arc<SharedSession>>>>,
-        open_in_read: Arc<AtomicBool>,
+        open_in_flush: Arc<AtomicBool>,
+        carrying_in_read: Arc<AtomicBool>,
     }
 
     impl RpcTransport for Carries {
@@ -8220,10 +8284,8 @@ mod tests {
             Ok(())
         }
         fn recv_raw(&self, _: &mut [u8]) -> RpcResult<usize> {
-            if let Some(shared) = &*self.shared.lock().expect("lock") {
-                let open = shared.open.load(Ordering::SeqCst) > 0;
-                self.open_in_read.store(open, Ordering::SeqCst);
-            }
+            let carrying = self.carrying.load(Ordering::SeqCst);
+            self.carrying_in_read.store(carrying, Ordering::SeqCst);
             Err(RpcError::EndOfStream)
         }
         fn __send_no_wait(
@@ -8241,6 +8303,10 @@ mod tests {
             true
         }
         fn __flush_carried(&self, _: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+            if let Some(shared) = &*self.shared.lock().expect("lock") {
+                let open = shared.open.load(Ordering::SeqCst) > 0;
+                self.open_in_flush.store(open, Ordering::SeqCst);
+            }
             self.carrying.store(false, Ordering::SeqCst);
             *self.flushed_on.lock().expect("lock") = Some(std::thread::current().id());
             Ok(())
@@ -8276,180 +8342,107 @@ mod tests {
         assert!(!inner.shared.lifecycle.is_torn_down());
     }
 
-    /// TCP whose first drained send fills the socket and reports the bytes written once flushed.
-    #[cfg(all(
-        feature = "rpc-tcp-debug",
-        any(target_os = "linux", target_os = "android")
-    ))]
-    struct FillsAfterSend {
-        inner: crate::rpc::transport::TcpDebugTransport,
-        fill: Arc<AtomicBool>,
-        written: std::sync::atomic::AtomicUsize,
-        total: mpsc::Sender<usize>,
-    }
-
-    #[cfg(all(
-        feature = "rpc-tcp-debug",
-        any(target_os = "linux", target_os = "android")
-    ))]
-    impl RpcTransport for FillsAfterSend {
-        fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
-            self.inner.send_raw(buf)?;
-            self.written.fetch_add(buf.len(), Ordering::SeqCst);
-            Ok(())
-        }
-        fn send_raw_draining(
-            &self,
-            buf: &[u8],
-            fds: &[std::os::fd::BorrowedFd<'_>],
-            drain: &mut dyn FnMut() -> RpcResult<()>,
-        ) -> RpcResult<()> {
-            self.inner.send_raw_draining(buf, fds, drain)?;
-            self.written.fetch_add(buf.len(), Ordering::SeqCst);
-            if self.fill.swap(false, Ordering::SeqCst) {
-                let total = self.written.load(Ordering::SeqCst) + self.inner.fill_and_carry();
-                self.total.send(total).expect("the peer");
-            }
-            Ok(())
-        }
-        fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
-            self.inner.recv_raw(buf)
-        }
-        fn __send_no_wait(
-            &self,
-            buf: &[u8],
-            fds: &[std::os::fd::BorrowedFd<'_>],
-        ) -> Option<RpcResult<bool>> {
-            self.inner.__send_no_wait(buf, fds)
-        }
-        fn __carrying(&self) -> bool {
-            self.inner.__carrying()
-        }
-        fn __flush_carried(
-            &self,
-            drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
-        ) -> RpcResult<()> {
-            self.inner.__flush_carried(drain)
-        }
-        fn __wait_for_room(&self) -> RpcResult<bool> {
-            self.inner.__wait_for_room()
-        }
-        fn set_read_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
-            self.inner.set_read_timeout(timeout)
-        }
-        fn set_write_timeout(&self, timeout: Option<Duration>) -> RpcResult<()> {
-            self.inner.set_write_timeout(timeout)
-        }
-        fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
-            self.inner.shutdown_handle()
-        }
-        fn peer_identity(&self) -> PeerIdentity {
-            self.inner.peer_identity()
-        }
-        fn describe(&self) -> &str {
-            self.inner.describe()
-        }
-        fn shutdown(&self) -> RpcResult<()> {
-            self.inner.shutdown()
-        }
-    }
-
-    /// A session over `FillsAfterSend`, the peer's end, and the channel of the bytes written.
-    #[cfg(all(
-        feature = "rpc-tcp-debug",
-        any(target_os = "linux", target_os = "android")
-    ))]
-    fn session_that_fills_after_send() -> (
-        RpcSession,
-        crate::rpc::transport::TcpDebugTransport,
-        Arc<AtomicBool>,
-        mpsc::Receiver<usize>,
-    ) {
-        let (a, peer) = crate::rpc::transport::TcpDebugTransport::pair_loopback().expect("a pair");
-        let fill = Arc::new(AtomicBool::new(false));
-        let (total, totals) = mpsc::channel();
-        let transport = FillsAfterSend {
-            inner: a,
-            fill: fill.clone(),
-            written: Default::default(),
-            total,
-        };
-        let session =
-            RpcSession::new(Box::new(transport), AddressSpace::Initiator).expect("session");
-        session
-            .set_reply_timeout(Some(Duration::from_secs(5)))
-            .expect("deadline");
-        peer.set_read_timeout(Some(Duration::from_secs(20)))
-            .expect("peer timeout");
-        peer.set_write_timeout(Some(Duration::from_secs(20)))
-            .expect("peer timeout");
-        (session, peer, fill, totals)
-    }
-
-    /// A peer that reads for the rest of a frame before it replies: both ends would only read.
-    #[cfg(all(
-        feature = "rpc-tcp-debug",
-        any(target_os = "linux", target_os = "android")
-    ))]
+    /// A serve loop reads with no part of a frame left, and the write to a slow reader is activity.
     #[test]
-    fn a_reply_wait_writes_what_a_no_wait_send_left_while_the_peer_reads_it() {
-        let (session, peer, fill, totals) = session_that_fills_after_send();
-        fill.store(true, Ordering::SeqCst);
-        let answering = std::thread::spawn(move || {
-            let total = totals.recv().expect("the bytes written");
-            read_bytes(&peer, total);
-            let reply = R34Codec
-                .encode_reply(&WireReply::default())
-                .expect("encode");
-            peer.send_raw(&reply).expect("the reply");
-            peer
-        });
-        let replied = session
-            .inner
-            .client_transact(peer_address(61), 1, &Parcel::new(), 0);
-        assert!(matches!(replied, Ok(Some(_))), "{:?}", replied.map(|_| ()));
-        let _peer = answering.join().expect("the peer");
-    }
-
-    /// A peer that writes a `REPLY` past the buffers before it reads: both ends would only write.
-    #[cfg(all(
-        feature = "rpc-tcp-debug",
-        any(target_os = "linux", target_os = "android")
-    ))]
-    #[test]
-    fn a_reply_wait_reads_a_reply_past_the_buffers_with_part_of_a_frame_left() {
-        let (session, peer, fill, totals) = session_that_fills_after_send();
-        fill.store(true, Ordering::SeqCst);
-        let answering = std::thread::spawn(move || {
-            let total = totals.recv().expect("the bytes written");
-            let reply = WireReply {
-                data: vec![0; 32 * 1024 * 1024],
-                ..WireReply::default()
-            };
-            let reply = R34Codec.encode_reply(&reply).expect("encode");
-            peer.send_raw(&reply).expect("the reply");
-            read_bytes(&peer, total);
-            peer
-        });
-        let replied = session
-            .inner
-            .client_transact(peer_address(62), 1, &Parcel::new(), 0);
-        assert!(matches!(replied, Ok(Some(_))), "{:?}", replied.map(|_| ()));
-        // The peer reads all of the frame, so the session finished it once the slot was free.
-        let _peer = answering.join().expect("the peer");
-        assert!(!session.inner.shared.lifecycle.is_torn_down());
-    }
-
-    /// A serve loop's read that writes to a slow reader keeps the session from an idle end.
-    #[test]
-    fn a_serve_loops_read_with_part_of_a_frame_left_is_activity() {
+    fn a_serve_loop_finishes_what_a_no_wait_send_left_before_it_reads() {
         let transport = Carries::default();
         let session =
             RpcSession::new(Box::new(transport.clone()), AddressSpace::Initiator).expect("session");
         *transport.shared.lock().expect("lock") = Some(session.inner.shared.clone());
         transport.carrying.store(true, Ordering::SeqCst);
         let _ = session.serve_blocking();
-        assert!(transport.open_in_read.load(Ordering::SeqCst));
+        assert!(transport.open_in_flush.load(Ordering::SeqCst));
+        assert!(!transport.carrying_in_read.load(Ordering::SeqCst));
+    }
+
+    /// A transport with no send that does not wait, as a custom one starts out; tells of its reads.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct WaitingSendsOnly(crate::rpc::transport::UnixTransport, mpsc::Sender<()>);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl RpcTransport for WaitingSendsOnly {
+        fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+            self.0.send_raw(buf)
+        }
+        fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+            let _ = self.1.send(());
+            self.0.recv_raw(buf)
+        }
+        fn peer_identity(&self) -> PeerIdentity {
+            self.0.peer_identity()
+        }
+        fn describe(&self) -> &str {
+            self.0.describe()
+        }
+        fn shutdown(&self) -> RpcResult<()> {
+            self.0.shutdown()
+        }
+    }
+
+    /// A hold on the `Outgoing` slot a serve loop keeps goes out before the loop's next read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_serve_loop_writes_what_its_outgoing_slot_holds_before_it_reads() {
+        let (a, peer) = crate::rpc::transport::UnixTransport::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("peer timeout");
+        let (read_began, reading) = mpsc::channel();
+        let session = RpcSession::with_profile(
+            Box::new(WaitingSendsOnly(a, read_began)),
+            AddressSpace::Initiator,
+            WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
+        )
+        .expect("session");
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let inner = session.inner.clone();
+        let serving = session.spawn_serve().expect("the loop");
+        let mut counter = 0;
+        let held = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let other = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        // Past this round's write: only the next round has it to write.
+        reading
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the loop's read");
+        inner.hold_dec_strong(RpcSession::FOUNDING_SLOT_ID, held, 1);
+        let (frame, _) = codec.encode_dec_strong(&other, 1).expect("a frame");
+        peer.send_raw(&frame).expect("a frame for the loop");
+        let (paid, _) = codec.encode_dec_strong(&held, 1).expect("a frame");
+        assert_eq!(read_bytes(&peer, paid.len()), paid);
+        session.close_session();
+        let _ = serving.join().expect("the loop");
+    }
+
+    /// A serve loop's write for what its slot holds reads meanwhile: the peer writes before it reads.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_serve_loops_write_reads_while_it_waits_for_room() {
+        use std::io::{Read, Write};
+        let (session, mut peer) = a13_client_with_raw_peer();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        session
+            .set_reply_timeout(Some(Duration::from_secs(5)))
+            .expect("deadline");
+        let inner = session.inner.clone();
+        let filled = fill_socket(&session);
+        let mut counter = 0;
+        let held = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let other = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        inner.hold_dec_strong(RpcSession::FOUNDING_SLOT_ID, held, 1);
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let (frame, _) = codec.encode_dec_strong(&other, 1).expect("a frame");
+        // Past every buffer: this write ends only if the loop reads.
+        let flood = frame.repeat(4 * 1024 * 1024 / frame.len());
+        let serving = session.spawn_serve().expect("the loop");
+        peer.write_all(&flood).expect("the flood");
+        let mut filler = vec![0u8; filled];
+        peer.read_exact(&mut filler)
+            .expect("what filled the socket");
+        let first = raw_peer_reads(&mut peer);
+        assert!(matches!(first, WireMessage::DecStrong(a, 1) if a == held));
+        assert!(!inner.shared.lifecycle.is_torn_down());
+        session.close_session();
+        let _ = serving.join().expect("the loop");
     }
 
     /// A slot held through a long call holds up neither this job nor the reaper's jobs behind it.
