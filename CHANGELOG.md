@@ -288,11 +288,13 @@ says what a peer does with the 0.12.0 value.
   transaction's target. Its release waits for the peer to pay, so a binder argument
   the peer never reads keeps the release, and the peer's node, until the session ends.
 - **wire**: from wire v1 on, a received parcel that names other fds than it came
-  with, or a binder below v2, is `BadValue`: a handler does not run, a reply's call
-  fails. 0.12.0 ran the handler, whose read of a missing fd failed.
-- **wire**: a session that dropped a `DEC_STRONG`, having no connection to write it
-  on, numbers on a later proxy's oneways after the peer attaches a connection, where
-  0.12.0 restarted at 0. The frame's format is the same.
+  with is `BadValue`: a handler does not run, a reply's call fails. 0.12.0 ran the
+  handler, whose read of a missing fd failed. An object the table cannot back, a
+  binder below v2 among them, also ends the session, as libbinder ends it.
+- **wire**: a session with no connection to write a `DEC_STRONG` on keeps it, and
+  writes it before a later reply on a connection the peer has called on, or on the
+  peer's attach, where 0.12.0 dropped it. A later proxy's oneways keep their numbers,
+  where 0.12.0 restarted at 0. The frame's format is the same.
 
 **Streams and topics**
 
@@ -1040,8 +1042,8 @@ says what a peer does with the 0.12.0 value.
 - **A `DEC_STRONG` with no connection to go on is kept for one.** A session with no
   outgoing connection dropped it, which kept the peer's node until the session
   ended, and after a late attach a later proxy could number its oneways from 0 below
-  what the node expects. It now goes out before the next reply on any connection, or
-  on the attach, and the number lasts until then.
+  what the node expects. It now goes out before a later reply on a connection the
+  peer has called on, or on the attach, and the number lasts until then.
 - **A frame that names fds it did not bring is refused**, as AOSP
   `rpcSetDataReference` refuses it, before any handler runs. An object the table
   cannot back ends the session, as there.

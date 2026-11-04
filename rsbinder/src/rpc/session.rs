@@ -3584,8 +3584,7 @@ impl RpcSessionInner {
         (p, entered)
     }
 
-    /// AOSP android-17.0.0_r1 `rpcSetDataReference` object loop: a bad object ends the session, so
-    /// no count is left to settle, and fds that do not match only refuse the parcel.
+    /// AOSP android-17.0.0_r1 `rpcSetDataReference` object loop: a bad object ends the session.
     fn validate_objects(&self, p: &mut Parcel, received_fds: usize) -> Result<()> {
         use super::wire_android13::TYPE_NATIVE_FILE_DESCRIPTOR;
         const TYPE_BINDER: i32 = 1;
@@ -3612,7 +3611,7 @@ impl RpcSessionInner {
             if let Err(e) = object {
                 log::error!("RPC: a parcel's object at {pos} is not readable ({e}); session ends");
                 self.stop_for_the_reaper();
-                return Err(e);
+                return Err(StatusCode::BadValue);
             }
         }
         if named_fds != received_fds {
@@ -4021,7 +4020,7 @@ impl RpcSessionInner {
                         return Err(StatusCode::from(status));
                     }
                     let (reply, entered) = self.receive_parcel(data, object_positions, in_fds);
-                    // The frame is consumed, so the stream stays in step; only this call fails.
+                    // The frame is consumed, so the stream stays in step, if the session goes on.
                     entered?;
                     return Ok(Some(reply));
                 }
@@ -4584,8 +4583,11 @@ impl RpcSessionInner {
         let _nested = AllowNestedGuard::arm(self, !oneway);
         let (mut reader, entered) = self.receive_parcel(t.data, t.object_positions, in_fds);
         if let Err(e) = entered {
-            // After an unreadable object the reply finds the session ended, as in AOSP.
             log::error!("RPC: a transaction's objects failed validation ({e:?}); refused");
+            // The session ended on an unreadable object: this loop ends on the fault, not its read.
+            if self.shared.lifecycle.is_torn_down() {
+                return Err(e);
+            }
             return if oneway {
                 Ok(())
             } else {
