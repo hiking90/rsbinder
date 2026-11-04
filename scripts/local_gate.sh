@@ -602,6 +602,7 @@ tier_stage3() {
         fi
         if [ "$sdk" -lt "$min" ] || { [ "$max" != - ] && [ "$sdk" -gt "$max" ]; }; then
             local want="SDK $min+"
+            [ "$max" = - ] || want="SDK $min-$max"
             [ "$max" = "$min" ] && want="SDK $min"
             skip "run_$name" "device SDK $sdk, needs $want"
             continue
