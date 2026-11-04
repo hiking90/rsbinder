@@ -3394,17 +3394,15 @@ impl RpcSessionInner {
                         return Err(StatusCode::InvalidOperation);
                     }
                     let addr = rp.address();
-                    // At v2 the peer pays it back read or not, so the release waits for that.
-                    if self.profile.records_binder_positions() {
-                        self.shared
-                            .state
-                            .lock()
-                            .expect("rpc state poisoned")
-                            .on_proxy_leaving(addr);
-                        // Recorded so an unsent parcel gives it back on drop (`cancel_leaving`).
-                        parcel.rpc_record_leaving_addr(addr);
-                    }
-                    // Pinned past the send, so below v2 its DEC_STRONG follows the reply naming it.
+                    // AOSP `onBinderLeaving` on every wire: the release waits for the peer's payment.
+                    self.shared
+                        .state
+                        .lock()
+                        .expect("rpc state poisoned")
+                        .on_proxy_leaving(addr);
+                    // Recorded so an unsent parcel gives it back on drop (`cancel_leaving`).
+                    parcel.rpc_record_leaving_addr(addr);
+                    // Pinned past the send, as the frame names the address this proxy keeps open.
                     parcel.rpc_pin_binder(b.clone());
                     addr
                 } else if (**b).is_remote() {
@@ -3651,10 +3649,8 @@ impl RpcSessionInner {
                 return Err(StatusCode::BadValue);
             } else if let Some(proxy) = st.lookup_remote(addr) {
                 // AOSP `appendFrom` runs `onBinderLeaving` on proxies too, as in `write_binder`.
-                if self.profile.records_binder_positions() {
-                    st.on_proxy_leaving(*addr);
-                    took.leaving.push(*addr);
-                }
+                st.on_proxy_leaving(*addr);
+                took.leaving.push(*addr);
                 took.pinned.push(proxy);
             }
             // No live proxy: a source that neither received nor wrote it (parcel.rs "append_from").

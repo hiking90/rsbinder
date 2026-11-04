@@ -21,22 +21,22 @@
 //!   but the node's strong count is **`timesSent`**: +1 on every send
 //!   ([`RpcState::on_binder_leaving`]), −`amount` on every inbound
 //!   `DEC_STRONG`, and the node with its strong `SIBinder` is dropped at 0.
-//! * **Sending a proxy.** Counted where the peer pays each send back (AOSP bumps
-//!   the proxy node's `timesSent` and keeps it in `sentRef`): a transaction's
-//!   target on the android-13+ wire, and a proxy flattened into a parcel at
-//!   wire v2, where the peer enters every binder of a parcel on receipt. The
-//!   count is [`RpcState::on_proxy_leaving`]; the peer's `DEC_STRONG` naming
-//!   its own address pays it ([`RpcState::pay_proxy_sends`]). While a send is
-//!   unpaid, a dropped proxy's own `DEC_STRONG` is held
-//!   ([`RpcState::release_proxy`]) and goes out with the payment. Without the
-//!   hold it can go out on another connection than a oneway still waiting to
-//!   be read, and a peer that handles it first frees the node that oneway
-//!   names (libbinder aborts: `Local binder must have been sent`). Below v2 a
-//!   peer pays an argument only if it reads it, so an argument is not counted;
-//!   the parcel pins the proxy until it drops, which orders its `DEC_STRONG`
-//!   after a reply on the same connection. A held release goes out as late as
-//!   the payment is read: a payment written where this end reads only inside a
-//!   reply wait waits for the next twoway there, or for the session's end.
+//! * **Sending a proxy.** Counted as AOSP bumps the proxy node's `timesSent` and
+//!   keeps it in `sentRef`: a transaction's target on the android-13+ wire, and
+//!   a proxy flattened into a parcel on every wire. The count is
+//!   [`RpcState::on_proxy_leaving`]; the peer's `DEC_STRONG` naming its own
+//!   address pays it ([`RpcState::pay_proxy_sends`]), and no frame says which
+//!   send it pays. While a send is unpaid, a dropped proxy's own `DEC_STRONG` is
+//!   held ([`RpcState::release_proxy`]) and goes out with the payment. Without
+//!   the hold it can go out on another connection than a oneway still waiting
+//!   to be read, and a peer that handles it first frees the node that oneway
+//!   names (libbinder aborts: `Local binder must have been sent`). At wire v2
+//!   a peer enters every binder of a parcel on receipt; below it a peer pays an
+//!   argument only if it reads it, so one it never reads keeps the release,
+//!   and with it the peer's node, until the session ends, as AOSP keeps
+//!   `sentRef`. A held release goes out as late as the payment is read: a
+//!   payment written where this end reads only inside a reply wait waits for
+//!   the next twoway there, or for the session's end.
 //! * **A send that never left.** A parcel dropped unsent rolls its
 //!   `on_binder_leaving` bump back ([`RpcState::cancel_binder_leaving`], AOSP
 //!   `cancelBinderLeaving`): the peer never received the binder, so it never

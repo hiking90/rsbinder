@@ -38,8 +38,8 @@
 //!   proxy dropped right after a oneway on it sends nothing until the owner pays the
 //!   oneway's target back, then its `DEC_STRONG` 1. Sent at once, it could be read before the
 //!   oneway on another connection, which libbinder aborts on.
-//! - `t10_a_proxy_argument_counts_at_v2`: the proxy also sent as that oneway's argument
-//!   needs both receipts at v2 and only the target's at v1.
+//! - `t10_a_proxy_argument_counts_on_every_wire`: the proxy also sent as that oneway's argument
+//!   needs both receipts, so a payment of the argument never pays for the target.
 //! - `t11_the_release_waits_on_the_wires_that_count_targets`: rsbinder on both ends; on r34
 //!   the release goes at once, on android-13+ with the server's receipt before its next reply.
 //! - `t12_a_proxy_in_a_v2_reply_waits_for_its_receipt`: a server's proxy returned in a v2
@@ -82,7 +82,7 @@
 //!   the first reads `DEC_STRONG`s ahead of the reply, and in the second the pin still comes
 //!   first, so none comes over the callback connection.
 //! - T9, T11: drop the target count in `client_transact` (`counts_target`).
-//! - T10, T12: drop the proxy count in `write_binder` (fails at v2).
+//! - T10, T12: drop the proxy count in `write_binder`, or gate it to v2 (T10 then fails at v1).
 //! - `state::tests::a_held_release_keeps_the_send_counter_for_a_successor`: close the
 //!   `async_number` book in `RpcState::release_proxy`'s held arm.
 //! - T18: close the book in `RpcState::release_proxy`'s other arm.
@@ -91,7 +91,7 @@
 //! - T20: drop the clear of `remote_books` in `RpcState::clear_remote_counts`.
 //!
 //! Outside this file,
-//! `strong_session_tests::argument_proxy_dec_strong_follows_the_reply_on_the_serving_connection`
+//! `strong_session_tests::argument_proxy_dec_strong_goes_out_on_the_serving_connection`
 //! fails when `execute_dispatched` arms `AllowNestedGuard` after building `reply` (its proxies
 //! then drop without `allow_nested` and take the idle callback slot), and
 //! `tests/rpc_e2e.rs` `a_sent_parcel_is_refused_on_resend` fails without the `drop(reader)`
@@ -864,8 +864,8 @@ fn t9_a_proxy_release_waits_for_the_owners_receipt() {
 
 /// T10: at v2 a proxy argument is a send too; below v2 the owner pays only what it reads.
 #[test]
-fn t10_a_proxy_argument_counts_at_v2() {
-    for (version, sends) in [(1, 1), (PROTOCOL_V2, 2)] {
+fn t10_a_proxy_argument_counts_on_every_wire() {
+    for (version, sends) in [(1, 2), (PROTOCOL_V2, 2)] {
         let (client, mut raw, target, root) = raw_owner(version);
         let mut d = rpc_of(&root).request_parcel(DESC).expect("request");
         d.write(&Some(root.clone())).expect("argument");
