@@ -1868,12 +1868,12 @@ impl ConnUse {
 
 /// Where a `DEC_STRONG` goes; module doc "Deferred `DEC_STRONG`".
 enum DecRoute<'a> {
-    /// Written now on this slot: an `Outgoing` pin, or a free `Outgoing` slot.
+    /// Written now on this free `Outgoing` slot.
     Conn(ConnGuard<'a>),
     /// Written now on this free `Outgoing` slot, for a thread on this `Incoming` pin.
     ConnFromPin(ConnGuard<'a>, u64),
-    /// Written now on this `Incoming` pin, where the peer waits for the reply of a twoway.
-    ServedPin(ConnGuard<'a>),
+    /// This thread's pin, which the peer reads: an `Outgoing` one, or a twoway's `Incoming` one.
+    Pin(ConnGuard<'a>),
     /// Held on this `Incoming` pin until its next `REPLY`.
     Pending(u64),
     /// Handed to the reaper, which waits for an `Outgoing` slot.
@@ -2150,14 +2150,23 @@ impl Drop for ConnGuard<'_> {
         }
         let key = (self.inner as *const _ as usize, self.slot_id);
         stack_remove_last(&DRIVING, |&k| k == key);
-        {
+        let held = {
             // `notify_all`: `notify_one` may wake only a waiter pinned to another slot.
             let mut st = self.inner.conn_state.lock().expect("conn_state poisoned");
+            let mut held = std::collections::HashMap::new();
             if let Some(s) = st.slots.iter_mut().find(|s| s.id == self.slot_id) {
                 s.exclusive_tid = None;
+                // With the release: the next holder's own hold is its own. Module doc step 1.
+                if s.role == SlotRole::Outgoing && !s.serving {
+                    held = std::mem::take(&mut s.pending_dec);
+                }
             }
             drop(st);
             self.inner.slot_cv.notify_all();
+            held
+        };
+        for (addr, amount) in held {
+            self.inner.send_dec_strong(addr, amount);
         }
         // After the release: `ReaperJob::Carried` skips a slot that is held and waits for no one.
         self.inner.queue_carried(self.transport());
@@ -2638,17 +2647,12 @@ impl RpcSessionInner {
             match st.slots.iter().find(|s| s.id == slot_id) {
                 // Read by the peer: it serves an `Outgoing` slot, awaits a twoway's reply here.
                 Some(s) if s.role == SlotRole::Outgoing || s.allow_nested => {
-                    let conn = ConnGuard {
+                    return DecRoute::Pin(ConnGuard {
                         inner: self,
                         slot_id,
                         transport: Arc::clone(&s.transport),
                         reentrant: true,
-                    };
-                    return if s.role == SlotRole::Outgoing {
-                        DecRoute::Conn(conn)
-                    } else {
-                        DecRoute::ServedPin(conn)
-                    };
+                    });
                 }
                 Some(_) => pending_on = Some(slot_id),
                 // The session ended since the push: the send below finds nothing to write on.
@@ -4006,15 +4010,15 @@ impl RpcSessionInner {
         let mut drained = DrainedReleases::default();
         let mut drain_deadline = None;
         let fault = std::cell::Cell::new(None);
-        let sent = self.send_msg(
-            transport,
-            &frame,
-            data.rpc_out_fds(),
-            Some(&mut || {
-                let slot = conn.slot_id;
-                self.drain_one(transport, slot, &mut drain_deadline, &mut drained, &fault)
-            }),
-        );
+        let slot = conn.slot_id;
+        let mut drain =
+            || self.drain_one(transport, slot, &mut drain_deadline, &mut drained, &fault);
+        // What this slot holds goes first, so a call sees the releases made before it.
+        let sent = self
+            .take_held_dec_strongs(slot)
+            .into_iter()
+            .try_for_each(|(a, amount)| self.send_dec_frames(&conn, a, amount, Some(&mut drain)))
+            .and_then(|()| self.send_msg(transport, &frame, data.rpc_out_fds(), Some(&mut drain)));
         drop(drain_deadline);
         let DrainedReleases { released, releases } = drained;
         if let Err(e) = sent {
@@ -4103,7 +4107,7 @@ impl RpcSessionInner {
                 drop(conn);
                 self.owe_from_pin(pin, addr, left);
             }
-            DecRoute::ServedPin(conn) => self.write_dec_on_pin(&conn, addr, amount),
+            DecRoute::Pin(conn) => self.write_dec_on_pin(&conn, addr, amount),
             DecRoute::Pending(slot_id) => match self.held_past_limit(slot_id, &addr) {
                 Some(conn) => self.write_dec_on_pin(&conn, addr, amount),
                 None => self.hold_dec_strong(slot_id, addr, amount),
@@ -4112,9 +4116,20 @@ impl RpcSessionInner {
         }
     }
 
-    /// Write on this `Incoming` pin, or hold what finds no room for its next `REPLY`.
+    /// Write on this pin, whose holder reads it next, leaving no part of a frame; hold what is left.
     fn write_dec_on_pin(&self, conn: &ConnGuard<'_>, addr: RpcAddress, amount: u32) {
-        let left = self.write_dec_no_wait(conn, addr, amount);
+        let transport = conn.transport();
+        let left = if transport.__whole_small_frame_now() {
+            self.write_dec_no_wait(conn, addr, amount)
+        } else {
+            amount
+        };
+        if transport.__carrying() && !self.shared.lifecycle.is_torn_down() {
+            let _sending = OpenCall::enter(&self.shared);
+            if let Err(e) = transport.__flush_carried(None) {
+                self.end_on_the_reaper(&e);
+            }
+        }
         if left > 0 {
             self.hold_dec_strong(conn.slot_id, addr, left);
         }
@@ -4223,15 +4238,30 @@ impl RpcSessionInner {
         addr: RpcAddress,
         amount: u32,
     ) -> RpcResult<()> {
+        // No drain, as AOSP `sendDecStrongToTarget`.
+        let written = self.send_dec_frames(conn, addr, amount, None);
+        if let Err(e) = &written {
+            self.end_after_failed_send(e);
+        }
+        written
+    }
+
+    /// The frames of what `conn` holds or the reader owes; the failure is the caller's to judge.
+    fn send_dec_frames(
+        &self,
+        conn: &ConnGuard<'_>,
+        addr: RpcAddress,
+        amount: u32,
+        mut drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
+    ) -> RpcResult<()> {
         let Some((frame, times)) = self.profile.codec().encode_dec_strong(&addr, amount) else {
             return Ok(());
         };
         for _ in 0..times {
-            // No drain, as AOSP `sendDecStrongToTarget`.
-            if let Err(e) = self.send_msg(conn.transport(), &frame, &[], None) {
-                self.end_after_failed_send(&e);
-                return Err(e);
-            }
+            let reads = drain
+                .as_mut()
+                .map(|d| &mut **d as &mut dyn FnMut() -> RpcResult<()>);
+            self.send_msg(conn.transport(), &frame, &[], reads)?;
         }
         self.pay_receipts(&addr, amount);
         Ok(())
@@ -6960,7 +6990,7 @@ fn flush_carried(weak: &Weak<RpcSessionInner>, mut inner: Arc<RpcSessionInner>) 
         };
         let flushed = wait_without_the_session(weak, inner, &*transport, |shared| {
             let _sending = OpenCall::enter(shared);
-            transport.__flush_carried()
+            transport.__flush_carried(None)
         });
         let Some((back, flushed)) = flushed else {
             return;
@@ -8207,7 +8237,10 @@ mod tests {
         fn __carrying(&self) -> bool {
             self.carrying.load(Ordering::SeqCst)
         }
-        fn __flush_carried(&self) -> RpcResult<()> {
+        fn __whole_small_frame_now(&self) -> bool {
+            true
+        }
+        fn __flush_carried(&self, _: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
             self.carrying.store(false, Ordering::SeqCst);
             *self.flushed_on.lock().expect("lock") = Some(std::thread::current().id());
             Ok(())
@@ -8292,8 +8325,11 @@ mod tests {
         fn __carrying(&self) -> bool {
             self.inner.__carrying()
         }
-        fn __flush_carried(&self) -> RpcResult<()> {
-            self.inner.__flush_carried()
+        fn __flush_carried(
+            &self,
+            drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
+        ) -> RpcResult<()> {
+            self.inner.__flush_carried(drain)
         }
         fn __wait_for_room(&self) -> RpcResult<bool> {
             self.inner.__wait_for_room()
@@ -9518,41 +9554,192 @@ mod tests {
                 .find(|s| s.id == slot_id)
                 .map(|s| s.pending_dec.len())
         };
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let caller = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let code = SpecialTransaction::GetSessionId.code();
+                let replied = inner.client_transact(RpcAddress::zero(), code, &Parcel::new(), 0);
+                replied.map(|_| ())
+            })
+        };
+        read_aosp_message(&mut peer).expect("the request");
+        // Made in the wait, as a nested handler's drops are: the request took what came before.
         let mut counter = 0;
         for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
             let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
             inner.hold_dec_strong(slot_id, addr, 1);
         }
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let other = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let (frame, _) = codec.encode_dec_strong(&other, 1).expect("a frame");
+        write_aosp_message(&mut peer, &frame).expect("a frame the wait reads on after");
+        for _ in 0..EXCESS {
+            let frame = read_aosp_message(&mut peer).expect("what is past the limit");
+            let message = codec.decode_message(&frame).expect("decode");
+            assert!(matches!(message, WireMessage::DecStrong(..)), "{message:?}");
+        }
+        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT), "only the excess");
+        let reply = codec
+            .encode_reply_ref(WireReplyRef {
+                status: 0,
+                data: &[],
+                object_positions: &[],
+            })
+            .expect("a reply");
+        write_aosp_message(&mut peer, &reply).expect("the reply");
+        let replied = caller.join().expect("the caller");
+        assert!(replied.is_ok(), "{replied:?}");
+    }
+
+    /// What a slot holds goes before a request, reading meanwhile: the peer writes before it reads.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn what_a_slot_holds_goes_before_a_request_reading_while_it_waits_for_room() {
+        use std::io::{Read, Write};
+        let (session, mut peer) = a13_client_with_raw_peer();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        session
+            .set_reply_timeout(Some(Duration::from_secs(5)))
+            .expect("deadline");
+        let inner = session.inner.clone();
+        let filled = fill_socket(&session);
+        let mut counter = 0;
+        let held = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let other = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        inner.hold_dec_strong(RpcSession::FOUNDING_SLOT_ID, held, 1);
         let peer_side = std::thread::spawn(move || {
-            peer.set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("peer timeout");
-            read_aosp_message(&mut peer).expect("the request");
-            peer.set_read_timeout(Some(Duration::from_millis(500)))
-                .expect("peer timeout");
-            // Whether or not they come, the reply does: a read that fails is the verdict below.
-            for _ in 0..EXCESS {
-                let _ = read_aosp_message(&mut peer);
-            }
             let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
-            let reply = codec
-                .encode_reply_ref(WireReplyRef {
-                    status: 0,
-                    data: &[],
-                    object_positions: &[],
-                })
-                .expect("a reply");
-            write_aosp_message(&mut peer, &reply).expect("the reply");
+            let (frame, _) = codec.encode_dec_strong(&other, 1).expect("a frame");
+            // Past every buffer: this write ends only if the sender reads.
+            let flood = frame.repeat(4 * 1024 * 1024 / frame.len());
+            peer.write_all(&flood).expect("the flood");
+            let mut filler = vec![0u8; filled];
+            peer.read_exact(&mut filler)
+                .expect("what filled the socket");
+            let first = raw_peer_reads(&mut peer);
+            assert!(matches!(first, WireMessage::DecStrong(a, 1) if a == held));
+            let second = raw_peer_reads(&mut peer);
+            assert!(matches!(second, WireMessage::Transact(_)));
+            let reply = codec.encode_reply(&WireReply::default()).expect("a reply");
+            peer.write_all(&reply).expect("the reply");
             peer
         });
-        let replied = inner.client_transact(
-            RpcAddress::zero(),
-            SpecialTransaction::GetSessionId.code(),
-            &Parcel::new(),
-            0,
-        );
+        let code = SpecialTransaction::GetSessionId.code();
+        let replied = inner.client_transact(RpcAddress::zero(), code, &Parcel::new(), 0);
+        assert!(replied.is_ok(), "{:?}", replied.map(|_| ()));
         let _peer = peer_side.join().expect("the peer");
-        assert!(replied.is_ok(), "{replied:?}");
-        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT), "only the excess");
+        session.close_session();
+    }
+
+    /// Part of a frame a pin's write left never stays: its holder reads next.
+    #[test]
+    fn a_pin_finishes_what_its_send_left() {
+        let transport = Carries::default();
+        let session =
+            RpcSession::new(Box::new(transport.clone()), AddressSpace::Initiator).expect("session");
+        let inner = &*session.inner;
+        let conn = inner.find_conn().expect("the slot");
+        let mut counter = 37;
+        inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1);
+        assert!(!transport.__carrying());
+        let flushed_on = transport.flushed_on.lock().expect("lock").take();
+        assert_eq!(flushed_on, Some(std::thread::current().id()));
+        drop(conn);
+        assert!(!inner.shared.lifecycle.is_torn_down());
+    }
+
+    /// A hold made in a reply wait on an `Outgoing` pin goes out when the wait's slot goes back.
+    #[test]
+    fn what_a_reply_wait_holds_goes_out_as_its_slot_goes_back() {
+        use crate::rpc::wire_android13::write_aosp_message;
+        let (session, mut peer) = a13_client_with_raw_peer();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let inner = session.inner.clone();
+        let mut counter = 0;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        let caller = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let code = SpecialTransaction::GetSessionId.code();
+                let replied = inner.client_transact(RpcAddress::zero(), code, &Parcel::new(), 0);
+                replied.map(|_| ())
+            })
+        };
+        read_aosp_message(&mut peer).expect("the request");
+        inner.hold_dec_strong(RpcSession::FOUNDING_SLOT_ID, addr, 2);
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let reply = codec
+            .encode_reply_ref(WireReplyRef {
+                status: 0,
+                data: &[],
+                object_positions: &[],
+            })
+            .expect("a reply");
+        write_aosp_message(&mut peer, &reply).expect("the reply");
+        assert!(caller.join().expect("the caller").is_ok());
+        match raw_peer_reads(&mut peer) {
+            WireMessage::DecStrong(paid, 2) => assert_eq!(paid, addr),
+            other => panic!("the hold goes out behind the reply, got {other:?}"),
+        }
+        session.close_session();
+    }
+
+    /// A oneway handler's hold stays on its `Incoming` slot past the frame: the limit counts it.
+    #[test]
+    fn a_hold_on_an_incoming_slot_outlives_its_frame() {
+        use crate::{Binder, Interface};
+        use std::io::Write;
+
+        let (t0, mut peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let t0 = crate::rpc::transport::UnixTransport::from_stream(t0).expect("transport");
+        let session = RpcSession::from_android13plus(
+            Box::new(t0),
+            Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2"),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("session");
+        let inner = session.inner.clone();
+        let target: SIBinder = Binder::new(TargetOfACall(Mutex::new(None))).as_binder();
+        let addr = inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state")
+            .on_binder_leaving(&target)
+            .expect("an address");
+        let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
+        let frame = codec
+            .encode_transact(&WireTransaction {
+                address: addr,
+                code: crate::FIRST_CALL_TRANSACTION,
+                flags: FLAG_ONEWAY,
+                async_number: 0,
+                data: Vec::new(),
+                object_positions: Vec::new(),
+            })
+            .expect("encode");
+        peer.write_all(&frame).expect("the oneway");
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Continue
+        ));
+        assert_eq!(
+            reaper_owed_len(&inner),
+            0,
+            "not handed on as the frame ended"
+        );
+        let held = inner.conn_state.lock().expect("conn_state").slots[0]
+            .pending_dec
+            .len();
+        assert_eq!(held, 1, "held for the slot's next REPLY");
+        session.close_session();
     }
 
     /// `session`'s reaper waits for room: its last handle and proxy end it all the same.

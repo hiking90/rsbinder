@@ -206,8 +206,12 @@ impl RpcTransport for TcpDebugTransport {
         !self.carry.is_empty()
     }
 
-    fn __flush_carried(&self) -> RpcResult<()> {
-        self.carry.flush(self.stream.as_fd(), &self.queue, None)
+    fn __flush_carried(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+        self.carry.flush(self.stream.as_fd(), &self.queue, drain)
+    }
+
+    fn __whole_small_frame_now(&self) -> bool {
+        super::unix::tcp_whole_small_frame_now(self.stream.as_fd())
     }
 
     fn __wait_for_room(&self) -> RpcResult<bool> {
@@ -395,7 +399,7 @@ mod tests {
     #[test]
     fn a_flush_finishes_what_a_no_wait_send_left() {
         let (sender, peer) = pair_carrying_part_of_a_frame();
-        sender.__flush_carried().expect("the flush");
+        sender.__flush_carried(None).expect("the flush");
         assert_eq!(read_all(&peer, FRAME.len()), FRAME);
         assert!(!sender.__carrying());
     }
@@ -405,7 +409,7 @@ mod tests {
     fn a_no_wait_send_takes_no_frame_while_part_of_one_is_carried() {
         let (sender, peer) = pair_carrying_part_of_a_frame();
         assert!(matches!(sender.__send_no_wait(b"x", &[]), Some(Ok(false))));
-        sender.__flush_carried().expect("the flush");
+        sender.__flush_carried(None).expect("the flush");
         assert!(matches!(sender.__send_no_wait(b"x", &[]), Some(Ok(true))));
         let read = read_all(&peer, FRAME.len() + 1);
         assert_eq!(read[..FRAME.len()], FRAME);
@@ -485,7 +489,7 @@ mod tests {
         sender
             .set_write_timeout(Some(std::time::Duration::from_millis(100)))
             .expect("send deadline");
-        let flushed = sender.__flush_carried();
+        let flushed = sender.__flush_carried(None);
         assert!(
             matches!(&flushed, Err(RpcError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock),
             "{flushed:?}"

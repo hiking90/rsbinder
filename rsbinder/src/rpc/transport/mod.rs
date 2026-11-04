@@ -586,17 +586,26 @@ pub trait RpcTransport: Send + Sync {
         None
     }
 
-    /// Not part of the API: part of a frame `__send_no_wait` took is not yet sent. A transport
-    /// that leaves any writes it in `recv_raw` too, whenever that read would otherwise wait.
+    /// Not part of the API: part of a frame `__send_no_wait` took is not yet sent.
     #[doc(hidden)]
     fn __carrying(&self) -> bool {
         false
     }
 
-    /// Not part of the API: write what `__carrying` reports, waiting as a send waits.
+    /// Not part of the API: write what `__carrying` reports, waiting as a send waits; `drain` reads
+    /// meanwhile as in [`send_raw_draining`](Self::send_raw_draining).
     #[doc(hidden)]
-    fn __flush_carried(&self) -> RpcResult<()> {
+    fn __flush_carried(&self, _drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
         Ok(())
+    }
+
+    /// Not part of the API: a `__send_no_wait` of a small frame now takes all of it or none, but for
+    /// a kernel short of memory. `false`, the default, is a transport that cannot say so: a slot's
+    /// holder reads next, so such a frame waits for what comes after the read (`session` module doc
+    /// "Deferred `DEC_STRONG`").
+    #[doc(hidden)]
+    fn __whole_small_frame_now(&self) -> bool {
+        false
     }
 
     /// Not part of the API: wait as a send that found no room waits. `Ok(true)` is room, or an

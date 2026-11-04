@@ -328,6 +328,18 @@ pub(crate) fn wait_for_room(
     Ok(SendWait::new(sock, queue).wait(false)?.is_some())
 }
 
+/// `__whole_small_frame_now` on TCP: past `POLLOUT` a small send stops short only for want of memory.
+#[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
+pub(crate) fn tcp_whole_small_frame_now(sock: std::os::fd::BorrowedFd<'_>) -> bool {
+    use rustix::event::PollFlags;
+    // XNU's `tcp_sendmsg` was not read for this; every read of a slot there waits for the hold.
+    cfg!(any(target_os = "linux", target_os = "android"))
+        && matches!(
+            super::poll_one(sock, PollFlags::OUT, Some(std::time::Duration::ZERO)),
+            Ok(seen) if seen.contains(PollFlags::OUT)
+        )
+}
+
 /// What a no-wait send left of a frame, which every later send writes first (module doc).
 #[cfg(any(
     not(any(target_os = "linux", target_os = "android")),
@@ -470,16 +482,17 @@ impl Carry {
     }
 
     /// Write what is carried, waiting as a send waits.
-    pub(crate) fn flush<'a>(
+    pub(crate) fn flush(
         &self,
         sock: std::os::fd::BorrowedFd<'_>,
-        queue: &'a OutQueue,
-        drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
+        queue: &OutQueue,
+        drain: Option<&mut dyn FnMut() -> RpcResult<()>>,
     ) -> RpcResult<()> {
         let carried = self.take();
         if carried.is_empty() {
             return Ok(());
         }
+        let drain = drain.map(|d| d as &mut dyn FnMut() -> RpcResult<()>);
         let slices = &mut [std::io::IoSlice::new(&carried)];
         // The frame's head went out with the no-wait send: `Timeout` would say none of it did.
         send_stream(sock, slices, &[], SendMode::of(queue, drain)).map_err(|e| match e {
@@ -725,10 +738,7 @@ impl UnixTransport {
 
     /// What a no-wait send left goes before any other frame, whose fds must not ride it.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn carried_first<'a>(
-        &'a self,
-        drain: Option<&'a mut dyn FnMut() -> RpcResult<()>>,
-    ) -> RpcResult<()> {
+    fn carried_first(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
         self.carry.flush(self.stream.as_fd(), &self.queue, drain)
     }
 
@@ -1130,14 +1140,19 @@ impl RpcTransport for UnixTransport {
         Some(self.carry.send_no_wait(self.stream.as_fd(), buf))
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn __whole_small_frame_now(&self) -> bool {
+        true
+    }
+
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn __carrying(&self) -> bool {
         !self.carry.is_empty()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn __flush_carried(&self) -> RpcResult<()> {
-        self.carried_first(None)
+    fn __flush_carried(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+        self.carried_first(drain)
     }
 
     fn __wait_for_room(&self) -> RpcResult<bool> {

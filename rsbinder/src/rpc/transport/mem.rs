@@ -234,6 +234,10 @@ impl RpcTransport for MemTransport {
         Some(self.send_raw(buf).map(|()| true))
     }
 
+    fn __whole_small_frame_now(&self) -> bool {
+        true
+    }
+
     fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
         if buf.is_empty() {
             return Ok(0);

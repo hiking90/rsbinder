@@ -153,9 +153,9 @@ impl RpcTransport for VsockTransport {
         !self.carry.is_empty()
     }
 
-    fn __flush_carried(&self) -> RpcResult<()> {
+    fn __flush_carried(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
         use std::os::fd::AsFd;
-        self.carry.flush(self.stream.as_fd(), &self.queue, None)
+        self.carry.flush(self.stream.as_fd(), &self.queue, drain)
     }
 
     fn __wait_for_room(&self) -> RpcResult<bool> {

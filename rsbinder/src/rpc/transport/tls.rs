@@ -1050,14 +1050,23 @@ impl RpcTransport for TlsTransport {
         !self.carry.is_empty()
     }
 
-    fn __flush_carried(&self) -> RpcResult<()> {
-        let sock = self.stream.socket().filter(|_| super::unix::WAITING_SENDS);
+    fn __flush_carried(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+        let sock = self.stream.socket();
         let _g = self.wlock.lock();
         let carried = self.carry.take();
-        match sock {
-            Some(sock) => self.write_socket_waiting(&carried, sock, None),
-            None => self.write_socket_locked(&carried),
+        match (sock, drain) {
+            (Some(sock), drain @ Some(_)) => self.write_socket_waiting(&carried, sock, drain),
+            (Some(sock), None) if super::unix::WAITING_SENDS => {
+                self.write_socket_waiting(&carried, sock, None)
+            }
+            _ => self.write_socket_locked(&carried),
         }
+    }
+
+    fn __whole_small_frame_now(&self) -> bool {
+        self.stream
+            .socket()
+            .is_some_and(super::unix::tcp_whole_small_frame_now)
     }
 
     fn __wait_for_room(&self) -> RpcResult<bool> {
@@ -1257,7 +1266,7 @@ mod tests {
     fn a_flush_finishes_what_a_no_wait_send_left() {
         let (sender, peer) = pair();
         carry_part_of_a_record(&sender);
-        sender.__flush_carried().expect("the flush");
+        sender.__flush_carried(None).expect("the flush");
         assert_eq!(read_all(&peer, FRAME.len()), FRAME);
         assert!(!sender.__carrying());
     }
