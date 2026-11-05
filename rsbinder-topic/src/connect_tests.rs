@@ -960,9 +960,11 @@ fn a_reactor_wait_whose_seq_moves_at_every_arm_ends_at_its_timeout() {
     };
     let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
     // Between the wait's `seen` and its look after arming, so that look never finds `seen`.
-    let stored = Mutex::new(stored);
+    let stored = Mutex::new((stored, 0u32));
     subscriber.about_to_park = Some(Box::new(move || {
-        stored.lock().unwrap().bump_seq();
+        let (stored, seq) = &mut *stored.lock().unwrap();
+        *seq += 1;
+        stored.store_seq(*seq);
     }));
     let (sent, got) = mpsc::channel();
     std::thread::spawn(move || {

@@ -31,10 +31,10 @@
 //! 1. `tail`: the start of the oldest record that survives, so that `w + r - tail <= capacity`.
 //!    From here on a reader treats everything below `tail` as gone.
 //! 2. `region_end = w + r`, the word a libfmq reader of the unsynchronized flavor judges by.
-//! 3. The record's bytes, with `Release` stores, a [`CHUNK`] at a time counted from `w`: before
-//!    each chunk, `frontier` = the chunk's end. The byte at `p` of the ring before this lap is
-//!    written over from position `p + capacity` on, so it is untouched while `frontier <= p +
-//!    capacity`.
+//! 3. The record's bytes, with `Relaxed` stores, a [`CHUNK`] at a time counted from `w`: before
+//!    each chunk, `frontier` = the chunk's end, then a release fence. The byte at `p` of the ring
+//!    before this lap is written over from position `p + capacity` on, so it is untouched while
+//!    `frontier <= p + capacity`.
 //! 4. `write = w + r`. The record is committed.
 //! 5. `last = w`, the start of the newest record.
 //! 6. `half`: the start of the oldest record at or above `write - capacity / 2`.
@@ -50,20 +50,23 @@
 //! acquire fence, then one load of `frontier`, and if `frontier` is past the piece's first byte
 //! plus the capacity, the piece may hold bytes of a newer record and the record is dropped. The
 //! first piece is judged from the record's start, with the header loaded before it. That check
-//! is ordered, not merely likely to work: the publisher's stores are `Release`, so a reader that
-//! copied even one byte of a chunk of an overwriting record then loads a `frontier` at least as
-//! new as the one stored before that chunk. The publisher writes the ring in the order the
-//! reader copies it, so a piece judged whole stays a whole copy whatever is written over it
-//! later: a record whose head the publisher writes over behind the reader is still returned, and
-//! a copy the publisher overtakes stops within a chunk of where it was overtaken. A header is
+//! is ordered, not merely likely to work: the publisher's release fence and the reader's acquire
+//! fence synchronize through any byte the reader got, so a reader that copied even one byte of a
+//! chunk of an overwriting record then loads a `frontier` at least as new as the one stored before
+//! that chunk. The publisher writes the ring chunk by chunk in the order the reader copies it, and
+//! promises no order inside a chunk, on which no judgment rests. A piece judged whole stays a whole
+//! copy whatever is written over it later: a record whose head the publisher writes over behind
+//! the reader is still returned, and a copy the publisher overtakes stops within a chunk of where
+//! it was overtaken. A header is
 //! believed before its judgment only when it is what the reader expects (the next index, or any
 //! index while the reader knows none, before the first record of a reader that attached with no
 //! index, whose copy is judged from its start; a length that fits what is committed); any other
 //! header is judged by `frontier` first, so a torn one is not taken for corruption.
 //!
-//! A chunk is 64 KiB. A move of `frontier` is a store and a judgment an acquire fence and a load,
-//! small beside storing or copying that much, and a record no longer than a chunk takes one of
-//! each.
+//! A chunk is 64 KiB. A move of `frontier` is a store and a release fence and a judgment an acquire
+//! fence and a load, small beside storing or copying that much, and a record no longer than a chunk
+//! takes one of each. A `Release` on every word instead costs more from 4 KiB up and a little less
+//! at 256 bytes and below on the aarch64 cores measured, none of them a Cortex-A (plan 19 §6.6).
 //!
 //! The reader holds the newest `write` it loaded and loads it again only once it has read up to
 //! it: every record below it is committed, and the acquire after that load orders the copies of
@@ -120,9 +123,10 @@ const CHUNK: usize = 64 * 1024;
 /// Smaller than the records of the race tests (24 bytes), so that they copy in two chunks.
 #[cfg(all(test, not(loom)))]
 const CHUNK: usize = 16;
-/// Half the payload of loom's records (16 bytes), so that a reader judges two chunks of each.
+/// Two words, so that loom runs stores no fence orders between them; loom's payload of 24 bytes
+/// is then two chunks for a reader too.
 #[cfg(loom)]
-const CHUNK: usize = 8;
+const CHUNK: usize = 16;
 
 /// The kinds of record this version writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +139,8 @@ pub(crate) enum Kind {
     Loan = 2,
 }
 
-/// Topic memory as the publisher reaches it. Each store is `Release`.
+/// Topic memory as the publisher reaches it. A counter's store is `Release`; the ring's stores are
+/// `Relaxed`, and [`fence`](Stores::fence) orders them.
 pub(crate) trait Stores {
     /// Bytes in the ring: a multiple of 8, never zero.
     fn capacity(&self) -> u64;
@@ -146,12 +151,15 @@ pub(crate) trait Stores {
     fn store_write(&self, position: u64);
     fn store_last(&self, position: u64);
     fn store_half(&self, position: u64);
-    /// Add one to the word a waiting subscriber sleeps on; the value it holds now.
-    fn bump_seq(&self) -> u32;
+    /// Store the word a waiting subscriber sleeps on: the commits announced so far.
+    fn store_seq(&self, seq: u32);
     /// Wake every subscriber that sleeps on that word: one system call, however many sleep.
     fn wake_seq(&self);
-    /// Copy `src` to `position`, wrapping at the ring's end. Both are multiples of 8.
+    /// Copy `src` to `position`, wrapping at the ring's end, with `Relaxed` stores. Both are
+    /// multiples of 8.
     fn store_ring(&self, position: u64, src: &[u8]);
+    /// A release fence: the stores before it come before the ring stores after it.
+    fn fence(&self);
 }
 
 /// Topic memory as a subscriber reaches it. A counter's load orders the caller as an `Acquire`
@@ -227,6 +235,7 @@ impl<'m, M: Stores> Aligned<'m, M> {
                 self.frontier += (self.end - self.frontier).min(CHUNK as u64);
                 // Before the chunk's bytes: a reader that copies one of them then loads this value.
                 self.memory.store_frontier(self.frontier);
+                self.memory.fence();
             }
             // Both on the grid of 8 and the gap at most a chunk: the piece is whole words.
             let take = words.len().min((self.frontier - self.position) as usize);
@@ -281,6 +290,8 @@ pub(crate) struct Writer<M> {
     written: u64,
     /// The index of the next record.
     index: u32,
+    /// Commits announced. Only stored too.
+    seq: u32,
     /// Where each record still in the ring starts, oldest first.
     starts: VecDeque<u64>,
     ended: bool,
@@ -298,6 +309,7 @@ impl<M: Stores> Writer<M> {
             memory,
             written: 0,
             index: 0,
+            seq: 0,
             starts: VecDeque::new(),
             ended: false,
             #[cfg(test)]
@@ -364,8 +376,10 @@ impl<M: Stores> Writer<M> {
     }
 
     /// Tell the subscribers that sleep that something was committed; the `seq` that says so.
-    pub(crate) fn announce(&self) -> u32 {
-        self.memory.bump_seq()
+    pub(crate) fn announce(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        self.memory.store_seq(self.seq);
+        self.seq
     }
 
     /// Wake the subscribers that sleep on `seq`. The caller decides that one does (plan 15 §5.5).

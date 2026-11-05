@@ -1393,8 +1393,8 @@ impl<M: Stores> Stores for Paced<'_, M> {
         self.0.store_half(position);
     }
 
-    fn bump_seq(&self) -> u32 {
-        self.0.bump_seq()
+    fn store_seq(&self, seq: u32) {
+        self.0.store_seq(seq);
     }
 
     fn wake_seq(&self) {
@@ -1405,6 +1405,10 @@ impl<M: Stores> Stores for Paced<'_, M> {
         self.0.store_ring(position, src);
         self.1.stores.fetch_add(1, Ordering::Relaxed);
         std::thread::yield_now();
+    }
+
+    fn fence(&self) {
+        Stores::fence(&self.0);
     }
 }
 
