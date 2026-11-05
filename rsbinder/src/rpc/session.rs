@@ -8326,6 +8326,7 @@ mod tests {
     }
 
     /// A oneway pin holds a bounded number of addresses; past it the `DEC_STRONG` goes out there.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_oneway_pin_holds_a_bounded_number_of_addresses() {
         use super::super::transport::UnixTransport;
@@ -8374,6 +8375,95 @@ mod tests {
             !inner.shared.lifecycle.is_torn_down(),
             "the session stays up"
         );
+    }
+
+    /// A no-wait send with no promise of a whole frame, as vsock and Apple's `AF_UNIX` have.
+    struct NoWholeFrame(super::super::transport::UnixTransport);
+
+    impl RpcTransport for NoWholeFrame {
+        fn send_raw(&self, buf: &[u8]) -> RpcResult<()> {
+            self.0.send_raw(buf)
+        }
+        fn recv_raw(&self, buf: &mut [u8]) -> RpcResult<usize> {
+            self.0.recv_raw(buf)
+        }
+        fn __send_no_wait(
+            &self,
+            buf: &[u8],
+            fds: &[std::os::fd::BorrowedFd<'_>],
+        ) -> Option<RpcResult<bool>> {
+            self.0.__send_no_wait(buf, fds)
+        }
+        fn shutdown_handle(&self) -> Option<Box<dyn FnOnce() + Send>> {
+            self.0.shutdown_handle()
+        }
+        fn peer_identity(&self) -> PeerIdentity {
+            self.0.peer_identity()
+        }
+        fn describe(&self) -> &str {
+            self.0.describe()
+        }
+        fn shutdown(&self) -> RpcResult<()> {
+            self.0.shutdown()
+        }
+    }
+
+    /// With no whole frame promised, the pin holds past its limit and its reader writes the excess.
+    #[test]
+    fn a_pin_with_no_whole_frame_holds_past_its_limit_for_its_reader() {
+        const EXCESS: usize = 3;
+        let (t0, peer) = super::super::transport::UnixTransport::pair().expect("socketpair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let session = RpcSession::from_android13plus(
+            Box::new(NoWholeFrame(t0)),
+            Android13PlusCodec::android14_15(),
+            FD_MODE_NONE,
+            false,
+        )
+        .expect("build session");
+        let inner = &*session.inner;
+        let slot_id = RpcSession::FOUNDING_SLOT_ID;
+        let held = || {
+            let st = inner.conn_state.lock().expect("conn_state");
+            st.slots
+                .iter()
+                .find(|s| s.id == slot_id)
+                .map(|s| s.pending_dec.len())
+        };
+        let sess_ptr = inner as *const RpcSessionInner as usize;
+        DRIVING.with(|d| d.borrow_mut().push((sess_ptr, slot_id)));
+        let mut counter = 0;
+        for _ in 0..HELD_DEC_STRONG_LIMIT + EXCESS {
+            inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Initiator), 1);
+        }
+        DRIVING.with(|d| d.borrow_mut().pop());
+        assert_eq!(
+            held(),
+            Some(HELD_DEC_STRONG_LIMIT + EXCESS),
+            "none on the pin"
+        );
+
+        let codec = Android13PlusCodec::android14_15();
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        let (frame, _) = codec.encode_dec_strong(&addr, 1).expect("a frame");
+        peer.send_raw(&frame).expect("a frame for the serve loop");
+        assert!(matches!(
+            inner.serve_once_on_slot(slot_id),
+            ServeStep::Continue
+        ));
+        assert_eq!(held(), Some(HELD_DEC_STRONG_LIMIT), "only the excess");
+        let mut got = vec![0u8; EXCESS * frame.len()];
+        let mut filled = 0;
+        while filled < got.len() {
+            let n = peer.recv_raw(&mut got[filled..]).expect("the excess");
+            assert!(n > 0, "the session closed the socket");
+            filled += n;
+        }
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("peer timeout");
+        let mut more = [0u8; 1];
+        assert!(peer.recv_raw(&mut more).is_err(), "more than the excess");
     }
 
     /// What fills a socket: frames this size go in until a send that does not wait finds no room.
