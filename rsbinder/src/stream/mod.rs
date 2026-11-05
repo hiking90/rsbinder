@@ -722,28 +722,7 @@ where
     // Fatal: back-pressure leaves nothing in flight to fail, so only this link reports death.
     crate::DeathLink::new(binder, Arc::new(recipient))
         .map(Some)
-        .inspect_err(|&e| {
-            if e == StatusCode::InvalidOperation {
-                log::error!(
-                    "stream: the RPC session to the other end has no incoming connections, so \
-                     the stream could neither be pushed to nor see that end die; open them \
-                     (ClientOptions::incoming_connections / RpcClientConfig::incoming_connections)"
-                );
-            } else {
-                log::error!("stream: cannot watch the peer for death: {e:?}");
-            }
-        })
-}
-
-/// An RPC proxy answers from its session; anything else is local or kernel and always callable.
-fn peer_caps(binder: &SIBinder) -> crate::TransportCaps {
-    #[cfg(feature = "rpc")]
-    if let Some(proxy) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
-        return proxy.session_caps();
-    }
-    #[cfg(not(feature = "rpc"))]
-    let _ = binder;
-    crate::TransportCaps::KERNEL
+        .inspect_err(|e| log::error!("stream: cannot watch the peer for death: {e:?}"))
 }
 
 /// Floor under a third of a tiny reply deadline, so a sub-3 ms deadline cannot spin the wait.
@@ -806,7 +785,7 @@ fn over_ring(peer: &SIBinder, policy: &ReceiverPolicy) -> bool {
         }
         return false;
     }
-    let caps = peer_caps(peer);
+    let caps = crate::TransportCaps::__of_binder(peer);
     if caps.contains(crate::TransportCaps::KERNEL_KNOBS) {
         return true;
     }
@@ -1080,11 +1059,12 @@ impl<T: Serialize> Sink<T> {
     ///   no EventFlag word, or a descriptor that does not describe a
     ///   ring), or a ring no larger than [`END_RESERVE`]` + 4`.
     /// - [`StatusCode::InvalidOperation`] when the transport cannot carry
-    ///   the stream: on the RPC path, a session whose client did not open
+    ///   the stream: on the RPC path, a live session whose client did not open
     ///   incoming connections
     ///   ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections));
     ///   the log line says so. A ring endpoint on a platform without
     ///   kernel binder.
+    /// - [`StatusCode::DeadObject`] on the RPC path when the session has ended.
     /// - [`StatusCode::BadType`] on the RPC path when the sink is already
     ///   known, without a transaction, to state some other interface. A
     ///   sink whose interface is not known is not asked, so opening never
@@ -1149,6 +1129,11 @@ impl<T: Serialize + ?Sized> Sink<T> {
             log::error!("Sink::open: the endpoint has no sink");
             return Err(StatusCode::BadValue);
         };
+        crate::TransportCaps::__require_of_binder(
+            sink,
+            crate::TransportCaps::CALLBACKS,
+            "a streaming sink",
+        )?;
         let inner = match &endpoint.ring {
             Some(ring) => SinkInner::Ring(ring::Producer::open(ring, sink, policy)?),
             None => SinkInner::Calls(Box::new(calls::Producer::open(sink, policy)?)),
@@ -1661,12 +1646,13 @@ impl<T: Deserialize> Receiver<T> {
     /// [`StatusCode::BadValue`] for a ring no larger than
     /// [`END_RESERVE`]` + 4`; whatever allocating the ring fails with (memfd,
     /// `fallocate`, seals); whatever linking to `peer`'s death fails with
-    /// — [`StatusCode::DeadObject`] for a peer already gone, and
-    /// [`StatusCode::InvalidOperation`] for an RPC `peer` whose client
-    /// session has no incoming connections
+    /// — [`StatusCode::DeadObject`] for a peer already gone, an RPC `peer`
+    /// whose session has ended among them; and
+    /// [`StatusCode::InvalidOperation`], before any of that, for an RPC `peer`
+    /// whose live session has no [calls both ways](crate::TransportCaps::CALLBACKS)
     /// ([`ClientOptions::incoming_connections`](crate::ClientOptions::incoming_connections)),
-    /// which a stream over RPC needs in either direction: nothing would
-    /// read the producer's batches, nor notice that end dying.
+    /// which a stream over RPC needs in either direction: one end's calls to
+    /// the other have no connection to go on.
     pub fn new(peer: &SIBinder) -> Result<(Self, StreamEndpoint<T>)> {
         Self::with_policy(peer, &ReceiverPolicy::default())
     }
@@ -1676,6 +1662,11 @@ impl<T: Deserialize> Receiver<T> {
         peer: &SIBinder,
         policy: &ReceiverPolicy,
     ) -> Result<(Self, StreamEndpoint<T>)> {
+        crate::TransportCaps::__require_of_binder(
+            peer,
+            crate::TransportCaps::CALLBACKS,
+            "a streaming receiver",
+        )?;
         let (inner, ring, sink, death) = if over_ring(peer, policy) {
             let (consumer, ring, sink) = ring::Consumer::new(policy)?;
             consumer.set_peer(peer, policy.ping);

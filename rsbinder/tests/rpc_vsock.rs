@@ -10,9 +10,11 @@
 //! sudo modprobe vsock_loopback   # if not built-in
 //! cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
 //! ```
+//! `tests/scripts/run_vsock_vm.sh` runs these in a VM's kernel, with no module on the host, and
+//! `tests/rpc_vsock_vm.rs` between that VM and the host.
 //!
 //! Demonstrates that the core runs unmodified with the
-//! transport swapped to vsock, host↔guest value round-trip, and
+//! transport swapped to vsock, a value round-trip, and
 //! `PeerIdentity::Vsock{cid}` never mis-reported as `Local`.
 //!
 //! The server is built with the same `RpcServer::setup_vsock_server`
@@ -204,7 +206,6 @@ fn vsock_session_shutdown_ends_serve_thread() {
     assert_eq!(ping_via(&root, "pre").unwrap(), "pong:pre");
     let (tx, rx) = mpsc::sync_channel::<()>(1);
     let flag: Arc<Flag> = Arc::new(Flag(tx));
-    // Served before the link: a session nothing reads refuses it.
     let serve = client.spawn_serve().expect("spawn_serve");
     root.link_to_death(Arc::downgrade(&flag) as _)
         .expect("link_to_death");

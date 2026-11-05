@@ -108,11 +108,12 @@
 //!   read under `SO_RCVTIMEO`. While a read deadline is armed, each read
 //!   costs one `ioctl` to tell the two apart.
 //!
-//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG` on
-//!   Linux and Android's `UnixTransport`, a hub's notice) is judged by the
-//!   same rule apart from the send: the session's reaper waits on the slot in
-//!   `__wait_for_room`, a `SendWait` of its own, and ends the session when the
-//!   deadline passes (`session` module doc "Deferred `DEC_STRONG`").
+//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG`, a hub's
+//!   notice) is judged by the same rule apart from the send: the session's
+//!   reaper waits on the slot in `__wait_for_room`, a `SendWait` of its own, and
+//!   ends the session when the deadline passes, and what such a send left of a
+//!   frame goes out through a send that waits (`session` module doc "Deferred
+//!   `DEC_STRONG`").
 //!
 //! The `ioctl` runs only while a deadline is armed: a send or read without
 //! one has no verdict for it to change. A socket that refuses it once
@@ -382,6 +383,25 @@ pub trait RpcTransport: Send + Sync {
         None
     }
 
+    /// The socket that tells of the peer's close on Linux and Android: `poll` for `POLLRDHUP`
+    /// reports `POLLRDHUP`, `POLLHUP` or `POLLERR` once the peer has closed its end, or shut it
+    /// for writing, or the connection is lost, and frames arriving do not wake it. `None`, the
+    /// default, is a transport with no such socket.
+    ///
+    /// A [`link_to_death`](crate::IBinder::link_to_death) on a session that nothing reads between
+    /// its calls polls a duplicate of this on a thread of its own, and is refused when a
+    /// connection returns `None` when the thread starts. Once it has started, a connection added
+    /// that returns `None`, or whose socket cannot be duplicated, goes unwatched, with a log, and
+    /// every link, made before or after it, is accepted.
+    /// The bundled socket transports return their socket on Linux and
+    /// Android and `None` elsewhere, where a blocking `poll` of this kind has not been measured:
+    /// XNU registers a read filter for `POLLHUP`, so what wakes it there is not known. TLS returns
+    /// the socket of a `TlsStream` that has one; a peer that sends `close_notify` and keeps the
+    /// socket open is not seen here, nor by [`peer_closed`](Self::peer_closed).
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        None
+    }
+
     /// A function that cuts this connection from another thread, as
     /// [`shutdown`](Self::shutdown) does, without a reference to the
     /// transport. `None` (the default) when the transport has none.
@@ -501,6 +521,10 @@ pub trait RpcTransport: Send + Sync {
     /// Receive one frame plus any out-of-band file descriptors.
     /// Default: never yields fds (the plain framed recv); only `unix`
     /// overrides with `SCM_RIGHTS`.
+    ///
+    /// A process that cannot take all of a frame's fds (`MSG_CTRUNC`) gets
+    /// `Ok` with those that came, as in
+    /// [`recv_raw_with_fds`](RpcTransport::recv_raw_with_fds).
     fn recv_frame_with_fds(&self) -> RpcResult<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_frame()?, Vec::new()))
     }
@@ -553,16 +577,27 @@ pub trait RpcTransport: Send + Sync {
     /// (`RpcTransportRaw::interruptableReadFully`), so the caller
     /// gathers fds across the header+body reads. Default: never yields
     /// fds (plain [`RpcTransport::recv_raw`]); only `unix` overrides.
+    ///
+    /// A process that cannot take all of a frame's fds (`MSG_CTRUNC`, for a
+    /// full fd table or a security module's refusal) gets `Ok` with those that
+    /// came and no other sign, so the caller compares their count with the one
+    /// its frame names. A whole frame's fds (64) with more behind them are
+    /// [`RpcError::Protocol`]: the peer sent past the limit.
     fn recv_raw_with_fds(&self, buf: &mut [u8]) -> RpcResult<(usize, Vec<std::os::fd::OwnedFd>)> {
         Ok((self.recv_raw(buf)?, Vec::new()))
     }
 
     /// Not part of the API: one small frame that waits for nothing.
     ///
-    /// `Ok(true)` is the whole of `buf` and `fds` sent; `Ok(false)` is none of them sent, for want
-    /// of room or of a kernel resource, with the stream as it was; any other failure is the
-    /// transport's, and a `buf` past the transport's limit is [`RpcError::FrameTooLarge`] before
-    /// anything is sent. `None`, the default, is a transport that cannot promise this.
+    /// `Ok(true)` is the whole of `buf` and `fds` taken: sent, or with what is not yet sent kept
+    /// for the next send, which writes it first ([`__carrying`](Self::__carrying)). `Ok(false)` is
+    /// none of them taken, for want of room or of a kernel resource, with the stream as it was; any
+    /// other failure is the transport's, and a `buf` past the transport's limit is
+    /// [`RpcError::FrameTooLarge`] before anything is sent. `None`, the default, is a transport
+    /// that cannot promise this, which finds no room on every release: a thread's own connection,
+    /// in a reply wait as in a handler, holds it for its next frame, and a thread that drives no
+    /// connection, or a oneway handler that wrote on a free outgoing connection, leaves it to the
+    /// session's reaper thread.
     #[doc(hidden)]
     fn __send_no_wait(
         &self,
@@ -570,6 +605,28 @@ pub trait RpcTransport: Send + Sync {
         _fds: &[std::os::fd::BorrowedFd<'_>],
     ) -> Option<RpcResult<bool>> {
         None
+    }
+
+    /// Not part of the API: part of a frame `__send_no_wait` took is not yet sent.
+    #[doc(hidden)]
+    fn __carrying(&self) -> bool {
+        false
+    }
+
+    /// Not part of the API: write what `__carrying` reports, waiting as a send waits; `drain` reads
+    /// meanwhile as in [`send_raw_draining`](Self::send_raw_draining).
+    #[doc(hidden)]
+    fn __flush_carried(&self, _drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+        Ok(())
+    }
+
+    /// Not part of the API: a `__send_no_wait` of a small frame now takes all of it or none, but for
+    /// a kernel short of memory. `false`, the default, is a transport that cannot say so: a slot's
+    /// holder reads next, so such a frame waits for what comes after the read (`session` module doc
+    /// "Deferred `DEC_STRONG`").
+    #[doc(hidden)]
+    fn __whole_small_frame_now(&self) -> bool {
+        false
     }
 
     /// Not part of the API: wait as a send that found no room waits. `Ok(true)` is room, or an

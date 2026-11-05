@@ -128,6 +128,8 @@ pub(crate) mod deadline;
 pub(crate) mod end;
 pub(crate) mod fd_mode;
 pub(crate) mod lifecycle;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod peer_watch;
 pub(crate) mod proxy;
 pub(crate) mod server;
 pub(crate) mod session;

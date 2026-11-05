@@ -7,7 +7,8 @@
 #   kernel    what integration-test.yml's Linux job runs against a live
 #             binderfs, `rsb_hub` and `test_service`, plus the gates no
 #             workflow runs: tests/scripts/run_*_ac.sh, run_d8b_register.sh,
-#             vsock loopback and the libfmq host peer.
+#             vsock (tests/scripts/run_vsock_vm.sh, or this host's loopback)
+#             and the libfmq host peer.
 #   stage3    the interop scripts against a booted Android device or
 #             emulator (real servicemanager, libbinder, libfmq): every
 #             script the device can take, when the diff against --base
@@ -141,11 +142,12 @@ rpc_suite_soak() {
 }
 
 big_endian() {
-    local s390=(cross test -p rsbinder --target s390x-unknown-linux-gnu)
+    # A target dir of its own: the container's registry path dirties host units in target/debug.
+    local s390=(cross test -p rsbinder --target s390x-unknown-linux-gnu --target-dir target/cross)
     tpass cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
         tpass cargo test -p rsbinder --no-default-features --lib blob:: &&
         "${s390[@]}" --no-default-features --lib parcel --no-run &&
-        file target/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | grep 'MSB.*IBM S/390' &&
+        file target/cross/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | grep 'MSB.*IBM S/390' &&
         tpass "${s390[@]}" --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
         tpass "${s390[@]}" --no-default-features --lib binder_object:: &&
         tpass "${s390[@]}" --features rpc,rpc-tcp-debug --lib file_descriptor:: &&
@@ -163,17 +165,24 @@ public_api() {
         diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
 }
 
+# `cargo miri test ARGS` under seeds 0-7 at once, which fails if any seed fails. The seeds' output
+# interleaves and libtest writes `test result: ok` apart from the counts, so only the counts are
+# matched: tpass could call a passing run failed.
+miri_seeds() {
+    local out rc
+    out=$(env CARGO_TARGET_DIR=target/miri MIRIFLAGS=-Zmiri-many-seeds=0..8 \
+        cargo +nightly-2026-05-25 miri test "$@" 2>&1)
+    rc=$?
+    printf '%s\n' "$out"
+    [ $rc -eq 0 ] && grep -qE '\. [1-9][0-9]* passed' <<<"$out"
+}
+
 # The carved pieces (`shm::piece`), the queue's `Regions` and the unsynchronized queue's two
 # cores under Miri. The copies that race need Miri's weak-memory emulation, and it is what tells
 # `Release`/`Acquire` from `Relaxed` (x86 runs both as the same code); it also refuses a byte
 # accessed at two sizes, which the pieces never do.
 miri_fmq() {
-    local seed dir=CARGO_TARGET_DIR=target/miri
-    local miri=(cargo +nightly-2026-05-25 miri test -p rsbinder-fmq --lib --)
-    for seed in 0 1 2 3 4 5 6 7; do
-        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" "${miri[@]}" \
-            shm::piece unsync::tests queue::tests || return 1
-    done
+    miri_seeds -p rsbinder-fmq --lib -- shm::piece unsync::tests queue::tests
 }
 
 # The topic ring over heap memory under Miri: the two tests in which a reader copies records while
@@ -181,12 +190,8 @@ miri_fmq() {
 # ring would be an out-of-bounds access. The other tests of `ring::tests` publish thousands of
 # records to one thread and add nothing here for the minutes they take.
 miri_topic() {
-    local seed dir=CARGO_TARGET_DIR=target/miri
-    for seed in 0 1 2 3 4 5 6 7; do
-        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" \
-            cargo +nightly-2026-05-25 miri test -p rsbinder-topic --lib -- image::tests \
-            ring::tests::records_returned ring::tests::a_copy_that || return 1
-    done
+    miri_seeds -p rsbinder-topic --lib -- image::tests \
+        ring::tests::records_returned ring::tests::a_copy_that
 }
 
 semver() {
@@ -258,7 +263,7 @@ tier_hermetic() {
         --test rpc_cross_stack --test rpc_transport_conformance --test source_invariants \
         --test blob_rpc --test pipe_rpc --test parcel_alloc --test rpc_unix_fd
     run "rsbinder tls targets" tpass cargo test -p rsbinder --features rpc-tls,rpc-tcp-debug \
-        --test rpc_tls --test rpc_transport_conformance
+        --test rpc_tls --test rpc_transport_conformance --test rpc_release_order
     # Skips (and still passes) where unprivileged user namespaces are off; CI sets REQUIRED.
     linux_run "rpc_link_break (network namespace)" tpass cargo test -p rsbinder \
         --features rpc-tls,rpc-tcp-debug --test rpc_link_break
@@ -443,12 +448,16 @@ tier_kernel() {
     run "topic fleet hub restart" tpass cargo test -p tests --test topic_fleet \
         -- --ignored --exact hub_restarts
 
-    if [ -e /dev/vsock ] && grep -q '^vsock_loopback ' /proc/modules 2>/dev/null; then
+    # A VM covers the loopback tests as well, in its own kernel; this host's module is the fallback.
+    local vm_missing
+    if vm_missing=$(bash tests/scripts/run_vsock_vm.sh --check); then
+        run "vsock between host and VM" bash tests/scripts/run_vsock_vm.sh
+    elif [ -e /dev/vsock ] && grep -q '^vsock_loopback ' /proc/modules 2>/dev/null; then
         run "rpc_vsock (loopback)" tpass cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
         run "rpc_tls over vsock" tpass cargo test -p rsbinder --features rpc-tls,rpc-vsock \
             --test rpc_tls -- --ignored --exact vsock_tls_loopback_e2e
     else
-        skip "vsock tests" "sudo modprobe vsock_loopback"
+        skip "vsock tests" "$vm_missing, or sudo modprobe vsock_loopback"
     fi
 
     local aosp=${AOSP:-$HOME/Workspace/aosp}
@@ -602,6 +611,7 @@ tier_stage3() {
         fi
         if [ "$sdk" -lt "$min" ] || { [ "$max" != - ] && [ "$sdk" -gt "$max" ]; }; then
             local want="SDK $min+"
+            [ "$max" = - ] || want="SDK $min-$max"
             [ "$max" = "$min" ] && want="SDK $min"
             skip "run_$name" "device SDK $sdk, needs $want"
             continue

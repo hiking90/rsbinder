@@ -521,7 +521,6 @@ impl<T: Serialize + ?Sized> Producer<T> {
             log::error!("Sink::open: the opening window must be 1..=i32::MAX batches");
             return Err(StatusCode::BadValue);
         };
-        super::peer_caps(sink).require(crate::TransportCaps::CALLBACKS, "a streaming sink")?;
         let peer = resolve_peer::<dyn IStreamSink>(
             sink,
             <BpStreamSink as crate::Proxy>::descriptor(),
@@ -2481,13 +2480,18 @@ mod tests {
         let (rx, sink_binder) = Consumer::<i32>::new(&receiver_policy(1, 4));
         let mut sink = Producer::<i32>::open(&sink_binder, &sink_policy(4, 1)).expect("open");
 
+        let (spent, first) = mpsc::channel();
         let (outcome, watch) = mpsc::channel();
         let producer = thread::spawn(move || {
             // The first send spends the opening credit; the second parks.
-            let first = sink.send(&0, None);
+            let _ = spent.send(sink.send(&0, None));
             let second = sink.send(&1, None);
-            let _ = outcome.send((first, second, sink.is_canceled()));
+            let _ = outcome.send((second, sink.is_canceled()));
         });
+        let first = first
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first send");
+        assert!(first.is_ok());
 
         // Nothing drains, so the producer is parked; only cancel can release it.
         assert!(
@@ -2496,10 +2500,9 @@ mod tests {
         );
         rx.cancel().expect("cancel");
 
-        let (first, second, canceled) = watch
+        let (second, canceled) = watch
             .recv_timeout(Duration::from_secs(5))
             .expect("cancel must release the producer");
-        assert!(first.is_ok());
         assert_eq!(second.err(), Some(StatusCode::InvalidOperation));
         assert!(
             canceled,
@@ -3010,7 +3013,7 @@ mod tests {
             FromIBinder::try_from(sink_binder).expect("the consumer's own sink");
         let local_source = BnStreamSource::new_binder(RefusingSource(Arc::default())).as_binder();
         sink.r#onStart(&local_source, 4).expect("onStart");
-        // Only the ping target is remote: a death link on it would need incoming connections.
+        // Only the ping target is remote; this test takes no death link on it.
         rx.stream.lock().source_binder = Some(remote_source);
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -3037,6 +3040,62 @@ mod tests {
             .expect("the receive spun: its first poll never returned");
         assert!(pending, "nothing arrived, so the receive waits");
         drop(rx);
+        client.close_session();
+        serving.join().unwrap();
+    }
+
+    /// An ended session is gone, not a setup to correct: both ends' gates answer `DeadObject`.
+    #[cfg(feature = "rpc")]
+    #[test]
+    fn a_session_that_has_ended_answers_a_stream_with_dead_object() {
+        use crate::rpc::transport::MemTransport;
+        use crate::rpc::{AddressSpace, RpcSession};
+
+        let (a, b) = MemTransport::pair();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let sink = BnStreamSource::new_binder(SourceObject(Arc::default())).as_binder();
+        server.set_root(sink).unwrap();
+        let serving = thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+        let root = client.get_root().unwrap();
+        client.close_session();
+        serving.join().unwrap();
+        assert_eq!(
+            crate::stream::Receiver::<i32>::new(&root).err(),
+            Some(StatusCode::DeadObject)
+        );
+        let endpoint = crate::stream::StreamEndpoint::<i32>::with(None, root);
+        assert_eq!(
+            crate::stream::Sink::open(&endpoint).err(),
+            Some(StatusCode::DeadObject)
+        );
+    }
+
+    /// A live session with nowhere to take callbacks is refused by `Sink::open`'s own gate.
+    #[cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
+    #[test]
+    fn a_live_session_with_no_callbacks_refuses_a_sink() {
+        use crate::rpc::transport::UnixTransport;
+        use crate::rpc::{AddressSpace, RpcSession};
+
+        // A socket the watcher can poll: with none a link is refused, gate or no gate.
+        let (a, b) = UnixTransport::pair().unwrap();
+        let server = RpcSession::new(Box::new(a), AddressSpace::Acceptor).unwrap();
+        let sink = BnStreamSource::new_binder(SourceObject(Arc::default())).as_binder();
+        server.set_root(sink).unwrap();
+        let serving = thread::spawn(move || {
+            let _ = server.serve_blocking();
+        });
+        let client = RpcSession::new(Box::new(b), AddressSpace::Initiator).unwrap();
+        let root = client.get_root().unwrap();
+        let endpoint = crate::stream::StreamEndpoint::<i32>::with(None, root);
+        assert_eq!(
+            crate::stream::Sink::open(&endpoint).err(),
+            Some(StatusCode::InvalidOperation)
+        );
+        drop(endpoint);
         client.close_session();
         serving.join().unwrap();
     }

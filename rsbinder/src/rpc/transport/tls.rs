@@ -29,10 +29,10 @@
 //! `RpcTransportCtx::newTransport(fd)`): the crypto state machine
 //! (`rustls::Connection`) is held separately from the byte stream, so it
 //! runs over **any** [`TlsStream`] — `TcpStream`, `UnixStream`, or a
-//! `vsock` stream — not just TCP. It is also **profile-agnostic**: it
-//! implements both the R34 length-framed I/O (`send_frame`/`recv_frame`)
-//! and the android-13+ raw I/O (`send_raw`/`recv_raw`), so the opt-in
-//! android-13+ `RpcSession` profile can run over TLS.
+//! `vsock` stream — not just TCP. It is also **profile-agnostic**: both
+//! wire profiles of an `RpcSession` go through its raw I/O
+//! (`send_raw`/`recv_raw`). `send_frame`/`recv_frame` are a separate API that
+//! no session calls.
 //!
 //! ## Concurrency
 //!
@@ -253,8 +253,14 @@ pub trait TlsStream: Send + Sync {
     /// `O_NONBLOCK` on the socket for the duration of each `send`) and `poll`s it, so the
     /// socket must carry exactly the bytes `read` and `write` do. The
     /// default is `None`: such a send then blocks without reading, and a
-    /// peer that writes on the connection meanwhile can stall it. The
-    /// bundled streams return their socket.
+    /// peer that writes on the connection meanwhile can stall it. With no
+    /// socket to look at there is also no send that waits for nothing, so
+    /// every release of a remote binder finds no room: a thread's own
+    /// connection, in a reply wait as in a handler, holds it for its next
+    /// frame, and a thread that drives no connection, or a oneway handler
+    /// that wrote on a free outgoing connection, leaves it to the session's
+    /// reaper thread, so it can come after the next reply. The bundled
+    /// streams return their socket.
     ///
     /// On Linux and Android a `Some` socket carries more than that send:
     /// every `send_raw` writes to it the same way, and a read with a
@@ -363,6 +369,14 @@ impl TlsStream for vsock::VsockStream {
     }
 }
 
+/// `__whole_small_frame_now` on a stream's socket; vsock's `POLLOUT` is only a byte of credit.
+fn whole_small_frame_now(sock: std::os::fd::BorrowedFd<'_>) -> bool {
+    use rustix::net::AddressFamily as Af;
+    super::unix::tcp_whole_small_frame_now(sock)
+        && rustix::net::getsockname(sock)
+            .is_ok_and(|addr| matches!(addr.address_family(), Af::INET | Af::INET6 | Af::UNIX))
+}
+
 /// `&dyn TlsStream` as `std::io::{Read, Write}` so rustls's blocking `complete_io` can drive it.
 struct IoAdapter<'a>(&'a dyn TlsStream);
 impl Read for IoAdapter<'_> {
@@ -412,6 +426,8 @@ pub struct TlsTransport {
     pending_in: Mutex<Vec<u8>>,
     reads: ReadDeadline,
     queue: OutQueue,
+    /// Ciphertext a no-wait send sequenced and the socket has yet to take; under `wlock`.
+    carry: super::unix::Carry,
 }
 
 /// Leaf-cert SHA-256 as [`CertId`]; `subject` is only a label (no X.509 parse), the hash decides.
@@ -497,12 +513,6 @@ fn rustls_payload(io: &std::io::Error) -> Option<&rustls::Error> {
 }
 
 /// After a failed server handshake: FIN behind the alert, then read until the client closes.
-///
-/// Closing at once with the client's bytes unread makes the kernel answer
-/// with RST, and the client loses the alert (TLS 1.3 clients write right
-/// after their `Finished`, before the server has judged their certificate).
-/// Bounded by `REJECT_LINGER` and `REJECT_LINGER_BYTES`: a client that does
-/// not close gets the cut it would have got anyway.
 fn linger_for_alert(conn: &mut Connection, stream: &dyn TlsStream) {
     let Some(sock) = stream.socket() else {
         return;
@@ -635,6 +645,7 @@ impl TlsTransport {
             pending_in: Mutex::new(Vec::new()),
             reads: ReadDeadline::default(),
             queue: OutQueue::default(),
+            carry: super::unix::Carry::default(),
         })
     }
 
@@ -708,6 +719,7 @@ impl TlsTransport {
             pending_in: Mutex::new(Vec::new()),
             reads: ReadDeadline::default(),
             queue: OutQueue::default(),
+            carry: super::unix::Carry::default(),
         })
     }
 
@@ -766,6 +778,16 @@ impl TlsTransport {
         let _g = self.wlock.lock();
         // rustls caps buffered plaintext (~64 KiB), so chunk and interleave encrypt + transmit.
         debug_assert!(!buf.is_empty(), "send_raw with an empty frame");
+        let carried = self.carry.take();
+        if !carried.is_empty() {
+            let first = drain
+                .as_mut()
+                .map(|d| &mut **d as &mut dyn FnMut() -> RpcResult<()>);
+            match sock {
+                Some(sock) => self.write_socket_waiting(&carried, sock, first)?,
+                None => self.write_socket_locked(&carried)?,
+            }
+        }
         let mut cipher = Vec::new();
         let mut off = 0;
         while off < buf.len() {
@@ -796,6 +818,49 @@ impl TlsTransport {
             }
         }
         Ok(())
+    }
+
+    /// `__send_no_wait`: one record, whose ciphertext is sequenced, so all of it is sent or kept.
+    fn send_record_no_wait(
+        &self,
+        buf: &[u8],
+        sock: std::os::fd::BorrowedFd<'_>,
+    ) -> RpcResult<bool> {
+        use rustix::event::PollFlags;
+
+        super::unix::check_no_wait_frame(buf)?;
+        if self.shut.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::EndOfStream);
+        }
+        let Some(_g) = self.wlock.try_lock() else {
+            return Ok(false);
+        };
+        if !self.carry.is_empty() {
+            return Ok(false);
+        }
+        // No record for a socket with no room: sequencing it would leave all of it kept.
+        match super::poll_one(sock, PollFlags::OUT, Some(Duration::ZERO)) {
+            Ok(seen) if seen.is_empty() => return Ok(false),
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => return Ok(false),
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+        let mut cipher = Vec::new();
+        {
+            let mut c = self.conn.lock().expect("tls conn poisoned");
+            let n = c.writer().write(buf)?;
+            if n == 0 {
+                return Err(RpcError::Protocol("rustls accepted no plaintext"));
+            }
+            if n != buf.len() {
+                return Err(RpcError::Io(std::io::Error::other(
+                    "rustls took part of a small frame",
+                )));
+            }
+            c.write_tls(&mut cipher)?;
+        }
+        self.carry.send_or_keep(sock, &cipher)?;
+        Ok(true)
     }
 
     /// `write_socket_locked` that waits in `poll`, handing input to `drain` if there is one.
@@ -954,6 +1019,47 @@ impl RpcTransport for TlsTransport {
         }
     }
 
+    /// `None` for a stream with no socket: nothing here could look at its room.
+    fn __send_no_wait(
+        &self,
+        buf: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Option<RpcResult<bool>> {
+        let sock = self.stream.socket()?;
+        if !fds.is_empty() {
+            return Some(Err(super::cannot_pass_fds()));
+        }
+        Some(self.send_record_no_wait(buf, sock))
+    }
+
+    fn __carrying(&self) -> bool {
+        !self.carry.is_empty()
+    }
+
+    fn __flush_carried(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
+        let sock = self.stream.socket();
+        let _g = self.wlock.lock();
+        let carried = self.carry.take();
+        match (sock, drain) {
+            (Some(sock), drain @ Some(_)) => self.write_socket_waiting(&carried, sock, drain),
+            (Some(sock), None) if super::unix::WAITING_SENDS => {
+                self.write_socket_waiting(&carried, sock, None)
+            }
+            _ => self.write_socket_locked(&carried),
+        }
+    }
+
+    fn __whole_small_frame_now(&self) -> bool {
+        self.stream.socket().is_some_and(whole_small_frame_now)
+    }
+
+    fn __wait_for_room(&self) -> RpcResult<bool> {
+        match self.stream.socket() {
+            Some(sock) => super::unix::wait_for_room(sock, &self.queue),
+            None => Ok(true),
+        }
+    }
+
     /// Single-reader: one thread drives `recv_*` per connection (the RPC
     /// serve loop / the in-flight transact's reply wait). Concurrent
     /// multi-reader would interleave `pump_incoming` socket reads and
@@ -1033,6 +1139,12 @@ impl RpcTransport for TlsTransport {
         self.stream.socket().and_then(super::socket_shutdown_handle)
     }
 
+    fn peer_close_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        cfg!(any(target_os = "linux", target_os = "android"))
+            .then(|| self.stream.socket())
+            .flatten()
+    }
+
     fn shutdown(&self) -> RpcResult<()> {
         // Refuse new sends; only the one already holding `wlock` remains to wait for.
         self.shut.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1041,7 +1153,7 @@ impl RpcTransport for TlsTransport {
         // Hold `wlock` through the cut: the alert follows a whole frame and none slips in after.
         let held = self.wlock.lock_timeout(CLOSE_NOTIFY_WLOCK_WAIT);
         if held.is_some() {
-            let mut cipher = Vec::new();
+            let mut cipher = self.carry.take();
             {
                 let mut c = self.conn.lock().expect("tls conn poisoned");
                 c.send_close_notify(); // idempotent in rustls
@@ -1055,5 +1167,142 @@ impl RpcTransport for TlsTransport {
         let cut = super::absorb_already_shut(self.stream.shutdown_stream());
         drop(held);
         cut
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    const CA: &str = include_str!("../../../tests/tls_fixtures/ca.crt");
+    const SRV_CRT: &str = include_str!("../../../tests/tls_fixtures/srv.crt");
+    const SRV_KEY: &str = include_str!("../../../tests/tls_fixtures/srv.key");
+    const FRAME: [u8; 2048] = [5; 2048];
+
+    fn pair() -> (TlsTransport, TlsTransport) {
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(SRV_CRT.as_bytes())
+            .collect::<std::result::Result<_, _>>()
+            .expect("the certificate");
+        let key = PrivateKeyDer::from_pem_slice(SRV_KEY.as_bytes()).expect("the key");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("the server's config");
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in CertificateDer::pem_slice_iter(CA.as_bytes()) {
+            roots.add(ca.expect("the CA")).expect("a root");
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("the address");
+        let peer = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            TlsTransport::accept(tcp, Arc::new(server_config)).expect("the server's handshake")
+        });
+        let tcp = TcpStream::connect(addr).expect("connect");
+        let sender = TlsTransport::connect(tcp, "localhost", Arc::new(client_config))
+            .expect("the client's handshake");
+        let peer = peer.join().expect("the peer");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("the peer's deadline");
+        (sender, peer)
+    }
+
+    /// `FRAME`'s record with its first bytes on the socket and the rest carried.
+    fn carry_part_of_a_record(sender: &TlsTransport) {
+        let mut cipher = Vec::new();
+        {
+            let mut c = sender.conn.lock().expect("tls conn poisoned");
+            c.writer().write_all(&FRAME).expect("the plaintext");
+            c.write_tls(&mut cipher).expect("the record");
+        }
+        let sock = sender.stream.socket().expect("a socket");
+        let sent = rustix::net::send(sock, &cipher[..10], super::super::unix::SEND_FLAGS);
+        assert_eq!(sent, Ok(10));
+        sender.carry.keep(&cipher[10..]);
+        assert!(sender.__carrying());
+    }
+
+    fn read_all(peer: &TlsTransport, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        let mut read = 0;
+        while read < len {
+            let n = peer.recv_raw(&mut bytes[read..]).expect("the peer's read");
+            assert!(n > 0, "the end of stream after {read} of {len} bytes");
+            read += n;
+        }
+        bytes
+    }
+
+    /// A later send writes the record's rest first: another record there breaks the stream.
+    #[test]
+    fn a_later_send_writes_what_a_no_wait_send_left_first() {
+        let (sender, peer) = pair();
+        carry_part_of_a_record(&sender);
+        sender.send_raw(b"tail").expect("the send");
+        let read = read_all(&peer, FRAME.len() + 4);
+        assert_eq!(read[..FRAME.len()], FRAME);
+        assert_eq!(&read[FRAME.len()..], b"tail");
+        assert!(!sender.__carrying());
+    }
+
+    /// `__flush_carried` alone finishes the record, for a stream with nothing to write next.
+    #[test]
+    fn a_flush_finishes_what_a_no_wait_send_left() {
+        let (sender, peer) = pair();
+        carry_part_of_a_record(&sender);
+        sender.__flush_carried(None).expect("the flush");
+        assert_eq!(read_all(&peer, FRAME.len()), FRAME);
+        assert!(!sender.__carrying());
+    }
+
+    /// A flush with room leaves its drain alone and finishes the record.
+    #[test]
+    fn a_flush_with_room_never_calls_its_drain() {
+        let (sender, peer) = pair();
+        carry_part_of_a_record(&sender);
+        let mut drain = || panic!("a drain with room to write");
+        sender.__flush_carried(Some(&mut drain)).expect("the flush");
+        assert_eq!(read_all(&peer, FRAME.len()), FRAME);
+    }
+
+    /// `close_notify` follows the whole record, so the peer sees a clean end after the frame.
+    #[test]
+    fn a_shutdown_writes_what_a_no_wait_send_left_before_its_alert() {
+        let (sender, peer) = pair();
+        carry_part_of_a_record(&sender);
+        sender.shutdown().expect("the shutdown");
+        assert_eq!(read_all(&peer, FRAME.len()), FRAME);
+        let mut more = [0u8; 8];
+        assert!(matches!(peer.recv_raw(&mut more), Ok(0)), "an unclean end");
+    }
+
+    /// A socket with room takes a whole frame, and no fd rides a stream that cannot carry one.
+    #[test]
+    fn a_no_wait_frame_arrives_and_no_fd_is_taken() {
+        let (sender, peer) = pair();
+        assert!(matches!(sender.__send_no_wait(&FRAME, &[]), Some(Ok(true))));
+        assert_eq!(read_all(&peer, FRAME.len()), FRAME);
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let fds = [std::os::fd::AsFd::as_fd(&a)];
+        assert!(matches!(sender.__send_no_wait(&FRAME, &fds), Some(Err(_))));
+    }
+
+    /// Only a family known to take a small send whole says so; netlink stands in for vsock here.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_of_another_family_says_no_frame_goes_whole() {
+        use rustix::net::{socket, AddressFamily, SocketType};
+        use std::os::fd::AsFd;
+        let other = socket(AddressFamily::NETLINK, SocketType::RAW, None).expect("a socket");
+        assert!(!whole_small_frame_now(other.as_fd()));
+        let (unix, _peer) = UnixStream::pair().expect("socketpair");
+        assert!(whole_small_frame_now(unix.as_fd()));
+        let (sender, _peer) = pair();
+        assert!(sender.__whole_small_frame_now());
     }
 }

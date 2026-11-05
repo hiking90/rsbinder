@@ -192,11 +192,11 @@
 //!   check fails on `pid == std::process::id()`. On Linux `SO_PEERCRED`
 //!   already reports the client.
 //! - `rpc_death_recipient_fires_on_session_drop`: the notified side runs a
-//!   serve loop (the AOSP incoming-thread requirement) and a link before it
-//!   starts is refused; an unlinked recipient must not fire, and a link
-//!   after death is `DeadObject`. Mutant: drop `send_session_obituaries()`
-//!   from `RpcSessionInner::on_session_dead`, or stub `RpcProxy::link_to_death` to
-//!   `InvalidOperation`; `binder_died` never arrives.
+//!   serve loop (the AOSP incoming-thread requirement), and off Linux and
+//!   Android a link before it starts is refused; an unlinked recipient must
+//!   not fire, and a link after death is `DeadObject`. Mutant: drop
+//!   `send_session_obituaries()` from `RpcSessionInner::on_session_dead`, or stub
+//!   `RpcProxy::link_to_death` to `InvalidOperation`; `binder_died` never arrives.
 //! - `rpc_death_signal_completes_on_session_drop`: adds the wake-up path
 //!   (sent on the session thread, awaited in another runtime) and the
 //!   already-dead case, which completes instead of erroring. Mutant:
@@ -3266,7 +3266,8 @@ fn rpc_death_recipient_fires_on_session_drop() {
     let weak_live: std::sync::Weak<dyn rsbinder::DeathRecipient> = Arc::downgrade(&live) as _;
     let weak_dead: std::sync::Weak<dyn rsbinder::DeathRecipient> = Arc::downgrade(&dead) as _;
 
-    // Nothing reads this session yet, so its loss would go unnoticed (AOSP: no incoming threads).
+    // Nothing reads this session yet, and off Linux and Android nothing can watch it either.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     assert_eq!(
         root.link_to_death(weak_live.clone()),
         Err(rsbinder::StatusCode::InvalidOperation)
@@ -4272,7 +4273,7 @@ fn entry_client_open_with_incoming() {
     ));
 }
 
-/// AC-20.5: incoming conn ⇒ eager death; none ⇒ no death link, and a failed call ends the session.
+/// AC-20.5: incoming conn ⇒ eager death; none: the watcher's, or a refusal off Linux and Android.
 #[test]
 fn server_death_is_eager_with_incoming() {
     if let Ok(path) = std::env::var("RSB_RPC_DEATH_A13_SERVER") {
@@ -4303,36 +4304,59 @@ fn server_death_is_eager_with_incoming() {
     )
     .expect("eager client");
     let lazy = RpcSession::setup_unix_client_android13plus(&path, 2).expect("lazy client");
+    let unlinked = RpcSession::setup_unix_client_android13plus(&path, 2).expect("unlinked client");
     let eager_root = eager.get_root().expect("root");
     let lazy_root = lazy.get_root().expect("root");
+    let unlinked_root = unlinked.get_root().expect("root");
     let (tx_e, rx_e) = std::sync::mpsc::sync_channel::<()>(1);
-    let (tx_l, _rx_l) = std::sync::mpsc::sync_channel::<()>(1);
+    let (tx_l, rx_l) = std::sync::mpsc::sync_channel::<()>(1);
     let flag_e: Arc<DeathFlag> = Arc::new(DeathFlag(tx_e));
     let flag_l: Arc<DeathFlag> = Arc::new(DeathFlag(tx_l));
     eager_root
         .link_to_death(Arc::downgrade(&flag_e) as _)
         .expect("link eager");
-    assert_eq!(
-        lazy_root.link_to_death(Arc::downgrade(&flag_l) as _),
-        Err(StatusCode::InvalidOperation),
-        "without an incoming connection nothing would observe the drop"
-    );
+    let watches = cfg!(any(target_os = "linux", target_os = "android"));
+    let lazy_link = lazy_root.link_to_death(Arc::downgrade(&flag_l) as _);
+    if watches {
+        lazy_link.expect("a thread watches what nothing reads");
+    } else {
+        assert_eq!(
+            lazy_link,
+            Err(StatusCode::InvalidOperation),
+            "without an incoming connection nothing would observe the drop"
+        );
+    }
     child.0.kill().expect("kill server child");
     child.0.wait().expect("reap server child");
     assert!(
         rx_e.recv_timeout(Duration::from_secs(3)).is_ok(),
         "the incoming connection's drop must fire the obituary at once"
     );
+    if watches {
+        assert!(
+            rx_l.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "the watcher must fire the obituary with no call to fail"
+        );
+    }
     assert!(EchoProxy(lazy_root.clone()).echo("x").is_err());
     assert_eq!(
         EchoProxy(lazy_root.clone()).echo("y"),
         Err(StatusCode::DeadObject),
-        "the failed call declares the session dead"
+        "an ended session's call"
+    );
+    // Nothing watches or reads this one, so its first call is what finds the loss.
+    assert!(!unlinked.is_ended());
+    assert!(EchoProxy(unlinked_root.clone()).echo("x").is_err());
+    assert!(unlinked.is_ended(), "the failed call declares it dead");
+    assert_eq!(
+        EchoProxy(unlinked_root.clone()).echo("y"),
+        Err(StatusCode::DeadObject)
     );
     eager.close_session();
     assert_eq!(eager.__incoming_thread_live_count(), 0);
     assert_eq!(eager.__incoming_thread_count(), 0);
     lazy.close_session();
+    unlinked.close_session();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -4386,6 +4410,37 @@ fn local_shutdown_ends_the_serve_loop_the_same_way_parked_or_dispatching() {
         }
         client.close_session();
     }
+}
+
+/// A preconnected fd's session reads only in its calls, and hears of the server's end all the same.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn a_preconnected_session_runs_its_recipient_when_the_server_ends() {
+    use rsbinder::rpc::transport::UnixTransport;
+    use std::os::fd::OwnedFd;
+
+    let (client_stream, server_stream) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let path = tmp_sock("pcfd_death");
+    // The server object needs a listener to exist; it is never run.
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    server.set_android13plus(2);
+    server
+        .set_root(make_service(Arc::new(AtomicI64::new(0))))
+        .expect("set_root");
+    server.serve_connection(Box::new(
+        UnixTransport::from_stream(server_stream).expect("server transport"),
+    ));
+    let client = RpcSession::from_preconnected_fd(OwnedFd::from(client_stream), 2)
+        .expect("android-13+ handshake over a preconnected fd");
+    let root = client.get_root().expect("root");
+    let (tx, died) = std::sync::mpsc::sync_channel::<()>(1);
+    let flag: Arc<DeathFlag> = Arc::new(DeathFlag(tx));
+    root.link_to_death(Arc::downgrade(&flag) as _)
+        .expect("the link");
+    server.terminate();
+    assert!(died.recv_timeout(Duration::from_secs(5)).is_ok());
+    assert!(client.is_ended());
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Plan 2-21 B-4: an `AF_INET` fd in `from_preconnected_fd` handshakes via `TcpDebugTransport`.

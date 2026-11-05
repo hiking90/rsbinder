@@ -225,8 +225,10 @@ impl<T: Payload> Subscriber<T> {
     /// One twoway call; after it, receiving makes none. The refusals of the publisher come back
     /// as it sent them ([`Acceptor::accept`](crate::Acceptor::accept) lists them, and an
     /// application's `ITopic` may refuse with `EX_SECURITY`). Of its own, `request` returns
-    /// `InvalidOperation` for an RPC binder of a session with no incoming connection, which would
-    /// not learn of its publisher's death, what the parcel answers to the fds of a session that
+    /// `InvalidOperation` for an RPC binder of a live session with no callback connection
+    /// (`TransportCaps::CALLBACKS`: one the publisher can call on, whichever end opened it), which
+    /// the publisher could not tell of an eviction, `DeadObject` for one of a session that has
+    /// ended, what the parcel answers to the fds of a session that
     /// passes none, `EX_UNSUPPORTED_OPERATION` where topics cannot work
     /// (off Linux and Android, or on a kernel without `F_SEAL_FUTURE_WRITE`),
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
@@ -254,6 +256,9 @@ impl<T: Payload> Subscriber<T> {
         start: impl FnOnce(RingId) -> Start,
     ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
+        // The publisher's call on the token tells of an eviction, and needs a connection to go on.
+        use rsbinder::TransportCaps as Caps;
+        Caps::__require_of_binder(topic, Caps::CALLBACKS, "a topic subscription")?;
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
         let local = Arc::new(Local::new());

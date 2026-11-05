@@ -2967,6 +2967,7 @@ impl core::fmt::Debug for rsbinder::rpc::transport::MemTransport
 pub fn rsbinder::rpc::transport::MemTransport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::MemTransport
 pub fn rsbinder::rpc::transport::MemTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::MemTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::MemTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::MemTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::MemTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3002,6 +3003,7 @@ impl core::fmt::Debug for rsbinder::rpc::transport::UnixTransport
 pub fn rsbinder::rpc::transport::UnixTransport::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::UnixTransport
 pub fn rsbinder::rpc::transport::UnixTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::UnixTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::UnixTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::UnixTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::UnixTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3029,6 +3031,7 @@ impl core::panic::unwind_safe::UnwindSafe for rsbinder::rpc::transport::UnixTran
 pub const rsbinder::rpc::transport::MAX_FRAME_LEN: usize
 pub trait rsbinder::rpc::transport::RpcTransport: core::marker::Send + core::marker::Sync
 pub fn rsbinder::rpc::transport::RpcTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::RpcTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::RpcTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::RpcTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::RpcTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3048,6 +3051,7 @@ pub fn rsbinder::rpc::transport::RpcTransport::shutdown_handle(&self) -> core::o
 pub fn rsbinder::rpc::transport::RpcTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::MemTransport
 pub fn rsbinder::rpc::transport::MemTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::MemTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::MemTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::MemTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::MemTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3067,6 +3071,7 @@ pub fn rsbinder::rpc::transport::MemTransport::shutdown_handle(&self) -> core::o
 pub fn rsbinder::rpc::transport::MemTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::UnixTransport
 pub fn rsbinder::rpc::transport::UnixTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::UnixTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::UnixTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::UnixTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::UnixTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3485,6 +3490,7 @@ impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::rpc::SessionEnd
 impl core::panic::unwind_safe::UnwindSafe for rsbinder::rpc::SessionEnd
 pub trait rsbinder::rpc::RpcTransport: core::marker::Send + core::marker::Sync
 pub fn rsbinder::rpc::RpcTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::RpcTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::RpcTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::RpcTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::RpcTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3504,6 +3510,7 @@ pub fn rsbinder::rpc::RpcTransport::shutdown_handle(&self) -> core::option::Opti
 pub fn rsbinder::rpc::RpcTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::MemTransport
 pub fn rsbinder::rpc::transport::MemTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::MemTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::MemTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::MemTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::MemTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>
@@ -3523,6 +3530,7 @@ pub fn rsbinder::rpc::transport::MemTransport::shutdown_handle(&self) -> core::o
 pub fn rsbinder::rpc::transport::MemTransport::supports_fd_passing(&self) -> bool
 impl rsbinder::rpc::transport::RpcTransport for rsbinder::rpc::transport::UnixTransport
 pub fn rsbinder::rpc::transport::UnixTransport::describe(&self) -> &str
+pub fn rsbinder::rpc::transport::UnixTransport::peer_close_fd(&self) -> core::option::Option<std::os::fd::owned::BorrowedFd<'_>>
 pub fn rsbinder::rpc::transport::UnixTransport::peer_closed(&self) -> core::option::Option<bool>
 pub fn rsbinder::rpc::transport::UnixTransport::peer_identity(&self) -> rsbinder::rpc::transport::PeerIdentity
 pub fn rsbinder::rpc::transport::UnixTransport::recv_frame(&self) -> rsbinder::rpc::RpcResult<alloc::vec::Vec<u8>>

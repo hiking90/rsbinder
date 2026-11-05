@@ -358,7 +358,7 @@ impl std::fmt::Debug for DeathSignal {
 /// - [`StatusCode::InvalidOperation`] for a local binder (`Binder<T>` does not
 ///   support death notification — there is no remote process to lose).
 /// - [`StatusCode::InvalidOperation`] for an RPC proxy whose session nothing
-///   serves (see *Requirements*).
+///   serves or can watch (see *Requirements*).
 /// - Whatever registering the notification reports otherwise.
 ///
 /// # Requirements
@@ -369,10 +369,12 @@ impl std::fmt::Debug for DeathSignal {
 ///   transaction. A pure client with neither never observes the death, and this
 ///   future stays pending — the same condition as
 ///   [`crate::SIBinder::link_to_death_arc`].
-/// - **RPC:** death is the session's connection dropping, so the session has to
-///   be served (`spawn_serve`/`serve_blocking`, or a client with incoming
-///   connections); otherwise the link is refused with
-///   [`StatusCode::InvalidOperation`].
+/// - **RPC:** death is the session's connection dropping. A session that is
+///   served (`spawn_serve`/`serve_blocking`, or a client with incoming
+///   connections) reads that, and on Linux and Android the link starts a thread
+///   that watches any other session's sockets. Where neither is possible the link
+///   is refused with [`StatusCode::InvalidOperation`]; see
+///   [`link_to_death`](crate::IBinder::link_to_death) on `RpcProxy`.
 pub fn death_signal(binder: &SIBinder) -> Result<DeathSignal, StatusCode> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let recipient = Arc::new(SignalRecipient(Mutex::new(Some(tx))));

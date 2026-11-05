@@ -104,15 +104,36 @@ impl rsbinder::DeathRecipient for Died {
     }
 }
 
+/// The publisher's word of an eviction is a call on the token, with no connection to go on here.
 #[test]
-fn a_session_that_would_not_notice_its_end_is_refused_a_death_link() {
+fn a_session_with_no_incoming_connection_is_refused_a_subscription() {
     let publisher = publisher();
     let (name, server) = serve(publisher.as_binder());
     let session = connect(&name, 0);
     let topic = session.get_root().unwrap();
-    let refused = link_death(&topic, Died(Arc::default())).err();
-    assert_eq!(refused, Some(StatusCode::InvalidOperation));
+    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    assert_eq!(
+        refused.err().map(|e| e.transaction_error()),
+        Some(StatusCode::InvalidOperation)
+    );
+    assert_eq!(publisher.subscriber_count(), 0);
     session.close_session();
+    server.terminate();
+}
+
+/// An ended session is gone, not refused: `DeadObject` sends a named subscriber to its lookup.
+#[test]
+fn a_session_that_has_ended_answers_a_subscription_with_dead_object() {
+    let publisher = publisher();
+    let (name, server) = serve(publisher.as_binder());
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    session.close_session();
+    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    assert_eq!(
+        refused.err().map(|e| e.transaction_error()),
+        Some(StatusCode::DeadObject)
+    );
     server.terminate();
 }
 

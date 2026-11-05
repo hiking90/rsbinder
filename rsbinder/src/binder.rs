@@ -352,11 +352,12 @@ pub trait IBinder: Any + Send + Sync {
     /// strong reference left, which could never fire.
     ///
     /// Over the RPC transport, death is detected as a dropped session
-    /// connection rather than a kernel `BR_DEAD_BINDER`, and the link is
-    /// refused with `InvalidOperation` unless this side's session notices a
-    /// connection loss: the server side, a client with incoming
-    /// connections, or a session whose serve loop runs (`spawn_serve` /
-    /// `serve_blocking`); see the `rpc` proxy implementation for details.
+    /// connection rather than a kernel `BR_DEAD_BINDER`. The server side, a
+    /// client with incoming connections and a session whose serve loop runs
+    /// (`spawn_serve` / `serve_blocking`) read that from the connection. Any
+    /// other session starts a thread that watches its sockets on Linux and
+    /// Android, and is refused with `InvalidOperation` where it cannot; see
+    /// the `rpc` proxy implementation for details.
     fn link_to_death(&self, recipient: sync::Weak<dyn DeathRecipient>) -> Result<()>;
 
     /// Remove a previously registered death notification.

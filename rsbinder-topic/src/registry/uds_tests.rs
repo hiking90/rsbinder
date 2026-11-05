@@ -1208,6 +1208,75 @@ fn a_session_closed_for_a_refusal_is_not_made_again_for_its_generation() {
     watch.end();
 }
 
+/// A reply that lost its fd, or a host out of descriptors: a round asks, with no notice.
+#[test]
+fn a_failed_reply_asks_again_with_no_notice_unless_the_session_ended() {
+    for failure in [
+        StatusCode::BadValue,
+        StatusCode::FailedTransaction,
+        StatusCode::Errno(libc::EMFILE),
+    ] {
+        let fixture = Fixture::new("failed_reply", AllowAll);
+        let raw = fixture.raw();
+        let (_publisher, _serving, _address, _generation) = served(&raw, "a.name");
+        let resolver = fixture.resolver();
+        let told = Arc::new(AtomicU32::new(0));
+        let count = told.clone();
+        let watch = resolver.reconciler(
+            "a.name",
+            Box::new(move |_| {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let ended = watch.asks_again_unless_ended(Err(StatusCode::DeadObject.into()));
+        assert!(ended.is_err());
+        assert!(watch.idle(), "a session that ended has no one to ask");
+        assert!(watch.asks_again_unless_ended(Err(failure.into())).is_err());
+        eventually("a round after the failed reply", || {
+            told.load(Ordering::SeqCst) == 1
+        });
+        watch.end();
+    }
+}
+
+/// A panic ends the call that asked and leaves the session, so one lookup alone fails.
+#[derive(Default)]
+struct NextLookupFails(AtomicU32);
+
+impl RegistryAccess for Arc<NextLookupFails> {
+    fn allows(&self, action: Action, _: &str, _: &Caller) -> bool {
+        if action == Action::Subscribe {
+            assert_eq!(self.0.swap(0, Ordering::SeqCst), 0, "this call fails");
+        }
+        true
+    }
+}
+
+/// `lookup` itself goes on in a round after a failed call the host really answered.
+#[test]
+fn a_lookup_the_host_failed_is_asked_again_with_no_notice() {
+    let access = Arc::new(NextLookupFails::default());
+    let fixture = Fixture::new("failed_lookup", access.clone());
+    let raw = fixture.raw();
+    let (_publisher, _serving, _address, _generation) = served(&raw, "a.name");
+    access.0.store(1, Ordering::SeqCst);
+    let resolver = fixture.resolver();
+    let told = Arc::new(AtomicU32::new(0));
+    let count = told.clone();
+    let watch = resolver.reconciler(
+        "a.name",
+        Box::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    let failed = watch.lookup().map(|_| ()).unwrap_err();
+    assert_ne!(failed.transaction_error(), StatusCode::DeadObject);
+    eventually("a round after the failed lookup", || {
+        told.load(Ordering::SeqCst) == 1
+    });
+    watch.end();
+}
+
 /// A notice brings no descriptor: with none free the session lives, and the watch asks once one is.
 #[test]
 fn a_process_with_no_descriptor_free_keeps_its_session_and_connects_later() {
@@ -1230,7 +1299,7 @@ fn a_process_with_no_descriptor_free_keeps_its_session_and_connects_later() {
         while let Ok(next) = file.try_clone() {
             filling.push(next);
         }
-        // Another watch, as a process with none free can make, and a lookup of its own.
+        // Another watch, as a process with none free can make; its lookup's reply would lose an fd.
         let other = resolver
             .watch_resolved("a.other", Box::new(|_| {}))
             .expect("a watch brings no descriptor");
@@ -1246,6 +1315,14 @@ fn a_process_with_no_descriptor_free_keeps_its_session_and_connects_later() {
     }
     let fixture = Fixture::new("no_descriptor", AllowAll);
     let raw = fixture.raw();
+    let (other_publisher, other_topic) = topic();
+    let other = raw.registry.r#allocate("a.other", &other_topic).unwrap();
+    let other_socket = OwnedFd::from(other.socket.unwrap());
+    let other_server = RpcServer::setup_unix_server_from_bound_fd(other_socket).unwrap();
+    let _other_serving = uds::serve(&other_server, other_publisher.as_binder()).unwrap();
+    raw.registry
+        .r#commit("a.other", &other_topic, other.allocation)
+        .unwrap();
     let (publisher, topic) = topic();
     let allocation = raw.registry.r#allocate("a.full", &topic).unwrap();
     let socket = OwnedFd::from(allocation.socket.unwrap());

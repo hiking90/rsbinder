@@ -137,6 +137,34 @@ impl TransportCaps {
     /// every bit.
     pub const KERNEL: Self = Self(0b1_1111);
 
+    /// Not part of the API: what a call on `binder` has. An RPC proxy answers from its session;
+    /// anything else is local or kernel and always callable.
+    #[doc(hidden)]
+    pub fn __of_binder(binder: &crate::SIBinder) -> Self {
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            return proxy.session_caps();
+        }
+        #[cfg(not(feature = "rpc"))]
+        let _ = binder;
+        Self::KERNEL
+    }
+
+    /// Not part of the API: [`require`](Self::require) on what a call on `binder` has. A session
+    /// that has ended lacks every connection, and that is `DeadObject`, not a setup to correct.
+    #[doc(hidden)]
+    pub fn __require_of_binder(binder: &crate::SIBinder, needed: Self, what: &str) -> Result<()> {
+        let caps = Self::__of_binder(binder);
+        // After `caps`: an end that emptied the slots has moved the lifecycle by then.
+        #[cfg(feature = "rpc")]
+        if let Some(proxy) = (**binder).as_any().downcast_ref::<crate::rpc::RpcProxy>() {
+            if proxy.session().is_ended() {
+                return Err(StatusCode::DeadObject);
+            }
+        }
+        caps.require(needed, what)
+    }
+
     /// Whether every bit in `other` is set here. `contains(NONE)` is
     /// always true.
     pub const fn contains(self, other: Self) -> bool {
