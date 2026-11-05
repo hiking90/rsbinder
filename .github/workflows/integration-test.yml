@@ -683,6 +683,18 @@ jobs:
             exit 1
           }
 
+      - name: Run the overwrite soak tests
+        # This core moves a store ahead of the `Release` store before it, which Apple cores were
+        # not seen to do: without the rings' release fences these two fail here (plan 19 §6.6).
+        env:
+          RSBINDER_FMQ_SOAK_SECS: 60
+          RSBINDER_TOPIC_SOAK_SECS: 60
+        run: |
+          cargo test --release -p rsbinder-fmq --test unsync_two_process \
+            elements_read_while_the_writer_overwrites_are_whole -- --exact
+          cargo test --release -p rsbinder-topic --lib \
+            ring::mapped_tests::records_received_while_the_publisher_overwrites_are_whole -- --exact
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v7

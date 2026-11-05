@@ -335,9 +335,9 @@ impl Stores for Stored {
         self.half.store(position, Ordering::Release);
     }
 
-    fn bump_seq(&self) -> u32 {
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-        seq.wrapping_add(1)
+    fn store_seq(&self, seq: u32) {
+        // `Release`: a wait that loads this value then finds the commit it announces.
+        self.seq.store(seq, Ordering::Release);
     }
 
     fn wake_seq(&self) {
@@ -349,8 +349,12 @@ impl Stores for Stored {
         let capacity = self.ring.len();
         let offset = ring_offset(capacity, position, src.len());
         shm::ring_parts(capacity, offset, src.len(), |at, range| {
-            self.ring.store_release(at, &src[range]);
+            self.ring.store(at, &src[range]);
         });
+    }
+
+    fn fence(&self) {
+        std::sync::atomic::fence(Ordering::Release);
     }
 }
 

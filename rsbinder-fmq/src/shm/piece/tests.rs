@@ -1,7 +1,7 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering::Relaxed, Ordering::Release};
 
 use super::*;
 use crate::shm::Mapping;
@@ -94,7 +94,7 @@ fn copies_round_trip_at_every_start_and_length() {
 fn elements_copy_as_their_bytes_and_the_ordered_copies_move_the_same_bytes() {
     let bytes = carve(64).bytes(4, 40).unwrap();
     let src = [0x0102_0304u32, 0xa0b0_c0d0, 7];
-    bytes.store_release(4, &src);
+    bytes.store(4, &src);
     let mut out = [0u32; 3];
     bytes.load_acquire(4, &mut out);
     assert_eq!(out, src);
@@ -127,7 +127,6 @@ fn copies_of_no_byte_touch_nothing() {
     assert!(empty.is_empty());
     for area in [&empty, &bytes] {
         area.store(area.len(), &[0u8; 0]);
-        area.store_release(0, &[0u8; 0]);
         area.load(area.len(), &mut [0u8; 0]);
         area.load_acquire(0, &mut [0u8; 0]);
         let mut held = vec![1u8, 2, 3];
@@ -313,7 +312,7 @@ fn wrapped_copies_race_as_atomics() {
             for i in 0..rounds {
                 let src = [(i % 2) as u8 * 0xaa; WORD + 3];
                 ring_parts(capacity, WORD + 5, src.len(), |at, range| {
-                    ring.store_release(at, &src[range]);
+                    ring.store(at, &src[range]);
                 });
             }
         });
@@ -353,8 +352,8 @@ fn a_partial_store_keeps_its_neighbours() {
     });
 }
 
-/// The order `store_release` and `load_acquire` give. Natively x86 keeps it with relaxed copies
-/// too; Miri does not.
+/// The order a release fence before `store` and `load_acquire` give. Natively x86 keeps it with no
+/// fence too; Miri does not.
 #[test]
 fn a_byte_read_orders_the_reader_after_the_writers_announcement() {
     let (repeats, rounds) = if cfg!(miri) { (1, 30) } else { (200, 200u8) };
@@ -368,7 +367,8 @@ fn a_byte_read_orders_the_reader_after_the_writers_announcement() {
             s.spawn(move || {
                 for round in 1..=rounds {
                     announced.store(usize::from(round), Relaxed);
-                    bytes.store_release(offset, &vec![round; len]);
+                    fence(Release);
+                    bytes.store(offset, &vec![round; len]);
                 }
             });
             s.spawn(move || {

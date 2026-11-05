@@ -658,8 +658,8 @@ impl Stores for Shared {
         self.0.store_half(position);
     }
 
-    fn bump_seq(&self) -> u32 {
-        self.0.bump_seq()
+    fn store_seq(&self, seq: u32) {
+        self.0.store_seq(seq);
     }
 
     fn wake_seq(&self) {
@@ -668,6 +668,10 @@ impl Stores for Shared {
 
     fn store_ring(&self, position: u64, src: &[u8]) {
         self.0.store_ring(position, src);
+    }
+
+    fn fence(&self) {
+        Stores::fence(&*self.0);
     }
 }
 

@@ -47,6 +47,8 @@ enum Flaw {
     None,
     /// The publisher loads `state` after bumping `seq` with no `SeqCst` fence between.
     NoFence,
+    /// The publisher stores `seq` `Relaxed`: a wait can load it and still find the old `write`.
+    RelaxedSeq,
     /// A waker in this process wakes once instead of until the wait is out.
     WakeOnce,
     /// A raise here wakes the bit after its wait's, as one naming another subscriber's would.
@@ -225,7 +227,13 @@ fn publish(model: &Arc<Model>) {
     if model.lapped {
         model.half.fetch_add(1, Ordering::Release);
     }
-    let seq = model.seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    // The writer's own count: nothing else stores this word.
+    let seq = model.seq.load(Ordering::Relaxed).wrapping_add(1);
+    let order = match model.flaw {
+        Flaw::RelaxedSeq => Ordering::Relaxed,
+        _ => Ordering::Release,
+    };
+    model.seq.store(seq, order);
     if model.flaw != Flaw::NoFence {
         fence(Ordering::SeqCst);
     }
@@ -371,6 +379,12 @@ fn loom_wait_a_commit_ends_a_wait() {
 #[should_panic(expected = "deadlock")]
 fn loom_wait_a_publisher_without_its_fence_sleeps_through() {
     a_commit_ends_a_wait(Flaw::NoFence);
+}
+
+#[test]
+#[should_panic(expected = "deadlock")]
+fn loom_wait_a_relaxed_seq_sleeps_through() {
+    a_commit_ends_a_wait(Flaw::RelaxedSeq);
 }
 
 /// A reader the publisher lapped, a commit, and looks that find nothing until `half` is stored.

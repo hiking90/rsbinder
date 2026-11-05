@@ -342,14 +342,14 @@ impl Area {
     }
 
     #[inline]
-    fn merge(&self, index: usize, shift: usize, part: &[u8], order: Ordering) {
+    fn merge(&self, index: usize, shift: usize, part: &[u8]) {
         let word = self.word(index);
         let mut seen = word.load(Ordering::Relaxed);
         loop {
             let mut bytes = seen.to_ne_bytes();
             bytes[shift..shift + part.len()].copy_from_slice(part);
             let next = usize::from_ne_bytes(bytes);
-            match word.compare_exchange_weak(seen, next, order, Ordering::Relaxed) {
+            match word.compare_exchange_weak(seen, next, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(now) => seen = now,
             }
@@ -369,12 +369,12 @@ impl Area {
     }
 
     #[inline]
-    fn store(&self, off: usize, src: &[u8], order: Ordering) {
+    fn store(&self, off: usize, src: &[u8]) {
         if let Some(words) = self.whole_words(off, src.len()) {
             for (d, s) in words.iter().zip(src.chunks_exact(WORD)) {
                 d.store(
                     usize::from_ne_bytes(s.try_into().expect("a whole word")),
-                    order,
+                    Ordering::Relaxed,
                 );
             }
             return;
@@ -382,11 +382,11 @@ impl Area {
         let cut = self.cut(off, src.len());
         let (head, mut src) = src.split_at(cut.head.len());
         for (d, s) in self.bytes_at(cut.head.start, head.len()).iter().zip(head) {
-            d.store(*s, order);
+            d.store(*s, Ordering::Relaxed);
         }
         if let Some((index, shift, n)) = cut.lead {
             let (part, rest) = src.split_at(n);
-            self.merge(index, shift, part, order);
+            self.merge(index, shift, part);
             src = rest;
         }
         let (whole, rest) = src.split_at(cut.whole.1 * WORD);
@@ -394,13 +394,13 @@ impl Area {
         for (d, s) in words.iter().zip(whole.chunks_exact(WORD)) {
             d.store(
                 usize::from_ne_bytes(s.try_into().expect("a whole word")),
-                order,
+                Ordering::Relaxed,
             );
         }
         src = rest;
         if let Some((index, n)) = cut.trail {
             let (part, rest) = src.split_at(n);
-            self.merge(index, 0, part, order);
+            self.merge(index, 0, part);
             src = rest;
         }
         for (d, s) in self
@@ -408,7 +408,7 @@ impl Area {
             .iter()
             .zip(src)
         {
-            d.store(*s, order);
+            d.store(*s, Ordering::Relaxed);
         }
     }
 
@@ -519,11 +519,11 @@ unsafe impl Sync for Area {}
 /// bytes and do not publish them. The protocol around them orders the copy
 /// against whatever counter says the bytes are there (a `Release` store of
 /// the counter after `store`, an `Acquire` load before `load`).
-/// [`store_release`](Self::store_release) and
-/// [`load_acquire`](Self::load_acquire) are for a protocol in which the bytes
+/// [`load_acquire`](Self::load_acquire) is for a protocol in which the bytes
 /// themselves carry the order: one whose writer may overwrite bytes a reader
 /// is copying, and whose reader finds out afterwards from a word the writer
-/// stored before it started.
+/// stored before it started. The writer's side of it is a
+/// `fence(Ordering::Release)` between that word and its `store`s.
 ///
 /// Offsets and lengths are in bytes from the area's start, for elements of
 /// any [`Element`] type. A range past the area's end is a panic: callers
@@ -550,24 +550,7 @@ impl Bytes {
     /// When `offset + size_of_val(src)` exceeds [`len`](Self::len).
     #[inline]
     pub fn store<T: Element>(&self, offset: usize, src: &[T]) {
-        self.0.store(offset, bytes_of(src), Ordering::Relaxed);
-    }
-
-    /// Copy `src` to the bytes at `offset` with `Release` stores.
-    ///
-    /// Whatever this thread did before the call — a store to a word that
-    /// announces the write, say — happens before a
-    /// [`load_acquire`](Self::load_acquire) that reads any byte this call
-    /// stored. That holds for each byte on its own: a reader that overlaps
-    /// the copy may get some bytes of this store and some older ones, and is
-    /// ordered after this thread's earlier actions if it got at least one.
-    ///
-    /// # Panics
-    ///
-    /// As [`store`](Self::store).
-    #[inline]
-    pub fn store_release<T: Element>(&self, offset: usize, src: &[T]) {
-        self.0.store(offset, bytes_of(src), Ordering::Release);
+        self.0.store(offset, bytes_of(src));
     }
 
     /// Copy the bytes at `offset` to `dst` with relaxed loads.
@@ -581,8 +564,13 @@ impl Bytes {
     }
 
     /// Copy the bytes at `offset` to `dst`, and be ordered after every
-    /// [`store_release`](Self::store_release) whose bytes the copy read. The
-    /// loads are `Relaxed` and one `fence(Ordering::Acquire)` follows them.
+    /// `fence(Ordering::Release)` that came before a [`store`](Self::store)
+    /// whose bytes the copy read: what the storing thread did before that
+    /// fence happens before this call returns. That holds for each byte on
+    /// its own: a copy that overlaps the store may get some bytes of it and
+    /// some older ones, in no order, and is ordered after the fence if it got
+    /// at least one. The loads are `Relaxed` and one `fence(Ordering::Acquire)`
+    /// follows them.
     ///
     /// # Panics
     ///
