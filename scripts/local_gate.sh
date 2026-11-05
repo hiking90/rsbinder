@@ -141,11 +141,12 @@ rpc_suite_soak() {
 }
 
 big_endian() {
-    local s390=(cross test -p rsbinder --target s390x-unknown-linux-gnu)
+    # A target dir of its own: the container's registry path dirties host units in target/debug.
+    local s390=(cross test -p rsbinder --target s390x-unknown-linux-gnu --target-dir target/cross)
     tpass cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
         tpass cargo test -p rsbinder --no-default-features --lib blob:: &&
         "${s390[@]}" --no-default-features --lib parcel --no-run &&
-        file target/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | grep 'MSB.*IBM S/390' &&
+        file target/cross/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | grep 'MSB.*IBM S/390' &&
         tpass "${s390[@]}" --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
         tpass "${s390[@]}" --no-default-features --lib binder_object:: &&
         tpass "${s390[@]}" --features rpc,rpc-tcp-debug --lib file_descriptor:: &&
@@ -163,17 +164,24 @@ public_api() {
         diff -u api/rsbinder-fmq.txt "$out-fmq.txt"
 }
 
+# `cargo miri test ARGS` under seeds 0-7 at once, which fails if any seed fails. The seeds' output
+# interleaves and libtest writes `test result: ok` apart from the counts, so only the counts are
+# matched: tpass could call a passing run failed.
+miri_seeds() {
+    local out rc
+    out=$(env CARGO_TARGET_DIR=target/miri MIRIFLAGS=-Zmiri-many-seeds=0..8 \
+        cargo +nightly-2026-05-25 miri test "$@" 2>&1)
+    rc=$?
+    printf '%s\n' "$out"
+    [ $rc -eq 0 ] && grep -qE '\. [1-9][0-9]* passed' <<<"$out"
+}
+
 # The carved pieces (`shm::piece`), the queue's `Regions` and the unsynchronized queue's two
 # cores under Miri. The copies that race need Miri's weak-memory emulation, and it is what tells
 # `Release`/`Acquire` from `Relaxed` (x86 runs both as the same code); it also refuses a byte
 # accessed at two sizes, which the pieces never do.
 miri_fmq() {
-    local seed dir=CARGO_TARGET_DIR=target/miri
-    local miri=(cargo +nightly-2026-05-25 miri test -p rsbinder-fmq --lib --)
-    for seed in 0 1 2 3 4 5 6 7; do
-        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" "${miri[@]}" \
-            shm::piece unsync::tests queue::tests || return 1
-    done
+    miri_seeds -p rsbinder-fmq --lib -- shm::piece unsync::tests queue::tests
 }
 
 # The topic ring over heap memory under Miri: the two tests in which a reader copies records while
@@ -181,12 +189,8 @@ miri_fmq() {
 # ring would be an out-of-bounds access. The other tests of `ring::tests` publish thousands of
 # records to one thread and add nothing here for the minutes they take.
 miri_topic() {
-    local seed dir=CARGO_TARGET_DIR=target/miri
-    for seed in 0 1 2 3 4 5 6 7; do
-        tpass env "$dir" MIRIFLAGS="-Zmiri-seed=$seed" \
-            cargo +nightly-2026-05-25 miri test -p rsbinder-topic --lib -- image::tests \
-            ring::tests::records_returned ring::tests::a_copy_that || return 1
-    done
+    miri_seeds -p rsbinder-topic --lib -- image::tests \
+        ring::tests::records_returned ring::tests::a_copy_that
 }
 
 semver() {
