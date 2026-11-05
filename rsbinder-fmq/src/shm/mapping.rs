@@ -455,7 +455,7 @@ mod tests {
         let (seen_word, seen) = (ro.word32(0).unwrap(), ro.bytes(5, 50).unwrap());
         word.store(0x1234_5678, Ordering::Release);
         let src: Vec<u8> = (0..50).map(|i| i as u8 ^ 0x3c).collect();
-        bytes.store_release(0, &src);
+        bytes.store(0, &src);
         let mut out = vec![0u8; 50];
         seen.load_acquire(0, &mut out);
         assert_eq!((seen_word.load_acquire(), out), (0x1234_5678, src));

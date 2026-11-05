@@ -11,7 +11,6 @@ pub fn rsbinder_fmq::shm::Bytes::load<T: rsbinder_fmq::Element>(&self, usize, &m
 pub fn rsbinder_fmq::shm::Bytes::load_acquire<T: rsbinder_fmq::Element>(&self, usize, &mut [T])
 pub fn rsbinder_fmq::shm::Bytes::load_extend(&self, usize, usize, &mut alloc::vec::Vec<u8>)
 pub fn rsbinder_fmq::shm::Bytes::store<T: rsbinder_fmq::Element>(&self, usize, &[T])
-pub fn rsbinder_fmq::shm::Bytes::store_release<T: rsbinder_fmq::Element>(&self, usize, &[T])
 impl core::clone::Clone for rsbinder_fmq::shm::Bytes
 pub fn rsbinder_fmq::shm::Bytes::clone(&self) -> Self
 impl core::fmt::Debug for rsbinder_fmq::shm::Bytes

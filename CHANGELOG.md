@@ -778,11 +778,11 @@ says what a peer does with the 0.12.0 value.
     methods, so that code naming it compiles everywhere:
     `RoWord64::PRESENT` tells the two apart, and there `RoCarve::word64`
     returns `Unsupported`.
-  - `Bytes::store_release` and `load_acquire` copy with an order: a reader
-    that got any byte of a `store_release` is ordered after what the writer
-    did before it, which lets a reader detect that its copy was overwritten.
-    `load_acquire` is relaxed loads and one acquire fence, so it is defined
-    through a read-only mapping.
+  - `Bytes::load_acquire` copies with an order: a reader that got any byte
+    of a `store` that follows a `fence(Ordering::Release)` is ordered after
+    what the writer did before that fence, which lets a reader detect that
+    its copy was overwritten. `load_acquire` is relaxed loads and one acquire
+    fence, so it is defined through a read-only mapping.
   - `Bytes::load_extend` and `RoBytes::load_extend` append bytes of the
     area to a `Vec<u8>`: the loads of `load`, relaxed and with no fence,
     written into the vector's spare capacity without zeroing it first. The

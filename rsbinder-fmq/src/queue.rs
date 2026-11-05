@@ -321,7 +321,7 @@ impl<T: Element> MessageQueue<T> {
     /// The ring's `n` elements at counter value `position`, borrowed apart from the state.
     fn regions_at(&mut self, position: u64, n: usize) -> (&mut State<T>, Regions<'_, T>) {
         assert!(n <= self.state.capacity, "more elements than the capacity");
-        let regions = Regions::over(&self.ring, position, n, false);
+        let regions = Regions::over(&self.ring, position, n);
         (&mut self.state, regions)
     }
 
@@ -990,9 +990,9 @@ impl<T: Element> std::fmt::Debug for MessageQueue<T> {
 /// caller's slice is ordinary memory on the other side of the copy. `'a` is
 /// a shared borrow of the ring, which the transaction takes apart from the
 /// mutable borrow of the queue's or writer's other state, so the ring stays
-/// mapped while a `Regions` lives. The regions of an
-/// [`UnsyncWriter`](crate::UnsyncWriter) differ in one respect: their
-/// stores are `Release`, the order that flavor's readers depend on.
+/// mapped while a `Regions` lives. An
+/// [`UnsyncWriter`](crate::UnsyncWriter) runs a release fence before it hands
+/// out its regions, the order that flavor's readers depend on.
 ///
 /// A change made to the ring from outside — the peer process, another
 /// handle in this process (each handle `mmap`s the memory itself: a second
@@ -1016,14 +1016,12 @@ pub struct Regions<'a, T: Element> {
     first_at: usize,
     first_len: usize,
     second_len: usize,
-    /// `write_at` stores with `Release`: the order the unsynchronized writer's readers need.
-    release: bool,
     _element: PhantomData<fn() -> T>,
 }
 
 impl<'a, T: Element> Regions<'a, T> {
     /// `n` elements of `ring` at counter value `position`; a span past the ring panics at the copy.
-    pub(crate) fn over(ring: &'a Bytes, position: u64, n: usize, release: bool) -> Self {
+    pub(crate) fn over(ring: &'a Bytes, position: u64, n: usize) -> Self {
         let q = size_of::<T>();
         let bytes = ring.len();
         let first_at = (position % bytes as u64) as usize;
@@ -1039,7 +1037,6 @@ impl<'a, T: Element> Regions<'a, T> {
             first_at,
             first_len,
             second_len,
-            release,
             _element: PhantomData,
         }
     }
@@ -1096,11 +1093,7 @@ impl<T: Element> Regions<'_, T> {
             return Err(Error::BadValue("write past the reserved elements"));
         }
         self.parts(start, src.len(), |at, range| {
-            if self.release {
-                self.ring.store_release(at, &src[range]);
-            } else {
-                self.ring.store(at, &src[range]);
-            }
+            self.ring.store(at, &src[range]);
         });
         Ok(())
     }

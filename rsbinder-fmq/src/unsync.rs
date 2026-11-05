@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::os::fd::AsFd;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{fence, Ordering};
 
 use crate::descriptor::{
     default_layout, recheck_ashmem_sizes, validate, AttachPolicy, Descriptor, Flavor, Grantor,
@@ -142,7 +142,7 @@ impl WriterCore {
         let position = self.counters.reserve((n * size_of::<T>()) as u64)?;
         Ok(UnsyncWriteTxn {
             core: &mut self.counters,
-            regions: Regions::over(&self.ring, position, n, true),
+            regions: Regions::over(&self.ring, position, n),
         })
     }
 }
@@ -159,6 +159,7 @@ impl WriterCounters {
         self.reserved = self.reserved.max(upto);
         // Before any byte of the write: a reader that copies one of them then loads this value.
         self.end.store(self.reserved, Ordering::Release);
+        fence(Ordering::Release);
         Ok(self.written)
     }
 
@@ -308,11 +309,10 @@ impl<T: Element> std::fmt::Debug for UnsyncWriteTxn<'_, T> {
 /// reader that copied elements while the writer was overwriting them loads
 /// the region end after its copy, sees that the reserved region reaches the
 /// position it read from, and discards what it copied
-/// ([`UnsyncRead::Lost`]). The stores into the ring are `Release` and the
-/// reader's loads end with an acquire fence
-/// ([`Bytes::store_release`](shm::Bytes::store_release)), so that check is
-/// ordered in Rust's memory model and not only on the processors it was
-/// tested on.
+/// ([`UnsyncRead::Lost`]). A release fence follows that store, the stores
+/// into the ring are `Relaxed`, and the reader's loads end with an acquire
+/// fence, so that check is ordered in Rust's memory model and not only on the
+/// processors it was tested on.
 ///
 /// One write is at most `capacity - 1` elements. A lapped reader resumes
 /// half a ring behind the writer, which is possible only while less than the
@@ -677,9 +677,9 @@ fn map_counter_ro(desc: &Descriptor, g: Grantor) -> Result<Word<RoWord64>> {
 /// counters again and discards the copy when the write counter or the write
 /// region end is more than one ring past the position it copied from
 /// (libfmq `processOverflow`). The copy's loads end with an acquire fence
-/// and the writer's stores are `Release`
-/// ([`Bytes::store_release`](shm::Bytes::store_release)), so a reader that
-/// copied even one overwritten byte then loads a region end that covers it.
+/// and the writer's release fence comes between the region end and its
+/// stores into the ring, so a reader that copied even one overwritten byte
+/// then loads a region end that covers it.
 ///
 /// That holds against an [`UnsyncWriter`]. Against a libfmq writer the
 /// check is libfmq's own, and as strong as libfmq's:

@@ -23,7 +23,7 @@
 mod common;
 
 use std::os::fd::AsFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rsbinder_fmq::shm::{self, Bytes, CreateOptions, Mapping, Seals, Words};
@@ -482,9 +482,10 @@ impl Foreign {
     /// Store `values` at element `position` and both counters as given, the way a writer would.
     fn put(&self, position: u64, values: &[u32], end: u64, write: u64) {
         self.counters.end().store(end, Ordering::Release);
+        fence(Ordering::Release);
         for (index, value) in values.iter().enumerate() {
             let offset = ((position + index as u64) * 4 % Self::BYTES) as usize;
-            self.ring.store_release(offset, &[*value]);
+            self.ring.store(offset, &[*value]);
         }
         self.counters.write().store(write, Ordering::Release);
     }

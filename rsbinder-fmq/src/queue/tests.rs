@@ -40,15 +40,13 @@ fn regions_copy_atomically() {
         std::thread::scope(|s| {
             let (ring, stored, done) = (&ring, &stored, &done);
             // Each thread makes its own `Regions` over the one ring, at the same split.
-            let regions = move |release: bool| Regions::<u8>::over(ring, position, n, release);
+            let regions = move || Regions::<u8>::over(ring, position, n);
             // The peer breaks the protocol: it keeps storing into the elements this thread copies.
             let peer = s.spawn(move || {
                 let mut i = 0;
                 while !done.load(Relaxed) {
                     let src = vec![PEER[i % 2]; len];
-                    regions(i % 2 == 0)
-                        .write_at(start, &src)
-                        .expect("peer write");
+                    regions().write_at(start, &src).expect("peer write");
                     stored.fetch_add(1, Relaxed);
                     i += 1;
                 }
@@ -64,13 +62,13 @@ fn regions_copy_atomically() {
                 let _stop = Stop(done);
                 let (src, mut out) = (vec![OURS; len], vec![0u8; len]);
                 for round in 0..rounds {
-                    regions(false).write_at(start, &src).expect("write");
+                    regions().write_at(start, &src).expect("write");
                     // The pause is right before the copy: the peer stores between write and read.
                     let seen = stored.load(Relaxed);
                     while stored.load(Relaxed) == seen && !peer.is_finished() {
                         std::thread::yield_now();
                     }
-                    regions(false).read_at(start, &mut out).expect("read");
+                    regions().read_at(start, &mut out).expect("read");
                     let whole = out.iter().all(|b| *b == OURS || PEER.contains(b));
                     assert!(whole, "{shape:?} round {round}: {out:x?}");
                 }
@@ -96,7 +94,7 @@ fn regions_copy_atomically() {
 fn regions_past_the_ring_panic_at_the_copy() {
     let ring = Mapping::heap(RING).unwrap().carve().bytes(0, RING).unwrap();
     // 45 one-byte elements from byte 24: 8 before the wrap, 37 after it, more than the ring.
-    let regions = Regions::<u8>::over(&ring, 24, 45, false);
+    let regions = Regions::<u8>::over(&ring, 24, 45);
     let mut out = [0u8; 45];
     let _ = regions.read_at(0, &mut out);
 }
