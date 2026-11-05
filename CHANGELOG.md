@@ -262,8 +262,9 @@ says what a peer does with the 0.12.0 value.
 - The last drop of an RPC proxy does not wait for the peer on any transport, and
   runs no death recipients on the dropping thread. With no room, a thread's own connection,
   in a reply wait as in a handler, holds the `DEC_STRONG` for its next frame or until the
-  thread gives the connection back, and a thread that drives no connection leaves it to the
-  session's reaper thread, so it can come after the next reply. A transport that cannot send
+  thread gives the connection back, and a thread that drives no connection, or a oneway
+  handler that wrote on a free outgoing connection, leaves it to the session's reaper
+  thread, so it can come after the next reply. A transport that cannot send
   without waiting finds no room on every release: a custom `RpcTransport` without the
   hidden no-wait send, and TLS over a `TlsStream` with no `socket`. On vsock, TLS over
   vsock included, and Apple platforms a handler's `drop` and a `drop` in a reply wait hold the release until the next
@@ -284,16 +285,26 @@ says what a peer does with the 0.12.0 value.
   it, in place of `InvalidOperation`: the recipient is not registered, and a later link can
   try again.
 - A serve loop's own write that fails ends it as `EndReason::Dispatch(status)`, a lost
-  stream, so `into_result()` is `Err(DeadObject)`. 0.12.0's loop wrote only replies, and a
-  `DEC_STRONG` that failed in a `drop` left the loop an end of stream, `Ok(())`. A write
-  that finds the peer closed still reads `EndOfStream`, `Ok(())`, and the session is over
-  by then: a frame the peer queued before it closed is not dispatched, where 0.12.0's loop
-  dispatched it. The receipt of a oneway, written on the loop's connection as the frame's
-  dispatch ends, is such a write: a peer that sends oneways and closes leaves the loop
-  `EndOfStream`, `Ok(())`, where 0.12.0 ended it as `SessionEnded`, `Err(DeadObject)`, and in
-  both the oneways past the first whose receipt finds it closed do not run. A reply wait's
-  write of what its connection holds that fails returns that write's status, `TimedOut` for a
-  send deadline.
+  stream. In 0.12.0 a `DEC_STRONG` that failed on the loop's connection ended the session
+  and the next step read `EndReason::SessionEnded`; `into_result()` is `Err(DeadObject)` in
+  both. A failure on another connection leaves the loop what the shutdown gives it, or
+  `SessionEnded` if the session's end has taken its connection by its next step, and that
+  order can decide between them; in 0.12.0 a failure on the loop's own thread was always
+  `SessionEnded`. A write that finds the peer closed ends the loop with what the read
+  reports, `EndOfStream`, `Ok(())` for a plain close, and the session is over by then: a
+  frame the peer queued before it closed is not dispatched. 0.12.0's loop wrote nothing
+  ahead of its read and dispatched such a frame. Another thread's release on the loop's
+  connection between frames counts as such a write; if the session's end has taken the
+  connection first there is no read, and it is `EndOfStream` even for a frame the peer cut.
+  The receipt of a oneway is such a write on a loop in an
+  outgoing connection, a client's `serve_blocking` or `spawn_serve`, at the android-13+ wire:
+  a peer that sends oneways and closes leaves that loop `EndOfStream`, `Ok(())`, where 0.12.0
+  ended it as `SessionEnded`, `Err(DeadObject)`, and in both the oneways past the first whose
+  receipt finds it closed do not run. A server's loop with no callback connection writes no
+  receipt and runs them all, as in 0.12.0. A `TRANSACT` that a reply wait, or a loop of a
+  session a fault ended, reads once the session is over runs no handler, where 0.12.0 ran it
+  unless its node was already cleared. A reply wait's write of what its connection holds
+  that fails returns that write's status, `TimedOut` for a send deadline.
 - `Receiver` and `Sink::open` over RPC ask for `TransportCaps::CALLBACKS` first. A live
   session served only by `spawn_serve`, or with no callback connection, gets
   `InvalidOperation` from them in its own process, and a session that has ended gets
@@ -554,7 +565,7 @@ says what a peer does with the 0.12.0 value.
   and receiving makes no binder call. See the book's
   [Topics](https://hiking90.github.io/rsbinder/topics.html) chapter and the
   crate's `examples/`. `Subscriber::request` refuses an RPC binder of a session with
-  no incoming connection with `InvalidOperation`, in its own process: the publisher
+  no callback connection with `InvalidOperation`, in its own process: the publisher
   could not tell it of an eviction. A session that has ended is `DeadObject`.
   - Its feature `uds` (off by default) makes the subscription call over RPC
     on a Unix domain socket, where a binder device cannot be had:
@@ -830,8 +841,9 @@ says what a peer does with the 0.12.0 value.
   goes whole, on TCP and TLS by `POLLOUT` on Linux and Android, TLS over vsock excepted,
   and otherwise holds the release for its next frame or until the thread gives the
   connection back. With no room a thread's own connection, in a reply wait as in a
-  handler, holds it the same way, and for a thread that drives no connection the
-  session's reaper thread writes it once the peer reads, and a peer that takes
+  handler, holds it the same way, and for a thread that drives no connection, or a
+  oneway handler that wrote on a free outgoing connection, the session's reaper thread
+  writes it once the peer reads, and a peer that takes
   nothing for the send deadline loses the session there; 0.12.0's drop waited in
   the write, for as long as a session with no deadline lasts. The reaper's wait
   keeps no session alive: with no incoming connection, the last handle and proxy

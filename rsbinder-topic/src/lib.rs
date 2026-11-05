@@ -81,7 +81,7 @@
 //!
 //! The subscription call never leaves a process whose publisher is in it, so a subscriber of a
 //! publisher of its own process needs no binder device. Over RPC on a Unix domain socket neither
-//! end needs one (`uds`, feature `uds`). A session that cannot pass fds, or has no incoming
+//! end needs one (`uds`, feature `uds`). A session that cannot pass fds, or has no callback
 //! connection for the publisher to tell it of an eviction on, is refused.
 //!
 //! Topics need Linux or Android: a kernel with `F_SEAL_FUTURE_WRITE` (mainline 5.1, the

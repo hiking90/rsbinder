@@ -596,7 +596,8 @@ pub trait RpcTransport: Send + Sync {
     /// [`RpcError::FrameTooLarge`] before anything is sent. `None`, the default, is a transport
     /// that cannot promise this, which finds no room on every release: a thread's own connection,
     /// in a reply wait as in a handler, holds it for its next frame, and a thread that drives no
-    /// connection leaves it to the session's reaper thread.
+    /// connection, or a oneway handler that wrote on a free outgoing connection, leaves it to the
+    /// session's reaper thread.
     #[doc(hidden)]
     fn __send_no_wait(
         &self,

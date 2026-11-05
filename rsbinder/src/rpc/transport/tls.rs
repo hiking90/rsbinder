@@ -257,9 +257,10 @@ pub trait TlsStream: Send + Sync {
     /// socket to look at there is also no send that waits for nothing, so
     /// every release of a remote binder finds no room: a thread's own
     /// connection, in a reply wait as in a handler, holds it for its next
-    /// frame, and a thread that drives no connection leaves it to the
-    /// session's reaper thread, so it can come after the next reply. The
-    /// bundled streams return their socket.
+    /// frame, and a thread that drives no connection, or a oneway handler
+    /// that wrote on a free outgoing connection, leaves it to the session's
+    /// reaper thread, so it can come after the next reply. The bundled
+    /// streams return their socket.
     ///
     /// On Linux and Android a `Some` socket carries more than that send:
     /// every `send_raw` writes to it the same way, and a read with a

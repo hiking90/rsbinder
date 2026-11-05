@@ -549,16 +549,27 @@ bytes, so only a peer that wrote something unusual sees a difference.
   every platform and transport; 0.12.0 refused it with `InvalidOperation` on a session
   with no incoming connection and no serve loop.
 - **A serve loop's own write that fails ends it as `EndReason::Dispatch(status)`**, a
-  lost stream, so `into_result()` is `Err(DeadObject)`. 0.12.0's loop wrote only replies,
-  and a `DEC_STRONG` that failed in a `drop` left the loop an end of stream, `Ok(())`. A
-  write that finds the peer closed still reads `EndOfStream`, `Ok(())`, and the session
-  is over by then: a frame the peer queued before it closed is not dispatched, where
-  0.12.0's loop dispatched it. The receipt of a oneway, written on the loop's connection
-  as the frame's dispatch ends, is such a write: a peer that sends oneways and closes
-  leaves the loop `EndOfStream`, `Ok(())`, where 0.12.0 ended it as `SessionEnded`,
-  `Err(DeadObject)`, and in both the oneways past the first whose receipt finds it closed
-  do not run. A reply wait's write of what its connection holds that fails returns that
-  write's status, `TimedOut` for a send deadline.
+  lost stream. In 0.12.0 a `DEC_STRONG` that failed on the loop's connection ended the
+  session and the next step read `EndReason::SessionEnded`; `into_result()` is
+  `Err(DeadObject)` in both, so only code that matches on `reason` sees a change. A failure
+  on another connection leaves the loop what the shutdown gives it, or `SessionEnded` if
+  the session's end has taken its connection by its next step, and that order can decide
+  between them; in 0.12.0 a failure on the loop's own thread was always `SessionEnded`. A
+  write that finds the peer closed ends the loop with what the read reports, `EndOfStream`,
+  `Ok(())` for a plain close, and the session is over by then: a frame the peer queued
+  before it closed is not dispatched. 0.12.0's loop wrote nothing ahead of its read and
+  dispatched such a frame. Another thread's release on the loop's connection between frames
+  counts as such a write; if the session's end has taken the connection first there is no
+  read, and it is `EndOfStream` even for a frame the peer cut. The receipt of a oneway is
+  such a write on a loop in an outgoing
+  connection, a client's `serve_blocking` or `spawn_serve`, at the android-13+ wire: a peer
+  that sends oneways and closes leaves that loop `EndOfStream`, `Ok(())`, where 0.12.0 ended
+  it as `SessionEnded`, `Err(DeadObject)`, and in both the oneways past the first whose
+  receipt finds it closed do not run. A server's loop with no callback connection writes no
+  receipt and runs them all, as in 0.12.0. A `TRANSACT` that a reply wait, or a loop of a
+  session a fault ended, reads once the session is over runs no handler, where 0.12.0 ran it
+  unless its node was already cleared. A reply wait's write of what its connection holds
+  that fails returns that write's status, `TimedOut` for a send deadline.
 - **`Receiver` and `Sink::open` over RPC ask for `TransportCaps::CALLBACKS`
   before anything else.** A client served only by `spawn_serve` and a live server
   session with no callback connection get `InvalidOperation` from `Receiver::new` in
@@ -670,7 +681,8 @@ bytes, so only a peer that wrote something unusual sees a difference.
   death recipients on the dropping thread.** With no room in the socket a thread's own
   connection, in a reply wait as in a handler, holds the `DEC_STRONG` for its next frame
   or until the thread gives the connection back, and for a thread that drives no
-  connection the session's reaper thread writes it once the peer reads, where 0.12.0's
+  connection, or a oneway handler that wrote on a free outgoing connection, the
+  session's reaper thread writes it once the peer reads, where 0.12.0's
   drop waited in the write. A transport that cannot send without waiting finds no room on
   every release, so a release there can come after the next reply: a custom
   `RpcTransport` without the hidden no-wait send, and TLS over a `TlsStream` with no

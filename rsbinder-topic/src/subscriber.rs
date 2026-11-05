@@ -225,7 +225,8 @@ impl<T: Payload> Subscriber<T> {
     /// One twoway call; after it, receiving makes none. The refusals of the publisher come back
     /// as it sent them ([`Acceptor::accept`](crate::Acceptor::accept) lists them, and an
     /// application's `ITopic` may refuse with `EX_SECURITY`). Of its own, `request` returns
-    /// `InvalidOperation` for an RPC binder of a live session with no incoming connection, which
+    /// `InvalidOperation` for an RPC binder of a live session with no callback connection
+    /// (`TransportCaps::CALLBACKS`: one the publisher can call on, whichever end opened it), which
     /// the publisher could not tell of an eviction, `DeadObject` for one of a session that has
     /// ended, what the parcel answers to the fds of a session that
     /// passes none, `EX_UNSUPPORTED_OPERATION` where topics cannot work

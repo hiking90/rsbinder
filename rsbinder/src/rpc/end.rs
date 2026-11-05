@@ -87,7 +87,9 @@ pub enum StreamState {
     /// end's* that elapsed between frames, or an end this loop reached
     /// after this end had already decided to stop — a frame it
     /// discarded, a session it had already ended, or a dispatch that
-    /// failed.
+    /// failed. A loop whose own write found the peer closed is here too,
+    /// although it discarded what the peer queued before that close: the
+    /// stream is intact, but those frames did not run.
     InSync,
     /// Not known to be intact — a frame stopped part-way or did not
     /// decode, the stream ended
@@ -108,7 +110,10 @@ pub enum StreamState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum EndReason {
-    /// The read reached end of stream at a frame boundary.
+    /// The read reached end of stream at a frame boundary. Also a release on
+    /// the loop's connection that found the peer closed, when the session's
+    /// end has taken the connection by the loop's next step: no read is left
+    /// then, so a frame the peer cut or a missing close signal goes unseen.
     EndOfStream,
     /// The stream ended without the transport's close signal
     /// ([`RpcError::UncleanEndOfStream`](super::RpcError::UncleanEndOfStream)).
@@ -119,7 +124,9 @@ pub enum EndReason {
     /// end's [`close_session`](super::RpcSession::close_session) ended it;
     /// [`SessionEnd::by`] and [`SessionEnd::stream`] follow that end: this
     /// end's decision reads `Local` and `InSync`, anything else `NotLocal`
-    /// and `Lost`.
+    /// and `Lost`. A release that failed on the loop's connection and ended
+    /// the session gives its own end instead:
+    /// [`EndOfStream`](Self::EndOfStream) or [`Dispatch`](Self::Dispatch).
     SessionEnded,
     /// This end ended the session while the loop held a frame it had
     /// just read; the frame was not dispatched.
@@ -227,6 +234,8 @@ impl SessionEnd {
     /// specific cause is in [`reason`](Self::reason), not in the code:
     /// every lost stream is one `DeadObject`, because that is the state
     /// the session is in, and a log line wants the reason, not the code.
+    /// `Ok(())` says the stream was intact, not that every frame the peer
+    /// sent ran: see [`StreamState::InSync`].
     pub fn into_result(self) -> crate::Result<()> {
         match self.stream {
             StreamState::InSync => Ok(()),

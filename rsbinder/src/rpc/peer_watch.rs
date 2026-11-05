@@ -26,6 +26,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use rustix::event::{poll, PollFd, PollFlags};
+use rustix::io::Errno;
 use rustix::net::SendFlags;
 
 /// What the session keeps of its watcher; its drop ends the thread.
@@ -79,9 +80,12 @@ impl PeerWatch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(socket);
-        // `EAGAIN`: a byte is there to be read. `EPIPE`: the thread ended.
         let flags = SendFlags::DONTWAIT | SendFlags::NOSIGNAL;
-        let _ = rustix::net::send(&self.wake, &[1], flags);
+        match rustix::net::send(&self.wake, &[1], flags) {
+            // `EAGAIN`: a byte is there to be read. `EPIPE`, `ECONNRESET`: the thread ended.
+            Ok(_) | Err(Errno::AGAIN | Errno::PIPE | Errno::CONNRESET) => {}
+            Err(e) => log::warn!("RPC: a new connection goes unwatched until the next one: {e}"),
+        }
     }
 
     /// Whether the thread has ended, which closed its end of the wake.
@@ -111,7 +115,7 @@ fn watch(
         );
         match poll(&mut set, None) {
             Ok(_) => count(),
-            Err(rustix::io::Errno::INTR) => continue,
+            Err(Errno::INTR) => continue,
             Err(e) => {
                 log::error!("RPC: watching a session's connections failed ({e}); nothing will");
                 return;

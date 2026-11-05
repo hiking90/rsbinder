@@ -779,9 +779,12 @@
 //! read runs no frame, since the session is over: what the peer queued before its close goes
 //! undispatched, and the end the read comes to is the loop's. A refusal before any byte leaves the
 //! session up and goes on too. A release that fails on the loop's own slot with no wait, in a
-//! frame's dispatch or a drop, is such a write: the loop ends the same way as that frame ends,
-//! whether or not the reaper has emptied the pool by then. A reply wait's write of the same
-//! kind fails its call with that status. The death sequence
+//! frame's dispatch or a drop, or on another thread between its frames, is such a write: the loop
+//! ends the same way, whether or not the reaper has emptied the pool by then, except that with
+//! the pool empty no read is left to tell a frame the peer cut from its close. A reply wait's write
+//! of the same kind fails its call with that status. Past `Live`, a `TRANSACT` that a loop or a
+//! reply wait reads goes undispatched: its target may be cleared already and its reply has no
+//! reader. The death sequence
 //! empties the pool, so the other loops stop with what their transport's shutdown gives them,
 //! or with `EndReason::SessionEnded` when `find_conn_pinned` finds their slot gone between
 //! frames; a loop that ends that way touches nothing, because whoever ended the session ran the
@@ -3091,14 +3094,21 @@ impl RpcSessionInner {
 
     /// The one rule for a failed send; see module doc "Failed sends". Hold no lock.
     fn end_after_failed_send(&self, e: &RpcError) {
+        if Self::failed_send_ends_session(e) {
+            self.fail_session();
+        }
+    }
+
+    /// Whether a failed send ends the session, logged if the peer's close did not cause it.
+    fn failed_send_ends_session(e: &RpcError) -> bool {
         // Refused before any byte: the stream is untouched and the session goes on.
         if matches!(e, RpcError::FrameTooLarge { .. } | RpcError::Protocol(_)) {
-            return;
+            return false;
         }
         if !matches!(e, RpcError::EndOfStream) {
             log::warn!("RPC: a send failed ({e}); ending the session");
         }
-        self.fail_session();
+        true
     }
 
     /// A failed send's status: a send deadline is `TimedOut` wherever it stopped the frame.
@@ -4354,16 +4364,21 @@ impl RpcSessionInner {
 
     /// `end_on_the_reaper` for a release on `conn`; its reader ends as on a hold's failed write.
     fn end_no_wait_write(&self, conn: &ConnGuard<'_>, e: RpcError) {
-        self.end_on_the_reaper(&e);
+        // Past `Live`, what ended the session failed this write: it says nothing of this slot.
+        if !Self::failed_send_ends_session(&e) || self.shared.lifecycle.is_torn_down() {
+            return;
+        }
+        // Before the stop: a loop whose slot the reaper has emptied reads its end from this.
         if let Err(end) = Self::held_write_end(e) {
             let mut st = self.conn_state.lock().expect("conn_state poisoned");
             st.no_wait_write_ends.entry(conn.slot_id).or_insert(end);
         }
+        self.stop_for_the_reaper();
     }
 
     /// What a failed no-wait write on `slot_id` left its reader; a nested wait reads it too.
     fn no_wait_write_end(&self, slot_id: u64) -> Option<HeldWriteEnd> {
-        // Its failure took the lifecycle out of `Live` on this thread: no lock for a live frame.
+        // Recorded before the failure takes the lifecycle out of `Live`: no lock for a live frame.
         if !self.shared.lifecycle.is_torn_down() {
             return None;
         }
@@ -4431,13 +4446,9 @@ impl RpcSessionInner {
 
     /// `end_after_failed_send` for a thread that runs no death sequence, holding the slot.
     fn end_on_the_reaper(&self, e: &RpcError) {
-        if matches!(e, RpcError::FrameTooLarge { .. } | RpcError::Protocol(_)) {
-            return;
+        if Self::failed_send_ends_session(e) {
+            self.stop_for_the_reaper();
         }
-        if !matches!(e, RpcError::EndOfStream) {
-            log::warn!("RPC: a send failed ({e}); ending the session");
-        }
-        self.stop_for_the_reaper();
     }
 
     /// Write the `DEC_STRONG` frames for `addr` on `conn`; a failed send follows "Failed sends".
@@ -4808,6 +4819,10 @@ impl RpcSessionInner {
         in_fds: Vec<OwnedFd>,
         peer: PeerIdentity,
     ) -> Result<()> {
+        // Past `Live` a frame read here does not run: its target may be cleared ("Session end").
+        if self.shared.lifecycle.is_torn_down() {
+            return Ok(());
+        }
         // A call is open here until its reply is out, nested calls included: module doc "Idle".
         let _open = OpenCall::enter(&self.shared);
         let oneway = (t.flags & FLAG_ONEWAY) != 0;
@@ -5048,7 +5063,12 @@ impl RpcSessionInner {
     fn serve_once_on_slot(&self, slot_id: u64) -> ServeStep {
         // Only the death sequence empties the pool of a served slot: module doc "Session end".
         let Ok(conn) = self.find_conn_pinned(slot_id) else {
-            return ServeStep::Ended(EndReason::SessionEnded);
+            return ServeStep::Ended(match self.no_wait_write_end(slot_id) {
+                Some(HeldWriteEnd::Failed(status)) => EndReason::Dispatch(status),
+                // No transport left to read it on: a frame the peer cut reads as its close.
+                Some(HeldWriteEnd::PeerClosed) => EndReason::EndOfStream,
+                None => EndReason::SessionEnded,
+            });
         };
         let transport = conn.transport();
         // Only the founding slot's first read takes it: no other read can come before it.
@@ -5978,7 +5998,8 @@ impl RpcSession {
     /// session, whichever of its connections the loop served, as a fault on
     /// any one connection does (AOSP `RpcState::handleRpcError`); a loop
     /// that finds the session already ended stops with
-    /// [`EndReason::SessionEnded`].
+    /// [`EndReason::SessionEnded`], or with what a failed release on its
+    /// connection left it.
     ///
     /// The returned [`SessionEnd`] says how the loop ended, on three
     /// axes: whether the stream was still intact
@@ -6023,7 +6044,8 @@ impl RpcSession {
     ///
     /// A session that had already ended when the thread starts, or when its
     /// loop goes to take its connection between frames, ends the thread
-    /// with [`EndReason::SessionEnded`]. One that ends while the loop is
+    /// with [`EndReason::SessionEnded`], or with what a failed release on
+    /// that connection left it. One that ends while the loop is
     /// reading stops it with what the connection's shutdown gives that
     /// read ([`EndReason::EndOfStream`] on a Unix socket).
     pub fn spawn_serve(&self) -> Result<std::thread::JoinHandle<SessionEnd>> {
@@ -7511,6 +7533,14 @@ mod tests {
     //!   `serve_once_on_slot` and the next step may find no slot.
     //!   `a_no_wait_writes_failure_fails_a_reply_wait_with_its_status`: drop the check of
     //!   `write_held_past_limit` and the wait reads the shutdown, `DeadObject`.
+    //!   `a_close_found_between_frames_ends_a_loop_the_same_past_the_reaper` and
+    //!   `a_failure_found_between_frames_ends_a_loop_the_same_past_the_reaper`: drop the check of
+    //!   `serve_once_on_slot`'s `find_conn_pinned` and the loop reads `SessionEnded`.
+    //!   `a_release_failed_by_an_end_under_way_leaves_a_loop_session_ended`: record past `Live` in
+    //!   `end_no_wait_write` and another connection's fault reads as this peer's clean close.
+    //! * `a_reply_wait_runs_nothing_it_reads_past_live` and
+    //!   `a_serve_loop_runs_nothing_it_reads_past_live`: drop the lifecycle check from
+    //!   `dispatch_transact` and the handler runs on the ended session.
     //! * `a_reply_whose_release_finds_the_peer_closed_fails_dead_object`: have `validate_objects`
     //!   return `BadValue` for every failure, and a session's end reads as a malformed parcel.
     //!   `a_serve_loops_drain_refusal_keeps_its_status`: drop `fault` from the failure's value.
@@ -9011,6 +9041,180 @@ mod tests {
         );
     }
 
+    /// Until the reaper's death sequence has emptied the pool.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn await_empty_pool(inner: &RpcSessionInner) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !inner
+            .conn_state
+            .lock()
+            .expect("conn_state")
+            .slots
+            .is_empty()
+        {
+            assert!(std::time::Instant::now() < deadline, "the session went on");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Another thread's release finds the close between a loop's frames: no order with the reaper.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_close_found_between_frames_ends_a_loop_the_same_past_the_reaper() {
+        let (session, peer) = a13_client_with_raw_peer();
+        drop(peer);
+        let inner = &session.inner;
+        let mut counter = 0;
+        inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1);
+        await_empty_pool(inner);
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Ended(EndReason::EndOfStream)
+        ));
+    }
+
+    /// Any other failure of that release: the loop ends with its status, as on its own write.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_failure_found_between_frames_ends_a_loop_the_same_past_the_reaper() {
+        let (session, _peer) = a13_client_whose_no_wait_send_expires();
+        let inner = &session.inner;
+        let mut counter = 0;
+        inner.send_dec_strong(RpcAddress::unique(&mut counter, AddressSpace::Acceptor), 1);
+        await_empty_pool(inner);
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Ended(EndReason::Dispatch(StatusCode::TimedOut))
+        ));
+    }
+
+    /// A release that an end already under way failed is no close of the peer's on that slot.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_release_failed_by_an_end_under_way_leaves_a_loop_session_ended() {
+        let (session, _peer) = a13_client_with_raw_peer();
+        let inner = &session.inner;
+        let conn = inner
+            .find_conn_pinned(RpcSession::FOUNDING_SLOT_ID)
+            .expect("the slot");
+        assert!(inner.shared.lifecycle.force_dying());
+        let mut counter = 0;
+        let addr = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
+        assert_eq!(inner.write_dec_no_wait(&conn, addr, 1), 0);
+        drop(conn);
+        inner.on_session_dead();
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Ended(EndReason::SessionEnded)
+        ));
+    }
+
+    /// A node that counts its handler's runs.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    struct CountsRuns(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl crate::Interface for CountsRuns {}
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    impl crate::Remotable for CountsRuns {
+        fn descriptor() -> &'static str {
+            "rsbinder.test.ICountsRuns"
+        }
+        fn on_transact(
+            &self,
+            _code: crate::TransactionCode,
+            _reader: &mut Parcel,
+            _reply: &mut Parcel,
+        ) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn on_dump(&self, _w: &mut dyn std::io::Write, _a: &[String]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A twoway call to a `CountsRuns` of `session`, and that node's count.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn a_call_to_a_counting_node(
+        session: &RpcSession,
+    ) -> (Vec<u8>, Arc<std::sync::atomic::AtomicUsize>) {
+        use crate::{Binder, Interface, Remotable};
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target: SIBinder = Binder::new(CountsRuns(Arc::clone(&runs))).as_binder();
+        let address = session
+            .inner
+            .shared
+            .state
+            .lock()
+            .expect("rpc state")
+            .on_binder_leaving(&target)
+            .expect("an address");
+        let mut token = Parcel::new();
+        write_rpc_interface_token(&mut token, CountsRuns::descriptor()).expect("token");
+        let call = Android13PlusCodec::with_version(PROTOCOL_V2)
+            .expect("v2")
+            .encode_transact(&WireTransaction {
+                address,
+                code: crate::FIRST_CALL_TRANSACTION,
+                flags: 0,
+                async_number: 0,
+                data: token.rpc_data_bytes().to_vec(),
+                object_positions: Vec::new(),
+            })
+            .expect("encode");
+        (call, runs)
+    }
+
+    /// A frame read past `Live` in a reply wait: stopped by hand, so no reaper can clear its node.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_reply_wait_runs_nothing_it_reads_past_live() {
+        use crate::rpc::wire_android13::read_aosp_message;
+        let (session, mut peer) = a13_client_with_raw_peer();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let (call, runs) = a_call_to_a_counting_node(&session);
+        let inner = session.inner.clone();
+        let caller = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let code = SpecialTransaction::GetSessionId.code();
+                inner
+                    .client_transact(RpcAddress::zero(), code, &Parcel::new(), 0)
+                    .map(|_| ())
+            })
+        };
+        read_aosp_message(&mut peer).expect("the request");
+        assert!(inner.shared.lifecycle.force_dying());
+        std::io::Write::write_all(&mut peer, &call).expect("a call");
+        drop(peer);
+        assert_eq!(
+            caller.join().expect("the caller"),
+            Err(StatusCode::DeadObject)
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        inner.on_session_dead();
+    }
+
+    /// The same in a serve loop whose read was under way as the session ended.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_serve_loop_runs_nothing_it_reads_past_live() {
+        let (session, mut peer) = a13_client_with_raw_peer();
+        let (call, runs) = a_call_to_a_counting_node(&session);
+        let inner = &session.inner;
+        assert!(inner.shared.lifecycle.force_dying());
+        std::io::Write::write_all(&mut peer, &call).expect("a call");
+        assert!(matches!(
+            inner.serve_once_on_slot(RpcSession::FOUNDING_SLOT_ID),
+            ServeStep::Continue
+        ));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        inner.on_session_dead();
+    }
+
     /// A failed release ends the session mid-table: the next binder reads what ended it, as AOSP.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
@@ -9110,17 +9314,19 @@ mod tests {
         read_aosp_message(&mut peer).expect("the request");
         fill_socket(&session);
         let mut counter = 0;
-        for _ in 0..HELD_DEC_STRONG_LIMIT + 1 {
+        for _ in 0..HELD_DEC_STRONG_LIMIT {
             let addr = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
             inner.hold_dec_strong(RpcSession::FOUNDING_SLOT_ID, addr, 1);
         }
         let codec = Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2");
         let other = RpcAddress::unique(&mut counter, AddressSpace::Acceptor);
         let (frame, _) = codec.encode_dec_strong(&other, 1).expect("a frame");
-        // Only now: the send deadline bounds the write, and the wait already begun has no read's.
+        // Nothing writes below the limit: any write has this deadline, and the frame follows it.
         session
             .set_reply_timeout(Some(Duration::from_secs(1)))
             .expect("deadline");
+        let last = RpcAddress::unique(&mut counter, AddressSpace::Initiator);
+        inner.hold_dec_strong(RpcSession::FOUNDING_SLOT_ID, last, 1);
         write_aosp_message(&mut peer, &frame).expect("a frame the wait reads on after");
         assert_eq!(
             caller.join().expect("the caller"),
