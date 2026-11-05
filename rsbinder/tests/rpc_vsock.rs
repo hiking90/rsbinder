@@ -10,9 +10,11 @@
 //! sudo modprobe vsock_loopback   # if not built-in
 //! cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
 //! ```
+//! `tests/scripts/run_vsock_vm.sh` runs these in a VM's kernel, with no module on the host, and
+//! `tests/rpc_vsock_vm.rs` between that VM and the host.
 //!
 //! Demonstrates that the core runs unmodified with the
-//! transport swapped to vsock, host↔guest value round-trip, and
+//! transport swapped to vsock, a value round-trip, and
 //! `PeerIdentity::Vsock{cid}` never mis-reported as `Local`.
 //!
 //! The server is built with the same `RpcServer::setup_vsock_server`

@@ -7,7 +7,8 @@
 #   kernel    what integration-test.yml's Linux job runs against a live
 #             binderfs, `rsb_hub` and `test_service`, plus the gates no
 #             workflow runs: tests/scripts/run_*_ac.sh, run_d8b_register.sh,
-#             vsock loopback and the libfmq host peer.
+#             vsock (tests/scripts/run_vsock_vm.sh, or this host's loopback)
+#             and the libfmq host peer.
 #   stage3    the interop scripts against a booted Android device or
 #             emulator (real servicemanager, libbinder, libfmq): every
 #             script the device can take, when the diff against --base
@@ -447,12 +448,16 @@ tier_kernel() {
     run "topic fleet hub restart" tpass cargo test -p tests --test topic_fleet \
         -- --ignored --exact hub_restarts
 
-    if [ -e /dev/vsock ] && grep -q '^vsock_loopback ' /proc/modules 2>/dev/null; then
+    # A VM covers the loopback tests as well, in its own kernel; this host's module is the fallback.
+    local vm_missing
+    if vm_missing=$(bash tests/scripts/run_vsock_vm.sh --check); then
+        run "vsock between host and VM" bash tests/scripts/run_vsock_vm.sh
+    elif [ -e /dev/vsock ] && grep -q '^vsock_loopback ' /proc/modules 2>/dev/null; then
         run "rpc_vsock (loopback)" tpass cargo test -p rsbinder --features rpc-vsock --test rpc_vsock -- --ignored
         run "rpc_tls over vsock" tpass cargo test -p rsbinder --features rpc-tls,rpc-vsock \
             --test rpc_tls -- --ignored --exact vsock_tls_loopback_e2e
     else
-        skip "vsock tests" "sudo modprobe vsock_loopback"
+        skip "vsock tests" "$vm_missing, or sudo modprobe vsock_loopback"
     fi
 
     local aosp=${AOSP:-$HOME/Workspace/aosp}
