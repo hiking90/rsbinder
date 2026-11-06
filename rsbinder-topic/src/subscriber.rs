@@ -155,7 +155,7 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     _abandon: Abandon,
     reader: TypedReader<T, Loaded>,
     control: Closing,
-    /// [`Wake::Fd`]'s fds on the reactor; dropped before `local` closes them.
+    /// [`Wake::Fd`]'s fd on the reactor, which holds `local` until it drops.
     #[cfg(feature = "tokio")]
     reactor: Option<Reactor>,
     local: Arc<Local<Parts>>,
@@ -540,10 +540,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             let reactor = match &mut self.reactor {
                 Some(reactor) => reactor,
                 none => {
-                    let fd = self.local.words().fd.as_ref().map(FdWake::fd);
-                    let fd = fd.expect("a `Wake::Fd` subscription waits on the reactor");
-                    // SAFETY: `reactor` is declared before `local`, whose last `Arc` closes it.
-                    let made = unsafe { Reactor::new(fd) };
+                    let made = Reactor::new(&self.local);
                     none.insert(made.map_err(|error| RecvError::Runtime(error.kind()))?)
                 }
             };
@@ -1078,23 +1075,30 @@ impl Drop for Abandon {
 #[cfg(feature = "tokio")]
 struct Reactor(AsyncFd<Unowned>);
 
-/// An fd the subscriber owns, as the reactor takes it.
+/// The fd of a subscription's [`FdWake`], with the `Local` whose words own it.
 #[cfg(feature = "tokio")]
-struct Unowned(RawFd);
+struct Unowned {
+    fd: RawFd,
+    _local: Arc<Local<Parts>>,
+}
 
 #[cfg(feature = "tokio")]
 impl AsRawFd for Unowned {
     fn as_raw_fd(&self) -> RawFd {
-        self.0
+        self.fd
     }
 }
 
 #[cfg(feature = "tokio")]
 impl Reactor {
-    /// # Safety: `fd` stays open, as the same file description, until the `Reactor` drops.
-    unsafe fn new(fd: BorrowedFd<'_>) -> std::io::Result<Self> {
-        let unowned = Unowned(fd.as_raw_fd());
-        // SAFETY: the caller keeps `fd` open, as the same file description, while `Self` lives.
+    fn new(local: &Arc<Local<Parts>>) -> std::io::Result<Self> {
+        let fd = local.words().fd.as_ref().map(FdWake::fd);
+        let fd = fd.expect("a `Wake::Fd` subscription waits on the reactor");
+        let unowned = Unowned {
+            fd: fd.as_raw_fd(),
+            _local: Arc::clone(local),
+        };
+        // SAFETY: `unowned` keeps `local` alive, whose words, set once, own the fd as an `OwnedFd`.
         let registered = unsafe { AsyncFd::register_with_interest(unowned, Interest::READABLE) };
         Ok(Self(registered?))
     }
