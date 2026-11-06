@@ -173,7 +173,6 @@ fn a_change_tells_every_watcher_of_its_name_with_its_generation() {
         .map(|n| (n.watcher.id, n.generation))
         .collect();
     assert_eq!(told, [(20, 1), (21, 1)]);
-    assert!(notices.iter().all(|n| n.topic == key(10) && n.name == "a"));
     // A watch of a name with a topic answers it, and a second watch by the same binder is one.
     assert_eq!(
         watch(&mut table, &mut links, "a", key(20)),

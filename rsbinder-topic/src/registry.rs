@@ -437,8 +437,8 @@ fn topic_ref((topic, generation): (Option<TopicKey>, u64)) -> TopicRef {
 }
 
 /// Send one notice; how it went, as [`classify`] judges a failure.
-fn send(watcher: &WatcherKey, name: &str, topic: &TopicKey, generation: u64) -> Sent {
-    match watcher.0.r#onAdvertised(name, &topic.0, generation as i64) {
+fn send(watcher: &WatcherKey, name: &str, topic: &Strong<dyn ITopic>, generation: u64) -> Sent {
+    match watcher.0.r#onAdvertised(name, topic, generation as i64) {
         Ok(()) => Sent::Delivered,
         Err(status) => classify(&status, rsbinder::get_extended_error),
     }
@@ -505,7 +505,7 @@ impl Shared {
         let key = TopicKey(topic.clone());
         let notices = table.advertise(ids, name, key, cross_uid, Instant::now(), &mut links);
         drop(inner);
-        self.deliver(notices.map_err(refused)?);
+        self.deliver(name, topic, notices.map_err(refused)?);
         drop(order);
         Ok(())
     }
@@ -619,36 +619,24 @@ impl Shared {
         Ok(infos.collect())
     }
 
-    /// Judge and send the notices of a change, with `fire_order` held.
-    fn deliver(&self, notices: Vec<Notice<TopicKey, WatcherKey>>) {
+    /// Judge and send the notices of `name`'s change to `topic`, with `fire_order` held.
+    fn deliver(&self, name: &str, topic: &Strong<dyn ITopic>, notices: Vec<Notice<WatcherKey>>) {
         for notice in notices {
             // Refused now, by a reload or a failed group lookup: the watch stays (plan 15 D4).
-            if !self
-                .access
-                .allows(Action::Subscribe, &notice.name, &notice.caller)
-            {
+            if !self.access.allows(Action::Subscribe, name, &notice.caller) {
                 continue;
             }
             #[cfg(test)]
             self.hook(|hooks| &hooks.before_send);
-            let sent = send(
-                &notice.watcher,
-                &notice.name,
-                &notice.topic,
-                notice.generation,
-            );
+            let sent = send(&notice.watcher, name, topic, notice.generation);
             let mut inner = self.lock();
             let now = Instant::now();
-            let owed =
-                inner
-                    .table
-                    .sent(&notice.name, &notice.watcher, notice.generation, sent, now);
+            let owed = inner
+                .table
+                .sent(name, &notice.watcher, notice.generation, sent, now);
             // Once per owed notice: a watcher that stays stuck fails every round.
             if owed || sent == Sent::Failed {
-                log::warn!(
-                    "topic registry: a notice of {:?} failed: {sent:?}",
-                    notice.name
-                );
+                log::warn!("topic registry: a notice of {name:?} failed: {sent:?}");
             }
             self.owe(inner, owed);
         }
@@ -692,7 +680,7 @@ impl Shared {
             let order = self.order();
             let target = self.lock().table.retry_target(&name, &watcher);
             if let Some((topic, generation)) = target {
-                let sent = send(&watcher, &name, &topic, generation);
+                let sent = send(&watcher, &name, &topic.0, generation);
                 self.lock()
                     .table
                     .retried(&name, &watcher, generation, sent, Instant::now());
