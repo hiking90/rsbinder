@@ -27,6 +27,7 @@ use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use loom::thread;
 
 use super::*;
+use crate::loom_cell;
 
 const SLOTS: u32 = 2;
 
@@ -84,8 +85,8 @@ impl Model {
     /// `publish_loan` with all read to `read`: lend, fill with `round`, commit, retire; the record.
     fn publish(&self, slots: &mut Slots, round: u64, read: u64) -> u64 {
         let slot = slots.lend(self, self, read).expect("a slot");
-        // SAFETY: a lent slot, which no pin holds; loom checks that it is so.
-        self.slots[slot as usize].with_mut(|value| unsafe { *value = round });
+        // A lent slot, which no pin holds; loom checks that it is so.
+        loom_cell::write(&self.slots[slot as usize], round);
         let generation = slots.publish(self, slot, round);
         let record = u64::from(slot) | round << 8 | generation << 16;
         if self.flaw == Flaw::RetireFirst {
@@ -161,8 +162,8 @@ fn a_pinned_slot_is_read_whole_and_never_written(flaw: Flaw, rounds: u64, read: 
             let loan = loan(record);
             match pin(&*model, &*model, loan, 8) {
                 Ok(()) => {
-                    // SAFETY: a pinned slot of the generation the record names; loom checks it.
-                    let value = model.slots[loan.slot as usize].with(|value| unsafe { *value });
+                    // A pinned slot of the generation the record names; loom checks it.
+                    let value = loom_cell::read(&model.slots[loan.slot as usize]);
                     assert_eq!(value, (record >> 8) & 0xff, "a pinned slot that changed");
                     unpin(&*model);
                 }
@@ -195,14 +196,14 @@ fn loom_pool_a_pin_moved_to_another_slot_orders_the_read_of_the_first() {
             let model = model.clone();
             thread::spawn(move || {
                 let slot = slots.lend(&*model, &*model, u64::MAX).expect("a slot");
-                // SAFETY: a lent slot, which no pin holds; loom checks that it is so.
-                model.slots[slot as usize].with_mut(|value| unsafe { *value = 3 });
+                // A lent slot, which no pin holds; loom checks that it is so.
+                loom_cell::write(&model.slots[slot as usize], 3);
             })
         };
         for loan in loans {
             if pin(&*model, &*model, loan, 8).is_ok() {
-                // SAFETY: a pinned slot of the generation the loan names; loom checks it.
-                model.slots[loan.slot as usize].with(|value| unsafe { *value });
+                // A pinned slot of the generation the loan names; loom checks it.
+                loom_cell::read(&model.slots[loan.slot as usize]);
                 unpin(&*model);
             }
         }
@@ -253,8 +254,8 @@ fn a_value_taken_back_has_a_newer_record(flaw: Flaw) {
             match pin(&*model, &*model, loan(record), 8) {
                 Ok(()) => {
                     let slot = loan(record).slot as usize;
-                    // SAFETY: a pinned slot of the generation the record names; loom checks it.
-                    let value = model.slots[slot].with(|value| unsafe { *value });
+                    // A pinned slot of the generation the record names; loom checks it.
+                    let value = loom_cell::read(&model.slots[slot]);
                     assert_eq!(value, (record >> 8) & 0xff, "a pinned slot that changed");
                     unpin(&*model);
                 }

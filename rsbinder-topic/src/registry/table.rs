@@ -57,10 +57,8 @@ pub(crate) enum Refused {
     NoAllocation,
 }
 
-/// A notice to send for a change: the shell judges the caller and sends it.
-pub(crate) struct Notice<T, W> {
-    pub name: String,
-    pub topic: T,
+/// A notice of a change to one watcher of the changed name: the shell judges the caller and sends.
+pub(crate) struct Notice<W> {
     pub generation: u64,
     pub watcher: W,
     pub caller: Caller,
@@ -209,7 +207,7 @@ impl<T: Key, W: Key> Table<T, W> {
         cross_uid: bool,
         now: Instant,
         links: &mut dyn Links<T, W>,
-    ) -> Result<Vec<Notice<T, W>>, Refused> {
+    ) -> Result<Vec<Notice<W>>, Refused> {
         match self.topics.get(name) {
             Some(held) if held.key == topic => return Ok(Vec::new()),
             Some(held) if held.uid != uid && !cross_uid => return Err(Refused::Taken),
@@ -230,7 +228,7 @@ impl<T: Key, W: Key> Table<T, W> {
         }
         self.generation += 1;
         let advertised = Advertised {
-            key: topic.clone(),
+            key: topic,
             uid,
             pid,
             since: now,
@@ -243,8 +241,6 @@ impl<T: Key, W: Key> Table<T, W> {
         }
         let watchers = self.watchers.get(name).map_or(&[][..], Vec::as_slice);
         let notices = watchers.iter().map(|watcher| Notice {
-            name: name.to_owned(),
-            topic: topic.clone(),
             generation: self.generation,
             watcher: watcher.key.clone(),
             caller: watcher.caller.clone(),
@@ -342,7 +338,7 @@ impl<T: Key, W: Key> Table<T, W> {
         cross_uid: bool,
         now: Instant,
         links: &mut dyn Links<T, W>,
-    ) -> Result<(Vec<Notice<T, W>>, u64), Refused> {
+    ) -> Result<(Vec<Notice<W>>, u64), Refused> {
         let Some(pending) = self.take_pending(name, key) else {
             return Err(Refused::NoAllocation);
         };

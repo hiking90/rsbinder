@@ -133,6 +133,9 @@ pub use trust::{Trust, Trusted, Untrusted};
 #[cfg(any(test, feature = "fuzzing"))]
 mod image;
 
+#[cfg(all(test, loom))]
+mod loom_cell;
+
 #[cfg(all(
     test,
     not(loom),

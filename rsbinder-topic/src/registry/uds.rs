@@ -126,32 +126,32 @@ impl SocketDir {
             Err(Errno::EXIST) => {}
             Err(errno) => return Err(errno.into()),
         }
-        let refused = |why: String| {
+        let refused = |why: &str| {
             let path = path.display();
             io::Error::new(io::ErrorKind::InvalidData, format!("{path}: {why}"))
         };
         let flags = OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC;
         let dir = rustix::fs::open(path, flags, Mode::empty()).map_err(|errno| match errno {
-            Errno::LOOP | Errno::NOTDIR => refused("a symlink, or not a directory".to_owned()),
+            Errno::LOOP | Errno::NOTDIR => refused("a symlink, or not a directory"),
             errno => errno.into(),
         })?;
         let stat = rustix::fs::fstat(&dir)?;
         let own = rustix::process::geteuid().as_raw();
         if stat.st_uid != 0 && stat.st_uid != own {
-            return Err(refused(format!(
+            return Err(refused(&format!(
                 "owned by uid {}, neither root nor this process",
                 stat.st_uid
             )));
         }
         if stat.st_mode & 0o777 != 0o700 {
-            return Err(refused(format!(
+            return Err(refused(&format!(
                 "mode {:o}, not 700",
                 stat.st_mode & 0o7777
             )));
         }
         match rustix::fs::flock(&dir, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {}
-            Err(Errno::WOULDBLOCK) => return Err(refused("in use by another host".to_owned())),
+            Err(Errno::WOULDBLOCK) => return Err(refused("in use by another host")),
             Err(errno) => return Err(errno.into()),
         }
         let this = Self {
@@ -163,7 +163,7 @@ impl SocketDir {
     }
 
     /// Remove what a crash between a bind and its unlink left, if that is all there is.
-    fn clear(&self, refused: impl Fn(String) -> io::Error) -> io::Result<()> {
+    fn clear(&self, refused: impl Fn(&str) -> io::Error) -> io::Result<()> {
         let mut left = Vec::new();
         for entry in rustix::fs::Dir::read_from(&self.dir)? {
             let entry = entry?;
@@ -174,7 +174,7 @@ impl SocketDir {
             let stat = rustix::fs::statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
             let socket = FileType::from_raw_mode(stat.st_mode) == FileType::Socket;
             if !socket || !name.to_bytes().iter().all(u8::is_ascii_digit) {
-                return Err(refused(format!(
+                return Err(refused(&format!(
                     "it holds {name:?}, which no registry made"
                 )));
             }
@@ -536,7 +536,7 @@ impl Shared {
         let change = table.commit(ids, name, &key, cross_uid, Instant::now(), &mut links);
         drop(inner);
         let (notices, generation) = change.map_err(refused)?;
-        self.deliver(notices);
+        self.deliver(name, notices);
         drop(order);
         Ok(generation as i64)
     }
@@ -687,26 +687,22 @@ impl Shared {
         Ok(infos.collect())
     }
 
-    /// Judge and send the notices of a change, with `fire_order` held.
-    fn deliver(&self, notices: Vec<Notice<TopicKey, WatcherKey>>) {
+    /// Judge and send the notices of a change of `name`, with `fire_order` held.
+    fn deliver(&self, name: &str, notices: Vec<Notice<WatcherKey>>) {
         for notice in notices {
             // Refused now, by a reload or a failed group lookup: the watch stays (plan 15 D4).
-            if !self.judged(&notice.name, &notice.caller) {
+            if !self.judged(name, &notice.caller) {
                 continue;
             }
-            let sent = self.send(&notice.watcher, &notice.name, notice.generation);
+            let sent = self.send(&notice.watcher, name, notice.generation);
             let mut inner = self.lock();
             let now = Instant::now();
-            let owed =
-                inner
-                    .table
-                    .sent(&notice.name, &notice.watcher, notice.generation, sent, now);
+            let owed = inner
+                .table
+                .sent(name, &notice.watcher, notice.generation, sent, now);
             // Once per owed notice: a watcher that stays stuck fails every round.
             if owed || sent == Sent::Failed {
-                log::warn!(
-                    "topic registry: a notice of {:?} failed: {sent:?}",
-                    notice.name
-                );
+                log::warn!("topic registry: a notice of {name:?} failed: {sent:?}");
             }
             self.owe(inner, owed);
         }
@@ -1310,7 +1306,6 @@ impl Resolver for UdsResolver {
         let asked = reconciler.clone();
         let watching = Watching {
             host: host.clone(),
-            name: name.to_owned(),
             reconciler,
         };
         Ok(Watch::with_resolved_lookup(watching, move || {
@@ -1346,18 +1341,16 @@ impl Host {
 /// Ends the watch when it is dropped: the host's, and what it was asking.
 struct Watching {
     host: Arc<Host>,
-    name: String,
     reconciler: Arc<Reconciler>,
 }
 
 impl Drop for Watching {
     fn drop(&mut self) {
         self.reconciler.end();
-        let name = std::mem::take(&mut self.name);
         let reconciler = self.reconciler.clone();
         off_this_thread(&self.host, move |host| {
             let _order = host.watch_order();
-            host.forget(&name, &reconciler);
+            host.forget(&reconciler.name, &reconciler);
         });
     }
 }
