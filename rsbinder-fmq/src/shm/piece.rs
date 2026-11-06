@@ -866,22 +866,17 @@ impl std::fmt::Debug for RoLendable {
 /// The ranges handed out so far, and what is left to hand out.
 struct Pieces {
     memory: Arc<Memory>,
-    at: NonNull<u8>,
+    delta: usize,
     len: usize,
     taken: Vec<Range<usize>>,
 }
 
-// SAFETY: an address and the ranges handed out; `Pieces` itself never dereferences the address.
-unsafe impl Send for Pieces {}
-// SAFETY: as for `Send`; `&Pieces` gives out nothing.
-unsafe impl Sync for Pieces {}
-
 impl Pieces {
     fn new(memory: Memory, delta: usize) -> Self {
-        let (at, len) = memory.at(delta);
+        let (_, len) = memory.at(delta);
         Self {
             memory: Arc::new(memory),
-            at,
+            delta,
             len,
             taken: Vec::new(),
         }
@@ -893,7 +888,8 @@ impl Pieces {
             .checked_add(len)
             .filter(|end| *end <= self.len)
             .ok_or(Error::BadValue("a piece past the end of its mapping"))?;
-        let at = self.at.map_addr(|a| a.saturating_add(offset));
+        let (base, _) = self.memory.at(self.delta);
+        let at = base.map_addr(|a| a.saturating_add(offset));
         if at.as_ptr() as usize % align != 0 {
             return Err(Error::BadValue("a word off its alignment"));
         }
