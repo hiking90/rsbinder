@@ -16,6 +16,8 @@ use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::thread;
 
+use crate::loom_cell;
+
 /// A ring of one record: the record, the records committed, and the records read.
 struct Model {
     record: UnsafeCell<u64>,
@@ -42,20 +44,20 @@ fn a_record_is_written_over_only_after_it_is_read(read_order: Ordering) {
                 while model.write.load(Ordering::Acquire) < 1 {
                     thread::yield_now();
                 }
-                // SAFETY: a committed record; loom checks that nothing writes it meanwhile.
-                let copied = model.record.with(|record| unsafe { *record });
+                // A committed record; loom checks that nothing writes it meanwhile.
+                let copied = loom_cell::read(&model.record);
                 assert_eq!(copied, 1, "a record written over before it was read");
                 model.read.store(1, model.read_order);
             })
         };
-        // SAFETY: before any commit, so no subscriber reads it; loom checks that it is so.
-        model.record.with_mut(|record| unsafe { *record = 1 });
+        // Before any commit, so no subscriber reads it; loom checks that it is so.
+        loom_cell::write(&model.record, 1);
         model.write.store(1, Ordering::Release);
         while model.read.load(Ordering::Acquire) < 1 {
             thread::yield_now();
         }
-        // SAFETY: the subscriber has read record 1; loom checks that its read came first.
-        model.record.with_mut(|record| unsafe { *record = 2 });
+        // The subscriber has read record 1; loom checks that its read came first.
+        loom_cell::write(&model.record, 2);
         model.write.store(2, Ordering::Release);
         subscriber.join().unwrap();
     });
