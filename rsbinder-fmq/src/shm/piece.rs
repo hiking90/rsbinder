@@ -250,6 +250,25 @@ struct Cut {
     tail: Range<usize>,
 }
 
+/// A byte `Area::load` writes: an element's byte, or a `Vec`'s spare capacity.
+trait Slot {
+    fn of(byte: u8) -> Self;
+}
+
+impl Slot for u8 {
+    #[inline]
+    fn of(byte: u8) -> Self {
+        byte
+    }
+}
+
+impl Slot for MaybeUninit<u8> {
+    #[inline]
+    fn of(byte: u8) -> Self {
+        MaybeUninit::new(byte)
+    }
+}
+
 impl Area {
     fn new(memory: Arc<Memory>, at: NonNull<u8>, len: usize) -> Self {
         let head = ((WORD - at.as_ptr() as usize % WORD) % WORD).min(len);
@@ -414,45 +433,39 @@ impl Area {
 
     // Always `Relaxed`: the one load ordering defined on a read-only mapping.
     #[inline]
-    fn load(&self, off: usize, dst: &mut [MaybeUninit<u8>]) {
+    fn load<D: Slot>(&self, off: usize, dst: &mut [D]) {
         if let Some(words) = self.whole_words(off, dst.len()) {
             for (s, d) in words.iter().zip(dst.chunks_exact_mut(WORD)) {
-                let d: &mut [MaybeUninit<u8>; WORD] = d.try_into().expect("a whole word");
-                *d = s
-                    .load(Ordering::Relaxed)
-                    .to_ne_bytes()
-                    .map(MaybeUninit::new);
+                let d: &mut [D; WORD] = d.try_into().expect("a whole word");
+                *d = s.load(Ordering::Relaxed).to_ne_bytes().map(D::of);
             }
             return;
         }
         let cut = self.cut(off, dst.len());
         let (head, mut dst) = dst.split_at_mut(cut.head.len());
         for (s, d) in self.bytes_at(cut.head.start, head.len()).iter().zip(head) {
-            *d = MaybeUninit::new(s.load(Ordering::Relaxed));
+            *d = D::of(s.load(Ordering::Relaxed));
         }
         if let Some((index, shift, n)) = cut.lead {
             let (part, rest) = dst.split_at_mut(n);
             let bytes = self.word(index).load(Ordering::Relaxed).to_ne_bytes();
             for (d, s) in part.iter_mut().zip(&bytes[shift..shift + n]) {
-                *d = MaybeUninit::new(*s);
+                *d = D::of(*s);
             }
             dst = rest;
         }
         let (whole, rest) = dst.split_at_mut(cut.whole.1 * WORD);
         let words = self.words_at(cut.whole.0, cut.whole.1);
         for (s, d) in words.iter().zip(whole.chunks_exact_mut(WORD)) {
-            let d: &mut [MaybeUninit<u8>; WORD] = d.try_into().expect("a whole word");
-            *d = s
-                .load(Ordering::Relaxed)
-                .to_ne_bytes()
-                .map(MaybeUninit::new);
+            let d: &mut [D; WORD] = d.try_into().expect("a whole word");
+            *d = s.load(Ordering::Relaxed).to_ne_bytes().map(D::of);
         }
         dst = rest;
         if let Some((index, n)) = cut.trail {
             let (part, rest) = dst.split_at_mut(n);
             let bytes = self.word(index).load(Ordering::Relaxed).to_ne_bytes();
             for (d, s) in part.iter_mut().zip(&bytes[..n]) {
-                *d = MaybeUninit::new(*s);
+                *d = D::of(*s);
             }
             dst = rest;
         }
@@ -461,16 +474,13 @@ impl Area {
             .iter()
             .zip(dst)
         {
-            *d = MaybeUninit::new(s.load(Ordering::Relaxed));
+            *d = D::of(s.load(Ordering::Relaxed));
         }
     }
 
     #[inline]
     fn load_into<T: Element>(&self, off: usize, dst: &mut [T]) {
-        let dst = bytes_of_mut(dst);
-        // SAFETY: `load` writes every byte of `dst` and only initialized values.
-        let dst = unsafe { &mut *(std::ptr::from_mut(dst) as *mut [MaybeUninit<u8>]) };
-        self.load(off, dst);
+        self.load(off, bytes_of_mut(dst));
     }
 
     #[inline]

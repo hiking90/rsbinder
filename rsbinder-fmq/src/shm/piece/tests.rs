@@ -206,11 +206,10 @@ fn words_read_back_through_their_read_only_views() {
 fn lendable_slices_see_what_the_copies_store_and_the_reverse() {
     let lent = carve(64).lendable(8, 48).unwrap();
     lent.store(3, &[9u8; 5]);
-    // SAFETY: no other access to bytes 0..16 while the slices live; one thread.
-    unsafe {
-        assert_eq!(lent.slice(3..8), &[9u8; 5]);
-        lent.slice_mut(16..24).copy_from_slice(&[4u8; 8]);
-    }
+    // SAFETY: nothing writes bytes 3..8 while the slice lives; one thread.
+    assert_eq!(unsafe { lent.slice(3..8) }, &[9u8; 5]);
+    // SAFETY: no other access to bytes 16..24 while the slice lives; one thread.
+    unsafe { lent.slice_mut(16..24) }.copy_from_slice(&[4u8; 8]);
     let mut out = [0u8; 8];
     lent.load(16, &mut out);
     assert_eq!(out, [4; 8]);
