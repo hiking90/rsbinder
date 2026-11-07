@@ -85,6 +85,11 @@ pub trait RegistryAccess: Send + Sync {
     /// sent by then are not sent either; a notice the retry thread was judging stays owed, and
     /// the next send starts another thread for it. On a registry on a socket a notice's judgement
     /// ends no call: the change's other notices go on, and it no longer owes the one judged.
+    ///
+    /// One registry call can ask several times, each time a call of its own: a list asks about
+    /// [`Action::List`] once and then about [`Action::Subscribe`] for each name. The registry
+    /// passes no snapshot between them, so a policy the implementation replaces meanwhile (a
+    /// reload) answers the later questions of that call.
     fn allows(&self, action: Action, name: &str, caller: &Caller) -> bool;
 }
 
