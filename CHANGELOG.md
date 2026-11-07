@@ -413,8 +413,11 @@ says what a peer does with the 0.12.0 value.
   not `DeadObject`.
 - `rsbinder-tools`: `config::Config`, `FileContents` and `ConfigError` are
   `#[non_exhaustive]` and have topic fields and variants; three messages
-  change wording, and `rsb_service`'s hint after a denial begins "The hub's
-  policy denies this to uid" (0.12.0: "The service manager's policy").
+  change wording, and `rsb_service`'s hint after a denial reads "If the
+  hub's policy is the reason, grant it in the hub's configuration ..."
+  (0.12.0: "The service manager's policy denies this to uid N. ..."): the
+  uid the hub judged is in its own message, and can differ from
+  `rsb_service`'s.
 - `rsb_hub` treats a service as an accessor by its `[[service]]` `accessor`
   key, not by the `android.os.IAccessor` descriptor; under
   `--insecure-allow-all` no binder is an accessor.
@@ -434,6 +437,23 @@ says what a peer does with the 0.12.0 value.
   is not the dump's end, and answers a `dump` during another `WOULD_BLOCK`.
 - A service `rsb_hub` starts runs with no signal blocked: a `SIGHUP`, `SIGINT`
   or `SIGTERM` it has no handler for ends it.
+- The tools' stderr changes form: `rsb_device` writes `rsb_device: <message>`
+  (0.12.0: `[<time> ERROR rsb_device] <message>`) and `rsb_device: warning:`
+  (0.12.0: `[WARN]`); `rsb_service` prints rsbinder's log records only when
+  `RUST_LOG` asks; `rsb_hub` writes a failure to start as a log record, its
+  later lines indented, `<N>`-prefixed under systemd, and a missing binder
+  device as `rsb_hub: cannot open the binder device ...` (0.12.0:
+  `Error: NameNotFound`).
+- `rsb_device --group 4294967295`, which chown(2) reads as "leave unchanged",
+  exits 1 before it mounts anything; 0.12.0 changed nothing and exited 0.
+- `nss::NssError` has a variant `OutOfRange`: `gid_for_group` refuses a
+  digits-only spec above `nss::MAX_ID` (4294967294), so `rsb_hub` refuses
+  such a policy `group` and `rsb_device` such a `--group`. 0.12.0 took
+  `"4294967295"` as that gid and looked a number past 32 bits up by name.
+- `rsb_hub` refuses a policy `uid` above 4294967294, and denies every call
+  from a kernel binder caller of uid 4294967295, under `"any"` and
+  `--insecure-allow-all` too, with a message that begins `rsb_hub refused`
+  and names the missing uid mapping (see *Security*).
 
 ### Added
 
@@ -829,9 +849,45 @@ says what a peer does with the 0.12.0 value.
   that wraps at a ring's end, handed to a closure that makes the copy
   with whichever `Bytes`/`RoBytes` method the protocol needs. The FMQ
   queues and `rsbinder-topic` copy through it.
+- **`rsb_device --owner USER`** ([#268](https://github.com/hiking90/rsbinder/issues/268)):
+  the user that owns the device node, by name or numeric uid, so a device
+  can belong to one user at mode `0600` (one per login session, say). A
+  digits-only `--owner` or `--group` is an id and is never looked up, so a
+  uid absent from the user database works. Handing an existing device to
+  another owner prints a warning: binder lets only the uid of the first
+  service manager that ran on a device register one again, and descriptors
+  already open stay open, so a device that was in use is removed (`rm`) and
+  created again. `rsbinder_tools::nss::uid_for_owner` resolves the spec;
+  digits above `nss::MAX_ID` (4294967294) are refused.
+- **`rsbinder_tools::config::is_unmapped`**: whether a kernel binder caller's
+  uid has no mapping in the hub's user namespace, the caller
+  `Enforcer::check_caller` denies whatever the policy says.
+- **`rsbinder_tools::logging`**: `init_command` and `init_daemon`, the two
+  ways the tool binaries set up their stderr log. `init_daemon` writes each
+  line with the `sd-daemon(3)` priority prefix when `JOURNAL_STREAM` names
+  stderr.
 
 ### Changed
 
+- **The tools write to stderr as a command or as a daemon** (see
+  *Migrating*). `rsb_device` and
+  `rsb_service` report their own errors as `rsb_device: <message>` and show
+  the `log` records of rsbinder only when `RUST_LOG` asks for them; 0.12.0's
+  `rsb_device` printed its errors as timestamped log lines, and `rsb_service`
+  printed rsbinder's record of a failure before its own report of it. `rsb_hub`
+  writes everything through `log`, failures to start included, which 0.12.0
+  printed partly with no level and, for a missing binder device, as
+  `Error: NameNotFound`. A failure to start, or the `--insecure-allow-all`
+  warning, that `RUST_LOG` filters out (`RUST_LOG=off`, or a value that names
+  only other targets) is written to stderr as plain text instead. Under
+  systemd (`JOURNAL_STREAM` naming its stderr) it drops the timestamp and
+  gives each line the `sd-daemon(3)` priority prefix, so `journalctl -p err`
+  finds the hub's errors. Past the record header, each message reads as in
+  0.12.0, except the messages that replace an `Error: <value>` line and the
+  `--insecure-allow-all` warning, now one record: "rsb_hub: running with
+  --insecure-allow-all; no access control is applied. Any local process may
+  register, look up, and enumerate any service." `rsbinder_tools::logging`
+  holds both setups (*Added*).
 - **The last drop of an RPC proxy waits for no peer** (see *Migrating*). On Linux
   and Android a `DEC_STRONG` on a `UnixTransport` is one `sendmsg` that puts the
   whole frame on the socket or nothing. TCP, vsock, TLS over a `TlsStream` with a
@@ -934,6 +990,13 @@ says what a peer does with the 0.12.0 value.
 
 ### Fixed
 
+- **`rsb_device` no longer opens an existing node wider than asked while it
+  changes the group.** 0.12.0 set the group before the mode, so rerunning
+  `--group B --mode 0600` on a `0660` node of group A left group B with
+  read-write access until the mode was set. The mode is now first narrowed
+  to the bits both the old and the new mode grant. `--group 4294967295`, which
+  chown(2) reads as "leave unchanged" and which so changed nothing without an
+  error, is refused (see *Migrating*).
 - **Interface code generated with `Builder::set_async_support(false)`
   compiles against rsbinder with its `async` feature on** (the default); it
   failed with `cannot find type BnFoo`. Code generated with async support
@@ -1169,6 +1232,15 @@ says what a peer does with the 0.12.0 value.
   needs `find` on `manager`) and read from the count whether a name it may
   not find contains that substring. The count now covers every name the
   policy withholds, whatever the filter (see *Migrating*).
+- **`rsb_hub` no longer judges callers it cannot tell apart as one uid.**
+  The binder driver reports a caller whose uid has no mapping in the
+  receiver's user namespace as `(uid_t)-1` (`from_kuid` in
+  `binder_thread_read`), so with `rsb_hub` in a container every caller from
+  outside it arrived as uid 4294967295. A rule `uid = [4294967295]` granted
+  all of them, and under `add = "any"` one could replace a name another had
+  registered, the owner check comparing two equal uids. Such a caller is now
+  denied every call, as an RPC peer with no uid is, and a policy `uid` above
+  4294967294 is refused at load (see *Migrating*).
 
 ## [0.12.0] - 2026-10-11
 

@@ -31,7 +31,7 @@ binder and is not expected to break.
 - **AIDL compiler entry points** — `rsbinder_aidl::Builder::{new, source,
   output, version, generate}`.
 - **rsb_device** binary CLI (binderfs setup); `--group` / `--mode` and the
-  `0600` default node are new in 0.11.0.
+  `0600` default node are new in 0.11.0, `--owner` in 0.13.0.
 
 ## Provisional
 

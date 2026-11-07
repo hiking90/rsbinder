@@ -63,6 +63,16 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
+Its log goes to stderr, filtered by `RUST_LOG` (default `warn`). When systemd
+connects stderr to the journal, `rsb_hub` leaves the timestamp to the journal
+and marks each line with its level as a syslog priority, so
+`journalctl -u <its unit> -p err` lists every error `rsb_hub` logs, a failure
+to start included. Three outputs carry no priority and are stored at the
+unit's default: a failure to start or the `--insecure-allow-all` warning
+that the unit's `RUST_LOG` filters out, which `rsb_hub` writes as plain text
+rather than drop, a command-line error from argument parsing, and a panic
+message.
+
 A binder device has exactly one service manager — the kernel enforces that,
 not `rsb_hub` — so a second instance on the same device exits 1 and says so.
 To run an independent one, give it its own device: `sudo rsb_device other`
@@ -520,6 +530,13 @@ load time), and `group` (matched against the caller's primary *and*
 supplementary groups). The shorthands `"any"` and `"none"` are also accepted;
 `"any"` must be written out, since an omitted key always means deny.
 
+A `uid`, or a digits-only `group`, above 4294967294 is refused at load time.
+`4294967295` is `(uid_t)-1`, which the binder driver reports as the uid of
+every caller whose uid has no mapping in `rsb_hub`'s user namespace (a hub in
+a container, called from outside it). Such callers cannot be told apart, so
+`rsb_hub` denies them every call, under `"any"` and `--insecure-allow-all`
+too, as it denies an RPC peer with no uid.
+
 **The first rule whose `name` matches decides**, and evaluation stops there —
 a later rule never widens what an earlier one refused. That makes the rule
 governing any given name unique and greppable, which is worth more in a
@@ -560,6 +577,17 @@ $ sudo groupadd -f binder
 $ sudo usermod -aG binder "$USER"
 $ sudo rsb_device binder --group binder --mode 0660
 ```
+
+`--owner USER` (a name, or a numeric uid) gives a device to one user at the
+default `0600`:
+
+```bash
+$ sudo rsb_device binder-alice --owner alice
+```
+
+A device that was in use keeps its first service manager's uid in the kernel
+and its open descriptors, so it moves to another owner by `rm` and a second
+`rsb_device`, not by a rerun with another `--owner`.
 
 An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
 platform provides one, but it is never what makes the first two unnecessary.

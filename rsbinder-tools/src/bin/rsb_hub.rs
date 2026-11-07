@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #![expect(non_snake_case, reason = "AIDL parameter names (`allowIsolated`, ..)")]
 
-use env_logger::Env;
 use hub::android_16::{
     BnServiceManager, IServiceManager, DUMP_FLAG_PRIORITY_ALL, DUMP_FLAG_PRIORITY_DEFAULT,
     FLAG_IS_LAZY_SERVICE,
@@ -503,8 +502,9 @@ impl ServiceManager {
                 }
             });
         if let Err(e) = spawn_result {
-            log::error!("Failed to spawn death receiver thread, exiting: {e}");
-            std::process::exit(1);
+            fail(format_args!(
+                "Failed to spawn death receiver thread, exiting: {e}"
+            ));
         }
     }
 
@@ -546,8 +546,9 @@ impl ServiceManager {
                 drop(order);
             });
         if let Err(e) = spawn_result {
-            log::error!("Failed to spawn client callback poller thread, exiting: {e}");
-            std::process::exit(1);
+            fail(format_args!(
+                "Failed to spawn client callback poller thread, exiting: {e}"
+            ));
         }
     }
 
@@ -671,26 +672,23 @@ impl ServiceManager {
             return Ok(());
         };
         let ctx = rsbinder::CallingContext::current();
+        let unmapped = unmapped_caller(caller.as_ref());
         let why = if permission == Permission::Add && is_reserved(target) {
             "rsb_hub reserves the name and refused"
+        } else if unmapped {
+            "rsb_hub refused"
         } else {
             "policy denied"
         };
+        let who = denied_to(&ctx, unmapped);
         // The caller learns no accessor name, as AOSP's "SELinux denied for the accessor".
         let of = if target == name {
             format!("{name:?}")
         } else {
             format!("the accessor of {name:?}")
         };
-        let wire = format!(
-            "{why} {permission} on {of} for uid={} (pid={})",
-            ctx.uid, ctx.pid
-        );
-        log::warn!(
-            "{why} {permission} on {target:?} ({of}) for uid={} (pid={})",
-            ctx.uid,
-            ctx.pid
-        );
+        let wire = format!("{why} {permission} on {of} for {who}");
+        log::warn!("{why} {permission} on {target:?} ({of}) for {who}");
         Err((ExceptionCode::Security, wire.as_str()).into())
     }
 
@@ -974,16 +972,20 @@ impl Interface for ServiceManager {
         let config = self.enforcer.config();
         let caller = rsbinder::calling_caller();
         if !self.allows_in(&config, caller.as_ref(), Permission::List, "") {
-            log::warn!(
-                "policy denied dump (list) for uid={} (pid={})",
-                ctx.uid,
-                ctx.pid
-            );
+            let unmapped = unmapped_caller(caller.as_ref());
+            let who = denied_to(&ctx, unmapped);
+            let why = if unmapped {
+                "rsb_hub refused"
+            } else {
+                "policy denied"
+            };
+            log::warn!("{why} dump (list) for {who}");
             // Also to the fd: its only channel, else a denial looks like an empty registry.
-            let text = format!(
-                "rsb_hub: policy denies `list` to uid={} (pid={})\n",
-                ctx.uid, ctx.pid
-            );
+            let text = if unmapped {
+                format!("rsb_hub: refused `list` to {who}\n")
+            } else {
+                format!("rsb_hub: policy denies `list` to {who}\n")
+            };
             let _ = send_dump(&self.dump_writer, fd, text.into_bytes(), &ctx);
             return Err(StatusCode::PermissionDenied);
         }
@@ -1403,9 +1405,15 @@ impl IServiceManager for ServiceManager {
         // AOSP `ServiceManager.cpp:748`: all filtered out is a denial, not "none declared".
         if allowed.is_empty() && declared != 0 {
             let ctx = rsbinder::CallingContext::current();
+            let unmapped = unmapped_caller(caller.as_ref());
+            let why = if unmapped {
+                "rsb_hub refused"
+            } else {
+                "policy denied"
+            };
             let msg = format!(
-                "policy denied find on every instance of {arg_iface:?} for uid={} (pid={})",
-                ctx.uid, ctx.pid
+                "{why} find on every instance of {arg_iface:?} for {}",
+                denied_to(&ctx, unmapped)
             );
             log::warn!("{msg}");
             return Err((ExceptionCode::Security, msg.as_str()).into());
@@ -1666,41 +1674,66 @@ const DEFAULT_CONFIG_DIR: &str = "/etc/rsbinder/hub.d";
 
 /// No permissive fallback: a config typo must not silently drop access control.
 fn exit_without_config(path: &Path, err: &config::ConfigError, on_a_socket: bool) -> ! {
-    eprintln!("rsb_hub: cannot load its configuration");
-    eprintln!("  {err}");
-    eprintln!();
-    eprintln!("rsb_hub denies every request its configuration does not allow. Create a");
-    eprintln!("file, for example {}/10-local.toml:", path.display());
-    eprintln!();
-    if on_a_socket {
-        eprintln!("    [global]");
-        eprintln!("    topics = {{ group = [\"binder-admin\"] }}");
-        eprintln!();
-        eprintln!("    [[topic]]");
-        eprintln!("    name = \"com.example.*\"");
-        eprintln!("    advertise = {{ user = [\"exampled\"] }}");
-        eprintln!("    subscribe = {{ group = [\"binder-clients\"] }}");
+    let example = if on_a_socket {
+        "    [global]\n    \
+         topics = { group = [\"binder-admin\"] }\n\n    \
+         [[topic]]\n    \
+         name = \"com.example.*\"\n    \
+         advertise = { user = [\"exampled\"] }\n    \
+         subscribe = { group = [\"binder-clients\"] }"
     } else {
-        eprintln!("    [global]");
-        eprintln!("    list = {{ group = [\"binder-admin\"] }}");
-        eprintln!();
-        eprintln!("    [[rule]]");
-        eprintln!("    name = \"com.example.*\"");
-        eprintln!("    add  = {{ user = [\"exampled\"] }}");
-        eprintln!("    find = {{ group = [\"binder-clients\"] }}");
-        eprintln!();
-        eprintln!("    [[service]]");
-        eprintln!("    name = \"com.example.IFoo/default\"");
-        eprintln!("    start = {{ systemd = \"example-foo.service\" }}");
-    }
-    eprintln!();
-    eprintln!("It and every directory above it must be owned by root or by rsb_hub's user, and");
-    eprintln!("writable by no one else (so not under /tmp): a start entry runs with rsb_hub's");
-    eprintln!("privileges when a lookup misses.");
-    eprintln!();
-    eprintln!("Point rsb_hub at a different path with --config <PATH>, or pass");
-    eprintln!("--insecure-allow-all to run with no access control (development only).");
+        "    [global]\n    \
+         list = { group = [\"binder-admin\"] }\n\n    \
+         [[rule]]\n    \
+         name = \"com.example.*\"\n    \
+         add  = { user = [\"exampled\"] }\n    \
+         find = { group = [\"binder-clients\"] }\n\n    \
+         [[service]]\n    \
+         name = \"com.example.IFoo/default\"\n    \
+         start = { systemd = \"example-foo.service\" }"
+    };
+    fail(format_args!(
+        "rsb_hub: cannot load its configuration\n  {err}\n\n\
+         rsb_hub denies every request its configuration does not allow. Create a\n\
+         file, for example {}/10-local.toml:\n\n\
+         {example}\n\n\
+         It and every directory above it must be owned by root or by rsb_hub's user, and\n\
+         writable by no one else (so not under /tmp): a start entry runs with rsb_hub's\n\
+         privileges when a lookup misses.\n\n\
+         Point rsb_hub at a different path with --config <PATH>, or pass\n\
+         --insecure-allow-all to run with no access control (development only).",
+        path.display()
+    ))
+}
+
+/// An error the hub exits 1 on, through [`report`]: at `err` unless `RUST_LOG` hides it.
+fn fail(message: std::fmt::Arguments<'_>) -> ! {
+    report(log::Level::Error, message);
     std::process::exit(1);
+}
+
+/// A caller no policy can grant (`config::is_unmapped`): its denial does not say "policy denied".
+fn unmapped_caller(caller: Option<&rsbinder::Caller>) -> bool {
+    caller.is_some_and(config::is_unmapped)
+}
+
+/// `uid=N (pid=P)` for a denial message, and the reason when the caller is `unmapped`.
+fn denied_to(ctx: &rsbinder::CallingContext, unmapped: bool) -> String {
+    let reason = if unmapped {
+        ": its uid has no mapping in rsb_hub's user namespace, and no policy grants such a caller"
+    } else {
+        ""
+    };
+    format!("uid={} (pid={}){reason}", ctx.uid, ctx.pid)
+}
+
+/// A `RUST_LOG` that filters out the hub's own `level` sends the message to stderr unprefixed.
+fn report(level: log::Level, message: std::fmt::Arguments<'_>) {
+    if log::log_enabled!(level) {
+        log::log!(level, "{message}");
+    } else {
+        eprintln!("{message}");
+    }
 }
 
 /// SIGTERM/SIGINT handled so systemd does not record a deliberate stop as a crash.
@@ -1765,10 +1798,9 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifi
         .spawn(move || {
             let set = match handled_signal_set() {
                 Ok(set) => set,
-                Err(e) => {
-                    log::error!("rsb_hub: cannot build the signal set, exiting: {e}");
-                    std::process::exit(1);
-                }
+                Err(e) => fail(format_args!(
+                    "rsb_hub: cannot build the signal set, exiting: {e}"
+                )),
             };
             loop {
                 let mut signo: libc::c_int = 0;
@@ -1776,11 +1808,10 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifi
                 let rc = unsafe { libc::sigwait(&set, &mut signo) };
                 // Exit, not return: the signals stay blocked, so nothing else could stop us.
                 if rc != 0 {
-                    log::error!(
+                    fail(format_args!(
                         "rsb_hub: sigwait failed, exiting: {}",
                         std::io::Error::from_raw_os_error(rc)
-                    );
-                    std::process::exit(1);
+                    ));
                 }
                 match signo {
                     libc::SIGHUP => reload(reloadable.as_ref(), on_a_socket, &notifier),
@@ -1806,8 +1837,9 @@ fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifi
             }
         });
     if let Err(e) = spawn_result {
-        eprintln!("rsb_hub: failed to spawn the signal thread: {e}");
-        std::process::exit(1);
+        fail(format_args!(
+            "rsb_hub: failed to spawn the signal thread: {e}"
+        ));
     }
 }
 
@@ -2094,11 +2126,11 @@ fn abort_on_a_background_panic() {
     }));
 }
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    rsbinder_tools::logging::init_daemon("rsb_hub", "warn");
     // Before any thread: the mask is inherited.
     if let Err(e) = block_handled_signals() {
-        eprintln!("rsb_hub: cannot block signals: {e}");
-        std::process::exit(1);
+        fail(format_args!("rsb_hub: cannot block signals: {e}"));
     }
     let notifier = Arc::new(Notifier::from_environment());
 
@@ -2190,7 +2222,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
         .get_matches();
 
-    env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
     abort_on_a_background_panic();
 
     let topic_socket = matches.get_one::<String>("topic-socket").map(PathBuf::from);
@@ -2200,11 +2231,10 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         any(target_os = "linux", target_os = "android")
     )))]
     if topic_socket.is_some() {
-        eprintln!(
+        fail(format_args!(
             "rsb_hub: --topic-socket takes the features `topic` and `rpc`, on Linux; \
              this build is not that"
-        );
-        std::process::exit(1);
+        ));
     }
     let on_a_socket = topic_socket.is_some();
 
@@ -2223,17 +2253,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let insecure_allow_all = matches.get_flag("insecure-allow-all");
     let config_path = matches.get_one::<String>("config").map(PathBuf::from);
     if insecure_allow_all && config_path.is_some() {
-        eprintln!("rsb_hub: --config and --insecure-allow-all are mutually exclusive");
-        std::process::exit(1);
+        fail(format_args!(
+            "rsb_hub: --config and --insecure-allow-all are mutually exclusive"
+        ));
     }
 
     let (enforcer, reloadable, ready_status) = if insecure_allow_all {
-        // Stderr too, so the operator sees it from the terminal that started it.
-        eprintln!(
-            "rsb_hub: WARNING --insecure-allow-all: no access control. Any local \
-             process may register, look up, and enumerate any service."
+        report(
+            log::Level::Warn,
+            format_args!(
+                "rsb_hub: running with --insecure-allow-all; no access control is applied. \
+                 Any local process may register, look up, and enumerate any service."
+            ),
         );
-        log::warn!("rsb_hub: running with --insecure-allow-all; no access control is applied");
         log::warn!("rsb_hub: SIGHUP will be ignored (there is no policy to reload)");
         (
             Arc::new(Enforcer::allow_all()),
@@ -2273,24 +2305,40 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             &ready_status,
         );
         if let Err(err) = served {
-            eprintln!(
-                "rsb_hub: cannot serve topics on {}: {err}",
-                socket.display()
-            );
             // Once the socket's mode is set the path is in use: a later failure is not the path's.
-            if TOPIC_SOCKET.get().is_none() && cannot_use_the_path(&*err) {
-                eprintln!("A hub that is not root takes a path it can write to, for example");
-                eprintln!("    --topic-socket $XDG_RUNTIME_DIR/rsbinder/topic.sock");
-            }
-            std::process::exit(1);
+            let hint = if TOPIC_SOCKET.get().is_none() && cannot_use_the_path(&*err) {
+                "\nA hub that is not root takes a path it can write to, for example\n    \
+                 --topic-socket $XDG_RUNTIME_DIR/rsbinder/topic.sock"
+            } else {
+                ""
+            };
+            fail(format_args!(
+                "rsb_hub: cannot serve topics on {}: {err}{hint}",
+                socket.display()
+            ));
         }
-        return Ok(());
+        return;
     }
 
     log::info!("Starting rsb_hub with binder device: {}", binder_path);
 
     // 0 = AOSP's `setThreadPoolMaxThreadCount(0)`: single-threaded like `servicemanager`.
-    ProcessState::init(&binder_path, 0)?;
+    if let Err(e) = ProcessState::init(&binder_path, 0) {
+        // The path itself, not the status: `NameNotFound` is not only ENOENT.
+        let absent = std::fs::metadata(&binder_path)
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+        let hint = if absent {
+            format!(
+                "\nCreate it first, for example\n    \
+                 sudo rsb_device {device_name} --group binder --mode 0660"
+            )
+        } else {
+            String::new()
+        };
+        fail(format_args!(
+            "rsb_hub: cannot open the binder device {binder_path}: {e}{hint}"
+        ));
+    }
     // AOSP `main.cpp`. Before any thread uses binder, so each copies it (plan 16 D1 S2).
     ProcessState::as_self().set_call_restriction(CallRestriction::FatalIfNotOneway);
 
@@ -2331,22 +2379,23 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // The kernel enforces one context manager; the raw ioctl error does not name the cause.
     if let Err(e) = ProcessState::as_self().become_context_manager(service.as_binder()) {
-        eprintln!("rsb_hub: cannot become the service manager for {binder_path}: {e}");
-        eprintln!();
-        eprintln!("A binder device has exactly one service manager, so this usually means");
-        eprintln!("one is already running on {binder_path}. Check with:");
-        eprintln!("    rsb_service --device {device_name} check manager");
-        eprintln!();
-        eprintln!("To run a second, independent service manager, give it its own device:");
-        eprintln!("    sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other");
-        std::process::exit(1);
+        fail(format_args!(
+            "rsb_hub: cannot become the service manager for {binder_path}: {e}\n\n\
+             A binder device has exactly one service manager, so this usually means\n\
+             one is already running on {binder_path}. Check with:\n    \
+             rsb_service --device {device_name} check manager\n\n\
+             To run a second, independent service manager, give it its own device:\n    \
+             sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other"
+        ));
     }
 
     // Only once handle 0 is ours, else `After=` units race the registry.
     log::info!("rsb_hub: serving on {binder_path}");
     notifier.ready(&ready_status);
 
-    Ok(ProcessState::join_thread_pool()?)
+    if let Err(e) = ProcessState::join_thread_pool() {
+        fail(format_args!("rsb_hub: the binder thread pool ended: {e}"));
+    }
 }
 
 #[cfg(test)]

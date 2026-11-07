@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rsb_hub acceptance gates: Plan 6-1 access control (AC-6.1.1 .. AC-6.1.9),
+# rsb_hub acceptance gates: Plan 6-1 access control (AC-6.1.1 .. AC-6.1.10),
 # plus the 6-2/6-3 declaration gates, the 6-5 diagnostic CLI, and the 6-4
 # service-supervisor integration.
 #
@@ -77,6 +77,15 @@ out=$($HUB --config "$POLDIR-nonexistent" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "exits non-zero" || bad "exit $rc"
 echo "$out" | grep -q "cannot load its configuration" && ok "names the failure" || bad "message: $out"
 echo "$out" | grep -q '\[\[rule\]\]'                      && ok "shows a minimal example" || bad "no example"
+# A RUST_LOG that leaves out rsb_hub's own records must not silence why it exits.
+for filter in off rsbinder=debug; do
+    out=$(RUST_LOG=$filter $HUB --config "$POLDIR-nonexistent" 2>&1)
+    echo "$out" | grep -q "cannot load its configuration" && ok "RUST_LOG=$filter still names it" \
+        || bad "RUST_LOG=$filter: $out"
+done
+out=$(RUST_LOG=error $HUB --insecure-allow-all --device rsb61-absent 2>&1)
+echo "$out" | grep -q "no access control is applied" && ok "RUST_LOG=error keeps the allow-all warning" \
+    || bad "RUST_LOG=error: $out"
 
 note "AC-6.1.1b  malformed policy -> refuse to start, point at the file"
 mkdir -p "$POLDIR"; echo 'rule = "oops"' > "$POLDIR/10.toml"
@@ -373,7 +382,7 @@ note "config trust: a configuration under /tmp is refused, sticky or not"
 TMPCFG=$(mktemp -d /tmp/rsb61-tmpcfg.XXXXXX); cp "$POLDIR"/*.toml "$TMPCFG"/; chmod 755 "$TMPCFG"
 out=$($HUB --config "$TMPCFG" 2>&1); rc=$?; rm -rf "$TMPCFG"
 [ "$rc" -eq 1 ] && ok "/tmp config refuses to start" || bad "exit $rc"
-echo "$out" | grep -q '^  /tmp is world-writable' && ok "and names /tmp" || bad "$out"
+echo "$out" | grep -q '^ *  /tmp is world-writable' && ok "and names /tmp" || bad "$out"
 
 ######################################################################
 note "AC-6.1.7  SIGHUP reload"
@@ -408,7 +417,8 @@ want_result debuginfo "" FAILEDTXN "AC-6.1.5d global list gate denies getService
 # nothing here and exit 0.
 run_svc list
 want_rc 2 "6-5  a denied list exits 2, not 0-with-no-output"
-want_out "policy denies this to uid" "6-5  and explains that the policy is the reason"
+want_out ": policy denied list" "6-5  and explains that the policy is the reason"
+want_out "grant it in the hub's configuration" "6-5  and where to grant it"
 run_svc info
 want_rc 2 "6-5  a denied info exits 2"
 run_svc dump manager
@@ -508,6 +518,30 @@ else
     bad "6-4  hub did not restart for the single-instance gate"; cat "$LOG"
 fi
 stop_hub
+
+######################################################################
+note "AC-6.1.10  a caller the hub's user namespace does not map is refused"
+# The driver gives such a caller uid 4294967295; a hub in a user namespace with no
+# uid_map leaves even this user unmapped. Killed by pid: `pkill -f` matches the shell.
+if unshare --user true 2>/dev/null; then
+    for ns in --map-current-user none; do
+        [ "$ns" = none ] && map="" || map="$ns"
+        RUST_LOG=info unshare --user $map $HUB --insecure-allow-all > "$LOG" 2>&1 &
+        ns_hub=$!; sleep 2
+        run_svc list
+        if [ "$ns" = none ]; then
+            want_rc 2 "AC-6.1.10 an unmapped caller is refused under --insecure-allow-all"
+            want_out "for uid=4294967295" "AC-6.1.10 the driver reports it as uid 4294967295"
+            want_out "no mapping in rsb_hub's user namespace" "AC-6.1.10 and the hub names why"
+            reject_out ": policy denied" "AC-6.1.10 not as a policy denial"
+        else
+            want_rc 0 "AC-6.1.10 the same caller, mapped, is answered"
+        fi
+        kill "$ns_hub" 2>/dev/null; wait "$ns_hub" 2>/dev/null
+    done
+else
+    printf '  SKIP  AC-6.1.10 (no unprivileged user namespaces on this host)\n'
+fi
 
 printf '\n==== Plan 6 AC gates: %d passed, %d failed ====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

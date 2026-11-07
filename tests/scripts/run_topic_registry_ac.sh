@@ -327,7 +327,7 @@ if start_hub "$HUB_TOPIC" --config "$CFG"; then
     want "$WORK/b" "RESULT list ac. SECURITY" "\"none\": refused"
     timeout 10 "$SVC_TOPIC" topics > "$WORK/topics" 2>&1; rc=$?
     [ "$rc" -eq 2 ] && ok "topics exits 2" || bad "topics exit $rc"
-    grep -q "policy denies" "$WORK/topics" && grep -q '\[global\] topics' "$WORK/topics" \
+    grep -q "hub's policy is the reason" "$WORK/topics" && grep -q '\[global\] topics' "$WORK/topics" \
         && ok "and says which policy" || bad "topics: $(cat "$WORK/topics")"
 else
     bad "hub did not start: $(tail -3 "$LOG")"

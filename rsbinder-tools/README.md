@@ -16,13 +16,29 @@ $ cd rsbinder
 $ cargo build --release
 ```
 
+## The tools
+
+| Tool | Kind | Runs |
+| --- | --- | --- |
+| [`rsb_device`](#rsb_device) | command, as root | once per device, before anything opens it |
+| [`rsb_hub`](#rsb_hub) | daemon | for as long as the device serves binder, one per device |
+| [`rsb_service`](#rsb_service) | command | whenever you want to ask the running `rsb_hub` something |
+
+The two commands report their own errors on stderr as `<tool>: <message>`
+and print the log of the rsbinder library only when `RUST_LOG` asks for it.
+The daemon writes what it reports through its log, filtered by `RUST_LOG`
+(default `warn`): on a terminal with a timestamp, and under systemd in the
+form the journal reads a priority from, so `journalctl -p err` finds its
+errors. A failure to start that `RUST_LOG` filters out is written as plain
+text instead, as are clap's command-line errors and a panic message.
+
 ## rsb_device
 
 A utility for initializing the Linux binder environment and creating binder device files.
 
 ### Usage
 ```bash
-$ sudo rsb_device <device_name> [--group <GROUP>] [--mode <MODE>]
+$ sudo rsb_device <device_name> [--owner <USER>] [--group <GROUP>] [--mode <MODE>]
 ```
 
 ### Example
@@ -34,6 +50,13 @@ $ sudo rsb_device binder
 $ sudo groupadd -f binder
 $ sudo usermod -aG binder "$USER"
 $ sudo rsb_device binder --group binder --mode 0660
+
+# A device of one user's own (mode 0600); a digits-only USER is a uid
+$ sudo rsb_device binder-alice --owner alice
+$ sudo rsb_device binder-1000 --owner 1000
+
+# Remove it; a new device of the same name lets any uid's service manager register
+$ sudo rm /dev/binderfs/binder-alice
 ```
 
 ### What it does
@@ -42,7 +65,7 @@ $ sudo rsb_device binder --group binder --mode 0660
 1. **Directory Creation**: Creates `/dev/binderfs` directory if it doesn't exist
 2. **Filesystem Mount**: Executes `mount -t binder binder /dev/binderfs` to mount binderfs
 3. **Device Creation**: Uses kernel ioctl interface to create `/dev/binderfs/<device_name>`
-4. **Ownership and permissions**: Applies `--group` (unchanged by default) and `--mode` (default `0600`)
+4. **Ownership and permissions**: Applies `--owner` and `--group` (each unchanged by default) and `--mode` (default `0600`); when the ids change, the mode is first narrowed to what the old and the new mode both grant
 5. **Symlink**: Links `/dev/<device_name>` to `/dev/binderfs/<device_name>`; if `/dev/<device_name>` already exists as anything else, it is left unchanged and a warning is printed
 
 ### Why the device is root-only by default
