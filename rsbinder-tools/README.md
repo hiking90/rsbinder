@@ -1,5 +1,8 @@
 # rsbinder-tools
 
+[![crates.io](https://img.shields.io/crates/v/rsbinder-tools.svg)](https://crates.io/crates/rsbinder-tools)
+[![GitHub](https://img.shields.io/badge/github-hiking90%2Frsbinder-8da0cb?logo=github)](https://github.com/hiking90/rsbinder/tree/master/rsbinder-tools)
+
 This crate provides essential CLI tools for using Binder IPC on Linux systems. While Android has several built-in tools for binder IPC, Linux environments require additional utilities to set up and manage Binder IPC infrastructure.
 
 ## Installation
@@ -7,6 +10,13 @@ This crate provides essential CLI tools for using Binder IPC on Linux systems. W
 ### From crates.io
 ```bash
 $ cargo install rsbinder-tools
+```
+
+Two features are off by default. `topic` adds `rsb_hub`'s registry of topic
+names and `rsb_service topics`; `topic` with `rpc` adds `--topic-socket`, the
+same registry on a Unix socket with no binder device:
+```bash
+$ cargo install rsbinder-tools --features topic,rpc
 ```
 
 ### From source
@@ -179,7 +189,12 @@ $ rsb_service instances com.example.IFoo            # every declared instance
 $ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
 $ rsb_service dump manager                          # rsb_hub's own registry
 $ rsb_service dump manager com.example              # ... narrowed by substring
+$ rsb_service topics                                # topic names (feature topic)
+$ rsb_service topics --topic-socket PATH            # ... of a hub on a socket
 ```
+
+Every command takes `-d, --device <NAME>` (default `binder`) to ask the
+`rsb_hub` of another device.
 
 Exit status is the answer: `0` yes, `1` no (not registered, not declared), `2`
 the question could not be answered -- no service manager, or its policy denied
@@ -196,3 +211,5 @@ denied caller cannot use it to enumerate which names exist.
 `dump <name>` works on any service, not just the hub: it sends
 `DUMP_TRANSACTION` and prints whatever the service writes, which for an
 rsbinder service is its `Interface::dump` implementation.
+
+Part of [rsbinder](https://github.com/hiking90/rsbinder). Apache-2.0.

@@ -1,5 +1,9 @@
 # rsbinder-topic
 
+[![crates.io](https://img.shields.io/crates/v/rsbinder-topic.svg)](https://crates.io/crates/rsbinder-topic)
+[![Docs.rs](https://docs.rs/rsbinder-topic/badge.svg)](https://docs.rs/rsbinder-topic)
+[![GitHub](https://img.shields.io/badge/github-hiking90%2Frsbinder-8da0cb?logo=github)](https://github.com/hiking90/rsbinder/tree/master/rsbinder-topic)
+
 **Experimental.** One publisher and many subscribers over kernel binder, on
 Linux and Android, or with the feature `uds` over a Unix domain socket on Linux,
 where there is no binder device. A binder call sets each subscription up; after
@@ -21,6 +25,12 @@ for them.
   of topic names `rsb_hub` serves with its `topic` feature, under a policy of
   its own. Without a binder device, at a socket path or through the same
   registry on a socket (`rsb_hub --topic-socket`).
+
+```toml
+[dependencies]
+rsbinder-topic = "0.1"                                      # over kernel binder
+# rsbinder-topic = { version = "0.1", features = ["uds"] }  # and over a Unix socket
+```
 
 A receiver that must see every value however slow it is uses
 `rsbinder::stream` instead, which holds the sender back.

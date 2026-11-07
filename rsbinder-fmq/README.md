@@ -1,5 +1,9 @@
 # rsbinder-fmq
 
+[![crates.io](https://img.shields.io/crates/v/rsbinder-fmq.svg)](https://crates.io/crates/rsbinder-fmq)
+[![Docs.rs](https://docs.rs/rsbinder-fmq/badge.svg)](https://docs.rs/rsbinder-fmq)
+[![GitHub](https://img.shields.io/badge/github-hiking90%2Frsbinder-8da0cb?logo=github)](https://github.com/hiking90/rsbinder/tree/master/rsbinder-fmq)
+
 AOSP-compatible Fast Message Queue (FMQ) in Rust: the shared-memory ring
 Android's `libfmq` builds, with the same layout, counters and futex protocol,
 so one end can be C++ on a device and the other this crate. It does not

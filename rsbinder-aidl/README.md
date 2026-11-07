@@ -1,4 +1,9 @@
 # rsbinder-aidl
+
+[![crates.io](https://img.shields.io/crates/v/rsbinder-aidl.svg)](https://crates.io/crates/rsbinder-aidl)
+[![Docs.rs](https://docs.rs/rsbinder-aidl/badge.svg)](https://docs.rs/rsbinder-aidl)
+[![GitHub](https://img.shields.io/badge/github-hiking90%2Frsbinder-8da0cb?logo=github)](https://github.com/hiking90/rsbinder/tree/master/rsbinder-aidl)
+
 This is an AIDL compiler for **rsbinder**.
 
 ## How to use the AIDL Code Generator
@@ -69,7 +74,7 @@ miette = "7"
 When an AIDL file contains a syntax or semantic error, the compiler reports the file name,
 line number, source snippet, and a helpful message:
 
-```
+```text
 aidl::parse_error
 
   × AIDL syntax error
@@ -118,3 +123,5 @@ fn main() {
 Please read Android AIDL documents.
 
 https://source.android.com/docs/core/architecture/aidl
+
+Part of [rsbinder](https://github.com/hiking90/rsbinder). Apache-2.0.

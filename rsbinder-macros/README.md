@@ -1,10 +1,14 @@
 # rsbinder-macros
 
+[![crates.io](https://img.shields.io/crates/v/rsbinder-macros.svg)](https://crates.io/crates/rsbinder-macros)
+[![Docs.rs](https://docs.rs/rsbinder-macros/badge.svg)](https://docs.rs/rsbinder-macros)
+[![GitHub](https://img.shields.io/badge/github-hiking90%2Frsbinder-8da0cb?logo=github)](https://github.com/hiking90/rsbinder/tree/master/rsbinder-macros)
+
 `#[rsbinder::interface]` — declare a Binder interface as a Rust trait, with no
 `.aidl` file and no `build.rs`.
 
 ```rust
-use rsbinder::{interface, BinderResult, Strong};
+use rsbinder::{interface, BinderResult, Strong, Uri};
 
 #[interface(descriptor = "com.example.IHello")]
 pub trait IHello {
@@ -14,8 +18,8 @@ pub trait IHello {
     fn ping(&self) -> BinderResult<()>;
 }
 
-rsbinder::serve("binder://")?.add("hello", BnHello::new_binder(Impl))?.run()?;
-let hello: Strong<dyn IHello> = rsbinder::connect("binder://hello")?;
+rsbinder::serve(Uri::kernel())?.add("hello", BnHello::new_binder(Impl))?.run()?;
+let hello: Strong<dyn IHello> = rsbinder::connect(Uri::kernel().with_service("hello"))?;
 ```
 
 This is for **rsbinder ↔ rsbinder** interfaces, where the wire is private to
@@ -43,4 +47,4 @@ Enable it through `rsbinder`:
 rsbinder = { version = "0.13", features = ["macros"] }
 ```
 
-Licensed under the Apache License, Version 2.0.
+Part of [rsbinder](https://github.com/hiking90/rsbinder). Apache-2.0.
