@@ -972,8 +972,11 @@ bytes, so only a peer that wrote something unusual sees a difference.
   declaration(s)" (0.12.0: "N rule(s) and M service declaration(s)"), and
   its supervisor's status line reads "serving; N rule(s), M service
   declaration(s)" (0.12.0: "serving; N rule(s), M declaration(s)").
-  `rsb_service`'s hint after a denial begins "The hub's policy denies this to
-  uid" (0.12.0: "The service manager's policy denies this to uid").
+  `rsb_service`'s hint after a denial reads "If the hub's policy is the
+  reason, grant it in the hub's configuration ..." (0.12.0: "The service
+  manager's policy denies this to uid N. ..."). The uid the hub judged is in
+  the hub's message on the line above; it is not always `rsb_service`'s own
+  uid.
 - **`rsb_hub` tells an accessor by a declaration, not by its descriptor.**
   `getService2` and `checkService2` answer with the `Service::Accessor` arm
   for an instance whose `[[service]]` entry has an `accessor` key, and with
@@ -1076,3 +1079,45 @@ bytes, so only a peer that wrote something unusual sees a difference.
   `SIGTERM` blocked, so one with no handler for them went on running through
   them. Now each of them ends it. A service that has to outlive one of them
   sets its own disposition for it.
+- **The tools' stderr has a new form** (CHANGELOG *Changed*). A script that
+  reads it matches the 0.13.0 form:
+
+  | Output | 0.12.0 | 0.13.0 |
+  | --- | --- | --- |
+  | `rsb_device` error | `[<time> ERROR rsb_device] <message>` | `rsb_device: <message>` |
+  | `rsb_device` symlink warning | `[WARN] /dev/<name> exists ...` | `rsb_device: warning: /dev/<name> exists ...` |
+  | `rsb_service` with no `RUST_LOG` | rsbinder's error records, then its own report | its own report only |
+  | `rsb_hub` failure to start | `rsb_hub: <message>`, lines as written | `[<time> ERROR rsb_hub] rsb_hub: <message>`, each later line indented by four spaces |
+  | `rsb_hub` with no binder device | `Error: NameNotFound` | `rsb_hub: cannot open the binder device <path>: NameNotFound` and how to create it |
+  | `rsb_hub --insecure-allow-all` | `rsb_hub: WARNING --insecure-allow-all: no access control. ...` and a log record | one `WARN` record: `rsb_hub: running with --insecure-allow-all; no access control is applied. ...` |
+
+  When systemd connects `rsb_hub`'s stderr to the journal (`JOURNAL_STREAM`),
+  each line starts with `<N>`, its syslog priority, and has no timestamp. A
+  failure to start or the `--insecure-allow-all` warning that `RUST_LOG`
+  filters out is written as plain text, with neither header nor prefix.
+- **`rsb_device --group 4294967295` exits 1** (CHANGELOG *Fixed*), before it
+  mounts binderfs or creates the device. chown(2) reads that id as "leave
+  unchanged", so 0.12.0 changed nothing and exited 0. A script that passed
+  it to keep the group drops `--group`; `--owner 4294967295` is refused the
+  same way.
+- **A digits-only group above 4294967294 is refused** (CHANGELOG
+  *Migrating*). 0.12.0 took `4294967295` as a gid and looked a spec that does
+  not fit in 32 bits, such as `4294967296`, up in the group database by name.
+  `4294967295` is `(gid_t)-1`, which the kernel uses for no id and chown(2)
+  reads as "leave unchanged", so no process has it as a gid.
+  `nss::gid_for_group` now returns `NssError::OutOfRange` for both without a
+  lookup: `rsb_hub` refuses a policy `group` of that form, and
+  `rsb_device --group` exits 1. A group whose name is all digits is reached
+  by its gid only. A `match` on `NssError` with no wildcard arm gets the new
+  variant; `nss::MAX_ID` is the bound.
+- **`rsb_hub` denies a caller whose uid it receives as 4294967295**
+  (CHANGELOG *Security*). The binder driver gives that uid to every caller
+  whose uid has no mapping in `rsb_hub`'s user namespace, which happens only
+  when the hub runs in a user namespace and something outside it opens the
+  device. 0.12.0 judged all of them as one uid; 0.13.0 denies each of their
+  calls, under `"any"` and `--insecure-allow-all` too. Such a caller is
+  served by a hub in its own namespace, or by mapping its uid into the
+  hub's. A policy `uid` above 4294967294 no longer loads; remove it. The
+  denial reads `rsb_hub refused <permission> on "<name>" for
+  uid=4294967295 (pid=N): its uid has no mapping in rsb_hub's user
+  namespace, ...`, not `policy denied ...`.

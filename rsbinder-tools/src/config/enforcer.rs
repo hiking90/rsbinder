@@ -16,7 +16,7 @@ use rsbinder::Caller;
 
 use super::parse::Config;
 use super::policy::{Permission, Subject, TopicPermission};
-use crate::nss::GroupCache;
+use crate::nss::{GroupCache, MAX_ID};
 
 /// Applies a [`Policy`](super::policy::Policy) to live callers.
 ///
@@ -180,6 +180,13 @@ impl Enforcer {
     /// that does not exist here, and an anonymous peer has no identity at
     /// all. Denying is the only honest answer for those — see
     /// `rsbinder::rpc::PeerIdentity`.
+    ///
+    /// A kernel binder caller whose uid has no mapping in `rsb_hub`'s user
+    /// namespace is denied the same way. The driver reports every such
+    /// caller as `(uid_t)-1` (`from_kuid` in `binder_thread_read`), so two
+    /// of them cannot be told apart: neither a uid rule nor the owner
+    /// check on `addService` could hold between them. Like the identities
+    /// above, it is denied under `"any"` and `--insecure-allow-all` too.
     pub fn check_caller(&self, permission: Permission, name: &str, caller: &Caller) -> bool {
         self.check_caller_in(&self.config(), permission, name, caller)
     }
@@ -209,15 +216,27 @@ impl Enforcer {
     }
 }
 
+/// Is `caller` a kernel binder caller whose uid has no mapping in this
+/// process's user namespace?
+///
+/// The driver reports every such caller as `(uid_t)-1`, and
+/// [`Enforcer::check_caller`] denies it whatever the policy says, so a
+/// denial message can name that, not the policy, as the reason.
+pub fn is_unmapped(caller: &Caller) -> bool {
+    matches!(caller, Caller::Kernel { .. }) && uid_of(caller).is_none()
+}
+
 /// The uid a policy can be keyed on, if this caller has one.
 fn uid_of(caller: &Caller) -> Option<u32> {
-    match caller {
-        Caller::Kernel { uid, .. } => Some(*uid),
+    let uid = match caller {
+        Caller::Kernel { uid, .. } => *uid,
         #[cfg(feature = "rpc")]
-        Caller::Rpc(rsbinder::rpc::PeerIdentity::Local { uid, .. }) => Some(*uid),
+        Caller::Rpc(rsbinder::rpc::PeerIdentity::Local { uid, .. }) => *uid,
         // No uid to key on; `Caller` is `#[non_exhaustive]`, so a new transport lands here too.
-        _ => None,
-    }
+        _ => return None,
+    };
+    // `(uid_t)-1` is the driver's uid for every sender unmapped in our user namespace.
+    (uid <= MAX_ID).then_some(uid)
 }
 
 #[cfg(test)]
@@ -282,6 +301,41 @@ mod tests {
             sid: None,
         };
         assert!(enforcer.check_caller(Permission::Add, "svc", &caller));
+    }
+
+    /// Every sender unmapped in the hub's user namespace arrives as uid `-1`: none is a principal.
+    #[test]
+    fn kernel_caller_with_no_mapping_is_denied() {
+        let unmapped = Caller::Kernel {
+            uid: u32::MAX,
+            pid: 4321,
+            sid: None,
+        };
+        let any = Policy {
+            list: Subjects::Any,
+            rules: vec![Rule {
+                pattern: NamePattern::Any,
+                add: Subjects::Any,
+                find: Subjects::Any,
+            }],
+        };
+        for enforcer in [
+            Enforcer::from_policy(policy_allowing_uid(u32::MAX)),
+            Enforcer::from_policy(any),
+            Enforcer::allow_all(),
+        ] {
+            for perm in [Permission::Add, Permission::Find, Permission::List] {
+                assert!(!enforcer.check_caller(perm, "svc", &unmapped));
+            }
+        }
+        let highest = Caller::Kernel {
+            uid: MAX_ID,
+            pid: 4321,
+            sid: None,
+        };
+        assert!(Enforcer::allow_all().check_caller(Permission::Add, "svc", &highest));
+        assert!(is_unmapped(&unmapped));
+        assert!(!is_unmapped(&highest));
     }
 
     /// A uid policy cannot judge an identity with no uid, so it is refused, not defaulted.

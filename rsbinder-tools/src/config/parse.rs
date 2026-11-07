@@ -136,7 +136,8 @@ pub enum ConfigError {
         /// Why the pattern was rejected.
         source: PolicyError,
     },
-    /// A user or group named in the policy could not be resolved.
+    /// A user or group named in the policy could not be resolved, or a
+    /// `uid` or digits-only `group` is above [`nss::MAX_ID`].
     #[error("{path}: {source}")]
     Name {
         /// The offending file.
@@ -511,7 +512,20 @@ impl RawSubjects {
                 }),
             },
             RawSubjects::Set(set) => {
-                let mut uids: BTreeSet<u32> = set.uid.into_iter().collect();
+                let mut uids = BTreeSet::new();
+                for uid in set.uid {
+                    // No caller has it: `uid_of` denies the uid an unmapped sender arrives with.
+                    if uid > nss::MAX_ID {
+                        return Err(ConfigError::Name {
+                            path: path.to_owned(),
+                            source: NssError::OutOfRange {
+                                id: "uid",
+                                spec: uid.to_string(),
+                            },
+                        });
+                    }
+                    uids.insert(uid);
+                }
                 for user in set.user {
                     uids.insert(resolver.uid(&user).map_err(|source| ConfigError::Name {
                         path: path.to_owned(),
@@ -1061,6 +1075,19 @@ mod tests {
         let policy = parse("[[rule]]\nname = \"*\"\nadd = { uid = [1234] }\n").unwrap();
         assert!(policy.check(Permission::Add, "x", &subject(1234, &[])));
         assert!(!policy.check(Permission::Add, "x", &subject(1235, &[])));
+    }
+
+    /// `(uid_t)-1` is what every unmapped sender arrives as, so a rule naming it is refused.
+    #[test]
+    fn a_uid_above_max_id_is_refused() {
+        assert!(parse("[[rule]]\nname = \"*\"\nfind = { uid = [4294967294] }\n").is_ok());
+        match parse("[[rule]]\nname = \"*\"\nfind = { uid = [0, 4294967295] }\n") {
+            Err(ConfigError::Name {
+                source: NssError::OutOfRange { id: "uid", spec },
+                ..
+            }) => assert_eq!(spec, "4294967295"),
+            other => panic!("got {other:?}"),
+        }
     }
 
     /// File-name order decides precedence and the first match wins, so `10-` beats `99-`.

@@ -50,6 +50,14 @@ pub enum NssError {
         /// `strerror` of the returned errno.
         message: String,
     },
+    /// A digits-only spec, which is an id and never a name, above [`MAX_ID`].
+    #[error("{id} {spec} is out of range: a {id} is at most {MAX_ID}")]
+    OutOfRange {
+        /// `"uid"` or `"gid"`.
+        id: &'static str,
+        /// The digits as given.
+        spec: String,
+    },
 }
 
 /// Cap on the `_r` scratch buffer: a real entry is under 1 KiB, so 1 MiB means a broken NSS.
@@ -118,15 +126,55 @@ pub fn uid_for_user(name: &str) -> Result<u32, NssError> {
     }
 }
 
+/// The largest uid or gid a digits-only spec may name.
+///
+/// `(uid_t)-1` is not an id: the kernel defines `INVALID_UID` and
+/// `INVALID_GID` as `-1` (`include/linux/uidgid.h`) and `from_kuid` returns
+/// it for an id with no mapping, chown(2) and setreuid(2) read it as "leave
+/// unchanged", and rsbinder reports it as the calling uid of a transport
+/// with none.
+pub const MAX_ID: u32 = u32::MAX - 1;
+
+/// A spec of ASCII digits only, as an id; `u32::from_str` alone also takes a leading `+`.
+fn literal_id(spec: &str, id: &'static str) -> Option<Result<u32, NssError>> {
+    if spec.is_empty() || !spec.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let out_of_range = || NssError::OutOfRange {
+        id,
+        spec: spec.to_owned(),
+    };
+    Some(
+        spec.parse::<u32>()
+            .ok()
+            .filter(|&n| n <= MAX_ID)
+            .ok_or_else(out_of_range),
+    )
+}
+
+/// Resolve a user name or a numeric uid to a uid, by the rule of
+/// [`gid_for_group`]: a spec that is entirely digits is taken as a literal
+/// uid and never touches the name service, so a uid absent from the user
+/// database (a container with no `/etc/passwd` entry for it) still works; anything
+/// else is looked up with [`uid_for_user`]. A user whose name is all
+/// digits is therefore reached by its uid only.
+///
+/// Policy files do not use this: there a user name and a numeric uid are
+/// separate fields (`user` / `uid`), and `user` takes names only.
+pub fn uid_for_owner(spec: &str) -> Result<u32, NssError> {
+    match literal_id(spec, "uid") {
+        Some(uid) => uid,
+        None => uid_for_user(spec),
+    }
+}
+
 /// Resolve a group name to its gid. A spec that is entirely digits is
 /// taken as a literal gid and never touches the name service — policy has
-/// to keep working in a minimal container with no group database.
+/// to keep working in a minimal container with no group database. Digits
+/// above [`MAX_ID`] are [`NssError::OutOfRange`], not a name to look up.
 pub fn gid_for_group(spec: &str) -> Result<u32, NssError> {
-    // `u32::from_str` also takes a leading `+`, which is not "entirely digits".
-    if !spec.is_empty() && spec.bytes().all(|b| b.is_ascii_digit()) {
-        if let Ok(gid) = spec.parse::<u32>() {
-            return Ok(gid);
-        }
+    if let Some(gid) = literal_id(spec, "gid") {
+        return gid;
     }
     let cname = cstring("group", spec)?;
     let mut buf = vec![0u8; 1024];
@@ -478,6 +526,39 @@ mod tests {
         assert_eq!(gid_for_group("0").unwrap(), 0);
         assert_eq!(gid_for_group("1234").unwrap(), 1234);
         assert_ne!(gid_for_group("+100"), Ok(100));
+        assert_eq!(gid_for_group("0004294967294"), Ok(MAX_ID));
+        assert_eq!(
+            gid_for_group("4294967295"),
+            Err(NssError::OutOfRange {
+                id: "gid",
+                spec: "4294967295".to_owned()
+            })
+        );
+        assert_eq!(
+            gid_for_group("4294967296"),
+            Err(NssError::OutOfRange {
+                id: "gid",
+                spec: "4294967296".to_owned()
+            })
+        );
+    }
+
+    /// Digits are a literal uid, whether or not the user database has it; the rest is a name.
+    #[test]
+    fn owner_spec_takes_names_and_numeric_uids() {
+        assert_eq!(uid_for_owner("0"), Ok(0));
+        assert_eq!(uid_for_owner("4000000000"), Ok(4_000_000_000));
+        assert_eq!(uid_for_owner("root"), Ok(0));
+        assert_ne!(uid_for_owner("+0"), Ok(0));
+        assert!(uid_for_owner("").is_err());
+        assert!(matches!(
+            uid_for_owner("99999999999999999999"),
+            Err(NssError::OutOfRange { id: "uid", .. })
+        ));
+        assert!(matches!(
+            uid_for_owner("rsbinder-no-such-user-ffffffff"),
+            Err(NssError::NotFound { kind: "user", .. })
+        ));
     }
 
     #[test]

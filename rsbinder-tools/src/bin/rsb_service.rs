@@ -37,15 +37,14 @@ mod exit {
     pub const ERR: u8 = 2;
 }
 
-/// rsb_hub's denial message names the permission, name and uid; the hint adds where to fix it.
+/// rsb_hub's message says why and for which uid, which only it knows; the hint says where to grant.
 fn report(what: &str, status: &Status) -> ExitCode {
     eprintln!("rsb_service: {what} failed: {status}");
     if status.exception_code() == ExceptionCode::Security {
         eprintln!(
-            "  The hub's policy denies this to uid {}. Grant it in \
-             the hub's configuration (`rsb_hub --config <DIR>`, default \
-             /etc/rsbinder/hub.d) or run as a user the policy allows.",
-            rustix::process::getuid().as_raw()
+            "  If the hub's policy is the reason, grant it in the hub's \
+             configuration (`rsb_hub --config <DIR>`, default \
+             /etc/rsbinder/hub.d) or run as a user the policy allows."
         );
     }
     ExitCode::from(exit::ERR)
@@ -396,7 +395,7 @@ fn cli() -> clap::Command {
 fn main() -> ExitCode {
     let matches = cli().get_matches();
 
-    env_logger::init();
+    rsbinder_tools::logging::init_command();
 
     #[cfg(not(feature = "topic"))]
     if matches.subcommand_name() == Some("topics") {
