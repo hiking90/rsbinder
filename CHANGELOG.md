@@ -558,8 +558,9 @@ says what a peer does with the 0.12.0 value.
   founding connection. `RpcServer::set_receive_fds(false)` has the kernel close
   the fds a peer sends, for a server whose calls take none, while it goes on
   sending fds.
-- **`rsbinder-topic`, a new crate (Experimental)**: one publisher and many
-  subscribers over kernel binder, on Linux and Android. A binder call sets
+- **`rsbinder-topic` 0.1.0, a new crate (Experimental)**: one publisher and many
+  subscribers over kernel binder, on Linux and Android. Its version is its
+  own, not the workspace's; it requires `rsbinder` `=0.13.0`. A binder call sets
   each subscription up; the records then travel through a ring in a sealed
   memfd that every subscriber maps read-only, so one copy serves all of them
   and receiving makes no binder call. See the book's
