@@ -3996,11 +3996,12 @@ impl RpcSessionInner {
 
     /// `RpcProxy::drop`: forget the proxy and send its `DEC_STRONG`, or hold it for unpaid sends.
     pub(crate) fn release_proxy(&self, addr: RpcAddress, who: *const ()) {
+        // Reached from a `Drop`, maybe while unwinding: a poisoned table is still consistent.
         let now = self
             .shared
             .state
             .lock()
-            .expect("rpc state poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .release_proxy(&addr, who);
         self.send_dec_strong(addr, now);
     }
@@ -6731,6 +6732,11 @@ impl RpcSession {
     /// [`negotiate()`](Self::negotiate) connections and echo
     /// [`get_session_id()`](Self::get_session_id) to keep an attach from
     /// costing the session.
+    ///
+    /// On a server's session it is [`StatusCode::InvalidOperation`], as
+    /// [`add_incoming_connection_with_config`](Self::add_incoming_connection_with_config)
+    /// is: a server's outgoing connections are the callback slots its
+    /// client opens.
     #[deprecated(
         since = "0.13.0",
         note = "use `add_outgoing_connection()`, which reuses the founding config's connector and echoes the session's own id, version and fd mode"
@@ -6785,6 +6791,10 @@ impl RpcSession {
         fd_mode: FileDescriptorTransportMode,
         handshake_timeout: Option<Duration>,
     ) -> Result<u64> {
+        // A server's outgoing slots are the callback slots its client opens, as for incoming.
+        if self.inner.shared.space() != AddressSpace::Initiator {
+            return Err(StatusCode::InvalidOperation);
+        }
         // AOSP: one version per session, 32-byte ids; checked before a handshake burns an attach.
         if session_id.len() != 32 {
             return Err(StatusCode::BadValue);
@@ -11210,6 +11220,31 @@ mod tests {
         let mut rest = Vec::new();
         std::io::Read::read_to_end(&mut s, &mut rest).expect("the client closes");
         assert!(rest.is_empty(), "the client sent {} bytes", rest.len());
+    }
+
+    /// A server's session opens no outgoing attach: its outgoing slots are its client's to open.
+    #[test]
+    fn an_outgoing_attach_on_a_server_session_never_connects() {
+        use super::super::transport::UnixTransport;
+        use std::os::unix::net::UnixStream;
+        let (server_fd, _client_peer_fd) = unix_socketpair_fd();
+        let session = RpcSession::with_profile(
+            Box::new(UnixTransport::from_stream(UnixStream::from(server_fd)).expect("transport")),
+            AddressSpace::Acceptor,
+            WireProfile::Android13Plus(Android13PlusCodec::with_version(PROTOCOL_V2).expect("v2")),
+        )
+        .expect("server session");
+        let own_id = session.session_id();
+        let added = session.add_outgoing_connection_android13plus_transport(
+            || -> Result<Box<dyn RpcTransport>> { panic!("the attach must not connect") },
+            PROTOCOL_V2,
+            &own_id,
+            FileDescriptorTransportMode::None,
+            Some(Duration::from_secs(5)),
+        );
+        assert_eq!(added, Err(StatusCode::InvalidOperation));
+        assert!(!session.inner.shared.lifecycle.is_torn_down());
+        assert_eq!(session.inner.slot_count(), 1, "only the founding slot");
     }
 
     /// A `max_version` below the session's is refused before connecting, so nothing is held.
