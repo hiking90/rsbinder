@@ -50,7 +50,8 @@
 //! defers via `postTask`; this is the equivalent.
 //!
 //! Callbacks run under `catch_unwind` (`fire_callback`), the same panic
-//! isolation as `death::DeathRecipients::dispatch`: they run from
+//! isolation as `death::DeathRecipients::dispatch`, the callback's own drop
+//! included (it may be the last reference): they run from
 //! `CallbackDeferGuard::drop`, where a panic escaping during an unwind aborts
 //! the process, and a panic in the first of several queued callbacks would
 //! otherwise discard the rest.
@@ -162,14 +163,15 @@ impl Drop for CallbackDeferGuard {
         // Deferral is cleared first, so a callback that creates a proxy fires its own inline.
         let pending: Vec<_> = PENDING_CALLBACKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         for (cb, event) in pending {
-            fire_callback(&cb, event);
+            fire_callback(cb, event);
         }
     }
 }
 
-/// Run a user callback under `catch_unwind` (runs in `Drop`); module doc "Callback deferral".
-fn fire_callback(cb: &ProxyCountCallback, event: ProxyCountEvent) {
-    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(event))) {
+/// Run, then drop, a user callback under `catch_unwind`; module doc "Callback deferral".
+fn fire_callback(cb: ProxyCountCallback, event: ProxyCountEvent) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || cb(event)))
+    {
         let msg = crate::error::panic_message(&payload);
         log::error!("ProxyCountCallback panicked for {event:?}: {msg}");
     }
@@ -294,7 +296,7 @@ pub(crate) fn on_proxy_create(uid: u32) -> bool {
         if CALLBACK_DEFER.with(|d| d.get()) {
             PENDING_CALLBACKS.with(|p| p.borrow_mut().push((cb, event)));
         } else {
-            fire_callback(&cb, event);
+            fire_callback(cb, event);
         }
     }
     true
@@ -390,6 +392,38 @@ mod tests {
         on_proxy_drop(2000, true);
         // All counts at 0 → map entries removed.
         assert_eq!(get_binder_proxy_counts_by_uid(), vec![]);
+    }
+
+    /// A queued callback whose drop panics, as its last reference: the next one still runs.
+    #[test]
+    #[serial_test::serial(binder)]
+    fn a_queued_callback_panicking_in_its_drop_skips_no_other() {
+        struct PanicOnDrop;
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("the callback's drop");
+            }
+        }
+        reset_for_test();
+        let event = ProxyCountEvent::Warning {
+            uid: 1000,
+            count: 4,
+        };
+        let ran = Arc::new(AtomicU64::new(0));
+        let guard = CallbackDeferGuard::new();
+        let doomed = PanicOnDrop;
+        let first: ProxyCountCallback = Arc::new(move |_| {
+            let _keep = &doomed;
+        });
+        let r = ran.clone();
+        let second: ProxyCountCallback = Arc::new(move |_| {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        PENDING_CALLBACKS.with(|p| p.borrow_mut().extend([(first, event), (second, event)]));
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(guard)));
+        assert!(dropped.is_ok(), "the drop's panic left the guard");
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the second callback ran");
+        reset_for_test();
     }
 
     #[test]

@@ -415,6 +415,11 @@ impl GroupCache {
             self.generation.load(Ordering::Relaxed)
         };
         let resolved = Arc::new((self.resolver)(uid).unwrap_or_default());
+        self.store(uid, resolved, generation)
+    }
+
+    /// Merge a read taken at `generation` into `uid`'s entry, unless a clear came between.
+    fn store(&self, uid: u32, resolved: Arc<BTreeSet<u32>>, generation: u64) -> Arc<BTreeSet<u32>> {
         let mut entries = self.entries.lock().expect("group cache poisoned");
         if self.generation.load(Ordering::Relaxed) != generation {
             return resolved;
@@ -465,18 +470,7 @@ impl GroupCache {
         let Some(resolved) = (self.resolver)(uid) else {
             return prev;
         };
-        let mut entries = self.entries.lock().expect("group cache poisoned");
-        if self.generation.load(Ordering::Relaxed) != generation {
-            return Arc::new(resolved);
-        }
-        let entry = entries.entry(uid).or_insert_with(|| Entry {
-            gids: Arc::default(),
-            resolved_at: Instant::now(),
-        });
-        if !resolved.is_subset(&entry.gids) {
-            entry.gids = Arc::new(entry.gids.union(&resolved).copied().collect());
-        }
-        Arc::clone(&entry.gids)
+        self.store(uid, Arc::new(resolved), generation)
     }
 
     /// Drop every memoized entry, so the next lookup re-reads the name

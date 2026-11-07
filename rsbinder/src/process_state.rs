@@ -1471,6 +1471,18 @@ impl ProcessState {
                     }
                 }
                 self.freeze_lock().end_batch(handle, token);
+                // A callback this batch held last drops here: user code, caught as its call was.
+                for callback in callbacks {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drop(callback);
+                    }));
+                    if let Err(payload) = result {
+                        let msg = crate::error::panic_message(&payload);
+                        log::error!(
+                            "FrozenStateChangeCallback drop panicked for handle {handle:X}: {msg}"
+                        );
+                    }
+                }
                 // `binder` drops here, after the guard: its drop may take the registry lock.
             }
             if !delivered {

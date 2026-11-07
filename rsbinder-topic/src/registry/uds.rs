@@ -781,6 +781,9 @@ impl Shared {
                 self.lock()
                     .table
                     .retried(&name, &watcher, generation, sent, Instant::now());
+                if sent == Sent::Delivered {
+                    log::info!("topic registry: an owed notice of {name:?} was delivered");
+                }
             }
             drop(order);
         }

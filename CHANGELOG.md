@@ -191,6 +191,10 @@ says what a peer does with the 0.12.0 value.
 - `RpcClientConfig` has no lifetime parameter and owns its source;
   `add_*_connection_with_config` and `RpcClientConfig::session_id` are
   deprecated for `add_outgoing_connection()` / `add_incoming_connection()`.
+- `add_outgoing_connection_with_config` on a server's session
+  (`accept_android13plus`, `RpcSession::new` with `AddressSpace::Acceptor`)
+  is `InvalidOperation`, as `add_incoming_connection_with_config` is;
+  0.12.0 returned `BadType` on an r34 one.
 - `RpcSession::session_id()` and `serve_blocking_on` are not public.
 - `RpcTransport::send_raw` and `recv_raw` are required; `send_frame` and
   `recv_frame` are provided.
@@ -997,6 +1001,24 @@ says what a peer does with the 0.12.0 value.
   to the bits both the old and the new mode grant. `--group 4294967295`, which
   chown(2) reads as "leave unchanged" and which so changed nothing without an
   error, is refused (see *Migrating*).
+- **Dropping an RPC proxy while a panic unwinds no longer aborts the process
+  when the session's state lock is poisoned.** `RpcProxy`'s drop took that
+  lock with `expect`, while the other paths a drop reaches
+  (`cancel_leaving`, `pay_receipts`) already recovered it; a panic leaving a
+  `Drop` during an unwind aborts.
+- **A user callback whose drop panics no longer cuts the delivery short.**
+  When the deliverer held the last reference to a proxy-count callback or a
+  `FrozenStateChangeCallback`, its drop ran outside the `catch_unwind` that
+  guards the call: the other queued proxy-count callbacks were discarded
+  (and the process aborted if it was already unwinding), and the other
+  owners of a frozen binder missed that state change. The drop is now caught
+  and logged like the call. Death recipients were already handled so.
+- **The deprecated `RpcSession::add_outgoing_connection_with_config` refuses a
+  server's session with `InvalidOperation`**, as
+  `add_incoming_connection_with_config` does (see *Migrating*). On an
+  android-13+ server session it connected and pooled an outgoing slot
+  outside the server's `set_max_threads` cap. `add_outgoing_connection`
+  already refused it.
 - **Interface code generated with `Builder::set_async_support(false)`
   compiles against rsbinder with its `async` feature on** (the default); it
   failed with `cannot find type BnFoo`. Code generated with async support

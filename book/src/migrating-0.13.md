@@ -474,7 +474,14 @@ bytes, so only a peer that wrote something unusual sees a difference.
   `add_incoming_connection_with_config` and `RpcClientConfig::session_id`
   are deprecated. A session built from a transport (`connect_android13plus`,
   `from_preconnected_fd`, r34) has no connector, so the new calls return
-  `InvalidOperation` there.
+  `InvalidOperation` there. On a server's session (`accept_android13plus`)
+  `add_outgoing_connection_with_config` is `InvalidOperation` too, as
+  `add_incoming_connection_with_config` already was: 0.12.0 connected and
+  pooled that slot outside the server's `set_max_threads` cap. On an r34
+  server's session (`RpcSession::new` with `AddressSpace::Acceptor`) the call
+  is `InvalidOperation` as well, where 0.12.0 returned `BadType`. A server's
+  outgoing slots are the callback slots its client opens with
+  `add_incoming_connection()`.
 - **`RpcSession::session_id()` and `serve_blocking_on` are no longer
   public.** The client-local id was never the one to echo; the server's is
   `get_session_id()`.

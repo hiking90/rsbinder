@@ -145,6 +145,12 @@ impl Enforcer {
     /// May `uid` exercise `permission` on the topic name `name`? Judged as
     /// [`check_uid`](Self::check_uid) judges a service name, against
     /// [`Config::topics`].
+    ///
+    /// Each call reads the configuration in force; there is no snapshot form
+    /// like [`check_uid_in`](Self::check_uid_in). The topic registry asks
+    /// once per judgement (`RegistryAccess::allows`), so the judgements of
+    /// one of its calls, a list's gate and its per-name filter, can fall on
+    /// both sides of a `SIGHUP`.
     pub fn check_topic_uid(&self, permission: TopicPermission, name: &str, uid: u32) -> bool {
         let config = self.config();
         let topics = &config.topics;
