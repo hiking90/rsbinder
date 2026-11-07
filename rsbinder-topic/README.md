@@ -41,5 +41,7 @@ in both processes. Elsewhere the crate compiles and every constructor returns
 
 The API and the shared-memory layout may change in any release; see the
 [stability tiers](https://hiking90.github.io/rsbinder/stability-tiers.html).
+The crate's version is its own, not `rsbinder`'s, and each release requires
+exactly the `rsbinder` release its `Cargo.toml` names.
 
 Part of [rsbinder](https://github.com/hiking90/rsbinder). Apache-2.0.

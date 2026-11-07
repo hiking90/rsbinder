@@ -37,9 +37,12 @@ sent now and then, to one process, is a `oneway` method.
 
 ## A topic through the service manager
 
-Add `rsbinder-topic` beside `rsbinder`, at the same version. The example below
-defines its value type with `#[derive(rsbinder::Parcelable)]`, which needs
-`rsbinder`'s `macros` feature:
+Add `rsbinder-topic` beside `rsbinder`. Its version is its own, starting at
+0.1 while it is Experimental, and each release requires one `rsbinder`
+release exactly (`=`), the one its `Cargo.toml` names; pick the
+`rsbinder-topic` release whose requirement matches the `rsbinder` you use.
+The example below defines its value type with `#[derive(rsbinder::Parcelable)]`,
+which needs `rsbinder`'s `macros` feature:
 
 ```toml
 [dependencies]

@@ -265,10 +265,12 @@ function publish_dry_run() {
     publish --dry-run
 }
 
-# Set every published crate to one version: `[workspace.package] version` and each `rsbinder*`
-# dependency requirement, keeping an `=` pin (`rsbinder-aidl`'s). Only the tracked manifests
-# outside bench/ and fuzz/ change, so target/ copies and those two crates' own 0.0.0 do not.
-# The workspace lockfile and the excluded crates' lockfiles follow.
+# Set every crate published at the workspace version to one version: `[workspace.package]
+# version` and each requirement on `rsbinder`, `rsbinder-aidl`, `rsbinder-macros` and
+# `rsbinder-fmq`, keeping an `=` pin (`rsbinder-aidl`'s, and `rsbinder-topic`'s on `rsbinder`).
+# `rsbinder-topic` has a version of its own, which `topic_version_update` sets. Only the tracked
+# manifests outside bench/ and fuzz/ change, so target/ copies and those two crates' own 0.0.0
+# do not. The workspace lockfile and the excluded crates' lockfiles follow.
 function version_update() {
     local NEW_VERSION="$1"
     if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -282,7 +284,29 @@ function version_update() {
         sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" Cargo.toml
         rm Cargo.toml.bak
         for manifest in $(git ls-files '*Cargo.toml' | grep -v -e '^bench/' -e '^fuzz/'); do
-            sed -i.bak -E "s/^(rsbinder[a-z-]* = \{ version = \"=?)[^\"]*\"/\1$NEW_VERSION\"/" "$manifest"
+            sed -i.bak -E "s/^(rsbinder(-aidl|-macros|-fmq)? = \{ version = \"=?)[^\"]*\"/\1$NEW_VERSION\"/" "$manifest"
+            rm "$manifest.bak"
+        done
+        cargo metadata --format-version 1 > /dev/null
+        scripts/excluded_lockfiles.sh
+    ) || return
+    echo "rsbinder-topic requires this rsbinder exactly: give it a release too (topic_version_update)"
+}
+
+# Set `rsbinder-topic`'s own version and every requirement on it, then the lockfiles as above.
+function topic_version_update() {
+    local NEW_VERSION="$1"
+    if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "usage: topic_version_update X.Y.Z" >&2
+        return 1
+    fi
+    (
+        set -e
+        cd "$TOP_DIR"
+        sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"$NEW_VERSION\"/" rsbinder-topic/Cargo.toml
+        rm rsbinder-topic/Cargo.toml.bak
+        for manifest in $(git ls-files '*Cargo.toml' | grep -v -e '^bench/' -e '^fuzz/'); do
+            sed -i.bak -E "s/^(rsbinder-topic = \{ version = \")[^\"]*\"/\1$NEW_VERSION\"/" "$manifest"
             rm "$manifest.bak"
         done
         cargo metadata --format-version 1 > /dev/null

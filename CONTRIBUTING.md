@@ -222,9 +222,9 @@ deprecation discussion in the PR.
 
 ## Releasing
 
-Every crate of the workspace is published at the workspace version, in
-dependency order, since each must already be on crates.io before the next
-one can resolve it:
+Every crate of the workspace but `rsbinder-topic` is published at the
+workspace version. All of them are published in dependency order, since
+each must already be on crates.io before the next one can resolve it:
 
 1. `rsbinder-fmq` — depends on no other crate here.
 2. `rsbinder-aidl`
@@ -244,6 +244,16 @@ rewrites `Cargo.lock` and the lockfiles of `bench/ipc-compare` and `fuzz`,
 which record the versions they reach by path;
 `scripts/excluded_lockfiles.sh --check` (CI, `local_gate.sh hermetic`)
 fails when those two are left behind.
+
+`rsbinder-topic` has a version of its own while it is Experimental, so the
+number does not claim the stability of the `rsbinder` it sits beside. It
+calls hidden items of `rsbinder` too, and requires it with `=`, which
+`version_update` moves with the rest. Every release of `rsbinder` is
+therefore a release of `rsbinder-topic` as well: a patch when `rsbinder`'s
+is a patch, a minor when `rsbinder`'s is a minor (its API carries
+`rsbinder`'s types) or when its own API breaks. `topic_version_update
+X.Y.Z` sets its version and the requirements on it in `rsbinder-tools` and
+`tests`, then the same lockfiles.
 
 `source envsetup.sh` and then `publish_dry_run` / `publish` run
 `cargo publish` in this order (`publish_dirs` there); a crate added to the
