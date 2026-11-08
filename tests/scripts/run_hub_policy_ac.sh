@@ -523,25 +523,32 @@ stop_hub
 note "AC-6.1.10  a caller the hub's user namespace does not map is refused"
 # The driver gives such a caller uid 4294967295; a hub in a user namespace with no
 # uid_map leaves even this user unmapped. Killed by pid: `pkill -f` matches the shell.
-if unshare --user true 2>/dev/null; then
-    for ns in --map-current-user none; do
-        [ "$ns" = none ] && map="" || map="$ns"
-        RUST_LOG=info unshare --user $map $HUB --insecure-allow-all > "$LOG" 2>&1 &
-        ns_hub=$!; sleep 2
-        run_svc list
-        if [ "$ns" = none ]; then
-            want_rc 2 "AC-6.1.10 an unmapped caller is refused under --insecure-allow-all"
-            want_out "for uid=4294967295" "AC-6.1.10 the driver reports it as uid 4294967295"
-            want_out "no mapping in rsb_hub's user namespace" "AC-6.1.10 and the hub names why"
-            reject_out ": policy denied" "AC-6.1.10 not as a policy denial"
-        else
-            want_rc 0 "AC-6.1.10 the same caller, mapped, is answered"
-        fi
-        kill "$ns_hub" 2>/dev/null; wait "$ns_hub" 2>/dev/null
-    done
-else
-    printf '  SKIP  AC-6.1.10 (no unprivileged user namespaces on this host)\n'
-fi
+# Each half is probed with its own unshare: Ubuntu's AppArmor userns restriction lets
+# `unshare --user` through but refuses the uid_map write `--map-current-user` makes.
+for ns in --map-current-user none; do
+    [ "$ns" = none ] && map="" || map="$ns"
+    if ! unshare --user $map true 2>/dev/null; then
+        printf '  SKIP  AC-6.1.10 unshare --user %s is refused on this host\n' "$map"
+        continue
+    fi
+    failed_before=$FAIL
+    RUST_LOG=info unshare --user $map $HUB --insecure-allow-all > "$LOG" 2>&1 &
+    ns_hub=$!; sleep 2
+    run_svc list
+    if [ "$ns" = none ]; then
+        want_rc 2 "AC-6.1.10 an unmapped caller is refused under --insecure-allow-all"
+        want_out "for uid=4294967295" "AC-6.1.10 the driver reports it as uid 4294967295"
+        want_out "no mapping in rsb_hub's user namespace" "AC-6.1.10 and the hub names why"
+        reject_out ": policy denied" "AC-6.1.10 not as a policy denial"
+    else
+        want_rc 0 "AC-6.1.10 the same caller, mapped, is answered"
+    fi
+    kill "$ns_hub" 2>/dev/null; wait "$ns_hub" 2>/dev/null
+    if [ "$FAIL" -gt "$failed_before" ]; then
+        tail -5 "$OUT" | sed 's/^/    [client] /'
+        tail -5 "$LOG" | sed 's/^/    [hub] /'
+    fi
+done
 
 printf '\n==== Plan 6 AC gates: %d passed, %d failed ====\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
