@@ -13,7 +13,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
-## [0.13.0] - 2026-10-31
+## [0.13.0]
 
 ### Migrating from 0.12.0
 
@@ -1264,7 +1264,7 @@ says what a peer does with the 0.12.0 value.
   denied every call, as an RPC peer with no uid is, and a policy `uid` above
   4294967294 is refused at load (see *Migrating*).
 
-## [0.12.0] - 2026-10-11
+## [0.12.0]
 
 ### Migrating from 0.11.0
 
@@ -1794,7 +1794,7 @@ RPC:
 - **The `rustls` floor is 0.23.45** for RUSTSEC-2026-0285 (TLS 1.3 handshake
   messages accepted across encryption levels); `rpc-tls` only.
 
-## [0.11.0] - 2026-09-10
+## [0.11.0]
 
 ### Migrating from 0.10.0
 
@@ -2494,7 +2494,7 @@ support* belongs here too (it changes bytes only on a big-endian host).
   kernel transaction buffer; the recovery now rewinds only to the reply's
   mark.
 
-## [0.10.0] - 2026-07-11
+## [0.10.0]
 
 ### Changed
 
@@ -2683,7 +2683,7 @@ support* belongs here too (it changes bytes only on a big-endian host).
   not get a compile-time warning. The parser discards doc comments today, so
   this awaits grammar support.
 
-## [0.9.0] - 2026-06-15
+## [0.9.0]
 
 The headline of this release is a complete **RPC transport** (binder over
 sockets) — a separate, opt-in stack alongside the existing kernel binder
