@@ -51,7 +51,8 @@ toml = "1.1"
 tera = { version = "1.20.*", default-features = false }
 similar = "3.1"
 pretty_hex = { version = "0.4", package = "pretty-hex" }
-rustix = "1.1"
+# Floor 1.1.6: earlier releases read past a truncated control message on macOS (CHANGELOG 0.13.0).
+rustix = "1.1.6"
 libc = "0.2"
 clap = "4.6"
 rsproperties = "0.6"

@@ -1234,6 +1234,15 @@ says what a peer does with the 0.12.0 value.
   (certificate verification may accept distrusted intermediates). No
   `rustls` release requires the fixed version yet, so `rpc-tls` now names
   `rustls-webpki` itself, for its floor alone; `rpc-tls` only.
+- **The `rustix` floor is 1.1.6.** On macOS the kernel leaves a truncated
+  control message's `cmsg_len` at its untruncated length, and rustix before
+  1.1.6 trusted it: a peer that sent more fds than an RPC frame may have
+  (64) over a Unix socket made the receive read past its control buffer and
+  take the bytes there as fds, which the session-ending error then closed.
+  1.1.6 bounds the message by the buffer, so the read ends with the
+  `Protocol` error alone. Linux and Android shorten `cmsg_len` themselves
+  and were not affected. The same range also holds GHSA-jh2m-fhpj-3vr7
+  (xattr buffers), which no rsbinder crate calls.
 - **An RPC session no longer admits a connection from a peer of another
   uid, certificate or VM on its id alone.** A peer that knew a session's
   id (r34's is 31 random bits) joined an r34 session over vsock or TLS, or
