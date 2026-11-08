@@ -261,9 +261,15 @@ X.Y.Z` sets its version and the requirements on it in `rsbinder-tools` and
 `tests`, then the same lockfiles.
 
 `source envsetup.sh` and then `publish_dry_run` / `publish` run
-`cargo publish` in this order (`publish_dirs` there); a crate added to the
-workspace is added to that list in its place. `tests`, `example-hello`,
-`fuzz` and `bench/ipc-compare` are not published.
+`cargo publish --workspace` (cargo 1.90+), which takes every member not
+marked `publish = false` in this order on its own; a new crate needs no
+entry anywhere. It packages each crate and builds it from the tarball
+against a local registry holding the ones before it, so `publish_dry_run`
+checks the whole release before any of it is on crates.io, and `publish`
+uploads nothing until every crate has built. An upload that fails partway
+(the network, the registry) leaves the crates before it published; publish
+the rest with `cargo publish -p <crate> -p <crate> ..`. `tests`,
+`example-hello`, `fuzz` and `bench/ipc-compare` are not published.
 
 ## License
 
