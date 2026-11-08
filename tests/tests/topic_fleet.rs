@@ -77,6 +77,12 @@ enum Seen {
     Ended { node: String },
 }
 
+/// What [`Fleet::read`] read: a thing a wait can be for, or a `COUNT` kept in `counts`.
+enum Read {
+    Seen(Seen),
+    Counted,
+}
+
 /// How the controller expects a node to end; any other end fails the run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Expect {
@@ -348,8 +354,20 @@ impl Fleet {
     }
 
     /// The next thing seen from the nodes before `deadline`, `None` at it. A `COUNT` is kept as
-    /// its node's latest and not returned: no wait is for one.
+    /// its node's latest and not returned: only [`Fleet::until`] waits on one, through `read`.
     fn pump(&mut self, what: &str, deadline: Instant) -> Result<Option<Seen>, Failure> {
+        loop {
+            match self.read(what, deadline)? {
+                Some(Read::Seen(seen)) => return Ok(Some(seen)),
+                Some(Read::Counted) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The next thing seen from the nodes before `deadline`, or a `COUNT` kept as its node's
+    /// latest; `None` at the deadline.
+    fn read(&mut self, what: &str, deadline: Instant) -> Result<Option<Read>, Failure> {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let Ok(message) = self.recv.recv_timeout(left) else {
@@ -380,7 +398,7 @@ impl Fleet {
                             };
                             self.counts
                                 .insert((event.node.clone(), topic.clone()), counted);
-                            continue;
+                            return Ok(Some(Read::Counted));
                         }
                         Kind::Ended {
                             ref topic,
@@ -415,7 +433,7 @@ impl Fleet {
                         }
                         _ => {}
                     }
-                    return Ok(Some(Seen::Event(event)));
+                    return Ok(Some(Read::Seen(Seen::Event(event))));
                 }
                 Message::Garbled { node, line } => {
                     self.log(&format!("{node} garbled: {line}"));
@@ -439,7 +457,7 @@ impl Fleet {
                             format!("{what}: {node} ended with {status}, expected {expect:?}"),
                         ));
                     }
-                    return Ok(Some(Seen::Ended { node }));
+                    return Ok(Some(Read::Seen(Seen::Ended { node })));
                 }
             }
         }
@@ -550,7 +568,9 @@ impl Fleet {
             .and_then(|ending| ending.count)
     }
 
-    /// Read what the nodes print until `done` holds of what was read, within `within`.
+    /// Read what the nodes print until `done` holds of what was read, within `within`. `done` is
+    /// asked again after every line, a `COUNT` included: a wait on counts that only the deadline
+    /// asked again would last all of `within`.
     fn until(
         &mut self,
         what: &str,
@@ -562,8 +582,9 @@ impl Fleet {
             if done(self) {
                 return Ok(());
             }
-            match self.pump(what, deadline)? {
-                Some(seen) => self.backlog.push_back(seen),
+            match self.read(what, deadline)? {
+                Some(Read::Seen(seen)) => self.backlog.push_back(seen),
+                Some(Read::Counted) => {}
                 None if done(self) => return Ok(()),
                 None => return Err(self.failure(None, format!("{what}: not within {within:?}"))),
             }
