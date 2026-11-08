@@ -243,7 +243,12 @@ envsetup.sh`) does both, and every other `rsbinder*` requirement, then
 rewrites `Cargo.lock` and the lockfiles of `bench/ipc-compare` and `fuzz`,
 which record the versions they reach by path;
 `scripts/excluded_lockfiles.sh --check` (CI, `local_gate.sh hermetic`)
-fails when those two are left behind.
+fails when those two are left behind. Last it runs `scripts/doc_versions.sh`,
+which sets the version in every dependency line the READMEs, the book and
+the crate docs show (`rsbinder = "X.Y"`, `{ version = "X.Y", .. }`) to the
+manifests' major.minor; its `--check` (CI, `local_gate.sh hermetic`) fails
+on a line left at another version. Write such a line in one of those two
+forms with a plain number, or the script does not see it.
 
 `rsbinder-topic` has a version of its own while it is Experimental, so the
 number does not claim the stability of the `rsbinder` it sits beside. It

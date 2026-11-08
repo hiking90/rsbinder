@@ -270,7 +270,8 @@ function publish_dry_run() {
 # `rsbinder-fmq`, keeping an `=` pin (`rsbinder-aidl`'s, and `rsbinder-topic`'s on `rsbinder`).
 # `rsbinder-topic` has a version of its own, which `topic_version_update` sets. Only the tracked
 # manifests outside bench/ and fuzz/ change, so target/ copies and those two crates' own 0.0.0
-# do not. The workspace lockfile and the excluded crates' lockfiles follow.
+# do not. The workspace lockfile, the excluded crates' lockfiles and the dependency lines the
+# documentation shows (scripts/doc_versions.sh) follow.
 function version_update() {
     local NEW_VERSION="$1"
     if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -289,11 +290,13 @@ function version_update() {
         done
         cargo metadata --format-version 1 > /dev/null
         scripts/excluded_lockfiles.sh
+        scripts/doc_versions.sh
     ) || return
     echo "rsbinder-topic requires this rsbinder exactly: give it a release too (topic_version_update)"
 }
 
-# Set `rsbinder-topic`'s own version and every requirement on it, then the lockfiles as above.
+# Set `rsbinder-topic`'s own version and every requirement on it, then the lockfiles and the
+# documentation as above.
 function topic_version_update() {
     local NEW_VERSION="$1"
     if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -311,5 +314,6 @@ function topic_version_update() {
         done
         cargo metadata --format-version 1 > /dev/null
         scripts/excluded_lockfiles.sh
+        scripts/doc_versions.sh
     )
 }

@@ -136,6 +136,10 @@ jobs:
         # bench/ipc-compare and fuzz lock the rsbinder versions they reach by path; a version
         # bump that leaves them behind fails here. Resolves only, so no extra toolchain.
         run: scripts/excluded_lockfiles.sh --check
+      - name: Check the documented dependency versions
+        # READMEs, the book and crate docs show `rsbinder = "X.Y"` lines no cargo command reads;
+        # one left at an older version than the manifests fails here.
+        run: scripts/doc_versions.sh --check
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Run clippy (rsbinder, no default features)
