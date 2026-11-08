@@ -243,7 +243,12 @@ envsetup.sh`) does both, and every other `rsbinder*` requirement, then
 rewrites `Cargo.lock` and the lockfiles of `bench/ipc-compare` and `fuzz`,
 which record the versions they reach by path;
 `scripts/excluded_lockfiles.sh --check` (CI, `local_gate.sh hermetic`)
-fails when those two are left behind.
+fails when those two are left behind. Last it runs `scripts/doc_versions.sh`,
+which sets the version in every dependency line the READMEs, the book and
+the crate docs show (`rsbinder = "X.Y"`, `{ version = "X.Y", .. }`) to the
+manifests' major.minor; its `--check` (CI, `local_gate.sh hermetic`) fails
+on a line left at another version. Write such a line in one of those two
+forms with a plain number, or the script does not see it.
 
 `rsbinder-topic` has a version of its own while it is Experimental, so the
 number does not claim the stability of the `rsbinder` it sits beside. It
@@ -256,9 +261,15 @@ X.Y.Z` sets its version and the requirements on it in `rsbinder-tools` and
 `tests`, then the same lockfiles.
 
 `source envsetup.sh` and then `publish_dry_run` / `publish` run
-`cargo publish` in this order (`publish_dirs` there); a crate added to the
-workspace is added to that list in its place. `tests`, `example-hello`,
-`fuzz` and `bench/ipc-compare` are not published.
+`cargo publish --workspace` (cargo 1.90+), which takes every member not
+marked `publish = false` in this order on its own; a new crate needs no
+entry anywhere. It packages each crate and builds it from the tarball
+against a local registry holding the ones before it, so `publish_dry_run`
+checks the whole release before any of it is on crates.io, and `publish`
+uploads nothing until every crate has built. An upload that fails partway
+(the network, the registry) leaves the crates before it published; publish
+the rest with `cargo publish -p <crate> -p <crate> ..`. `tests`,
+`example-hello`, `fuzz` and `bench/ipc-compare` are not published.
 
 ## License
 

@@ -229,40 +229,19 @@ function run_coverage() {
     rustup override unset
 }
 
-# Publish order is the dependency order, and every step must already be on
-# crates.io before the next one can resolve it. `rsbinder-macros` sits between
-# the two it bridges: it depends on `rsbinder-aidl`, and `rsbinder` declares it
-# (optionally, behind the `macros` feature) with a version requirement, which a
-# published manifest carries whether the dependency is optional or not.
-# `rsbinder-fmq` depends on no other crate here and `rsbinder` requires it
-# unconditionally, so it goes first. `rsbinder-topic` depends on `rsbinder`
-# and builds its AIDL with `rsbinder-aidl`; `rsbinder-tools` comes last.
-declare -a publish_dirs=("rsbinder-fmq" "rsbinder-aidl" "rsbinder-macros" "rsbinder" "rsbinder-topic" "rsbinder-tools")
-
+# Publish every member not marked `publish = false`, in dependency order, with
+# `cargo publish --workspace` (cargo 1.90+). Cargo packages each crate and
+# builds it from its tarball against a local registry holding the ones before
+# it, and uploads only after all of them pass; so a version none of them has on
+# crates.io yet is checked whole, and a crate that fails to build leaves nothing
+# published. Extra arguments go to cargo (`publish --features rsbinder-tools/topic`).
 function publish() {
-    local cargo_options=()
-    if [[ "$1" == "--dry-run" ]]; then
-        cargo_options=("$1" "--allow-dirty")
-    fi
-
-    for dir in "${publish_dirs[@]}"; do
-        echo "Publishing $dir with options: $cargo_options"
-        pushd "$dir" > /dev/null
-
-        cargo publish "${cargo_options[@]}"
-        local result=$?
-
-        popd > /dev/null
-        if [ $result -ne 0 ]; then
-            echo "Error occurred in $dir, exiting..."
-            return $result
-        fi
-    done
-    return 0
+    (cd "$TOP_DIR" && cargo publish --workspace "$@")
 }
 
+# The same packaging and builds, without uploading; a dirty tree is allowed.
 function publish_dry_run() {
-    publish --dry-run
+    publish --dry-run --allow-dirty "$@"
 }
 
 # Set every crate published at the workspace version to one version: `[workspace.package]
@@ -270,7 +249,8 @@ function publish_dry_run() {
 # `rsbinder-fmq`, keeping an `=` pin (`rsbinder-aidl`'s, and `rsbinder-topic`'s on `rsbinder`).
 # `rsbinder-topic` has a version of its own, which `topic_version_update` sets. Only the tracked
 # manifests outside bench/ and fuzz/ change, so target/ copies and those two crates' own 0.0.0
-# do not. The workspace lockfile and the excluded crates' lockfiles follow.
+# do not. The workspace lockfile, the excluded crates' lockfiles and the dependency lines the
+# documentation shows (scripts/doc_versions.sh) follow.
 function version_update() {
     local NEW_VERSION="$1"
     if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -289,11 +269,13 @@ function version_update() {
         done
         cargo metadata --format-version 1 > /dev/null
         scripts/excluded_lockfiles.sh
+        scripts/doc_versions.sh
     ) || return
     echo "rsbinder-topic requires this rsbinder exactly: give it a release too (topic_version_update)"
 }
 
-# Set `rsbinder-topic`'s own version and every requirement on it, then the lockfiles as above.
+# Set `rsbinder-topic`'s own version and every requirement on it, then the lockfiles and the
+# documentation as above.
 function topic_version_update() {
     local NEW_VERSION="$1"
     if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -311,5 +293,6 @@ function topic_version_update() {
         done
         cargo metadata --format-version 1 > /dev/null
         scripts/excluded_lockfiles.sh
+        scripts/doc_versions.sh
     )
 }
