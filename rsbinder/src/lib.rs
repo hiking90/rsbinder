@@ -355,7 +355,7 @@ pub mod reconnect;
 pub use reconnect::Reconnecting;
 
 #[cfg(feature = "tokio")]
-pub use entry::connect_async;
+pub use entry::{connect_async, connect_async_with};
 pub use entry::{
     connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
     ServerGuard, Uri,

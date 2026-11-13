@@ -49,7 +49,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// ([`is_handling_transaction`](crate::is_handling_transaction)), each runs
 /// its whole operation inline on that thread and returns a future of its
 /// result, as AOSP `binder_tokio` does; an operation that waits holds the
-/// thread until the wait ends, and dropping its future cannot end it. Two
+/// thread until the wait ends, and dropping its future cannot end it. A
+/// proxy, the lookups and `connect_async` decide when called, so a future
+/// made in a handler and then `tokio::spawn`ed has already run there; the
+/// lookups and `connect_async` decide again at the first poll when called
+/// elsewhere, and the waits of `stream`, which borrow their endpoint, decide
+/// only at each poll. Two
 /// things need the nested call made from that thread: the kernel binder
 /// driver routes the callbacks of a nested call back to the thread that
 /// waits for it, which is what keeps a call back into the caller from

@@ -1395,14 +1395,17 @@ mod tests {
     }
 
     /// A proxy that clones, as a live connection's `Snapshot` needs.
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
     struct Held(SIBinder);
 
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
     impl crate::Interface for Held {
         fn as_binder(&self) -> SIBinder {
             self.0.clone()
         }
     }
 
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
     impl FromIBinder for Held {
         fn interface_descriptor() -> &'static str {
             "rsbinder.test.Unreachable"

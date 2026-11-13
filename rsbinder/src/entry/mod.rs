@@ -100,31 +100,68 @@ pub fn connect_binder(uri: impl Into<Uri>) -> Result<SIBinder> {
 /// the service appears. RPC: the connect runs on `spawn_blocking`; it does
 /// not wait for a name to appear, only for the connection and the lookup.
 ///
+/// # A silent RPC peer
+///
+/// With the default [`ClientOptions`], connecting has no deadline, so a
+/// peer that accepts the socket and then never answers the handshake or the
+/// lookup holds the pool thread for good. A `timeout` around this future
+/// returns to the caller but cannot release that thread, which blocks in a
+/// socket read, and `Runtime::drop`, which waits for the blocking pool,
+/// then never returns. Use [`connect_async_with`] and set
+/// [`ClientOptions::timeout`] whenever the peer is not trusted to answer.
+///
+/// # From inside a transaction
+///
 /// Called while handling a transaction
 /// ([`is_handling_transaction`](crate::is_handling_transaction)), on either
-/// endpoint, the whole connect runs **inline** on the handler's thread, as
-/// every async API of this crate does there (see
+/// endpoint, the whole connect runs **inline** on the handler's thread
+/// before this returns, as every async API of this crate does there (see
 /// [`BinderAsyncPool`](crate::BinderAsyncPool)'s *Which thread a transact
-/// runs on*), and needs no Tokio runtime. The first poll then blocks that
-/// thread until the name is registered (kernel, the inline
-/// `wait_for_interface_async` described in its *From inside a transaction*)
-/// or the lookup ends (RPC). Dropping the future cannot end that wait, and
-/// a `timeout` around it never fires. Look services up before serving, not
-/// while serving.
+/// runs on*), and needs no Tokio runtime. The call blocks that thread until
+/// the name is registered (kernel, the inline `wait_for_interface_async`
+/// described in its *From inside a transaction*) or the lookup ends (RPC).
+/// Dropping the future cannot end that wait, and a `timeout` around it
+/// never fires. Called anywhere else, the first poll decides the same way
+/// for the thread that polls. Look services up before serving, not while
+/// serving.
 #[cfg(feature = "tokio")]
 pub fn connect_async<T: FromIBinder + ?Sized + 'static>(
     uri: impl Into<Uri>,
-) -> impl std::future::Future<Output = Result<Strong<T>>> + 'static {
+) -> impl std::future::Future<Output = Result<Strong<T>>> + Send + 'static {
+    connect_async_with(uri, |_, _| {})
+}
+
+/// [`connect_async`] with [`ClientOptions`], as [`Client::open_with`] is to
+/// [`Client::open`]; the closure also sees the [`Endpoint`]. The usual
+/// option is [`ClientOptions::timeout`], which bounds each step of an RPC
+/// connect, so a `timeout` around this future no longer leaves a pool
+/// thread behind (see [`connect_async`]'s *A silent RPC peer*).
+#[cfg(feature = "tokio")]
+pub fn connect_async_with<T: FromIBinder + ?Sized + 'static>(
+    uri: impl Into<Uri>,
+    f: impl FnOnce(&mut ClientOptions, &Endpoint),
+) -> impl std::future::Future<Output = Result<Strong<T>>> + Send + 'static {
     let uri = uri.into();
-    async move {
-        if uri.endpoint.is_kernel() {
-            let (uri, name) = split_service(uri, "rsbinder::connect_async")?;
-            // Initializes `ProcessState` as `connect` does; opens the driver, never waits.
-            client::new_client(uri, ClientOptions::default())?;
-            return crate::wait_for_interface_async::<T>(&name).await;
-        }
-        crate::rt::blocking_op(move || connect::<T>(uri)).await
+    let mut o = ClientOptions::default();
+    f(&mut o, &uri.endpoint);
+    if uri.endpoint.is_kernel() {
+        // Initializes `ProcessState` as `connect` does; opens the driver, never waits.
+        let wait = split_service(uri, "rsbinder::connect_async").and_then(|(uri, name)| {
+            client::new_client(uri, o)?;
+            Ok(crate::wait_for_interface_async::<T>(&name))
+        });
+        let wait: crate::BoxFuture<'static, Result<Strong<T>>> = match wait {
+            Ok(wait) => Box::pin(wait),
+            Err(e) => Box::pin(std::future::ready(Err(e))),
+        };
+        return wait;
     }
+    crate::rt::blocking_op(move || {
+        let (uri, name) = split_service(uri, "rsbinder::connect_async")?;
+        client::new_client(uri, o)?
+            .binder(&name)?
+            .into_interface_checked()
+    })
 }
 
 /// Validate first: an empty name taken out here would skip the check in `new_client`.
@@ -201,5 +238,101 @@ mod tests {
             Err(mpsc::RecvTimeoutError::Timeout) => panic!("the inline connect did not end"),
             Err(e) => panic!("the polling thread died: {e}"),
         }
+    }
+
+    /// A socket path nobody listens on: the connect fails at once, on whichever thread runs it.
+    fn unreachable_unix() -> Uri {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rsbinder-entry-absent-{}-{n}.sock",
+            std::process::id()
+        ));
+        Uri::from(Endpoint::unix(path)).with_service("absent")
+    }
+
+    fn poll_once<F: std::future::Future>(fut: F) -> std::task::Poll<F::Output> {
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        fut.as_mut().poll(&mut cx)
+    }
+
+    /// The choice is made at the call, as a proxy's is: a future made in a handler has run there.
+    #[test]
+    fn an_rpc_connect_async_made_in_a_handler_runs_at_the_call() {
+        let (made, take) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _calling = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 0, pid: 7 }),
+                crate::TransportCaps::SAME_HOST,
+            );
+            let _ = made.send(connect_async::<Absent>(unreachable_unix()));
+        });
+        let connect = take
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the handler thread died");
+        // No runtime and no transaction here: a deferred hand-off would panic in `spawn_blocking`.
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_once(connect)));
+        match polled {
+            Ok(std::task::Poll::Ready(r)) => assert!(r.is_err(), "nothing listens there"),
+            Ok(std::task::Poll::Pending) => panic!("the connect was left to the pool"),
+            Err(_) => panic!("the connect was deferred to a poll off the handler"),
+        }
+    }
+
+    /// A peer that accepts and never answers: `ClientOptions::timeout` ends the pool thread's wait.
+    #[test]
+    fn connect_async_with_a_timeout_frees_its_pool_thread_from_a_silent_peer() {
+        let path = std::env::temp_dir().join(format!(
+            "rsbinder-entry-silent-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Accepted and held, never read or written: the handshake waits on it.
+        let held = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let uri = Uri::from(Endpoint::unix(path.clone())).with_service("silent");
+
+        let (done, watch) = mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            let r = rt.block_on(connect_async_with::<Absent>(uri, |o, _| {
+                o.timeout = Some(Duration::from_millis(200));
+            }));
+            // `Runtime::drop` joins the blocking pool: it returns only if the wait ended.
+            drop(rt);
+            let _ = done.send(r.err());
+        });
+        let ended = watch.recv_timeout(Duration::from_secs(10));
+        let _ = std::fs::remove_file(&path);
+        drop(held.join());
+        assert!(
+            matches!(ended, Ok(Some(_))),
+            "the connect or the runtime's shutdown waited on the silent peer: {ended:?}"
+        );
+    }
+
+    /// Made elsewhere, the first poll decides for its own thread: inline in a handler.
+    #[test]
+    fn an_rpc_connect_async_first_polled_in_a_handler_runs_there() {
+        let connect = connect_async::<Absent>(unreachable_unix());
+        let (done, watch) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _calling = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 0, pid: 7 }),
+                crate::TransportCaps::SAME_HOST,
+            );
+            let polled =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_once(connect)));
+            let _ = done.send(matches!(polled, Ok(std::task::Poll::Ready(Err(_)))));
+        });
+        assert!(
+            watch
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the handler thread died"),
+            "the first poll in a handler needed a runtime or left the connect to another thread"
+        );
     }
 }

@@ -75,24 +75,29 @@ pub(crate) fn join_error_status(e: tokio::task::JoinError) -> StatusCode {
 ///
 /// Called while handling a transaction
 /// ([`is_handling_transaction`](crate::is_handling_transaction)), the lookup
-/// and the interface check run **inline** on the handler's thread, as every
-/// async API of this crate does there (see [`BinderAsyncPool`]'s *Which
-/// thread a transact runs on*), and need no Tokio runtime; elsewhere they run
-/// on the blocking pool. Inside a handler this is also the bounded way to wait
+/// and the interface check run **inline** on the handler's thread before this
+/// returns, as every async API of this crate does there (see
+/// [`BinderAsyncPool`]'s *Which thread a transact runs on*), and need no Tokio
+/// runtime; handing the returned future to `tokio::spawn` does not move them
+/// off that thread. Called anywhere else, the first poll decides the same way
+/// for the thread that polls: inline there, on the blocking pool elsewhere. Inside a handler this is also the bounded way to wait
 /// for a name: loop over it with a `tokio::time::sleep` between tries, under a
 /// `timeout` (see [`wait_for_interface_async`]'s *From inside a transaction*).
-pub async fn try_get_interface_async<T: FromIBinder + ?Sized + 'static>(
+pub fn try_get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> BinderResult<Option<Strong<T>>> {
+) -> impl Future<Output = BinderResult<Option<Strong<T>>>> + Send + 'static {
     let name = name.to_string();
-    blocking_op(move || hub::try_get_interface::<T>(&name)).await
+    blocking_op(move || hub::try_get_interface::<T>(&name))
 }
 
 /// Run the blocking binder work of an async API of this crate through
-/// [`crate::__spawn_transact`]: inline on a thread that is handling a
-/// transaction, on the Tokio blocking pool otherwise. Every async lookup and
-/// [`crate::connect_async`] go through here, so the choice is made in one
-/// place; `rsbinder/tests/source_invariants.rs` pins the `spawn_blocking`,
+/// [`crate::__spawn_transact`], twice if need be: called on a thread that is
+/// handling a transaction, `op` runs inline before this returns, as a
+/// generated proxy's transact does; otherwise the first poll decides again,
+/// inline on a polling thread that handles a transaction, on the Tokio
+/// blocking pool elsewhere. Every async lookup and [`crate::connect_async`]
+/// go through here, so the choice is made in one function;
+/// `rsbinder/tests/source_invariants.rs` pins the `spawn_blocking`,
 /// `is_handling_transaction` and pool `::spawn(` sites that would bypass it.
 pub(crate) fn blocking_op<B, E, F>(op: F) -> BoxFuture<'static, Result<B, E>>
 where
@@ -100,7 +105,29 @@ where
     B: Send + 'static,
     E: From<StatusCode> + Send + 'static,
 {
-    crate::__spawn_transact::<Tokio, _, _, _, _, _, _>(op, |res| async move { res })
+    crate::__spawn_transact::<AtFirstPoll, _, _, _, _, _, _>(op, |res| async move { res })
+}
+
+/// [`Tokio`], with the choice of thread made again at the first poll rather than at the call.
+enum AtFirstPoll {}
+
+impl BinderAsyncPool for AtFirstPoll {
+    fn spawn<'a, F1, F2, Fut, A, B, E>(spawn_me: F1, after_spawn: F2) -> BoxFuture<'a, Result<B, E>>
+    where
+        F1: FnOnce() -> A,
+        F2: FnOnce(A) -> Fut,
+        Fut: Future<Output = Result<B, E>>,
+        F1: Send + 'static,
+        F2: Send + 'a,
+        Fut: Send + 'a,
+        A: Send + 'static,
+        B: Send + 'a,
+        E: From<crate::StatusCode>,
+    {
+        Box::pin(async move {
+            crate::__spawn_transact::<Tokio, _, _, _, _, _, _>(spawn_me, after_spawn).await
+        })
+    }
 }
 
 /// [`try_get_interface_async`] with "not registered" folded into
@@ -110,12 +137,11 @@ where
     note = "use `try_get_interface_async`, which returns `Ok(None)` for a name that is not \
             registered, as `hub::try_get_interface` does"
 )]
-pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
+pub fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> Result<Strong<T>, StatusCode> {
-    try_get_interface_async::<T>(name)
-        .await?
-        .ok_or(StatusCode::NameNotFound)
+) -> impl Future<Output = Result<Strong<T>, StatusCode>> + Send + 'static {
+    let lookup = try_get_interface_async::<T>(name);
+    async move { lookup.await?.ok_or(StatusCode::NameNotFound) }
 }
 
 /// Wait until the service named `name` is registered, then cast it to `T` —
@@ -132,9 +158,10 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// retried on a descriptor mismatch.
 ///
 /// Called while handling a transaction, the whole wait runs inline on the
-/// handler's thread instead, and the first poll returns only when it ends (see
-/// *From inside a transaction*). What *Dropping the future*, *Cost* and *What
-/// drives it* say about the blocking pool is about a call made anywhere else.
+/// handler's thread instead, and this returns only when it ends (see *From
+/// inside a transaction*); a future made elsewhere whose first poll runs on
+/// such a thread waits there the same way. What *Dropping the future*, *Cost*
+/// and *What drives it* say about the blocking pool is about the other cases.
 ///
 /// # Dropping the future
 ///
@@ -169,7 +196,7 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// | How this future is driven | Completion | A `timeout` around it |
 /// |---|---|---|
 /// | awaited on a runtime that is being driven | observed | fires |
-/// | polled on a thread handling a transaction (a kernel binder or RPC transaction's handler, with or without a Tokio runtime) | the first poll runs the whole wait inline and returns its result | never — see *From inside a transaction* |
+/// | called, or first polled, on a thread handling a transaction (a kernel binder or RPC transaction's handler, with or without a Tokio runtime) | that call or poll runs the whole wait inline; the future then holds its result | never — see *From inside a transaction* |
 /// | polled in a local async service called in-process through its sync handle (`Bn*::new_async_binder`) from a thread that handles no transaction | on the blocking pool, as in the first row | fires while the runtime the [`TokioRuntime`] handle points at runs its timer |
 /// | `tokio::spawn`ed onto a current-thread runtime nobody is parked in | never — the task is not polled, so the wait never starts and no pool thread is taken | – |
 ///
@@ -193,7 +220,10 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// never be answered by a peer whose binder threads all wait for this handler
 /// and whose thread pool cannot grow.
 ///
-/// The cost is that only the wait's own end ends it. The first poll returns
+/// The decision is made at the call, as a generated proxy's is, so a future
+/// made in a handler and handed to `tokio::spawn` has already waited there.
+///
+/// The cost is that only the wait's own end ends it. The call returns
 /// once the service appears or the wait gives up, so a `timeout`, a `select!`
 /// or a drop around the future never takes effect, and the handler's binder
 /// thread and its caller's reply stay held until then — for good, if the name
@@ -210,16 +240,16 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// A binder thread pool ([`crate::ProcessState::start_thread_pool`]) is what
 /// makes the wait event-driven; without one it degrades to the ~1s re-poll,
 /// exactly as the synchronous path does.
-pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
+pub fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> Result<Strong<T>, StatusCode> {
+) -> impl Future<Output = Result<Strong<T>, StatusCode>> + Send + 'static {
     // Outside the closure: the drop guard must reach the wait's condvar after this future ends.
     let state = Arc::new(hub::WaiterState::default());
-    let _cancel = CancelWaitOnDrop(state.clone());
+    let cancel = CancelWaitOnDrop(state.clone());
 
     let name = name.to_string();
     let wait_state = state.clone();
-    blocking_op(move || {
+    let wait = blocking_op(move || {
         // `hub::default()` may probe the wire; casting here matches the sync path's `BadType`.
         let binder = hub::default()?
             .wait_for_service_cancellable(&name, wait_state)
@@ -228,8 +258,11 @@ pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
                 StatusCode::NameNotFound
             })?;
         binder.into_interface_checked()
-    })
-    .await
+    });
+    async move {
+        let _cancel = cancel;
+        wait.await
+    }
 }
 
 /// Cancels the wait on drop: a `spawn_blocking` task ignores `abort()`, so its state tells it.
@@ -251,15 +284,16 @@ impl Drop for CancelWaitOnDrop {
 ///
 /// Called while handling a transaction
 /// ([`is_handling_transaction`](crate::is_handling_transaction)), the lookup
-/// and the interface check run **inline** on the handler's thread, as every
-/// async API of this crate does there (see [`BinderAsyncPool`]'s *Which
-/// thread a transact runs on*), and need no Tokio runtime; elsewhere they run
-/// on the blocking pool.
-pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
+/// and the interface check run **inline** on the handler's thread before this
+/// returns, as every async API of this crate does there (see
+/// [`BinderAsyncPool`]'s *Which thread a transact runs on*), and need no Tokio
+/// runtime. Called anywhere else, the first poll decides the same way for the
+/// thread that polls: inline there, on the blocking pool elsewhere.
+pub fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> Result<Strong<T>, StatusCode> {
+) -> impl Future<Output = Result<Strong<T>, StatusCode>> + Send + 'static {
     let name = name.to_string();
-    blocking_op(move || hub::check_interface::<T>(&name)).await
+    blocking_op(move || hub::check_interface::<T>(&name))
 }
 
 /// A future that completes when a binder dies — one `select!` arm instead of a

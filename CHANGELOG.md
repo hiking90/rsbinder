@@ -13,6 +13,32 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Added
+
+- `connect_async_with`, `connect_async` with `ClientOptions`. Without
+  `ClientOptions::timeout`, an RPC peer that accepts and never answers holds
+  a blocking-pool thread that a `timeout` around the future cannot release,
+  and `Runtime::drop` then waits for it.
+
+### Changed
+
+- `try_get_interface_async`, `check_interface_async`,
+  `wait_for_interface_async`, `get_interface_async` and `connect_async`
+  decide where their binder work runs when called, as a generated async
+  proxy does: called while handling a transaction, the work runs inline
+  before the call returns, so a future made in a handler and then
+  `tokio::spawn`ed no longer leaves the handler's transaction chain. Called
+  elsewhere, the first poll decides for the polling thread, as before. They
+  are now `fn`s returning `impl Future + Send + 'static`, so the future no
+  longer borrows `name`.
+
+### Fixed
+
+- `Reconnecting::connected` returns a connection that is up while handling
+  a transaction, as `wait_connected` does; only a wait is `WouldBlock`.
+- `#[rsbinder::interface]`: an argument type with `&` inside a fixed-array
+  length expression no longer breaks the async half of the expansion.
+
 ## [0.13.0]
 
 ### Migrating from 0.12.0
