@@ -59,15 +59,30 @@ pub fn as_written(ty: &Type) -> syn::Result<String> {
     as_written_in(ty, Ctx::Interface)
 }
 
+/// [`as_written`] with every reference given the async trait's `'a`, as `rsbinder-aidl`'s
+/// `args_async`; structural, so a `&` inside an array length expression stays an operator.
+pub fn as_written_async(ty: &Type) -> syn::Result<String> {
+    render(ty, Ctx::Interface, Some("'a"))
+}
+
 pub fn as_written_in(ty: &Type, ctx: Ctx) -> syn::Result<String> {
+    render(ty, ctx, None)
+}
+
+fn render(ty: &Type, ctx: Ctx, lifetime: Option<&str>) -> syn::Result<String> {
+    let as_written_in = |ty: &Type, ctx: Ctx| render(ty, ctx, lifetime);
     let ty = unwrap_group(ty);
     Ok(match ty {
         Type::Reference(r) => {
             let inner = as_written_in(&r.elem, ctx)?;
+            let amp = match lifetime {
+                Some(lt) => format!("&{lt} "),
+                None => "&".to_string(),
+            };
             if r.mutability.is_some() {
-                format!("&mut {inner}")
+                format!("{amp}mut {inner}")
             } else {
-                format!("&{inner}")
+                format!("{amp}{inner}")
             }
         }
         Type::Slice(s) => format!("[{}]", as_written_in(&s.elem, ctx)?),
@@ -1151,4 +1166,22 @@ pub fn reject_nullable_primitive(ty: &Type) -> syn::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn async_of(ty: &str) -> String {
+        as_written_async(&syn::parse_str(ty).expect("type")).expect("render")
+    }
+
+    #[test]
+    fn async_lifetimes_go_on_references_only() {
+        assert_eq!(async_of("&str"), "&'a str");
+        assert_eq!(async_of("&mut Vec<i32>"), format!("&'a mut {VEC}<i32>"));
+        assert_eq!(async_of("Option<&[i32]>"), format!("{OPTION}<&'a [i32]>"));
+        // `&` in a length is an operator: a blind replace made it `LEN &'a  3`.
+        assert_eq!(async_of("&[i32; LEN & 3]"), "&'a [i32; LEN & 3]");
+    }
 }

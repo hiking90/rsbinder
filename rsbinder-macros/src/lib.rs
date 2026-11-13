@@ -764,7 +764,7 @@ fn make_fn_member(f: &TraitItemFn, index: u32) -> syn::Result<FnMembers> {
 
         let arg_str = format!(", {ident}: {as_written}");
         args += &arg_str;
-        args_async += &arg_str.replace('&', "&'a ");
+        args_async += &format!(", {ident}: {}", type_str::as_written_async(&pat_ty.ty)?);
         func_call_params += &format!("{ident}, ");
 
         // Structural, not string: `std::vec::Vec<T>` carries the same length word as `Vec<T>`.
