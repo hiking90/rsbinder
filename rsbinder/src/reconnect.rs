@@ -438,16 +438,16 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
     /// deadline: resolves once connected, across as many attempts as it
     /// takes, without blocking the executor. Wrap it in
     /// `tokio::time::timeout` for a bound. The closing error once the helper
-    /// is closed (`DeadObject` if there was none); `WouldBlock` inside a
-    /// binder transaction or `on_connect`, where waiting could block the
-    /// reconnect itself. Outside those, a reconnect thread that cannot be
-    /// spawned resolves it to `Unknown`, as in `wait_connected`. Dropping the
-    /// future stops the wait, not the reconnect.
+    /// is closed (`DeadObject` if there was none); while not connected,
+    /// `WouldBlock` inside a binder transaction or `on_connect`, where
+    /// waiting could block the reconnect itself. A connection that is up is
+    /// returned there too, as `wait_connected` does. Outside those, a
+    /// reconnect thread that cannot be spawned resolves it to `Unknown`, as
+    /// in `wait_connected`. Dropping the future stops the wait, not the
+    /// reconnect.
     #[cfg(feature = "tokio")]
     pub async fn connected(&self) -> Result<Strong<T>> {
-        if crate::is_handling_transaction() {
-            return Err(StatusCode::WouldBlock);
-        }
+        let in_transaction = crate::is_handling_transaction();
         // Subscribed before looking, so a publish in between still wakes `changed`.
         let mut published = self.shared.watch.subscribe();
         loop {
@@ -456,6 +456,8 @@ impl<T: FromIBinder + ?Sized + 'static> Reconnecting<T> {
                 Err(AcquireError::Closed(code)) => {
                     return Err(code.unwrap_or(StatusCode::DeadObject))
                 }
+                // Before `NoThread`, as `acquire` orders it for `wait_connected`.
+                Err(_) if in_transaction => return Err(StatusCode::WouldBlock),
                 Err(AcquireError::NoThread) => return Err(StatusCode::Unknown),
                 Err(_) => {}
             }
@@ -1392,6 +1394,24 @@ mod tests {
         }
     }
 
+    /// A proxy that clones, as a live connection's `Snapshot` needs.
+    struct Held(SIBinder);
+
+    impl crate::Interface for Held {
+        fn as_binder(&self) -> SIBinder {
+            self.0.clone()
+        }
+    }
+
+    impl FromIBinder for Held {
+        fn interface_descriptor() -> &'static str {
+            "rsbinder.test.Unreachable"
+        }
+        fn try_from(binder: SIBinder) -> Result<Strong<Self>> {
+            Ok(Strong::new(Box::new(Held(binder))))
+        }
+    }
+
     /// A remote binder that links, and whose unlink panics and is counted.
     struct PanickingUnlink(Arc<std::sync::atomic::AtomicUsize>);
     impl crate::IBinder for PanickingUnlink {
@@ -1424,7 +1444,7 @@ mod tests {
     fn a_panicking_unlink_stays_inside_discard() {
         let unlinked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let binder = SIBinder::new(Arc::new(PanickingUnlink(unlinked.clone()))).expect("binder");
-        let h = stale_helper();
+        let h = stale_helper::<Unreachable>();
         let recipient = Arc::new(Recipient {
             shared: Arc::downgrade(&h.shared),
             attempt: 1,
@@ -1446,7 +1466,7 @@ mod tests {
     }
 
     /// A helper as `build` leaves it after a transient failure: `Stale`, no thread yet.
-    fn stale_helper() -> Reconnecting<Unreachable> {
+    fn stale_helper<T: FromIBinder + ?Sized + 'static>() -> Reconnecting<T> {
         let name = "rsbinder-reconnect-spawn-test";
         Reconnecting {
             shared: Arc::new(Shared {
@@ -1471,7 +1491,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             FAIL_SPAWN.with(|fail| fail.set(true));
-            let h = stale_helper();
+            let h = stale_helper::<Unreachable>();
             let waited = h.wait_connected(None).err();
             let current = h.current().err();
             #[cfg(feature = "tokio")]
@@ -1490,5 +1510,60 @@ mod tests {
         assert_eq!(waited, Some(StatusCode::Unknown));
         assert_eq!(current, Some(StatusCode::DeadObject));
         assert_eq!(connected, Some(StatusCode::Unknown));
+    }
+
+    /// In a handler a connection that is up is returned, async as sync; only a wait is refused.
+    #[cfg(all(feature = "tokio", feature = "rpc"))]
+    #[test]
+    fn a_handler_gets_a_live_connection_and_no_wait() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _calling = crate::thread_state::RpcCallingGuard::install(
+                Arc::new(crate::rpc::transport::PeerIdentity::Local { uid: 0, pid: 7 }),
+                crate::TransportCaps::SAME_HOST,
+            );
+            assert!(crate::is_handling_transaction());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+
+            // Stale: the thread is spawned, but the handler may not wait for it.
+            FAIL_SPAWN.with(|fail| fail.set(true));
+            let h = stale_helper::<Held>();
+            let stale = (
+                h.wait_connected(None).err(),
+                rt.block_on(h.connected()).err(),
+            );
+
+            let binder =
+                SIBinder::new(Arc::new(PanickingUnlink(Default::default()))).expect("binder");
+            {
+                let mut st = h.shared.lock();
+                st.phase = Phase::Connected;
+                st.conn = Some(Conn {
+                    proxy: Strong::new(Box::new(Held(binder.clone()))),
+                    parts: Parts {
+                        link: None,
+                        binder,
+                        session: None,
+                    },
+                    attempt: 1,
+                    watch: Watch::Recipient,
+                });
+            }
+            let live = (
+                h.wait_connected(None).is_ok(),
+                rt.block_on(h.connected()).is_ok(),
+            );
+            let _ = tx.send((stale, live));
+        });
+        let (stale, live) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a handler must not park");
+        assert_eq!(
+            stale,
+            (Some(StatusCode::WouldBlock), Some(StatusCode::WouldBlock))
+        );
+        assert_eq!(live, (true, true));
     }
 }
