@@ -326,8 +326,8 @@ with the batch it was added to.
 
 Batching is an RPC-path matter. On the ring every accepted item is already in
 the ring when `send` returns; nothing is queued, and `flush` returns at once —
-unless a dropped `send_async` left a record on the pool, which `flush` waits
-for (see [Async](#async)).
+unless a dropped `send_async` left a record waiting for room, which `flush`
+waits for (see [Async](#async)).
 
 Over RPC two things send a batch, and a clock is neither of them: the pending
 batch reaching the byte threshold, and a call to `flush` or `end`.
@@ -342,14 +342,14 @@ batch reaching the byte threshold, and a call to `flush` or `end`.
   nothing to say. `Sink::pending()` reports how many items are queued.
 
 `flush` on an empty batch returns at once, and on the ring costs nothing beyond
-that pool wait, so a producer unsure which path it is on can simply flush after
+that wait, so a producer unsure which path it is on can simply flush after
 every item.
 
 ## Ending a stream
 
 `end()` finishes the stream: on the ring it writes the end record, for which
 room is always reserved, so it waits for the consumer only for a record a
-dropped `send_async` left on the pool (see [Async](#async)); over RPC it
+dropped `send_async` left waiting for room (see [Async](#async)); over RPC it
 flushes first, and that flush blocks for credit. `end_with(&status)` does the
 same and hands the consumer an error — the failure the starting method could
 have returned, arriving late because that method had already succeeded:
@@ -436,18 +436,27 @@ The deadline is the session's: `RpcSession::set_reply_timeout` or
 default — never pings, and `PingPolicy::Off` in either policy turns it off for
 that end. The ping is not counted against `recv_timeout` or `send_timeout`, so
 a call whose peer stops answering returns later than its own bound, by up to
-the deadline. An `*_async` wait that may ping waits on the blocking pool (see
+the deadline. An `*_async` wait that may ping waits on a wait thread (see
 below).
 
 ## Async
 
-Both ends have `tokio` counterparts, behind the default `tokio` feature. Each
-of them makes its wait from the blocking pool — a futex wait on the ring, a
-`oneway` send over RPC — so **poll them inside a Tokio runtime context**:
-`spawn_blocking` panics outside one. (A call made from inside a transaction
-handler runs on the calling thread and is exempt.) A futex cannot be polled,
-so on the ring each wait holds one pool thread for as long as it lasts, the
-same cost as a thread of its own.
+Both ends have `tokio` counterparts, behind the default `tokio` feature. None
+of them blocks an executor thread; what they cannot poll goes elsewhere, by
+kind:
+
+- **Waits** — a futex wait on the ring, and on calls a wait that may ping or
+  has a `send_timeout` — run on threads of rsbinder's own. A futex cannot be
+  polled, so each wait holds one of them for as long as it lasts, the same cost
+  as a thread of its own; they are not capped and an idle one is reused, so a
+  wait never queues behind other waits, however many streams are idle.
+- **Binder calls** on calls — a batch, a grant, a cancel, the terminator — run
+  on the runtime's blocking pool, as every outbound call does, so **poll a
+  calls stream inside a Tokio runtime context**: `spawn_blocking` panics
+  outside one.
+
+(A call made from inside a transaction handler runs on the calling thread and
+is exempt.)
 
 The consumer awaits `recv_async()`. There is no `futures::Stream` impl — that
 would tie rsbinder's public API to a `futures-core` major version — so adapt it
@@ -462,9 +471,9 @@ while let Some(line) = lines.recv_async().await {
 The producer uses `send_async`, `flush_async`, `end_async` and `end_with_async`
 from a task. On calls, waiting for the consumer suspends the task instead of
 parking a thread — except a wait that may [ping](#a-peer-that-goes-silent) or
-has a `send_timeout`, which holds a pool thread while it lasts, as does a
+has a `send_timeout`, which holds a wait thread while it lasts, as does a
 `recv_async` that may ping: there is no timer to suspend a task against. On the
-ring every such wait holds a pool thread, as above.
+ring every such wait holds a wait thread, as above.
 
 ```rust
 let mut sink = Sink::open(endpoint)?;
@@ -482,7 +491,7 @@ tokio::spawn(async move {
 polled, so the future does not borrow the item and is `Send` whatever the item
 type is. `send_async`, `flush_async` and `recv_async` are cancel-safe: a future
 dropped mid-wait loses no credit, and no item without the terminator saying so.
-A record or batch already handed to the blocking pool still goes out, in its
+A record or batch already handed to another thread still goes out, in its
 place, and the next call waits for it first; a send that then fails is not
 forgotten with the future — the next call that sends (`flush_async`, or a
 `send`/`send_async` that has to wait) returns that failure, or the terminator
