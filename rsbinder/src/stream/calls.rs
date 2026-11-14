@@ -25,7 +25,7 @@ use super::generated::rsbinder::stream::IStreamSource::{
     BnStreamSource, BpStreamSource, IStreamSource,
 };
 #[cfg(feature = "tokio")]
-use super::pool::{on_pool, on_pool_reclaimable, Reclaim};
+use super::pool::{on_pool, on_pool_reclaimable, on_wait_thread, Reclaim};
 #[cfg(feature = "tokio")]
 use super::EndDecision;
 use super::{
@@ -256,8 +256,8 @@ impl Credit {
             }
             let abandon = Abandon::new(&self.state, &self.wake);
             let gone = abandon.gone();
-            // No `tokio/time` to suspend against, so a bounded wait is a condvar on the pool.
-            let pooled = on_pool(self.clone(), move |credit| {
+            // No `tokio/time` to suspend against, so a bounded wait is a condvar on a wait thread.
+            let pooled = on_wait_thread(self.clone(), move |credit| {
                 park(
                     &credit.state,
                     &credit.wake,
@@ -1394,8 +1394,8 @@ impl<T: Deserialize> Consumer<T> {
             };
             let abandon = Abandon::new(&stream.state, &stream.arrived);
             let gone = abandon.gone();
-            // No `tokio/time` to suspend against: the wait, and the ping ending it, use the pool.
-            let parked = on_pool(self.stream.clone(), move |stream| {
+            // No `tokio/time` to suspend against: the wait, and the ping ending it, use a wait thread.
+            let parked = on_wait_thread(self.stream.clone(), move |stream| {
                 park(
                     &stream.state,
                     &stream.arrived,

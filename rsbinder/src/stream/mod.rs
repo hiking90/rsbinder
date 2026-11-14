@@ -36,7 +36,7 @@
 //!
 //! An async service does the same from a task, where waiting for the
 //! consumer does not hold an executor thread (see [Async](#async) for the
-//! waits that hold a blocking-pool thread instead):
+//! threads the waits and calls run on instead):
 #![cfg_attr(
     feature = "tokio",
     doc = "[`Sink::send_async`] and [`Sink::end_async`]."
@@ -181,29 +181,29 @@
 //!
 //! # Async
 //!
-//! With the `tokio` feature, every `*_async` method makes its wait from
-//! the blocking pool — a futex wait on the ring, a `oneway` send on RPC —
-//! so a producer or consumer that has to wait does not hold an executor
-//! thread. A futex cannot be polled, so on the ring each wait holds one
-//! pool thread for as long as it lasts, the same cost as a thread of its
-//! own. On RPC a wait that is bounded or may [ping](PingPolicy) holds a
-//! pool thread the same way. **Poll them inside a Tokio runtime**:
-//! outside one the hand-off panics, as `tokio::task::spawn_blocking` does. A call from inside a
-//! transaction handler makes its wait on the calling thread instead and
-//! is exempt.
+//! With the `tokio` feature, no `*_async` method blocks an executor thread.
+//! What they cannot poll goes to another thread, by kind:
 //!
-//! The pool is the runtime's one blocking pool, shared with every outbound
-//! binder call, and it starts at most `max_blocking_threads` tasks at a time
-//! (512 by default). A wait handed to a pool with no free thread is queued,
-//! and until a thread takes it nothing looks at the ring or the credit for
-//! it: an item, a grant, a death or [`SinkPolicy::send_timeout`] passing
-//! does not end the call. On RPC the send or grant that follows a wait is a
-//! pool task too. So size the pool above the number of stream waits that
-//! can be in progress at once — each waiting ring `recv_async` holds a
-//! thread for as long as its stream is idle — plus the calls made beside
-//! them. A dropped future's record or batch that is still queued does not
-//! hold up its sink's drop: the drop gives the record up, or sends the
-//! batch itself.
+//! * **A wait** — a futex wait on the ring, for an item or for room, and on
+//!   RPC a credit wait that is bounded or may [ping](PingPolicy), and a
+//!   consumer's pinged wait for a batch — runs on a thread of this crate's
+//!   own. One wait holds one thread for as long as it lasts, the same cost as
+//!   a thread of its own, but these threads are not capped and an idle one is
+//!   reused, so a wait never queues behind other waits: an item, a grant, a
+//!   death or [`SinkPolicy::send_timeout`] ends it when it happens, however
+//!   many streams are idle. An unbounded, unpinged RPC wait needs no thread:
+//!   it suspends the task.
+//! * **A binder call** — an RPC batch, a grant, a cancel, the terminator —
+//!   runs on the runtime's blocking pool, as every outbound call of this
+//!   crate does, so **poll an RPC stream's futures inside a Tokio runtime**:
+//!   outside one that hand-off panics, as `tokio::task::spawn_blocking` does.
+//!   A pool at its `max_blocking_threads` (512 by default) queues these
+//!   calls, but the waits no longer take its threads. A batch that a dropped
+//!   future left queued there does not hold up its sink's drop: the drop
+//!   sends it itself.
+//!
+//! A call from inside a transaction handler makes its wait and its calls on
+//! the calling thread instead and is exempt.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -504,8 +504,8 @@ pub struct SinkPolicy {
     /// `None`, the default, waits for as long as it takes. A consumer that
     /// is alive but neither reads nor cancels then holds the producer's
     /// thread for good — or, for an `*_async` call on the ring or one on
-    /// RPC that may [ping](PingPolicy), a blocking-pool thread — which a
-    /// service streaming to an untrusted
+    /// RPC that may [ping](PingPolicy), a wait thread (module doc,
+    /// *Async*) — which a service streaming to an untrusted
     /// client should not allow.
     ///
     /// `Some(d)` sets one deadline per call, `d` after a blocking method
@@ -514,7 +514,7 @@ pub struct SinkPolicy {
     /// [`send_all`](Sink::send_all) has one deadline for all its items,
     /// not one per item. On expiry the call returns
     /// [`StatusCode::TimedOut`], and no thread is left parked past the
-    /// deadline, the pool thread of an `*_async` call included. It bounds
+    /// deadline, the wait thread of an `*_async` call included. It bounds
     /// only waits for room or credit: the RPC transaction that carries a
     /// batch or the terminator waits under the session's own deadline
     /// (`RpcSession::set_reply_timeout`, or `RpcServer::set_reply_timeout`
@@ -529,7 +529,7 @@ pub struct SinkPolicy {
     /// * [`flush`](Sink::flush), on the RPC path: the pending batch stays
     ///   pending, whole, and a later successful flush — or `end` — sends
     ///   it. On the ring, flush waits only for a record a dropped
-    ///   `send_async` future left on the pool; that record waits under the
+    ///   `send_async` future left waiting for room; that record waits under the
     ///   deadline of the call that made it, and one whose deadline expires
     ///   is counted lost, which `end` reports.
     /// * [`end`](Sink::end) and [`end_with`](Sink::end_with): the end
@@ -544,11 +544,10 @@ pub struct SinkPolicy {
     /// or credit is there now and returns `TimedOut` otherwise. A duration
     /// too long for an `Instant` to express waits without a bound, as
     /// `None` does. On the RPC path a bounded `*_async` credit wait holds
-    /// a blocking-pool thread while it lasts (this build has no timer to
-    /// suspend the task against); an unbounded one suspends the task,
-    /// unless it may [ping](PingPolicy), which holds a pool thread too.
-    /// A `*_async` wait queued behind a pool with no free thread is not
-    /// ended by `d` until a thread takes it (module doc, *Async*).
+    /// a wait thread while it lasts (this build has no timer to suspend the
+    /// task against); an unbounded one suspends the task, unless it may
+    /// [ping](PingPolicy), which holds a wait thread too (module doc,
+    /// *Async*).
     ///
     /// Nor does it count a [ping](PingPolicy) made while waiting for
     /// credit: a call whose consumer stops answering can return later than
@@ -645,9 +644,9 @@ impl SinkPolicy {
 /// [`Receiver::recv_timeout`]'s `timeout`, [`SinkPolicy::send_timeout`] —
 /// so a call whose peer stops answering can return later than that bound,
 /// by up to the reply deadline. With the `tokio` feature, an `*_async`
-/// wait that may ping is made on the blocking pool and holds a thread
-/// there for as long as it lasts; this build has no timer to suspend a
-/// task against.
+/// wait that may ping is made on a wait thread ([module docs](self#async))
+/// and holds it for as long as it lasts; this build has no timer to suspend
+/// a task against.
 ///
 /// A ring over kernel binder never pings: the kernel reports the peer's
 /// death itself. A ring over an RPC session ([`RingUse::AlsoUnixRpc`])
@@ -1175,7 +1174,7 @@ impl<T: Serialize + ?Sized> Sink<T> {
     ///
     /// On the ring an error always means this item was not written,
     /// whichever write failed — this call's, or a record a dropped
-    /// `send_async` left on the pool, whose failure
+    /// `send_async` left waiting for room, whose failure
     /// the next call reports before writing anything.
     ///
     /// - [`StatusCode::TimedOut`] when [`SinkPolicy::send_timeout`]
@@ -1363,19 +1362,18 @@ impl<T: Serialize + ?Sized> Sink<T> {
     /// [`send`](Self::send) for a producer running as a task.
     ///
     /// Same contract, with the wait moved off the executor thread: on the
-    /// ring a record that finds no room is written from the blocking
-    /// pool; on the RPC path the credit wait follows the
-    /// [module docs](self#async) — a wait that is bounded or may ping
-    /// holds a pool thread, any other suspends the task — and the batch is
-    /// sent from the pool, the way every generated async proxy sends
-    /// ([`Tokio`](crate::Tokio)).
+    /// ring a record that finds no room is written from a wait thread; on
+    /// the RPC path the credit wait follows the [module docs](self#async) —
+    /// a wait that is bounded or may ping holds a wait thread, any other
+    /// suspends the task — and the batch is sent from the blocking pool,
+    /// the way every generated async proxy sends ([`Tokio`](crate::Tokio)).
     ///
     /// The item is encoded **when this is called**, not when the future
     /// is first polled, so the future does not borrow `item` and stays
     /// `Send` whatever `T` is. Dropping the future unpolled therefore
     /// leaves the item queued (RPC) or unwritten (ring). Dropping it
-    /// mid-wait is safe too: a record or batch already handed to the pool
-    /// still goes out, in its place, and the next call waits for it
+    /// mid-wait is safe too: a record or batch already handed to another
+    /// thread still goes out, in its place, and the next call waits for it
     /// first. On the ring, a future dropped while it still waits for such
     /// an earlier record drops its own item, and the terminator counts it
     /// as lost: [`pending`](Self::pending) cannot tell the two cases apart,
@@ -1809,18 +1807,18 @@ impl<T: Deserialize> Receiver<T> {
 
     /// [`recv`](Self::recv) for an async consumer.
     ///
-    /// Same result as `recv`, without blocking the executor thread. The
-    /// blocking pool runs a futex wait on the ring; on the RPC path it
-    /// runs a credit grant and a wait for an item that may
-    /// [ping](PingPolicy), and any other wait suspends the task
+    /// Same result as `recv`, without blocking the executor thread. A wait
+    /// thread runs a futex wait on the ring; on the RPC path the blocking
+    /// pool sends a credit grant, a wait thread runs a wait for an item
+    /// that may [ping](PingPolicy), and any other wait suspends the task
     /// ([module docs](self#async)). No `Stream` trait is implemented and
     /// none is in the public signature: that would bind rsbinder's API
     /// to a `futures-core` major version. Adapt it where you need one.
     ///
     /// Cancel-safe: a future dropped mid-wait loses no item. On the ring
-    /// a wait the pool has not started goes with the future, and one it has
-    /// started is joined by the next call, so the wake it consumes is not
-    /// lost and a pool with no free thread holds up no record; on the RPC
+    /// a wait no thread has started yet goes with the future, and one that
+    /// has started is joined by the next call, so the wake it consumes is
+    /// not lost; on the RPC
     /// path a grant already handed to the pool still goes out, and the next
     /// call may send the same running total again, which the producer counts
     /// once.

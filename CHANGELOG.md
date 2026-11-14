@@ -22,6 +22,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
+- Stream `*_async` waits — a futex wait on the ring, for an item or for
+  room, and on calls a credit or item wait that is bounded or may ping —
+  run on rsbinder's own threads instead of the runtime's blocking pool.
+  They are not capped and an idle one is reused, so a wait no longer queues
+  behind other waits once `max_blocking_threads` are taken, where it saw no
+  item, grant or `send_timeout` until another wait ended, and the waits no
+  longer take the threads binder calls need. Latency, CPU per item and
+  throughput measured the same as before. Binder calls (batches, grants,
+  the terminator) stay on the blocking pool.
+
 - `try_get_interface_async`, `check_interface_async`,
   `wait_for_interface_async`, `get_interface_async` and `connect_async`
   decide where their binder work runs when called, as a generated async

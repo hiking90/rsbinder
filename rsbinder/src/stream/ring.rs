@@ -23,7 +23,7 @@ use crate::SIBinder;
 
 use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink};
 #[cfg(feature = "tokio")]
-use super::pool::{on_pool_reclaimable, wait_on_pool, Reclaim};
+use super::pool::{on_wait_thread_reclaimable, wait_on_thread, Reclaim};
 use super::{
     decode_item, dropped_terminator, encode_item, end_decision, status_from_fields, watch_death,
     Book, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
@@ -655,7 +655,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             let record =
                 RecordInTransit::new(self.shared.clone(), self.transit.clone(), bytes, wait);
             // The record settles itself: a dropped future detaches the task, which may never run.
-            let (sent, reclaim) = on_pool_reclaimable(record, |record| {
+            let (sent, reclaim) = on_wait_thread_reclaimable(record, |record| {
                 record.send();
                 Ok(())
             });
@@ -1123,7 +1123,7 @@ impl<T: Deserialize> Consumer<T> {
                 hook();
             }
             let wait = WaitInTransit::new(self.shared.clone(), self.transit.clone());
-            if let Err(e) = wait_on_pool(wait, |wait| {
+            if let Err(e) = wait_on_thread(wait, |wait| {
                 wait.wait();
                 Ok(())
             })
@@ -2142,10 +2142,9 @@ mod tests {
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
-    /// A saturated pool never starts a dropped future's wait: nothing may wait for it to end.
+    /// A runtime whose blocking pool is full: tokio's pool with its one thread taken.
     #[cfg(feature = "tokio")]
-    #[test]
-    fn a_dropped_wait_the_pool_never_started_holds_up_no_record() {
+    fn a_full_blocking_pool() -> (tokio::runtime::Runtime, mpsc::Sender<()>) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .max_blocking_threads(1)
@@ -2153,33 +2152,38 @@ mod tests {
             .expect("runtime");
         let (holding, held) = mpsc::channel();
         let (release, hold) = mpsc::channel::<()>();
-        let blocker = runtime.spawn_blocking(move || {
+        runtime.spawn_blocking(move || {
             holding.send(()).expect("the test waits");
-            let _ = hold.recv();
+            let _ = hold.recv_timeout(Duration::from_secs(30));
         });
         held.recv_timeout(Duration::from_secs(5))
             .expect("the pool's one thread is taken");
+        (runtime, release)
+    }
 
+    /// A wait does not take a thread of the runtime's blocking pool, so a full one holds none up.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_full_blocking_pool_holds_up_no_ring_wait() {
+        let (runtime, release) = a_full_blocking_pool();
         let (mut tx, mut rx) = pair::<i32>(512);
-        runtime.block_on(async {
-            let mut pending = std::pin::pin!(rx.recv_async());
-            let polled = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
-            })
-            .await;
-            assert!(polled, "nothing to read, so the wait goes to the pool");
+        let (done, got) = mpsc::channel();
+        let consumer = thread::spawn(move || {
+            let item = runtime.block_on(rx.recv_async());
+            let _ = done.send(item.map(|r| r.ok()));
+            (runtime, rx)
         });
+        // Sent after the consumer is likely parked; either order must deliver.
+        thread::sleep(Duration::from_millis(50));
         tx.send(&9, None).expect("send");
-        assert_eq!(
-            rx.recv_timeout(Duration::from_millis(300))
-                .expect("no error"),
-            Some(9),
-            "the record is in the ring, whatever the pool is doing"
-        );
-        assert!(!rx.transit.in_transit(), "taken back as its future dropped");
-
+        let item = got.recv_timeout(Duration::from_secs(5));
         release.send(()).expect("the blocker waits");
-        runtime.block_on(blocker).expect("blocker");
+        assert_eq!(
+            item.expect("the wait sat behind the full pool"),
+            Some(Some(9))
+        );
+        let (runtime, rx) = consumer.join().expect("consumer");
+        drop((tx, rx));
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
@@ -2205,13 +2209,13 @@ mod tests {
             .worker_threads(1)
             .build()
             .expect("runtime");
-        let handle = runtime.handle().clone();
-        // No pool will run the record: it settles unrun, as a failure the future reports.
-        runtime.shutdown_background();
-
         let (mut tx, mut rx) = pair::<i32>(512);
         let sent = fill_with_ones(&mut tx);
-        let failed = handle.block_on(tx.send_async(&2, None));
+        // No thread will run the record: it settles unrun, as a failure the future reports.
+        let refuse = |on| super::super::pool::REFUSE_WAIT_THREAD.with(|r| r.set(on));
+        refuse(true);
+        let failed = runtime.block_on(tx.send_async(&2, None));
+        refuse(false);
         // An unsettled record would read `Ok` here, with the item nowhere.
         assert!(
             failed.is_err(),
@@ -2237,24 +2241,12 @@ mod tests {
         );
     }
 
-    /// A saturated pool never starts a dropped `send_async`'s record: the drop gives it up there.
+    /// A dropped `send_async` leaves its record waiting for room on a wait thread; the producer's
+    /// drop gives it up there at once, a full blocking pool notwithstanding.
     #[cfg(feature = "tokio")]
     #[test]
-    fn dropping_a_producer_waits_for_no_record_the_pool_never_started() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .max_blocking_threads(1)
-            .build()
-            .expect("runtime");
-        let (holding, held) = mpsc::channel();
-        let (release, hold) = mpsc::channel::<()>();
-        let blocker = runtime.spawn_blocking(move || {
-            holding.send(()).expect("the test waits");
-            let _ = hold.recv();
-        });
-        held.recv_timeout(Duration::from_secs(5))
-            .expect("the pool's one thread is taken");
-
+    fn dropping_a_producer_gives_up_a_record_waiting_for_room() {
+        let (runtime, release) = a_full_blocking_pool();
         let (mut tx, mut rx) = pair::<i32>(512);
         let sent = fill_with_ones(&mut tx);
         runtime.block_on(async {
@@ -2263,12 +2255,9 @@ mod tests {
                 std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
             })
             .await;
-            assert!(polled, "the ring is full, so the record goes to the pool");
+            assert!(polled, "the ring is full, so the record waits for room");
         });
-        assert!(
-            tx.transit.in_transit(),
-            "the record is queued behind the blocker"
-        );
+        assert!(tx.transit.in_transit(), "the record waits on a wait thread");
 
         let (done, dropped) = mpsc::channel();
         thread::spawn(move || {
@@ -2277,8 +2266,7 @@ mod tests {
         });
         let ended = dropped.recv_timeout(Duration::from_secs(2));
         release.send(()).expect("the blocker waits");
-        runtime.block_on(blocker).expect("blocker");
-        ended.expect("the drop waited for a pool thread to start the record");
+        ended.expect("the drop waited for the record");
 
         for _ in 0..sent {
             assert_eq!(
