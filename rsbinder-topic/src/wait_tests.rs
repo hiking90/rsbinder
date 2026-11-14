@@ -763,7 +763,7 @@ mod pool {
     fn a_wait_the_pool_has_not_started_is_taken_back_when_its_future_drops() {
         let (runtime, release) = held_pool();
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         abandon(&runtime, &mut subscriber);
         assert!(!subscriber.leftover().busy(), "taken back at the drop");
         let stop = subscriber.local().stop_bits();
@@ -784,7 +784,7 @@ mod pool {
     fn a_bounded_receive_after_a_wait_taken_back_sleeps_on_its_own_to_its_deadline() {
         let (runtime, release) = held_pool();
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         abandon(&runtime, &mut subscriber);
         let started = Instant::now();
         let got = subscriber.recv_timeout(Duration::from_millis(100));
@@ -802,7 +802,7 @@ mod pool {
     fn a_record_committed_after_a_receive_behind_a_wait_taken_back_began_ends_it() {
         let (runtime, release) = held_pool();
         let publisher = Arc::new(topic(64 << 10));
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         abandon(&runtime, &mut subscriber);
         let publishing = {
             let publisher = publisher.clone();
@@ -825,7 +825,7 @@ mod pool {
     fn an_interrupt_before_a_receive_after_a_wait_taken_back_ends_it_at_once() {
         let (runtime, release) = held_pool();
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         abandon(&runtime, &mut subscriber);
         subscriber.interrupter().interrupt();
         let started = Instant::now();
@@ -856,7 +856,7 @@ mod pool {
     fn a_hand_off_after_a_wait_taken_back_is_not_settled_by_its_closure() {
         let (runtime, release) = held_pool();
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         abandon(&runtime, &mut subscriber);
         let local = subscriber.local().clone();
         let left = subscriber.leftover().clone();
@@ -877,7 +877,7 @@ mod pool {
     #[test]
     fn a_hand_off_that_unwinds_leaves_no_wait_out() {
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut future = std::pin::pin!(subscriber.recv_async());
             let _ = future
@@ -886,6 +886,69 @@ mod pool {
         }));
         assert!(unwound.is_err(), "no runtime to hand the wait to");
         assert!(!subscriber.leftover().busy());
+    }
+
+    /// A wait does not take a thread of the runtime's blocking pool, so a full one holds none up.
+    #[test]
+    fn a_full_blocking_pool_holds_up_no_async_receive() {
+        let (runtime, release) = held_pool();
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        let local = subscriber.local().clone();
+        let receiving = runtime.spawn(async move { subscriber.recv_async().await });
+        let parked = within_a_second(|| local.is_parked());
+        publisher.publish(&num(9)).unwrap();
+        let returned = within_a_second(|| receiving.is_finished());
+        release.send(()).unwrap();
+        assert!(parked, "the wait never started");
+        assert!(returned, "the wait sat behind the full pool");
+        let got = runtime.block_on(receiving).unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Ok(9));
+    }
+
+    /// No Tokio runtime is needed for a futex wait: it runs on a wait thread.
+    #[test]
+    fn an_async_receive_needs_no_runtime() {
+        let publisher = topic(64 << 10);
+        let mut subscriber = subscriber(&publisher);
+        let local = subscriber.local().clone();
+        let receiving = thread::spawn(move || block_on(subscriber.recv_async()));
+        assert!(
+            within_a_second(|| local.is_parked()),
+            "the wait never started"
+        );
+        publisher.publish(&num(4)).unwrap();
+        let got = receiving.join().unwrap();
+        assert_eq!(got.map(|bytes| value(&bytes)), Ok(4));
+    }
+
+    /// Poll `future` on this thread to its end, with no runtime: parked between polls.
+    fn block_on<F: Future>(future: F) -> F::Output {
+        struct Unpark(thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(Unpark(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+                return out;
+            }
+            thread::park();
+        }
+    }
+
+    /// `subscriber`, its waits handed to the runtime's blocking pool rather than a wait thread:
+    /// with [`held_pool`], a wait no thread has started.
+    fn on_blocking_pool(subscriber: Subscriber<Bytes>) -> Subscriber<Bytes> {
+        subscriber
+            .leftover()
+            .on_blocking_pool
+            .store(true, Ordering::Relaxed);
+        subscriber
     }
 
     /// A runtime whose one blocking thread is busy until the sender sends, for 10 s at most.
@@ -921,7 +984,7 @@ mod pool {
     ) -> Subscriber<Bytes> {
         let (runtime, release) = held_pool();
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         abandon(&runtime, &mut subscriber);
         let (local, interrupter) = (subscriber.local().clone(), subscriber.interrupter());
         let (send, got) = mpsc::channel();
@@ -969,7 +1032,7 @@ mod pool {
     fn an_unbounded_receive_behind_a_leaked_wait_the_pool_has_not_run_returns_the_record() {
         let (runtime, release) = held_pool();
         let publisher = topic(64 << 10);
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         leak(&runtime, &mut subscriber);
         publisher.publish(&num(7)).unwrap();
         publisher.publish(&num(8)).unwrap();
@@ -1001,7 +1064,7 @@ mod pool {
     fn a_bounded_receive_gets_a_record_committed_while_it_joins_a_leaked_wait() {
         let (runtime, release) = held_pool();
         let publisher = Arc::new(topic(64 << 10));
-        let mut subscriber = subscriber(&publisher);
+        let mut subscriber = on_blocking_pool(subscriber(&publisher));
         leak(&runtime, &mut subscriber);
         {
             let publisher = publisher.clone();

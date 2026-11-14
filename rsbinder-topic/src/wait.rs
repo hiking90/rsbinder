@@ -690,7 +690,7 @@ mod real {
 #[cfg(feature = "tokio")]
 pub(crate) use pool::{on_pool, Leftover};
 
-/// A wait handed to the blocking pool, and the record of it the next wait joins.
+/// A wait handed to a wait thread, and the record of it the next wait joins.
 #[cfg(feature = "tokio")]
 mod pool {
     use std::sync::Arc;
@@ -718,6 +718,10 @@ mod pool {
         /// A test's step as a receive begins to join, after the look before it.
         #[cfg(test)]
         pub(crate) before_join: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// Hand this subscriber's waits to the runtime's blocking pool, as before
+        /// `WaitThreads`: a test that needs a wait no thread has started holds that pool.
+        #[cfg(test)]
+        pub(crate) on_blocking_pool: std::sync::atomic::AtomicBool,
     }
 
     impl Leftover {
@@ -750,10 +754,10 @@ mod pool {
         }
     }
 
-    /// One wait for `seen` on the pool, handed over at the first poll; `leftover` records it
-    /// until it ends. Dropped before a pool thread takes the wait, the future takes it back and
-    /// settles it, also when the hand-off unwinds, as `spawn_blocking` does outside a Tokio
-    /// runtime, where its `Handle::current` panics.
+    /// One wait for `seen` on a wait thread (`rsbinder`'s `WaitThreads`, which never queues
+    /// one), handed over at the first poll; `leftover` records it until it ends. Dropped before
+    /// a thread takes the wait, the future takes it back and settles it, also when the hand-off
+    /// unwinds.
     pub(crate) async fn on_pool(
         local: &Arc<Local<Parts>>,
         leftover: &Arc<Leftover>,
@@ -766,8 +770,22 @@ mod pool {
             seen,
         }));
         let mut give_back = GiveBack::new(&hand, local);
-        let ran = rsbinder::__spawn_transact::<rsbinder::Tokio, _, _, _, _, _, _>(
-            move || serve(&hand),
+        let wait = move || serve(&hand);
+        #[cfg(test)]
+        if leftover
+            .on_blocking_pool
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let ran =
+                rsbinder::__spawn_transact::<rsbinder::Tokio, _, _, _, _, _, _>(wait, |()| async {
+                    Ok(())
+                })
+                .await;
+            give_back.armed = false;
+            return ran;
+        }
+        let ran = rsbinder::__spawn_transact::<rsbinder::__sync::WaitThreads, _, _, _, _, _, _>(
+            wait,
             |()| async { Ok(()) },
         )
         .await;

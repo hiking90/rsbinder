@@ -29,10 +29,10 @@ pub enum RecvError {
     /// An [`Interrupter`](crate::Interrupter) ended the wait, and nothing else does. The next
     /// receive tries again from the same place.
     Cancelled,
-    /// The async runtime could not run the wait of a `recv_async`: the blocking pool did not run
-    /// it (`Other`, as when its runtime shuts down), or the reactor did not take the
-    /// subscription's file descriptor (the kind of `AsyncFd`'s error). The next receive tries
-    /// again from the same place, and fails the same way while the runtime does.
+    /// The wait of a `recv_async` could not be run: no thread could be started for it (`Other`,
+    /// as when the OS refuses one), or the reactor did not take the subscription's file
+    /// descriptor (the kind of `AsyncFd`'s error). The next receive tries again from the same
+    /// place, and fails the same way while that lasts.
     Runtime(std::io::ErrorKind),
     /// The publisher overwrote this many records before they were read. The next receive returns
     /// the first record after them.

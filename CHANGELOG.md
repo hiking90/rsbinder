@@ -31,6 +31,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   longer take the threads binder calls need. Latency, CPU per item and
   throughput measured the same as before. Binder calls (batches, grants,
   the terminator) stay on the blocking pool.
+- `rsbinder-topic`: `Subscriber::recv_async` and `recv_sample_async` with
+  `Wake::Futex` wait on the same threads, so their waits no longer queue
+  behind each other on a full blocking pool, and they no longer need a
+  Tokio runtime (they panicked outside one). `RecvError::Runtime` now means
+  no thread could be started for the wait, or the reactor refused the fd.
 
 - `try_get_interface_async`, `check_interface_async`,
   `wait_for_interface_async`, `get_interface_async` and `connect_async`

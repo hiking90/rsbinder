@@ -431,7 +431,7 @@ blocking thread. The `Backpressure` rustdoc lists what waits with it.
 | `try_recv`, `try_latest` | `RecvError::Empty` at once |
 | `recv`, `recv_latest` | waits for one |
 | `recv_timeout` | waits, then `RecvError::Timeout` |
-| `recv_async` (`tokio` feature) | on the blocking pool; with `Wake::Fd`, the reactor |
+| `recv_async` (`tokio` feature) | on a wait thread of rsbinder's own; with `Wake::Fd`, the reactor |
 | `Wait`, `wait_any` (`Wake::Fd`) | the caller polls |
 
 A waiting subscriber first watches the ring for up to 20 µs, then sleeps. By
