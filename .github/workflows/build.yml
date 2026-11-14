@@ -485,11 +485,12 @@ jobs:
         # `file` must say MSB / IBM S/390 before any result counts.
         # The binary's path is the one cargo reports, not a guess: newer cargo puts test
         # executables under `debug/build/<pkg>/<hash>/out/`, not `debug/deps/`. `cross` reports
-        # it inside its container, where the target directory is mounted at `/target`.
+        # it inside its container, where the target directory is mounted at `/target`. Its first
+        # run also prints `docker pull` progress on stdout, so only lines that parse are read.
         run: |
           cross test -p rsbinder --target s390x-unknown-linux-gnu \
             --no-default-features --lib parcel --no-run --message-format=json > /tmp/build.json
-          exe=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' /tmp/build.json)
+          exe=$(jq -rR 'fromjson? | select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable' /tmp/build.json)
           test "$(printf '%s\n' "$exe" | wc -l)" -eq 1 && test -n "$exe"
           [ -e "$exe" ] || exe="target${exe#/target}"
           file "$exe" | tee /tmp/file.out

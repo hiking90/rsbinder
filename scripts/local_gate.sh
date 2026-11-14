@@ -143,11 +143,12 @@ rpc_suite_soak() {
 
 # Build the parcel tests and check the binary cargo reports is s390x. Cargo 1.100 puts test
 # executables under `debug/build/<pkg>/<hash>/out/`, so the path is read, not globbed; `cross`
-# reports it inside its container, where `target/cross` is mounted at `/target`.
+# reports it inside its container, where `target/cross` is mounted at `/target`, and its first run
+# prints `docker pull` progress on stdout, so only lines that parse are read.
 s390_is_big_endian() {
     local exe
     exe=$("$@" --no-default-features --lib parcel --no-run --message-format=json |
-        jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable') ||
+        jq -rR 'fromjson? | select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable') ||
         return 1
     [ -n "$exe" ] && [ "$(printf '%s\n' "$exe" | wc -l)" -eq 1 ] || return 1
     [ -e "$exe" ] || exe="target/cross${exe#/target}"
