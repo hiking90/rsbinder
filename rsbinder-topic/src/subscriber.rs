@@ -366,7 +366,7 @@ impl<T: Payload> Subscriber<T> {
     }
 
     /// What [`with_session`](Self::with_session) gave it, for a test.
-    #[cfg(all(test, feature = "uds"))]
+    #[cfg(all(test, feature = "uds", any(target_os = "linux", target_os = "android")))]
     pub(crate) fn session_guard<G: Any + Send + Sync>(&self) -> Option<&G> {
         self.session.as_ref()?.downcast_ref()
     }

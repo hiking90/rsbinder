@@ -1138,14 +1138,11 @@ impl Parcel {
 
     /// No kernel object, RPC object position or out-of-band fd (all three: see module doc).
     pub(crate) fn is_self_contained(&self) -> bool {
-        if self.objects.len() != 0 {
-            return false;
-        }
         #[cfg(feature = "rpc")]
         if !self.rpc_object_positions().is_empty() || !self.rpc_out_fds().is_empty() {
             return false;
         }
-        true
+        self.objects.len() == 0
     }
 
     /// The bytes, or `BadType` unless [`Parcel::is_self_contained`] (always true if data-only).

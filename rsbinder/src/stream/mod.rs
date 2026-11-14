@@ -191,6 +191,19 @@
 //! outside one the hand-off panics, as `tokio::task::spawn_blocking` does. A call from inside a
 //! transaction handler makes its wait on the calling thread instead and
 //! is exempt.
+//!
+//! The pool is the runtime's one blocking pool, shared with every outbound
+//! binder call, and it starts at most `max_blocking_threads` tasks at a time
+//! (512 by default). A wait handed to a pool with no free thread is queued,
+//! and until a thread takes it nothing looks at the ring or the credit for
+//! it: an item, a grant, a death or [`SinkPolicy::send_timeout`] passing
+//! does not end the call. On RPC the send or grant that follows a wait is a
+//! pool task too. So size the pool above the number of stream waits that
+//! can be in progress at once — each waiting ring `recv_async` holds a
+//! thread for as long as its stream is idle — plus the calls made beside
+//! them. A dropped future's record or batch that is still queued does not
+//! hold up its sink's drop: the drop gives the record up, or sends the
+//! batch itself.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -534,6 +547,8 @@ pub struct SinkPolicy {
     /// a blocking-pool thread while it lasts (this build has no timer to
     /// suspend the task against); an unbounded one suspends the task,
     /// unless it may [ping](PingPolicy), which holds a pool thread too.
+    /// A `*_async` wait queued behind a pool with no free thread is not
+    /// ended by `d` until a thread takes it (module doc, *Async*).
     ///
     /// Nor does it count a [ping](PingPolicy) made while waiting for
     /// credit: a call whose consumer stops answering can return later than

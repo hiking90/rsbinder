@@ -13,6 +13,51 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Added
+
+- `connect_async_with`, `connect_async` with `ClientOptions`. Without
+  `ClientOptions::timeout`, an RPC peer that accepts and never answers holds
+  a blocking-pool thread that a `timeout` around the future cannot release,
+  and `Runtime::drop` then waits for it.
+
+### Changed
+
+- `try_get_interface_async`, `check_interface_async`,
+  `wait_for_interface_async`, `get_interface_async` and `connect_async`
+  decide where their binder work runs when called, as a generated async
+  proxy does: called while handling a transaction, the work runs inline
+  before the call returns, so a future made in a handler and then
+  `tokio::spawn`ed no longer leaves the handler's transaction chain. Called
+  elsewhere, the first poll decides for the polling thread, as before. They
+  are now `fn`s returning `impl Future + Send + 'static`, so the future no
+  longer borrows `name`.
+- `TokioRuntime::block_on` steps out with `block_in_place` from any runtime
+  context, not only a multi-threaded one. A handler driven on a
+  current-thread handle can now call a second local async service through
+  its sync handle, which panicked before. A call from a current-thread
+  runtime's own `Runtime::block_on` body still panics, now with
+  `block_in_place`'s message.
+
+### Fixed
+
+- Dropping a stream `Sink` no longer blocks until a blocking-pool thread is
+  free when a dropped `send_async` left a record or batch queued behind a
+  full pool: the ring path gives the record up at once, the RPC path sends
+  the batch from the dropping thread. `end` past its deadline on the ring,
+  and the sync `send`/`flush`/`end` on RPC, take the same route.
+- An awaited ring `send_async` whose record failed counts it as reported,
+  not lost, as a failed sync `send` does, so a later `end` sends the
+  caller's end rather than an `EX_ILLEGAL_STATE` naming that item.
+- `Reconnecting::current`, `connected` and `with`, finding that an
+  unwatched RPC peer has closed, end its session on the session's reaper
+  thread instead of the calling one, so a poll of `connected` no longer
+  runs the transport shutdown (for TLS, a wait for a concurrent send),
+  death recipients or the drops of local objects the peer held.
+- `Reconnecting::connected` returns a connection that is up while handling
+  a transaction, as `wait_connected` does; only a wait is `WouldBlock`.
+- `#[rsbinder::interface]`: an argument type with `&` inside a fixed-array
+  length expression no longer breaks the async half of the expansion.
+
 ## [0.13.0]
 
 ### Migrating from 0.12.0

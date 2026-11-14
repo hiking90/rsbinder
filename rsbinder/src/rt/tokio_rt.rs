@@ -75,24 +75,29 @@ pub(crate) fn join_error_status(e: tokio::task::JoinError) -> StatusCode {
 ///
 /// Called while handling a transaction
 /// ([`is_handling_transaction`](crate::is_handling_transaction)), the lookup
-/// and the interface check run **inline** on the handler's thread, as every
-/// async API of this crate does there (see [`BinderAsyncPool`]'s *Which
-/// thread a transact runs on*), and need no Tokio runtime; elsewhere they run
-/// on the blocking pool. Inside a handler this is also the bounded way to wait
+/// and the interface check run **inline** on the handler's thread before this
+/// returns, as every async API of this crate does there (see
+/// [`BinderAsyncPool`]'s *Which thread a transact runs on*), and need no Tokio
+/// runtime; handing the returned future to `tokio::spawn` does not move them
+/// off that thread. Called anywhere else, the first poll decides the same way
+/// for the thread that polls: inline there, on the blocking pool elsewhere. Inside a handler this is also the bounded way to wait
 /// for a name: loop over it with a `tokio::time::sleep` between tries, under a
 /// `timeout` (see [`wait_for_interface_async`]'s *From inside a transaction*).
-pub async fn try_get_interface_async<T: FromIBinder + ?Sized + 'static>(
+pub fn try_get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> BinderResult<Option<Strong<T>>> {
+) -> impl Future<Output = BinderResult<Option<Strong<T>>>> + Send + 'static {
     let name = name.to_string();
-    blocking_op(move || hub::try_get_interface::<T>(&name)).await
+    blocking_op(move || hub::try_get_interface::<T>(&name))
 }
 
 /// Run the blocking binder work of an async API of this crate through
-/// [`crate::__spawn_transact`]: inline on a thread that is handling a
-/// transaction, on the Tokio blocking pool otherwise. Every async lookup and
-/// [`crate::connect_async`] go through here, so the choice is made in one
-/// place; `rsbinder/tests/source_invariants.rs` pins the `spawn_blocking`,
+/// [`crate::__spawn_transact`], twice if need be: called on a thread that is
+/// handling a transaction, `op` runs inline before this returns, as a
+/// generated proxy's transact does; otherwise the first poll decides again,
+/// inline on a polling thread that handles a transaction, on the Tokio
+/// blocking pool elsewhere. Every async lookup and [`crate::connect_async`]
+/// go through here, so the choice is made in one function;
+/// `rsbinder/tests/source_invariants.rs` pins the `spawn_blocking`,
 /// `is_handling_transaction` and pool `::spawn(` sites that would bypass it.
 pub(crate) fn blocking_op<B, E, F>(op: F) -> BoxFuture<'static, Result<B, E>>
 where
@@ -100,7 +105,29 @@ where
     B: Send + 'static,
     E: From<StatusCode> + Send + 'static,
 {
-    crate::__spawn_transact::<Tokio, _, _, _, _, _, _>(op, |res| async move { res })
+    crate::__spawn_transact::<AtFirstPoll, _, _, _, _, _, _>(op, |res| async move { res })
+}
+
+/// [`Tokio`], with the choice of thread made again at the first poll rather than at the call.
+enum AtFirstPoll {}
+
+impl BinderAsyncPool for AtFirstPoll {
+    fn spawn<'a, F1, F2, Fut, A, B, E>(spawn_me: F1, after_spawn: F2) -> BoxFuture<'a, Result<B, E>>
+    where
+        F1: FnOnce() -> A,
+        F2: FnOnce(A) -> Fut,
+        Fut: Future<Output = Result<B, E>>,
+        F1: Send + 'static,
+        F2: Send + 'a,
+        Fut: Send + 'a,
+        A: Send + 'static,
+        B: Send + 'a,
+        E: From<crate::StatusCode>,
+    {
+        Box::pin(async move {
+            crate::__spawn_transact::<Tokio, _, _, _, _, _, _>(spawn_me, after_spawn).await
+        })
+    }
 }
 
 /// [`try_get_interface_async`] with "not registered" folded into
@@ -110,12 +137,11 @@ where
     note = "use `try_get_interface_async`, which returns `Ok(None)` for a name that is not \
             registered, as `hub::try_get_interface` does"
 )]
-pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
+pub fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> Result<Strong<T>, StatusCode> {
-    try_get_interface_async::<T>(name)
-        .await?
-        .ok_or(StatusCode::NameNotFound)
+) -> impl Future<Output = Result<Strong<T>, StatusCode>> + Send + 'static {
+    let lookup = try_get_interface_async::<T>(name);
+    async move { lookup.await?.ok_or(StatusCode::NameNotFound) }
 }
 
 /// Wait until the service named `name` is registered, then cast it to `T` —
@@ -132,9 +158,10 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// retried on a descriptor mismatch.
 ///
 /// Called while handling a transaction, the whole wait runs inline on the
-/// handler's thread instead, and the first poll returns only when it ends (see
-/// *From inside a transaction*). What *Dropping the future*, *Cost* and *What
-/// drives it* say about the blocking pool is about a call made anywhere else.
+/// handler's thread instead, and this returns only when it ends (see *From
+/// inside a transaction*); a future made elsewhere whose first poll runs on
+/// such a thread waits there the same way. What *Dropping the future*, *Cost*
+/// and *What drives it* say about the blocking pool is about the other cases.
 ///
 /// # Dropping the future
 ///
@@ -169,7 +196,7 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// | How this future is driven | Completion | A `timeout` around it |
 /// |---|---|---|
 /// | awaited on a runtime that is being driven | observed | fires |
-/// | polled on a thread handling a transaction (a kernel binder or RPC transaction's handler, with or without a Tokio runtime) | the first poll runs the whole wait inline and returns its result | never — see *From inside a transaction* |
+/// | called, or first polled, on a thread handling a transaction (a kernel binder or RPC transaction's handler, with or without a Tokio runtime) | that call or poll runs the whole wait inline; the future then holds its result | never — see *From inside a transaction* |
 /// | polled in a local async service called in-process through its sync handle (`Bn*::new_async_binder`) from a thread that handles no transaction | on the blocking pool, as in the first row | fires while the runtime the [`TokioRuntime`] handle points at runs its timer |
 /// | `tokio::spawn`ed onto a current-thread runtime nobody is parked in | never — the task is not polled, so the wait never starts and no pool thread is taken | – |
 ///
@@ -193,7 +220,10 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// never be answered by a peer whose binder threads all wait for this handler
 /// and whose thread pool cannot grow.
 ///
-/// The cost is that only the wait's own end ends it. The first poll returns
+/// The decision is made at the call, as a generated proxy's is, so a future
+/// made in a handler and handed to `tokio::spawn` has already waited there.
+///
+/// The cost is that only the wait's own end ends it. The call returns
 /// once the service appears or the wait gives up, so a `timeout`, a `select!`
 /// or a drop around the future never takes effect, and the handler's binder
 /// thread and its caller's reply stay held until then — for good, if the name
@@ -210,16 +240,16 @@ pub async fn get_interface_async<T: FromIBinder + ?Sized + 'static>(
 /// A binder thread pool ([`crate::ProcessState::start_thread_pool`]) is what
 /// makes the wait event-driven; without one it degrades to the ~1s re-poll,
 /// exactly as the synchronous path does.
-pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
+pub fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> Result<Strong<T>, StatusCode> {
+) -> impl Future<Output = Result<Strong<T>, StatusCode>> + Send + 'static {
     // Outside the closure: the drop guard must reach the wait's condvar after this future ends.
     let state = Arc::new(hub::WaiterState::default());
-    let _cancel = CancelWaitOnDrop(state.clone());
+    let cancel = CancelWaitOnDrop(state.clone());
 
     let name = name.to_string();
     let wait_state = state.clone();
-    blocking_op(move || {
+    let wait = blocking_op(move || {
         // `hub::default()` may probe the wire; casting here matches the sync path's `BadType`.
         let binder = hub::default()?
             .wait_for_service_cancellable(&name, wait_state)
@@ -228,8 +258,11 @@ pub async fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
                 StatusCode::NameNotFound
             })?;
         binder.into_interface_checked()
-    })
-    .await
+    });
+    async move {
+        let _cancel = cancel;
+        wait.await
+    }
 }
 
 /// Cancels the wait on drop: a `spawn_blocking` task ignores `abort()`, so its state tells it.
@@ -251,15 +284,16 @@ impl Drop for CancelWaitOnDrop {
 ///
 /// Called while handling a transaction
 /// ([`is_handling_transaction`](crate::is_handling_transaction)), the lookup
-/// and the interface check run **inline** on the handler's thread, as every
-/// async API of this crate does there (see [`BinderAsyncPool`]'s *Which
-/// thread a transact runs on*), and need no Tokio runtime; elsewhere they run
-/// on the blocking pool.
-pub async fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
+/// and the interface check run **inline** on the handler's thread before this
+/// returns, as every async API of this crate does there (see
+/// [`BinderAsyncPool`]'s *Which thread a transact runs on*), and need no Tokio
+/// runtime. Called anywhere else, the first poll decides the same way for the
+/// thread that polls: inline there, on the blocking pool elsewhere.
+pub fn check_interface_async<T: FromIBinder + ?Sized + 'static>(
     name: &str,
-) -> Result<Strong<T>, StatusCode> {
+) -> impl Future<Output = Result<Strong<T>, StatusCode>> + Send + 'static {
     let name = name.to_string();
-    blocking_op(move || hub::check_interface::<T>(&name)).await
+    blocking_op(move || hub::check_interface::<T>(&name))
 }
 
 /// A future that completes when a binder dies — one `select!` arm instead of a
@@ -437,9 +471,10 @@ impl BinderAsyncPool for Tokio {
 /// The same `block_on` is also reached from a *synchronous* handle to a local
 /// async service: `Bn*::new_async_binder` returns `Strong<dyn IFoo>`, whose
 /// generated wrapper implements each sync method as `block_on(inner.method())`.
-/// Calling that handle from a task on a multi-threaded runtime would otherwise
-/// panic with "Cannot start a runtime from within a runtime", so this impl
-/// releases the worker's core with [`tokio::task::block_in_place`] first.
+/// Calling that handle from inside a runtime would otherwise panic with
+/// "Cannot start a runtime from within a runtime", so this impl first steps
+/// out with [`tokio::task::block_in_place`] whenever the calling thread is
+/// inside one.
 ///
 /// Two independent things then decide what the call does, and reading them as
 /// one list is how the failures get misattributed. **Where the call is made
@@ -451,30 +486,32 @@ impl BinderAsyncPool for Tokio {
 ///
 /// Where the call is made from, whatever the handle points at. Tokio refuses a
 /// `Handle::block_on` on a thread that is already executing inside a runtime,
-/// and [`block_in_place`] — which steps back out of one — exists only for the
-/// multi-threaded runtime. That is the whole rule:
+/// so the call first steps out with [`block_in_place`]. Tokio lets that leave
+/// a multi-threaded runtime's worker and any `Handle::block_on`, of either
+/// flavor, but not a current-thread runtime's `Runtime::block_on` body or a
+/// [`LocalSet`]. That is the whole rule:
 ///
 /// | The calling thread | Result |
 /// |---|---|
 /// | Not executing inside a runtime | runs |
-/// | Inside a **multi-threaded** runtime | runs — releasing the core first when the caller is a worker holding one, inline otherwise |
-/// | Inside a multi-threaded runtime, within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime"; `block_in_place` is refused there |
-/// | Inside a **current-thread** runtime | **panic** — "Cannot start a runtime from within a runtime"; there is no way back out |
+/// | A **multi-threaded** runtime's worker, or its `Runtime::block_on` body | runs — releasing the worker's core first |
+/// | Inside a `Handle::block_on`, either flavor | runs — stepping out of it first |
+/// | Within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime" |
+/// | Inside a **current-thread** runtime's `Runtime::block_on` body | **panic** — the same message; `block_in_place` cannot leave it |
 ///
 /// Reading a position off that rule is the part worth doing carefully, because
 /// "inside a runtime" is not the same as "on a runtime's thread":
 ///
 /// - A `spawn_blocking` pool thread is **outside** the runtime it belongs to,
 ///   for either flavor. Those calls run.
-/// - A `Runtime::block_on` body is **inside** — so a current-thread runtime's
-///   `Runtime::block_on` body is the last row, not the first.
-/// - **A handler this adapter is already driving is inside**, for as long as
-///   `block_on` is driving it, and inside *the handle's* runtime whatever thread
-///   it started on. So a service whose `TokioRuntime` holds a current-thread
-///   handle cannot reach a second local service through a sync handle from
-///   within a handler — that nested call is the last row. Reach it with
-///   [`Strong::into_async`] instead, or drive the service from a
-///   multi-threaded handle.
+/// - A task of a current-thread runtime runs inside its `Runtime::block_on`
+///   body: the last row. Reach a local service from there with
+///   [`Strong::into_async`] instead.
+/// - **A handler this adapter is already driving is inside its
+///   `Handle::block_on`**, for as long as `block_on` is driving it, so a nested
+///   call through a second local service's sync handle runs, whichever flavor
+///   either handle points at. [`Strong::into_async`] still avoids the nested
+///   `block_on`.
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 ///
@@ -525,13 +562,13 @@ pub struct TokioRuntime<R>(pub R);
 
 impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Handle> {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        match tokio::runtime::Handle::try_current() {
-            // Multi-thread: `block_in_place` frees a worker's core; inline on its blocking threads.
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.0.block_on(future))
-            }
-            // No runtime, or current-thread: panics only inside it; its blocking pool may block.
-            _ => self.0.block_on(future),
+        // Any runtime context, either flavor: `block_in_place` leaves a worker or a
+        // `Handle::block_on` and runs the call outside; inside a current-thread
+        // `Runtime::block_on` body or a `LocalSet` it panics, as the call there would.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.0.block_on(future))
+        } else {
+            self.0.block_on(future)
         }
     }
 }
@@ -702,6 +739,90 @@ mod tests {
         assert_eq!(poll_once(&mut signal), Poll::Pending);
         fake.fire_obituary(&who);
         assert_eq!(poll_once(&mut signal), Poll::Ready(()));
+    }
+
+    /// Whether `TokioRuntime(handle).block_on` of a ready future returns `7` where it is called.
+    fn nested_block_on_runs(call: impl FnOnce() -> i32 + Send + 'static) -> bool {
+        let (done, watch) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+            let _ = done.send(matches!(ran, Ok(7)));
+        });
+        watch
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the call neither returned nor panicked")
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// A handler driven on a current-thread handle reaches a second local async service's sync
+    /// handle: the inner call is inside `Handle::block_on`, which allows `block_in_place`.
+    #[test]
+    fn a_nested_block_on_inside_a_current_thread_handle_runs() {
+        assert!(nested_block_on_runs(|| {
+            let rt = current_thread();
+            let outer = TokioRuntime(rt.handle().clone());
+            let inner = TokioRuntime(rt.handle().clone());
+            outer.block_on(async move { inner.block_on(async { 7 }) })
+        }));
+    }
+
+    /// A multi-thread worker that entered a current-thread handle is still a worker.
+    #[test]
+    fn a_worker_that_entered_a_current_thread_handle_runs_it() {
+        assert!(nested_block_on_runs(|| {
+            let ct = current_thread();
+            let mt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .build()
+                .expect("runtime");
+            let handle = ct.handle().clone();
+            mt.block_on(async move {
+                tokio::spawn(async move {
+                    let _entered = handle.enter();
+                    TokioRuntime(handle.clone()).block_on(async { 7 })
+                })
+                .await
+                .expect("the task")
+            })
+        }));
+    }
+
+    /// Still refused inside a current-thread `Runtime::block_on` body: there is no way out of it.
+    #[test]
+    fn a_block_on_inside_a_current_thread_runtime_body_still_panics() {
+        assert!(!nested_block_on_runs(|| {
+            let rt = current_thread();
+            let inner = TokioRuntime(rt.handle().clone());
+            rt.block_on(async move { inner.block_on(async { 7 }) })
+        }));
+    }
+
+    /// Still refused within a `LocalSet`, whose tasks may not leave their thread.
+    #[test]
+    fn a_block_on_within_a_local_set_still_panics() {
+        assert!(!nested_block_on_runs(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .build()
+                .expect("runtime");
+            let inner = TokioRuntime(rt.handle().clone());
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move { inner.block_on(async { 7 }) }))
+        }));
+    }
+
+    /// Off any runtime the call runs on the handle, whatever its flavor.
+    #[test]
+    fn a_block_on_off_any_runtime_runs() {
+        assert!(nested_block_on_runs(|| {
+            let rt = current_thread();
+            TokioRuntime(rt.handle().clone()).block_on(async { 7 })
+        }));
     }
 
     /// AC-11-1.6 — usable as a `select!` arm from a spawned task.

@@ -158,34 +158,34 @@ is the default advice.
 `new_async_binder` hands back a **synchronous** `Strong<dyn IMyService>`. Each of its
 methods is implemented as `block_on(inner.method())`, so calling it from inside the
 runtime — a gateway that calls its own service, start-up code, a test — re-enters the
-runtime. On a multi-threaded runtime rsbinder handles that by releasing the worker's core
-first.
+runtime. rsbinder handles that by stepping out with `block_in_place` first.
 
 Two independent things decide what such a call does. Read them as one list and you will
 attribute a failure to the wrong one.
 
 **Where you call from** decides whether the call runs. Tokio refuses a `block_on` on a
-thread already executing inside a runtime, and `block_in_place` — which steps back out of
-one — exists only for the multi-threaded runtime. That is the whole rule:
+thread already executing inside a runtime. `block_in_place` steps back out of a
+multi-threaded runtime's worker and of any `Handle::block_on`, either flavor, but not of a
+current-thread runtime's `Runtime::block_on` body or a `LocalSet`. That is the whole rule:
 
 | The calling thread | Result |
 |---|---|
 | Not executing inside a runtime | runs |
-| Inside a multi-threaded runtime | runs — releasing the core first from a worker holding one, inline otherwise |
-| Inside a multi-threaded runtime, within a `LocalSet` | panic — `block_in_place` is refused there |
-| Inside a current-thread runtime | panic — "Cannot start a runtime from within a runtime" |
+| A multi-threaded runtime's worker, or its `Runtime::block_on` body | runs — releasing the worker's core first |
+| Inside a `Handle::block_on`, either flavor | runs — stepping out of it first |
+| Within a `LocalSet` | panic — `block_in_place` is refused there |
+| Inside a current-thread runtime's `Runtime::block_on` body | panic — `block_in_place` cannot leave it |
 
 Applying it takes some care, because "inside a runtime" is not "on a runtime's thread":
 
 - A `spawn_blocking` pool thread is *outside* the runtime it belongs to, either flavor.
   Those calls run.
-- A `Runtime::block_on` body is *inside* — so a current-thread runtime's
-  `Runtime::block_on` body is the last row, not the first.
-- **An async handler is inside** for as long as `block_on` is driving it, and inside
-  *the handle's* runtime whatever thread it started on. A service whose `TokioRuntime`
-  holds a current-thread handle therefore cannot reach a second local service through a
-  sync handle from inside a handler — that is the last row, and it is the gateway pattern
-  exactly. Use `into_async` there, or give the service a multi-threaded handle.
+- A task of a current-thread runtime runs inside its `Runtime::block_on` body: the last
+  row. Use `into_async` there.
+- **An async handler is inside the `Handle::block_on` that drives it**, so a nested call
+  through a second local service's sync handle — the gateway pattern — runs, whichever
+  flavor either `TokioRuntime` handle points at. `into_async` still avoids the nested
+  `block_on`.
 
 **Which runtime the handle points at** decides whether the call finishes, whatever the
 answer above. The future itself is polled on the *calling* thread either way, and that is

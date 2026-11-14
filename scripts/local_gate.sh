@@ -141,13 +141,26 @@ rpc_suite_soak() {
     done
 }
 
+# Build the parcel tests and check the binary cargo reports is s390x. Cargo 1.100 puts test
+# executables under `debug/build/<pkg>/<hash>/out/`, so the path is read, not globbed; `cross`
+# reports it inside its container, where `target/cross` is mounted at `/target`, and its first run
+# prints `docker pull` progress on stdout, so only lines that parse are read.
+s390_is_big_endian() {
+    local exe
+    exe=$("$@" --no-default-features --lib parcel --no-run --message-format=json |
+        jq -rR 'fromjson? | select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable') ||
+        return 1
+    [ -n "$exe" ] && [ "$(printf '%s\n' "$exe" | wc -l)" -eq 1 ] || return 1
+    [ -e "$exe" ] || exe="target/cross${exe#/target}"
+    file "$exe" | grep 'MSB.*IBM S/390'
+}
+
 big_endian() {
     # A target dir of its own: the container's registry path dirties host units in target/debug.
     local s390=(cross test -p rsbinder --target s390x-unknown-linux-gnu --target-dir target/cross)
     tpass cargo test -p rsbinder --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
         tpass cargo test -p rsbinder --no-default-features --lib blob:: &&
-        "${s390[@]}" --no-default-features --lib parcel --no-run &&
-        file target/cross/s390x-unknown-linux-gnu/debug/deps/rsbinder-* | grep 'MSB.*IBM S/390' &&
+        s390_is_big_endian "${s390[@]}" &&
         tpass "${s390[@]}" --no-default-features --lib parcel -- --skip shared_memory --skip fmq:: &&
         tpass "${s390[@]}" --no-default-features --lib binder_object:: &&
         tpass "${s390[@]}" --features rpc,rpc-tcp-debug --lib file_descriptor:: &&

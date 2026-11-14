@@ -139,6 +139,8 @@ impl SessionGuard {
     }
 
     /// Closed because its publisher refused this subscriber, for good while it has the name.
+    // Read only by `registry::uds`, which builds on Linux and Android.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn was_refused(&self) -> bool {
         self.1.load(Ordering::Relaxed)
     }

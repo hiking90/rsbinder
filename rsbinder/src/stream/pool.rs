@@ -18,6 +18,10 @@
 //! than `spawn_blocking` directly, because inside a transaction handler the
 //! work has to stay on the current thread and that rule lives there.
 //!
+//! [`on_pool_reclaimable`] also returns the task's slot, so the owner can take
+//! a queued token back later, after the future is gone: a producer's `Drop`
+//! does, rather than wait for a pool thread to start a record or batch.
+//!
 //! [`wait_on_pool`] is for a task that only waits. A pool with no free thread
 //! may not start such a task for as long as its other tasks run, and a caller
 //! that joins the token before reading the ring would wait all that time with
@@ -83,12 +87,46 @@ where
     R: Send + 'static,
     F: FnOnce(R) -> Result<()> + Send + 'static,
 {
-    carry(token, run, |task| {
+    on_pool_reclaimable(token, run).0
+}
+
+/// [`on_pool`], and the task's slot, for an owner that gives the token up while it is queued.
+pub(super) fn on_pool_reclaimable<R, F>(
+    token: R,
+    run: F,
+) -> (crate::BoxFuture<'static, Result<()>>, Reclaim<R>)
+where
+    R: Send + 'static,
+    F: FnOnce(R) -> Result<()> + Send + 'static,
+{
+    let mut reclaim = None;
+    let handed = carry(token, run, |task| {
+        reclaim = Some(Reclaim(Arc::downgrade(&task.slot)));
         crate::__spawn_transact::<crate::Tokio, _, _, _, _, _, _>(
             move || task.run(),
             |result| async move { result },
         )
-    })
+    });
+    (handed, reclaim.expect("`carry` hands the task over"))
+}
+
+/// The slot of a task [`on_pool_reclaimable`] handed over.
+///
+/// A queued task can wait as long as the pool's other tasks run, so an owner that must not
+/// wait — a `Drop`, a call past its deadline — takes the token back with [`take`](Self::take)
+/// and deals with it itself; the task then runs with nothing to do. `None` once a pool thread
+/// has taken the token, or ran it inline: that run is under way or over, and ends on its own.
+///
+/// Weak: a pool that drops the task unrun (a runtime shut down) must drop the token with it,
+/// so that it settles; a strong handle here would keep it alive and unsettled.
+pub(super) struct Reclaim<R>(std::sync::Weak<Mutex<Option<R>>>);
+
+impl<R> Reclaim<R> {
+    pub(super) fn take(&self) -> Option<R> {
+        let slot = self.0.upgrade()?;
+        let token = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        token
+    }
 }
 
 /// [`on_pool`] for a task that only waits: handed over at the first poll, and taken back by a
