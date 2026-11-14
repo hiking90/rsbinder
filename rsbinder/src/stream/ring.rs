@@ -2212,7 +2212,7 @@ mod tests {
         let (mut tx, mut rx) = pair::<i32>(512);
         let sent = fill_with_ones(&mut tx);
         // No thread will run the record: it settles unrun, as a failure the future reports.
-        let refuse = |on| super::super::pool::REFUSE_WAIT_THREAD.with(|r| r.set(on));
+        let refuse = |on| crate::rt::REFUSE_WAIT_THREAD.with(|r| r.set(on));
         refuse(true);
         let failed = runtime.block_on(tx.send_async(&2, None));
         refuse(false);
