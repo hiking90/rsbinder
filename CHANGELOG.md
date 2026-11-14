@@ -34,6 +34,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Fixed
 
+- Dropping a stream `Sink` no longer blocks until a blocking-pool thread is
+  free when a dropped `send_async` left a record or batch queued behind a
+  full pool: the ring path gives the record up at once, the RPC path sends
+  the batch from the dropping thread. `end` past its deadline on the ring,
+  and the sync `send`/`flush`/`end` on RPC, take the same route.
 - `Reconnecting::connected` returns a connection that is up while handling
   a transaction, as `wait_connected` does; only a wait is `WouldBlock`.
 - `#[rsbinder::interface]`: an argument type with `&` inside a fixed-array

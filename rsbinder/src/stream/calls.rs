@@ -25,7 +25,7 @@ use super::generated::rsbinder::stream::IStreamSource::{
     BnStreamSource, BpStreamSource, IStreamSource,
 };
 #[cfg(feature = "tokio")]
-use super::pool::on_pool;
+use super::pool::{on_pool, on_pool_reclaimable, Reclaim};
 #[cfg(feature = "tokio")]
 use super::EndDecision;
 use super::{
@@ -508,6 +508,9 @@ pub(super) struct Producer<T: ?Sized> {
     ping: PingPolicy,
     /// The death link on the sink; `None` for a local sink.
     death: Option<crate::DeathLink>,
+    /// The slot of the last batch handed to the pool, so `Drop` can send it itself.
+    #[cfg(feature = "tokio")]
+    batch_on_pool: Option<Reclaim<BatchInTransit>>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -548,6 +551,8 @@ impl<T: Serialize + ?Sized> Producer<T> {
             sink: sink.clone(),
             ping: policy.ping,
             death,
+            #[cfg(feature = "tokio")]
+            batch_on_pool: None,
             _item: PhantomData,
         })
     }
@@ -561,7 +566,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             return Ok(());
         }
         // As in `flush`, but a credit timeout takes this item back out: `TimedOut` = not queued.
-        self.ledger.wait_idle();
+        self.join_pool_batch();
         self.reported_before_send(mark)?;
         if let Err(e) = self.credit.wait_credit(deadline, &self.sink, self.ping) {
             return self.unqueue_on_timeout(e, mark);
@@ -594,7 +599,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
             return self.reported();
         }
         // A batch a dropped future left on the pool goes out first, and its failure is this call's.
-        self.ledger.wait_idle();
+        self.join_pool_batch();
         self.reported()?;
         self.credit.wait_credit(deadline, &self.sink, self.ping)?;
         self.send_with_credit()
@@ -642,7 +647,7 @@ impl<T: Serialize + ?Sized> Producer<T> {
         // `Drop` runs next and must not send a second terminator.
         self.ended = true;
         // Don't overtake a pool batch; take its failure so the flush still sends what is queued.
-        self.ledger.wait_idle();
+        self.join_pool_batch();
         let stale = self.ledger.take_unreported();
         let failed = match (self.flush(deadline), stale) {
             (Err(e), _) => {
@@ -715,11 +720,12 @@ impl<T: Serialize + ?Sized> Producer<T> {
         if let Some(batch) = self.take_pending() {
             let peer = self.peer.clone();
             // `batch` records its outcome itself: the future may drop, the task may never run.
-            let _ = on_pool(batch, move |batch| {
+            let (sent, reclaim) = on_pool_reclaimable(batch, move |batch| {
                 batch.send(&peer);
                 Ok(())
-            })
-            .await;
+            });
+            self.batch_on_pool = Some(reclaim);
+            let _ = sent.await;
         }
         self.reported()
     }
@@ -846,6 +852,18 @@ impl<T: ?Sized> Producer<T> {
     }
 }
 
+impl<T: ?Sized> Producer<T> {
+    /// Wait out a batch a dropped `send_async` left on the pool. One no pool thread has started
+    /// yet is sent here instead: a full pool can hold it back for as long as its other tasks run.
+    fn join_pool_batch(&self) {
+        #[cfg(feature = "tokio")]
+        if let Some(batch) = self.batch_on_pool.as_ref().and_then(Reclaim::take) {
+            batch.send(&self.peer);
+        }
+        self.ledger.wait_idle();
+    }
+}
+
 impl<T: ?Sized> Drop for Producer<T> {
     /// Deliver what is queued and end the stream without waiting for credit.
     fn drop(&mut self) {
@@ -855,7 +873,7 @@ impl<T: ?Sized> Drop for Producer<T> {
             return;
         }
         // The terminator must not overtake a batch still on the pool.
-        self.ledger.wait_idle();
+        self.join_pool_batch();
         if self.count > 0 {
             if self.ledger.broken().is_none() && self.credit.try_credit() {
                 if let Some(batch) = self.take_pending() {
@@ -2945,6 +2963,61 @@ mod tests {
         assert!(watch
             .recv_timeout(Duration::from_secs(10))
             .expect("the abandoned credit wait still holds the pool's only thread"));
+    }
+
+    /// A saturated pool never starts a dropped `send_async`'s batch: the drop sends it itself.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn dropping_a_producer_sends_a_batch_the_pool_never_started() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        let (holding, held) = mpsc::channel();
+        let (release, hold) = mpsc::channel::<()>();
+        let blocker = runtime.spawn_blocking(move || {
+            holding.send(()).expect("the test waits");
+            let _ = hold.recv();
+        });
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the pool's one thread is taken");
+
+        // One `i32` fills a 4-byte batch, and the opening credit covers it.
+        let (mut tx, mut rx) = pair::<i32>(4, 4, 4);
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(tx.send_async(&7, None));
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(pending.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(polled, "the batch goes to the pool, which has no free thread");
+        });
+
+        let (done, dropped) = mpsc::channel();
+        thread::spawn(move || {
+            drop(tx);
+            let _ = done.send(());
+        });
+        let ended = dropped.recv_timeout(Duration::from_secs(2));
+        release.send(()).expect("the blocker waits");
+        runtime.block_on(blocker).expect("blocker");
+        ended.expect("the drop waited for a pool thread to start the batch");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("no error"),
+            Some(7),
+            "the drop sent the batch"
+        );
+        let end = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect_err("ended as dropped");
+        assert_eq!(end.exception_code(), ExceptionCode::IllegalState);
+        assert!(
+            end.message().unwrap_or_default().contains("0 queued item"),
+            "nothing was lost: {end:?}"
+        );
+        runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
     /// An `Abandon` dropped while its `park` sleeps wakes that wait instead of leaving it asleep.

@@ -23,7 +23,7 @@ use crate::SIBinder;
 
 use super::generated::rsbinder::stream::IStreamSink::{BnStreamSink, IStreamSink};
 #[cfg(feature = "tokio")]
-use super::pool::{on_pool, wait_on_pool};
+use super::pool::{on_pool_reclaimable, wait_on_pool, Reclaim};
 use super::{
     decode_item, dropped_terminator, encode_item, end_decision, status_from_fields, watch_death,
     Book, Ping, PingPolicy, ReceiverPolicy, SinkPolicy, END_RESERVE,
@@ -510,6 +510,9 @@ pub(super) struct Producer<T: ?Sized> {
     ended: bool,
     /// The death link on the consumer's sink; `None` for a local sink.
     death: Option<crate::DeathLink>,
+    /// The slot of the last record handed to the pool, so giving it up need not wait for it.
+    #[cfg(feature = "tokio")]
+    record: Option<Reclaim<RecordInTransit>>,
     _item: PhantomData<fn(&T)>,
 }
 
@@ -536,6 +539,8 @@ impl<T: Serialize + ?Sized> Producer<T> {
             scratch: Box::new(Parcel::new_data_only()),
             ended: false,
             death,
+            #[cfg(feature = "tokio")]
+            record: None,
             _item: PhantomData,
         })
     }
@@ -652,11 +657,12 @@ impl<T: Serialize + ?Sized> Producer<T> {
             let record =
                 RecordInTransit::new(self.shared.clone(), self.transit.clone(), bytes, wait);
             // The record settles itself: a dropped future detaches the task, which may never run.
-            let _ = on_pool(record, |record| {
+            let (sent, reclaim) = on_pool_reclaimable(record, |record| {
                 record.send();
                 Ok(())
-            })
-            .await;
+            });
+            self.record = Some(reclaim);
+            let _ = sent.await;
             if self.transit.reclaim_timed_out() {
                 return Err(StatusCode::TimedOut);
             }
@@ -674,6 +680,9 @@ impl<T: ?Sized> Producer<T> {
 
     /// Give up the pool's record, woken via this side's own mask; it settles as lost at once.
     fn give_up_in_transit(&self) {
+        // Still queued: no pool thread would see `abandoned` until one is free, so drop it here.
+        #[cfg(feature = "tokio")]
+        drop(self.record.as_ref().and_then(Reclaim::take));
         if self.transit.in_transit() {
             self.shared.abandoned.store(true, Ordering::SeqCst);
             let _ = self.shared.flag.wake(NOT_FULL);
@@ -2172,6 +2181,66 @@ mod tests {
 
         release.send(()).expect("the blocker waits");
         runtime.block_on(blocker).expect("blocker");
+        runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+
+    /// A saturated pool never starts a dropped `send_async`'s record: the drop gives it up there.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn dropping_a_producer_waits_for_no_record_the_pool_never_started() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        let (holding, held) = mpsc::channel();
+        let (release, hold) = mpsc::channel::<()>();
+        let blocker = runtime.spawn_blocking(move || {
+            holding.send(()).expect("the test waits");
+            let _ = hold.recv();
+        });
+        held.recv_timeout(Duration::from_secs(5))
+            .expect("the pool's one thread is taken");
+
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let mut sent = 0;
+        while tx.send(&1, Some(Instant::now())).is_ok() {
+            sent += 1;
+        }
+        runtime.block_on(async {
+            let mut pending = std::pin::pin!(tx.send_async(&2, None));
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(pending.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(polled, "the ring is full, so the record goes to the pool");
+        });
+        assert!(tx.transit.in_transit(), "the record is queued behind the blocker");
+
+        let (done, dropped) = mpsc::channel();
+        thread::spawn(move || {
+            drop(tx);
+            let _ = done.send(());
+        });
+        let ended = dropped.recv_timeout(Duration::from_secs(2));
+        release.send(()).expect("the blocker waits");
+        runtime.block_on(blocker).expect("blocker");
+        ended.expect("the drop waited for a pool thread to start the record");
+
+        for _ in 0..sent {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(1)).expect("no error"),
+                Some(1)
+            );
+        }
+        let end = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect_err("ended as dropped");
+        assert_eq!(end.exception_code(), ExceptionCode::IllegalState);
+        assert!(
+            end.message().unwrap_or_default().contains("1 queued item"),
+            "the given-up record is counted: {end:?}"
+        );
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
