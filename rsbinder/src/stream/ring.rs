@@ -353,16 +353,14 @@ impl Transit {
         });
     }
 
-    /// The awaiting future takes back its own record's timeout: reported to it, so not lost.
+    /// The awaiting future takes back its own record's failure: reported to it, so not lost, as
+    /// a sync `send` that fails counts nothing lost. `broken` stays, as `mark_broken` leaves it.
     #[cfg(feature = "tokio")]
-    fn reclaim_timed_out(&self) -> bool {
+    fn reclaim_reported(&self) -> Option<StatusCode> {
         let mut state = self.lock();
-        if state.unreported != Some(StatusCode::TimedOut) {
-            return false;
-        }
-        state.unreported = None;
+        let failure = state.unreported.take()?;
         state.lost = state.lost.saturating_sub(1);
-        true
+        Some(failure)
     }
 
     /// Block until nothing is in transit; `false` if `deadline` passes first.
@@ -663,10 +661,11 @@ impl<T: Serialize + ?Sized> Producer<T> {
             });
             self.record = Some(reclaim);
             let _ = sent.await;
-            if self.transit.reclaim_timed_out() {
-                return Err(StatusCode::TimedOut);
+            // `reported` checked before the hand-off, so a failure now is this record's.
+            match self.transit.reclaim_reported() {
+                Some(e) => Err(e),
+                None => self.reported(),
             }
-            self.reported()
         }
     }
 }
@@ -2184,6 +2183,53 @@ mod tests {
         runtime.shutdown_timeout(Duration::from_secs(5));
     }
 
+    /// Write `1`s until the ring refuses one with no wait at all; how many went in.
+    #[cfg(feature = "tokio")]
+    fn fill_with_ones(tx: &mut Producer<i32>) -> usize {
+        let mut sent = 0;
+        loop {
+            tx.encode(&1).expect("encode");
+            let bytes = tx.scratch.as_bytes().expect("bytes").to_vec();
+            if !tx.write_item(&bytes, Wait::Never).expect("write") {
+                return sent;
+            }
+            sent += 1;
+        }
+    }
+
+    /// A `send_async` told its record failed counts nothing lost, as a failed sync `send` does.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn a_failure_reported_to_send_async_is_not_counted_lost() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        // No pool will run the record: it settles unrun, as a failure the future reports.
+        runtime.shutdown_background();
+
+        let (mut tx, mut rx) = pair::<i32>(512);
+        let sent = fill_with_ones(&mut tx);
+        let failed = handle.block_on(tx.send_async(&2, None));
+        // An unsettled record would read `Ok` here, with the item nowhere.
+        assert!(failed.is_err(), "the record never reached the ring: {failed:?}");
+        assert!(!tx.transit.in_transit(), "dropped unrun, the record settled");
+        assert_eq!(tx.transit.lost(), 0, "reported to the caller, so not lost");
+        end(tx).expect("nothing left unreported or lost");
+
+        for _ in 0..sent {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(1)).expect("no error"),
+                Some(1)
+            );
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).expect("a clean end"),
+            None
+        );
+    }
+
     /// A saturated pool never starts a dropped `send_async`'s record: the drop gives it up there.
     #[cfg(feature = "tokio")]
     #[test]
@@ -2203,10 +2249,7 @@ mod tests {
             .expect("the pool's one thread is taken");
 
         let (mut tx, mut rx) = pair::<i32>(512);
-        let mut sent = 0;
-        while tx.send(&1, Some(Instant::now())).is_ok() {
-            sent += 1;
-        }
+        let sent = fill_with_ones(&mut tx);
         runtime.block_on(async {
             let mut pending = std::pin::pin!(tx.send_async(&2, None));
             let polled = std::future::poll_fn(|cx| {
