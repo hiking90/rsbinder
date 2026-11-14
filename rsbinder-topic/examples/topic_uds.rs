@@ -20,7 +20,9 @@
 //!     hub-subscribe "$XDG_RUNTIME_DIR/rsbinder/topic.sock"
 //! ```
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::path::PathBuf;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

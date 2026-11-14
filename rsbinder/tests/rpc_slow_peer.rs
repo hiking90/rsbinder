@@ -367,6 +367,10 @@ enum Pace {
     /// The first `n` bytes at once, then `Trickle`: a peer whose preamble arrives in time.
     TrickleAfter(usize, Duration),
     /// At most `n` bytes per interval from the source: a reader that is slow but steady.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        allow(dead_code, reason = "used only by a Linux/Android test")
+    )]
     Rate(usize, Duration),
     /// Full until the flag is set, then nothing more is read: a peer that stops reading.
     HoldWhen(Arc<AtomicBool>),

@@ -697,7 +697,7 @@ impl StoredPool {
     }
 
     /// The address the mapping starts at, for tests that look it up in `/proc/self/smaps`.
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
     fn mapping_start(&self) -> usize {
         self.area.as_ptr() as usize - slot_area(self.slots) as usize
     }
