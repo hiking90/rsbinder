@@ -101,7 +101,7 @@ where
 {
     let mut reclaim = None;
     let handed = carry(token, run, |task| {
-        reclaim = Some(Reclaim(task.slot.clone()));
+        reclaim = Some(Reclaim(Arc::downgrade(&task.slot)));
         crate::__spawn_transact::<crate::Tokio, _, _, _, _, _, _>(
             move || task.run(),
             |result| async move { result },
@@ -116,11 +116,16 @@ where
 /// wait — a `Drop`, a call past its deadline — takes the token back with [`take`](Self::take)
 /// and deals with it itself; the task then runs with nothing to do. `None` once a pool thread
 /// has taken the token, or ran it inline: that run is under way or over, and ends on its own.
-pub(super) struct Reclaim<R>(Arc<Mutex<Option<R>>>);
+///
+/// Weak: a pool that drops the task unrun (a runtime shut down) must drop the token with it,
+/// so that it settles; a strong handle here would keep it alive and unsettled.
+pub(super) struct Reclaim<R>(std::sync::Weak<Mutex<Option<R>>>);
 
 impl<R> Reclaim<R> {
     pub(super) fn take(&self) -> Option<R> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let slot = self.0.upgrade()?;
+        let token = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        token
     }
 }
 
