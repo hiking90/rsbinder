@@ -2991,7 +2991,10 @@ mod tests {
                 std::task::Poll::Ready(std::future::Future::poll(pending.as_mut(), cx).is_pending())
             })
             .await;
-            assert!(polled, "the batch goes to the pool, which has no free thread");
+            assert!(
+                polled,
+                "the batch goes to the pool, which has no free thread"
+            );
         });
 
         let (done, dropped) = mpsc::channel();

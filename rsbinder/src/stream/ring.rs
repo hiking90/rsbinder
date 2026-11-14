@@ -2213,8 +2213,14 @@ mod tests {
         let sent = fill_with_ones(&mut tx);
         let failed = handle.block_on(tx.send_async(&2, None));
         // An unsettled record would read `Ok` here, with the item nowhere.
-        assert!(failed.is_err(), "the record never reached the ring: {failed:?}");
-        assert!(!tx.transit.in_transit(), "dropped unrun, the record settled");
+        assert!(
+            failed.is_err(),
+            "the record never reached the ring: {failed:?}"
+        );
+        assert!(
+            !tx.transit.in_transit(),
+            "dropped unrun, the record settled"
+        );
         assert_eq!(tx.transit.lost(), 0, "reported to the caller, so not lost");
         end(tx).expect("nothing left unreported or lost");
 
@@ -2225,7 +2231,8 @@ mod tests {
             );
         }
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).expect("a clean end"),
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("a clean end"),
             None
         );
     }
@@ -2258,7 +2265,10 @@ mod tests {
             .await;
             assert!(polled, "the ring is full, so the record goes to the pool");
         });
-        assert!(tx.transit.in_transit(), "the record is queued behind the blocker");
+        assert!(
+            tx.transit.in_transit(),
+            "the record is queued behind the blocker"
+        );
 
         let (done, dropped) = mpsc::channel();
         thread::spawn(move || {

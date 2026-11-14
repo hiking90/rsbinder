@@ -354,12 +354,12 @@ pub mod entry;
 pub mod reconnect;
 pub use reconnect::Reconnecting;
 
-#[cfg(feature = "tokio")]
-pub use entry::{connect_async, connect_async_with};
 pub use entry::{
     connect, connect_binder, serve, Client, ClientOptions, Endpoint, ServeOptions, Server,
     ServerGuard, Uri,
 };
+#[cfg(feature = "tokio")]
+pub use entry::{connect_async, connect_async_with};
 // For generated `IFooAsyncService` impls, so consumers need no `async-trait` dependency.
 #[cfg(feature = "async")]
 #[doc(hidden)]

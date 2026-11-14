@@ -173,7 +173,10 @@ fn current_alone_moves_an_unnoticed_restart_to_a_new_connection() {
     );
     assert_eq!(h.current().unwrap().r#echo("y").unwrap(), "b:y");
     // The old session ended all the same, from its reaper.
-    assert!(eventually(|| old.r#ping().is_err()), "the old proxy still answers");
+    assert!(
+        eventually(|| old.r#ping().is_err()),
+        "the old proxy still answers"
+    );
 }
 
 /// AC-10b.2 (a): with the server down, a call between attempts does not wait.

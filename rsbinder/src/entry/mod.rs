@@ -293,7 +293,11 @@ mod tests {
             use std::os::linux::net::SocketAddrExt;
             let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).expect("name");
             let listener = std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind");
-            (listener, Endpoint::unix_abstract(name), None::<std::path::PathBuf>)
+            (
+                listener,
+                Endpoint::unix_abstract(name),
+                None::<std::path::PathBuf>,
+            )
         };
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let (listener, endpoint, path) = {
