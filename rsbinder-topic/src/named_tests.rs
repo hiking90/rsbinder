@@ -1892,13 +1892,6 @@ impl ITopic for Counted {
 
 thread_local! {
     /// Set on the thread a `Counted` call ran on: a call within this process runs on the caller's.
-    #[cfg_attr(
-        target_os = "android",
-        expect(
-            clippy::missing_const_for_thread_local,
-            reason = "the initializer is `const`; Android's expansion of the macro hides that"
-        )
-    )]
     static ASKED_HERE: Cell<bool> = const { Cell::new(false) };
 }
 

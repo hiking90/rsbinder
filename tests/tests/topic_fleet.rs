@@ -268,6 +268,11 @@ impl Fleet {
         *start += 1;
         let start = *start;
         let stderr = self.dir.join(format!("{node}.{start}.stderr"));
+        #[allow(
+            clippy::zombie_processes,
+            reason = "clippy 1.86 (rust_min) takes the reader thread's `return` for this fn's; \
+                      the child is kept in `self.nodes` and waited for there"
+        )]
         let mut child = Command::new(node_bin())
             .args(["--node", node, "--start", &start.to_string()])
             .args(role)

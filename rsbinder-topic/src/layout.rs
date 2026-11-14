@@ -198,13 +198,6 @@ pub(crate) fn check_target() -> Result<()> {
 #[cfg(test)]
 thread_local! {
     /// Set by a test: `add_seals` then answers as a kernel without `F_SEAL_FUTURE_WRITE` does.
-    #[cfg_attr(
-        target_os = "android",
-        expect(
-            clippy::missing_const_for_thread_local,
-            reason = "the initializer is `const`; Android's expansion of the macro hides that"
-        )
-    )]
     pub(crate) static NO_FUTURE_WRITE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }

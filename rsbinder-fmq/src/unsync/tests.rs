@@ -10,6 +10,10 @@ use super::*;
 use crate::shm::Mapping;
 
 // The `cfg` above stands for "has `RoWord64`", which `Heap::reader` views the counters as.
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "a compile-time check; clippy 1.86 (rust_min) reads it as a runtime one"
+)]
 const _: () = assert!(RoWord64::PRESENT);
 
 /// Counters and a ring of `u64` elements in one heap mapping, carved as `UnsyncWriter` lays it out.
