@@ -283,15 +283,28 @@ mod tests {
     /// A peer that accepts and never answers: `ClientOptions::timeout` ends the pool thread's wait.
     #[test]
     fn connect_async_with_a_timeout_frees_its_pool_thread_from_a_silent_peer() {
-        let path = std::env::temp_dir().join(format!(
-            "rsbinder-entry-silent-{}.sock",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
-        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let name = format!("rsbinder-entry-silent-{}", std::process::id());
+        // Abstract where there is one: Android's SELinux refuses a socket file in a shell's dirs.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (listener, endpoint, path) = {
+            #[cfg(target_os = "android")]
+            use std::os::android::net::SocketAddrExt;
+            #[cfg(target_os = "linux")]
+            use std::os::linux::net::SocketAddrExt;
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(&name).expect("name");
+            let listener = std::os::unix::net::UnixListener::bind_addr(&addr).expect("bind");
+            (listener, Endpoint::unix_abstract(name), None::<std::path::PathBuf>)
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let (listener, endpoint, path) = {
+            let path = std::env::temp_dir().join(format!("{name}.sock"));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+            (listener, Endpoint::unix(path.clone()), Some(path))
+        };
         // Accepted and held, never read or written: the handshake waits on it.
         let held = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
-        let uri = Uri::from(Endpoint::unix(path.clone())).with_service("silent");
+        let uri = Uri::from(endpoint).with_service("silent");
 
         let (done, watch) = mpsc::channel();
         std::thread::spawn(move || {
@@ -306,7 +319,9 @@ mod tests {
             let _ = done.send(r.err());
         });
         let ended = watch.recv_timeout(Duration::from_secs(10));
-        let _ = std::fs::remove_file(&path);
+        if let Some(path) = path {
+            let _ = std::fs::remove_file(path);
+        }
         drop(held.join());
         assert!(
             matches!(ended, Ok(Some(_))),
