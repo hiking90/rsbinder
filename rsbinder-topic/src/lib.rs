@@ -89,6 +89,14 @@
 //! mapping can be loaded (`rsbinder::fmq::shm::RoWord64::PRESENT`). Elsewhere the crate
 //! compiles and every constructor returns `Unsupported`.
 
+// `allow`, not `expect`: clippy 1.86 (rust_min) fires this, newer clippy does not.
+#![cfg_attr(
+    target_os = "android",
+    allow(
+        clippy::missing_const_for_thread_local,
+        reason = "android-only false positive, even on thread_locals already using `const { .. }`"
+    )
+)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::allow_attributes_without_reason))]
 

@@ -1219,13 +1219,6 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
 #[cfg(test)]
 thread_local! {
     /// Set by a test: `join` then fails as `epoll_ctl` does with `ENOSPC` or `ENOMEM`.
-    #[cfg_attr(
-        target_os = "android",
-        expect(
-            clippy::missing_const_for_thread_local,
-            reason = "the initializer is `const`; Android's expansion of the macro hides that"
-        )
-    )]
     pub(crate) static NO_JOIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Set by a test: run between a drain's look that gave up lapped and the look after it.
     pub(crate) static BETWEEN_LOOKS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =

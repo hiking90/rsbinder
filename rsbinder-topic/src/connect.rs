@@ -54,13 +54,6 @@ impl Token {
 
 thread_local! {
     /// The address of the request this thread subscribes with, while it does; 0 for none.
-    #[cfg_attr(
-        target_os = "android",
-        expect(
-            clippy::missing_const_for_thread_local,
-            reason = "the initializer is `const`; Android's expansion of the macro hides that"
-        )
-    )]
     static ASKING: Cell<usize> = const { Cell::new(0) };
 }
 
