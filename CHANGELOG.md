@@ -48,6 +48,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
 - An awaited ring `send_async` whose record failed counts it as reported,
   not lost, as a failed sync `send` does, so a later `end` sends the
   caller's end rather than an `EX_ILLEGAL_STATE` naming that item.
+- `Reconnecting::current`, `connected` and `with`, finding that an
+  unwatched RPC peer has closed, end its session on the session's reaper
+  thread instead of the calling one, so a poll of `connected` no longer
+  runs the transport shutdown (for TLS, a wait for a concurrent send),
+  death recipients or the drops of local objects the peer held.
 - `Reconnecting::connected` returns a connection that is up while handling
   a transaction, as `wait_connected` does; only a wait is `WouldBlock`.
 - `#[rsbinder::interface]`: an argument type with `&` inside a fixed-array

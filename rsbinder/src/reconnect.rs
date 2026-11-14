@@ -1270,7 +1270,8 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
         };
         let ended = s.is_ended() || (snap.watch == Watch::Probe && s.peer_closed());
         if ended {
-            s.fail();
+            // On the reaper: `current` and `connected` run here, and must not block a task.
+            s.fail_on_the_reaper();
         }
         ended
     }

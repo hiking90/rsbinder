@@ -153,6 +153,29 @@ fn first_call_after_an_unnoticed_restart_runs_on_the_new_connection() {
     assert_eq!(h.generation(), 2);
 }
 
+/// `current` alone notices an unwatched restart: it ends the old session on its reaper, not on
+/// the calling thread, and the next connection comes up without a call that waits.
+#[test]
+fn current_alone_moves_an_unnoticed_restart_to_a_new_connection() {
+    let sock = Sock::new("r34cur");
+    let guard = sock.serve(R34, "a");
+    let h = Reconnecting::<dyn IRpcSmoke>::builder(sock.uri().with_service("smoke"))
+        .build()
+        .expect("build");
+    let old = h.current().expect("connected");
+    assert_eq!(old.r#echo("x").unwrap(), "a:x");
+
+    drop(guard);
+    let _guard = sock.serve(R34, "b");
+    assert!(
+        eventually(|| h.current().is_ok() && h.generation() == 2),
+        "current() never moved to the new connection"
+    );
+    assert_eq!(h.current().unwrap().r#echo("y").unwrap(), "b:y");
+    // The old session ended all the same, from its reaper.
+    assert!(eventually(|| old.r#ping().is_err()), "the old proxy still answers");
+}
+
 /// AC-10b.2 (a): with the server down, a call between attempts does not wait.
 #[test]
 fn a_call_between_attempts_fails_at_once() {

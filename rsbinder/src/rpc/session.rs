@@ -6273,9 +6273,11 @@ impl RpcSession {
         self.inner.peer_closed()
     }
 
-    /// End the session as a connection fault does ("Session end"), from outside the module.
-    pub(crate) fn fail(&self) {
-        self.inner.fail_session();
+    /// End the session as a connection fault does ("Session end"), from outside the module,
+    /// without running the death sequence (transport shutdown, recipients, local drops) on the
+    /// caller: the connections are cut here and the reaper runs the rest.
+    pub(crate) fn fail_on_the_reaper(&self) {
+        self.inner.stop_for_the_reaper();
     }
 
     /// Set the reply deadline: how long the peer may go without answering
