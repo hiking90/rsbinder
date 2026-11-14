@@ -461,6 +461,8 @@ pub use transport_caps::TransportCaps;
 /// The waits `stream` and `rsbinder-topic` share: not part of the API.
 #[doc(hidden)]
 pub mod __sync {
+    #[cfg(feature = "tokio")]
+    pub use crate::rt::WaitThreads;
     pub use crate::signal::{wait_until, PoolGate, Signal, Waited};
 }
 

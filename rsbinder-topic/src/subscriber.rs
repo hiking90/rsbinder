@@ -74,7 +74,7 @@ pub enum Start {
 pub enum Wake {
     /// A futex on a word of the topic's memory: one wake system call per commit serves every
     /// subscriber of this kind that sleeps, however many. A wait holds a thread: `recv` the
-    /// calling one, `recv_async` one of the blocking pool.
+    /// calling one, `recv_async` a wait thread of rsbinder's own, which is never queued.
     #[default]
     Futex,
     /// A byte on a socket of this subscription alone, which the publisher sends without waiting
@@ -133,7 +133,7 @@ impl Default for SubscriberPolicy {
 /// | [`try_recv`](Self::try_recv), [`try_latest`](Self::try_latest) | [`RecvError::Empty`] at once |
 /// | [`recv`](Self::recv), [`recv_latest`](Self::recv_latest) | waits for one |
 /// | [`recv_timeout`](Self::recv_timeout) | waits, then [`RecvError::Timeout`] |
-/// | `recv_async` (`tokio` feature) | on the blocking pool; with [`Wake::Fd`], the reactor |
+/// | `recv_async` (`tokio` feature) | on a wait thread; with [`Wake::Fd`], the reactor |
 /// | [`Wait`](crate::Wait), [`wait_any`](crate::wait_any) ([`Wake::Fd`]) | the caller polls |
 ///
 /// A wait first looks at the ring for up to 20 µs, the policy of
@@ -165,7 +165,7 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     /// Values returned and records that failed to decode, for [`SubscriberStats`].
     received: u64,
     decode_errors: u64,
-    /// The wait a `recv_async` handed to the blocking pool, which the next wait joins.
+    /// The wait a `recv_async` handed to a wait thread, which the next wait joins.
     #[cfg(feature = "tokio")]
     leftover: Arc<Leftover>,
     /// The token the publisher links to; alive as long as the subscription.
@@ -443,33 +443,34 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
 
     /// [`recv`](Self::recv) for an async caller.
     ///
-    /// With [`Wake::Futex`] the wait sleeps on a thread of the blocking pool
-    /// (`tokio::task::spawn_blocking`, or the calling thread inside a binder transaction), so
-    /// it holds that thread, not an executor thread, for as long as it lasts. With [`Wake::Fd`]
+    /// With [`Wake::Futex`] the wait sleeps on a wait thread of rsbinder's own (or the calling
+    /// thread inside a binder transaction), so it holds that thread, not an executor thread, for
+    /// as long as it lasts. Those threads are not capped and an idle one is reused, so a wait is
+    /// never queued behind other waits, and none takes a thread of the runtime's blocking pool;
+    /// no runtime is needed for it. With [`Wake::Fd`]
     /// it waits on the runtime's reactor (`tokio::io::unix::AsyncFd`) and holds no thread. That
     /// reactor is the one of the runtime the first such call ran on, and later calls wait on it
     /// from any runtime: a `current_thread` runtime that no longer runs `block_on` wakes none of
     /// them until it is dropped; a wait whose reactor's runtime is dropped registers again with
     /// the runtime it runs on.
     ///
-    /// Cancel-safe: dropping the future loses no record. A wait the pool has not started is taken
-    /// back at the drop, and one it has started is woken, so the next receive waits only for that
-    /// thread to leave it. That drop blocks, as [`Interrupter::interrupt`] does, until the pool
-    /// thread is out of its sleep: dropped on an executor thread, as by an expired
-    /// `tokio::time::timeout`, it holds that thread until the pool thread is scheduled. A future
-    /// leaked rather than dropped leaves its wait to the pool: the
+    /// Cancel-safe: dropping the future loses no record. A wait no thread has started is taken
+    /// back at the drop, and one that has started is woken, so the next receive waits only for
+    /// that thread to leave it. That drop blocks, as [`Interrupter::interrupt`] does, until the
+    /// wait thread is out of its sleep: dropped on an executor thread, as by an expired
+    /// `tokio::time::timeout`, it holds that thread until the wait thread is scheduled. A future
+    /// leaked rather than dropped leaves its wait running: the
     /// next receive that may wait returns a record already unread, and else joins that wait
-    /// before it waits itself. The join lasts until a pool thread has run that wait, which ends
-    /// as any wait does, at a commit, an interrupt or a death; while it is still queued nothing
-    /// ends the join, however long the pool takes. A [`recv_timeout`](Self::recv_timeout) whose
+    /// before it waits itself. The join lasts until that wait ends, as any wait does, at a
+    /// commit, an interrupt or a death. A [`recv_timeout`](Self::recv_timeout) whose
     /// `timeout` passes first looks at the ring once more and does not wait. Besides `recv`'s
-    /// results, [`RecvError::Runtime`] when the pool cannot run the wait, or the reactor cannot
-    /// take the subscription's file descriptor.
+    /// results, [`RecvError::Runtime`] when no thread can be started for the wait, or the reactor
+    /// cannot take the subscription's file descriptor.
     ///
     /// # Panics
     ///
-    /// Outside a Tokio runtime, as `tokio::task::spawn_blocking` does, and with [`Wake::Fd`] in a
-    /// runtime whose IO driver is off, as `AsyncFd::register` does.
+    /// With [`Wake::Fd`], outside a Tokio runtime or in one whose IO driver is off, as
+    /// `AsyncFd::register` does.
     #[cfg(feature = "tokio")]
     pub async fn recv_async(&mut self) -> Result<T, RecvError> {
         self.wait_async_with(|subscriber| subscriber.look(false))
@@ -972,7 +973,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
     }
 
     /// [`recv_sample`](Self::recv_sample) for an async caller: the value where it lies, waiting
-    /// for one as [`recv_async`](Self::recv_async) waits, on the blocking pool or the reactor.
+    /// for one as [`recv_async`](Self::recv_async) waits, on a wait thread or the reactor.
     ///
     /// Cancel-safe, as `recv_async` is: a slot is pinned only by the look that finds its value,
     /// and the future returns the [`Sample`] in that same poll, so a future dropped while it
@@ -981,8 +982,8 @@ impl<M: Trust> Subscriber<Bytes, M> {
     ///
     /// # Panics
     ///
-    /// As `recv_async` does: outside a Tokio runtime, and with [`Wake::Fd`] in a runtime whose IO
-    /// driver is off.
+    /// As `recv_async` does: with [`Wake::Fd`], outside a Tokio runtime or in one whose IO driver
+    /// is off.
     #[cfg(feature = "tokio")]
     pub async fn recv_sample_async(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self
