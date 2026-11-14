@@ -31,6 +31,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   elsewhere, the first poll decides for the polling thread, as before. They
   are now `fn`s returning `impl Future + Send + 'static`, so the future no
   longer borrows `name`.
+- `TokioRuntime::block_on` steps out with `block_in_place` from any runtime
+  context, not only a multi-threaded one. A handler driven on a
+  current-thread handle can now call a second local async service through
+  its sync handle, which panicked before. A call from a current-thread
+  runtime's own `Runtime::block_on` body still panics, now with
+  `block_in_place`'s message.
 
 ### Fixed
 
@@ -39,6 +45,9 @@ This changelog starts at 0.9.0. For earlier releases, see the
   full pool: the ring path gives the record up at once, the RPC path sends
   the batch from the dropping thread. `end` past its deadline on the ring,
   and the sync `send`/`flush`/`end` on RPC, take the same route.
+- An awaited ring `send_async` whose record failed counts it as reported,
+  not lost, as a failed sync `send` does, so a later `end` sends the
+  caller's end rather than an `EX_ILLEGAL_STATE` naming that item.
 - `Reconnecting::connected` returns a connection that is up while handling
   a transaction, as `wait_connected` does; only a wait is `WouldBlock`.
 - `#[rsbinder::interface]`: an argument type with `&` inside a fixed-array

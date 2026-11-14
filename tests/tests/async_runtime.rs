@@ -171,14 +171,15 @@ fn sync_handle_from_multi_thread_blocking_pool() {
 }
 
 /// B3 — a current-thread runtime's own thread. `block_on` there is
-/// re-entrant by construction and there is no core to release, so this
-/// stays a panic; the `TokioRuntime` docs name it. Asserted so the
-/// adapter is not quietly extended to swallow it.
+/// re-entrant by construction and `block_in_place` cannot leave a
+/// current-thread `Runtime::block_on` body, so this stays a panic; the
+/// `TokioRuntime` docs name it. Asserted so the adapter is not quietly
+/// extended to swallow it.
 #[test]
-// Not the whole tokio sentence: it is an internal literal, and the point of
-// asserting on it is only to tell it apart from `block_in_place`'s "can call
-// blocking only when running on the multi-threaded runtime".
-#[should_panic(expected = "within a runtime")]
+// `block_in_place`'s refusal, not `Handle::block_on`'s "Cannot start a runtime
+// from within a runtime": the adapter steps out before it nests. A tokio
+// literal, so only the part that tells the two apart.
+#[should_panic(expected = "only when running on the multi-threaded runtime")]
 fn sync_handle_from_current_thread_owner_panics() {
     let rt = current_thread();
     rt.block_on(async {
@@ -278,18 +279,16 @@ fn async_handle_skips_block_on_entirely() {
 // ---- the nested call: a handler reaching a second local service ----
 
 /// The gateway pattern, and the position an enumeration of "calling threads"
-/// kept missing: a handler is *inside* the handle's runtime for as long as
-/// `block_on` drives it, whatever thread it started on. With a current-thread
-/// handle there is no `block_in_place` to step back out with, so a sync-handle
-/// call made from inside a handler hits the same re-entrancy panic as that
-/// runtime's own thread — even though the outer call came from a plain thread
-/// the docs classify as "runs".
+/// kept missing: a handler is *inside* the `Handle::block_on` that drives it,
+/// whatever thread it started on. `block_in_place` steps out of that for a
+/// current-thread handle too, so a sync-handle call made from inside a handler
+/// runs, unlike one from that runtime's own `Runtime::block_on` body.
 #[test]
-fn nested_sync_call_inside_a_current_thread_handler_panics() {
+fn nested_sync_call_inside_a_current_thread_handler_runs() {
     // Parked, so the backend's own `sleep` is not what fails here — this test
     // is about axis 1, and an idle runtime would stall instead. Waited for:
-    // if the panic ever regressed, an owner that had not entered
-    // `Runtime::block_on` yet would turn the regression into a hang.
+    // an owner that had not entered `Runtime::block_on` yet would turn a
+    // regression into a hang rather than a failure.
     let rt = current_thread();
     let handle = rt.handle().clone();
     let (parked_tx, parked_rx) = mpsc::channel();
@@ -306,37 +305,21 @@ fn nested_sync_call_inside_a_current_thread_handler_panics() {
     // The outer call comes from a plain thread: the row that runs.
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let panic_msg =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gateway.echo("via")))
-                .err()
-                .map(|e| {
-                    e.downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_default()
-                });
-        let _ = tx.send(panic_msg);
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gateway.echo("via")));
+        let _ = tx.send(got.map_err(|_| ()));
     });
 
-    let panic_msg = rx
+    let got = rx
         .recv_timeout(Duration::from_millis(3000))
         .expect("the nested call neither returned nor panicked");
-
-    // The message matters: `block_in_place`'s refusal is a different failure,
-    // and only this one says the call was rejected as re-entrant.
-    match panic_msg {
-        Some(m) if m.contains("within a runtime") => {}
-        Some(m) => panic!("panicked, but not as a re-entrant block_on: {m}"),
-        None => panic!(
-            "a nested sync-handle call under a current-thread handle completed; \
-             the documented last row no longer holds"
-        ),
-    }
+    assert_eq!(
+        got.expect("the nested call panicked").expect("gateway"),
+        "echo:via"
+    );
 }
 
-/// The same shape with a multi-threaded handle completes: `block_in_place`
-/// steps out of the runtime, so the nested call is legal. The pairing is what
-/// makes the row above about the *flavor* rather than about nesting.
+/// The same shape with a multi-threaded handle completes too: the flavor of
+/// the handle does not decide a nested call from inside a handler.
 #[test]
 fn nested_sync_call_inside_a_multi_thread_handler_runs() {
     let rt = multi_thread();

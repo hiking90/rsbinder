@@ -471,9 +471,10 @@ impl BinderAsyncPool for Tokio {
 /// The same `block_on` is also reached from a *synchronous* handle to a local
 /// async service: `Bn*::new_async_binder` returns `Strong<dyn IFoo>`, whose
 /// generated wrapper implements each sync method as `block_on(inner.method())`.
-/// Calling that handle from a task on a multi-threaded runtime would otherwise
-/// panic with "Cannot start a runtime from within a runtime", so this impl
-/// releases the worker's core with [`tokio::task::block_in_place`] first.
+/// Calling that handle from inside a runtime would otherwise panic with
+/// "Cannot start a runtime from within a runtime", so this impl first steps
+/// out with [`tokio::task::block_in_place`] whenever the calling thread is
+/// inside one.
 ///
 /// Two independent things then decide what the call does, and reading them as
 /// one list is how the failures get misattributed. **Where the call is made
@@ -485,30 +486,32 @@ impl BinderAsyncPool for Tokio {
 ///
 /// Where the call is made from, whatever the handle points at. Tokio refuses a
 /// `Handle::block_on` on a thread that is already executing inside a runtime,
-/// and [`block_in_place`] — which steps back out of one — exists only for the
-/// multi-threaded runtime. That is the whole rule:
+/// so the call first steps out with [`block_in_place`]. Tokio lets that leave
+/// a multi-threaded runtime's worker and any `Handle::block_on`, of either
+/// flavor, but not a current-thread runtime's `Runtime::block_on` body or a
+/// [`LocalSet`]. That is the whole rule:
 ///
 /// | The calling thread | Result |
 /// |---|---|
 /// | Not executing inside a runtime | runs |
-/// | Inside a **multi-threaded** runtime | runs — releasing the core first when the caller is a worker holding one, inline otherwise |
-/// | Inside a multi-threaded runtime, within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime"; `block_in_place` is refused there |
-/// | Inside a **current-thread** runtime | **panic** — "Cannot start a runtime from within a runtime"; there is no way back out |
+/// | A **multi-threaded** runtime's worker, or its `Runtime::block_on` body | runs — releasing the worker's core first |
+/// | Inside a `Handle::block_on`, either flavor | runs — stepping out of it first |
+/// | Within a [`LocalSet`] | **panic** — "can call blocking only when running on the multi-threaded runtime" |
+/// | Inside a **current-thread** runtime's `Runtime::block_on` body | **panic** — the same message; `block_in_place` cannot leave it |
 ///
 /// Reading a position off that rule is the part worth doing carefully, because
 /// "inside a runtime" is not the same as "on a runtime's thread":
 ///
 /// - A `spawn_blocking` pool thread is **outside** the runtime it belongs to,
 ///   for either flavor. Those calls run.
-/// - A `Runtime::block_on` body is **inside** — so a current-thread runtime's
-///   `Runtime::block_on` body is the last row, not the first.
-/// - **A handler this adapter is already driving is inside**, for as long as
-///   `block_on` is driving it, and inside *the handle's* runtime whatever thread
-///   it started on. So a service whose `TokioRuntime` holds a current-thread
-///   handle cannot reach a second local service through a sync handle from
-///   within a handler — that nested call is the last row. Reach it with
-///   [`Strong::into_async`] instead, or drive the service from a
-///   multi-threaded handle.
+/// - A task of a current-thread runtime runs inside its `Runtime::block_on`
+///   body: the last row. Reach a local service from there with
+///   [`Strong::into_async`] instead.
+/// - **A handler this adapter is already driving is inside its
+///   `Handle::block_on`**, for as long as `block_on` is driving it, so a nested
+///   call through a second local service's sync handle runs, whichever flavor
+///   either handle points at. [`Strong::into_async`] still avoids the nested
+///   `block_on`.
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 ///
@@ -559,13 +562,13 @@ pub struct TokioRuntime<R>(pub R);
 
 impl BinderAsyncRuntime for TokioRuntime<tokio::runtime::Handle> {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
-        match tokio::runtime::Handle::try_current() {
-            // Multi-thread: `block_in_place` frees a worker's core; inline on its blocking threads.
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.0.block_on(future))
-            }
-            // No runtime, or current-thread: panics only inside it; its blocking pool may block.
-            _ => self.0.block_on(future),
+        // Any runtime context, either flavor: `block_in_place` leaves a worker or a
+        // `Handle::block_on` and runs the call outside; inside a current-thread
+        // `Runtime::block_on` body or a `LocalSet` it panics, as the call there would.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.0.block_on(future))
+        } else {
+            self.0.block_on(future)
         }
     }
 }
@@ -736,6 +739,90 @@ mod tests {
         assert_eq!(poll_once(&mut signal), Poll::Pending);
         fake.fire_obituary(&who);
         assert_eq!(poll_once(&mut signal), Poll::Ready(()));
+    }
+
+    /// Whether `TokioRuntime(handle).block_on` of a ready future returns `7` where it is called.
+    fn nested_block_on_runs(call: impl FnOnce() -> i32 + Send + 'static) -> bool {
+        let (done, watch) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+            let _ = done.send(matches!(ran, Ok(7)));
+        });
+        watch
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the call neither returned nor panicked")
+    }
+
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    /// A handler driven on a current-thread handle reaches a second local async service's sync
+    /// handle: the inner call is inside `Handle::block_on`, which allows `block_in_place`.
+    #[test]
+    fn a_nested_block_on_inside_a_current_thread_handle_runs() {
+        assert!(nested_block_on_runs(|| {
+            let rt = current_thread();
+            let outer = TokioRuntime(rt.handle().clone());
+            let inner = TokioRuntime(rt.handle().clone());
+            outer.block_on(async move { inner.block_on(async { 7 }) })
+        }));
+    }
+
+    /// A multi-thread worker that entered a current-thread handle is still a worker.
+    #[test]
+    fn a_worker_that_entered_a_current_thread_handle_runs_it() {
+        assert!(nested_block_on_runs(|| {
+            let ct = current_thread();
+            let mt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .build()
+                .expect("runtime");
+            let handle = ct.handle().clone();
+            mt.block_on(async move {
+                tokio::spawn(async move {
+                    let _entered = handle.enter();
+                    TokioRuntime(handle.clone()).block_on(async { 7 })
+                })
+                .await
+                .expect("the task")
+            })
+        }));
+    }
+
+    /// Still refused inside a current-thread `Runtime::block_on` body: there is no way out of it.
+    #[test]
+    fn a_block_on_inside_a_current_thread_runtime_body_still_panics() {
+        assert!(!nested_block_on_runs(|| {
+            let rt = current_thread();
+            let inner = TokioRuntime(rt.handle().clone());
+            rt.block_on(async move { inner.block_on(async { 7 }) })
+        }));
+    }
+
+    /// Still refused within a `LocalSet`, whose tasks may not leave their thread.
+    #[test]
+    fn a_block_on_within_a_local_set_still_panics() {
+        assert!(!nested_block_on_runs(|| {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .build()
+                .expect("runtime");
+            let inner = TokioRuntime(rt.handle().clone());
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async move { inner.block_on(async { 7 }) }))
+        }));
+    }
+
+    /// Off any runtime the call runs on the handle, whatever its flavor.
+    #[test]
+    fn a_block_on_off_any_runtime_runs() {
+        assert!(nested_block_on_runs(|| {
+            let rt = current_thread();
+            TokioRuntime(rt.handle().clone()).block_on(async { 7 })
+        }));
     }
 
     /// AC-11-1.6 — usable as a `select!` arm from a spawned task.
