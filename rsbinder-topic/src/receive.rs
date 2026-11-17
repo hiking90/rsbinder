@@ -362,6 +362,11 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         self.reader.position()
     }
 
+    /// [`Reader::last_index`].
+    pub(crate) fn last_index(&self) -> Option<u32> {
+        self.reader.last_index()
+    }
+
     /// Records and loans reported as lost so far.
     pub(crate) fn lost(&self) -> u64 {
         self.reader.lost().saturating_add(self.lost_loans)

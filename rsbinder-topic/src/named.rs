@@ -126,9 +126,12 @@ pub enum NamedState {
 /// record of the new ring, unless that `start` is [`Start::Last`]: the subscription is older than
 /// that publisher, so all it published is news to it. A connection to a publisher it was
 /// connected to before, as when the name comes back to that publisher after another held it,
-/// starts at [`Start::Latest`], so that no record the earlier connection returned is returned
-/// again. A connection counts from the receive that takes it; one whose fd the subscriber's
-/// epoll instance refuses ([`Disconnected::Rejected`]) does not.
+/// returns no record an earlier connection to it returned. With [`Start::Last`] it starts at that
+/// publisher's newest record, which is its current value, and steps over that record when it is
+/// the one the earlier connections returned last, so that a value published while the subscriber
+/// read another publisher is returned at once. With any other `start` it starts at
+/// [`Start::Latest`]. A connection counts from the receive that takes it; one whose fd the
+/// subscriber's epoll instance refuses ([`Disconnected::Rejected`]) does not.
 ///
 /// The subscriber remembers a publisher it was connected to by its topic's memory, which stays
 /// the same however it is reached: a publisher a registry on a socket gave a new socket is still
@@ -366,12 +369,19 @@ struct State<T: Payload> {
     /// Ends the wait of the subscriber's connection when the state changes.
     wake: Option<Interrupter>,
     /// Topics joined, each once; one leaves when its connection saw the topic's end or its death.
-    joined: Vec<RingId>,
+    joined: Vec<Joined>,
     /// A connection has joined: a later one to a topic not joined starts at `Oldest`, or `Last`.
     later: bool,
     /// The wait before asking again a publisher whose connection failed to join; zero after a join.
     rejoin: Duration,
     find: Find,
+}
+
+/// A topic a connection joined, and the record of it connections returned last.
+struct Joined {
+    ring: RingId,
+    /// Set as each connection to it ends, by one that returned a record or was started to skip one.
+    last_index: Option<u32>,
 }
 
 /// The watch's lookup, as far as the subscriber knows it.
@@ -888,8 +898,12 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
                 }
                 state.rejoin = Duration::ZERO;
                 state.later = true;
-                if !state.joined.contains(&subscriber.ring()) {
-                    state.joined.push(subscriber.ring());
+                let ring = subscriber.ring();
+                if !state.joined.iter().any(|joined| joined.ring == ring) {
+                    state.joined.push(Joined {
+                        ring,
+                        last_index: None,
+                    });
                 }
                 let wake = subscriber.interrupter();
                 if state.interrupted {
@@ -1055,6 +1069,15 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         let gone = self.current.take();
         if let Some(connection) = &gone {
             self.past += connection.subscriber.stats();
+            // Before the next connection starts: `start_of` runs on its thread, which this starts.
+            let (ring, index) = (
+                connection.subscriber.ring(),
+                connection.subscriber.last_index(),
+            );
+            let joined = state.joined.iter_mut().find(|joined| joined.ring == ring);
+            if let (Some(joined), Some(index)) = (joined, index) {
+                joined.last_index = Some(index);
+            }
         }
         state.connected = None;
         state.wake = None;
@@ -1067,7 +1090,7 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         let ended = gone.as_ref().filter(|c| c.subscriber.saw_publisher_end());
         if let Some(connection) = ended {
             let ring = connection.subscriber.ring();
-            state.joined.retain(|joined| *joined != ring);
+            state.joined.retain(|joined| joined.ring != ring);
         }
         let next = state
             .latest
@@ -1325,15 +1348,16 @@ impl<T: Payload> Named<T> {
         }
     }
 
-    /// Where a connection to the topic of `ring` starts, as [`NamedSubscriber`] documents.
-    fn start_of(&self, ring: RingId) -> Start {
+    /// Where a connection to the topic of `ring` starts, as [`NamedSubscriber`] documents, and
+    /// for [`Start::Last`] the record to skip.
+    fn start_of(&self, ring: RingId) -> (Start, Option<u32>) {
         let state = self.lock();
-        if state.joined.contains(&ring) {
-            Start::Latest
-        } else if state.later && self.policy.start != Start::Last {
-            Start::Oldest
-        } else {
-            self.policy.start
+        let start = self.policy.start;
+        match state.joined.iter().find(|joined| joined.ring == ring) {
+            Some(joined) if start == Start::Last => (Start::Last, joined.last_index),
+            Some(_) => (Start::Latest, None),
+            None if state.later && start != Start::Last => (Start::Oldest, None),
+            None => (start, None),
         }
     }
 }

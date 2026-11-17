@@ -564,11 +564,128 @@ fn a_publisher_connected_to_again_returns_no_record_the_first_connection_returne
     connected_to_again(Start::Latest);
 }
 
-/// As above, from a start that would return the records the first connection returned.
+/// As above, from a start that would return the records the first connection returned: `Last`
+/// steps over the value returned last, which is still the newest, `Oldest` starts at `Latest`.
 #[test]
-fn a_publisher_connected_to_again_starts_at_latest_whatever_the_policy_start() {
+fn a_publisher_connected_to_again_returns_no_record_whatever_the_policy_start() {
     connected_to_again(Start::Last);
     connected_to_again(Start::Oldest);
+}
+
+/// The name back to a publisher that published while another held it: with `Last`, that value.
+#[test]
+fn a_last_start_connected_to_again_returns_the_value_published_meanwhile() {
+    let names = Names::default();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Last);
+    connected(&subscriber);
+    first.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    other.publish(&bytes(5)).unwrap();
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    first.publish(&bytes(3)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    // At once, without a publish after the reconnection, and once.
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    // Published twice meanwhile: the newer, and the older is not counted as lost.
+    names.give(NAME, other.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    // Connected to the other publisher, whose value was returned before: nothing.
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(4)).unwrap();
+    first.publish(&bytes(6)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.stats().lost, 0);
+    assert_eq!(subscriber.stats().received, 4);
+}
+
+/// A connection that returned nothing keeps the record the one before it returned last, so that
+/// a third connection does not return that record again.
+#[test]
+fn a_last_start_connection_that_returned_nothing_keeps_the_record_to_skip() {
+    let names = Names::default();
+    let first = advertise(&names, &policy());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Last);
+    connected(&subscriber);
+    first.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    other.publish(&bytes(5)).unwrap();
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    names.give(NAME, other.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    for _ in 0..2 {
+        // Back and forth with nothing published: each connection returns nothing.
+        names.give(NAME, first.as_binder());
+        assert_eq!(recv(&mut subscriber), replaced);
+        connected(&subscriber);
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+        names.give(NAME, other.as_binder());
+        assert_eq!(recv(&mut subscriber), replaced);
+        connected(&subscriber);
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    }
+    first.publish(&bytes(2)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+    assert_eq!(subscriber.stats().received, 3);
+}
+
+/// `Last` connected again to a publisher that lends: the value lent meanwhile, as a sample; the
+/// value the earlier connection returned is stepped over without a pin of its slot.
+#[test]
+fn a_last_start_connected_to_again_returns_the_value_lent_meanwhile() {
+    let names = Names::default();
+    let first = advertise(&names, &pooled(1));
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Last);
+    connected(&subscriber);
+    lend(&first, &[1; 64]);
+    let sample = subscriber.recv_sample_timeout(WAIT).map(|s| s.to_owned());
+    assert_eq!(sample, Ok(vec![1; 64]));
+    let other = Publisher::<Bytes>::new(&pooled(1)).unwrap();
+    lend(&other, &[5; 64]);
+    let replaced = RecvError::Disconnected(Disconnected::Replaced);
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        subscriber.recv_sample_timeout(WAIT).err(),
+        Some(replaced.clone())
+    );
+    let sample = subscriber.recv_sample_timeout(WAIT).map(|s| s.to_owned());
+    assert_eq!(sample, Ok(vec![5; 64]));
+    // Back with nothing lent meanwhile: the value returned before is not returned again.
+    names.give(NAME, first.as_binder());
+    assert_eq!(
+        subscriber.recv_sample_timeout(WAIT).err(),
+        Some(replaced.clone())
+    );
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv_sample().err(), Some(RecvError::Empty));
+    assert_eq!(first.stats().subscribers[0].pinned, None);
+    // Away again, and back after a lend: that value.
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        subscriber.recv_sample_timeout(WAIT).err(),
+        Some(replaced.clone())
+    );
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv_sample().err(), Some(RecvError::Empty));
+    lend(&first, &[3; 64]);
+    names.give(NAME, first.as_binder());
+    assert_eq!(subscriber.recv_sample_timeout(WAIT).err(), Some(replaced));
+    let sample = subscriber.recv_sample_timeout(WAIT).map(|s| s.to_owned());
+    assert_eq!(sample, Ok(vec![3; 64]));
 }
 
 fn connected_to_again(start: Start) {

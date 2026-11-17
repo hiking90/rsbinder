@@ -121,16 +121,23 @@ pub(crate) fn replay(image: &[u8], start: Start) -> Vec<Got> {
     got
 }
 
-/// [`replay`] from each kind of start. The position of a `Latest` start is the image's `tail`.
+/// [`replay`] from each kind of start. The position of a `Latest` start is the image's `tail`;
+/// a `Last` start skips nothing, and then the record the first call of that replay returned.
 pub(crate) fn drive(image: &[u8]) -> usize {
     let Some(tail) = Heap::from_image(image).map(|heap| heap.loaded().tail()) else {
         return 0;
     };
+    let last = replay(image, Start::Last { skip: None });
+    let skip = match last.first() {
+        Some(Got::Item(index, _) | Got::Loan(index, _)) => Some(*index),
+        _ => None,
+    };
     let latest = Start::Latest { at: tail, index: 0 };
-    [Start::Oldest, Start::Last, latest]
+    let others = [Start::Oldest, Start::Last { skip }, latest]
         .into_iter()
         .map(|start| replay(image, start).len())
-        .sum()
+        .sum::<usize>();
+    last.len() + others
 }
 
 #[cfg(all(
@@ -296,7 +303,10 @@ mod tests {
         let image = Image::new().record(0, 0, 0, b"").write(8).last(8);
         let got = oldest(image);
         assert_eq!(got[0], Got::Item(0, Vec::new()));
-        assert_eq!(replay(&Image::new().write(8).last(8).0, Start::Last), []);
+        assert_eq!(
+            replay(&Image::new().write(8).last(8).0, Start::Last { skip: None }),
+            []
+        );
         // `half` by a reader the publisher has lapped.
         let lapped = |half| {
             let image = Image::new()
@@ -362,7 +372,10 @@ mod tests {
             .record(0, 2, 4, &loan.bytes())
             .write(24)
             .last(0);
-        assert_eq!(replay(&image.0, Start::Last)[0], Got::Loan(4, loan));
+        assert_eq!(
+            replay(&image.0, Start::Last { skip: None })[0],
+            Got::Loan(4, loan)
+        );
         for payload in [&b""[..], &[0; 8], &[0; 24]] {
             let image = Image::new().record(0, 2, 0, payload).write(64).last(0);
             let image = image.record(8 + payload.len(), 0, 1, b"");

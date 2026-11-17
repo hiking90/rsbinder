@@ -332,7 +332,7 @@ fn close_ends_the_topic_with_its_status_after_the_last_value() {
     };
     assert_eq!(read, status);
     assert_eq!(read.message(), Some("gone"));
-    let mut late = subscriber::<Bytes>(&heap, Start::Last);
+    let mut late = subscriber::<Bytes>(&heap, Start::Last { skip: None });
     assert_eq!(
         late.try_latest(),
         Err(RecvError::Closed(Closed::Status(status)))

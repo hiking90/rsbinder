@@ -62,7 +62,10 @@ pub enum Start {
     #[default]
     Latest,
     /// At the newest record, so that the first receive returns the current value, then on from
-    /// there. On a topic with no record yet, as `Latest`.
+    /// there. On a topic with no record yet, as `Latest`. A
+    /// [`NamedSubscriber`](crate::NamedSubscriber) connected again to a publisher it read before
+    /// starts at that publisher's newest record as well, unless that is the record the earlier
+    /// connection returned last: then at the record after it.
     Last,
     /// At the oldest record still in the ring: as much history as the ring holds.
     Oldest,
@@ -245,15 +248,17 @@ impl<T: Payload> Subscriber<T> {
     /// through the session's incoming connection instead, and the caller keeps the session open
     /// for as long as the subscriber.
     pub fn request(topic: &SIBinder, policy: &SubscriberPolicy) -> BinderResult<Self> {
-        Self::request_starting(topic, policy, |_| policy.start)
+        Self::request_starting(topic, policy, |_| (policy.start, None))
     }
 
     /// [`request`](Self::request), with where it starts chosen once the reply says which topic
     /// it is. Nothing of the subscription call depends on it: the start is this side's to apply.
+    /// With [`Start::Last`], the index beside it is that of a record an earlier connection to the
+    /// same ring returned last, which the subscriber steps over unread when it is still the newest.
     pub(crate) fn request_starting(
         topic: &SIBinder,
         policy: &SubscriberPolicy,
-        start: impl FnOnce(RingId) -> Start,
+        start: impl FnOnce(RingId) -> (Start, Option<u32>),
     ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
         // The publisher's call on the token tells of an eviction, and needs a connection to go on.
@@ -317,12 +322,12 @@ impl<T: Payload> Subscriber<T> {
         });
         let start = match start(ring) {
             // The bits of the position and the index, as the publisher wrote them.
-            Start::Latest => ring::Start::Latest {
+            (Start::Latest, _) => ring::Start::Latest {
                 at: endpoint.start as u64,
                 index: endpoint.startIndex as u32,
             },
-            Start::Last => ring::Start::Last,
-            Start::Oldest => ring::Start::Oldest,
+            (Start::Last, skip) => ring::Start::Last { skip },
+            (Start::Oldest, _) => ring::Start::Oldest,
         };
         let reader = Reader::attach(memory, start).map_err(|ring::Corrupted(what)| {
             log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
@@ -376,6 +381,13 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// Which memory this subscription reads.
     pub(crate) fn ring(&self) -> RingId {
         self.ring
+    }
+
+    /// The index of the record this subscription returned last, of a value or of one that failed
+    /// to decode; before one, the index it was started to skip
+    /// ([`request_starting`](Subscriber::request_starting)).
+    pub(crate) fn last_index(&self) -> Option<u32> {
+        self.reader.last_index()
     }
 
     /// The next value, without waiting.

@@ -17,6 +17,8 @@ const RING: usize = 4096;
 /// A record with [`BODY`] bytes of payload.
 const SLOT: u64 = 32;
 const BODY: usize = 24;
+/// The start at the newest record that skips none.
+const LAST: Start = Start::Last { skip: None };
 
 /// The record's index over and over, inverted: taken for a header it has a length no record has.
 fn body(index: u32, len: usize) -> Vec<u8> {
@@ -283,7 +285,7 @@ fn each_start_reads_its_first_record() {
         index: writer.next_index(),
     };
     // On a topic without a record every start waits for the first one.
-    let mut early = [Start::Oldest, Start::Last, latest_at(&writer)].map(|s| reader_of(&heap, s));
+    let mut early = [Start::Oldest, LAST, latest_at(&writer)].map(|s| reader_of(&heap, s));
     for reader in &mut early {
         assert_eq!(take(reader), Got::Empty);
     }
@@ -293,7 +295,7 @@ fn each_start_reads_its_first_record() {
     }
     let mut oldest = reader_of(&heap, Start::Oldest);
     assert_eq!(take(&mut oldest), item(0));
-    let mut last = reader_of(&heap, Start::Last);
+    let mut last = reader_of(&heap, LAST);
     assert_eq!(take(&mut last), item(4));
     assert_eq!(take(&mut last), Got::Empty);
     let mut later = reader_of(&heap, latest_at(&writer));
@@ -311,6 +313,91 @@ fn each_start_reads_its_first_record() {
     assert_eq!(refused(writer.position() + 8), past);
     assert_eq!(refused(4), past);
     assert_eq!(refused(writer.position()), None);
+}
+
+#[test]
+fn a_last_start_steps_over_the_record_it_skips_and_counts_the_losses_after_it() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    publish(&mut writer, 5);
+    let skip = |index| Start::Last { skip: Some(index) };
+    // The newest is the record skipped: nothing to return until the next one.
+    let mut reader = reader_of(&heap, skip(4));
+    assert_eq!(reader.last_index(), Some(4));
+    assert_eq!(take(&mut reader), Got::Empty);
+    assert_eq!(reader.position(), writer.position());
+    publish(&mut writer, 1);
+    assert_eq!(take(&mut reader), item(5));
+    assert_eq!(reader.last_index(), Some(5));
+    // Another index: the newest record is returned, and no later one is skipped.
+    let mut other = reader_of(&heap, skip(3));
+    assert_eq!(take(&mut other), item(5));
+    // The losses after the skipped record count from the one after it.
+    let mut lapped = reader_of(&heap, skip(5));
+    assert_eq!(take(&mut lapped), Got::Empty);
+    publish(&mut writer, 1000);
+    // 64 records fit the newer half, 942 to 1005; 6 to 941 are lost.
+    assert_eq!(take(&mut lapped), Got::Lagged(936));
+    let rest = drain(&mut lapped);
+    assert_eq!(rest, (942..1006).map(item).collect::<Vec<_>>());
+    assert_eq!(lapped.lost() + rest.len() as u64, 1000);
+}
+
+#[test]
+fn a_last_start_skips_through_try_latest_as_through_try_recv() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    publish(&mut writer, 5);
+    let mut reader = reader_of(&heap, Start::Last { skip: Some(4) });
+    assert_eq!(latest(&mut reader), Got::Empty);
+    assert_eq!(reader.position(), writer.position());
+    publish(&mut writer, 2);
+    assert_eq!(latest(&mut reader), item(6));
+    assert_eq!(reader.last_index(), Some(6));
+    // Another index: the newest record is returned.
+    let mut other = reader_of(&heap, Start::Last { skip: Some(5) });
+    assert_eq!(latest(&mut other), item(6));
+    assert_eq!(other.lost(), 0);
+}
+
+#[test]
+fn a_last_start_skips_a_loan_but_never_an_end() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let loan = Loan {
+        slot: 1,
+        len: 9,
+        generation: 2,
+    };
+    publish(&mut writer, 1);
+    writer.put(Kind::Loan, &loan.bytes()).unwrap();
+    let read = |reader: &mut Reader<_>, newest| match newest {
+        true => latest(reader),
+        false => take(reader),
+    };
+    for newest in [false, true] {
+        let mut reader = reader_of(&heap, Start::Last { skip: Some(1) });
+        assert_eq!(read(&mut reader, newest), Got::Empty);
+        assert_eq!(reader.position(), writer.position());
+    }
+    let end = writer.next_index();
+    writer.put(Kind::End, b"closed").unwrap();
+    for newest in [false, true] {
+        let mut reader = reader_of(&heap, Start::Last { skip: Some(end) });
+        assert_eq!(read(&mut reader, newest), Got::End(b"closed".to_vec()));
+    }
+}
+
+#[test]
+fn a_last_start_whose_record_is_written_over_before_the_first_read_reads_on_at_half() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    publish(&mut writer, 5);
+    let mut reader = reader_of(&heap, Start::Last { skip: Some(4) });
+    publish(&mut writer, 1000);
+    // Nothing read yet, so nothing is counted, as with no record to skip.
+    assert_eq!(take(&mut reader), item(1005 - 64));
+    assert_eq!(reader.lost(), 0);
 }
 
 #[test]
@@ -340,7 +427,7 @@ fn a_publisher_stopped_after_any_store_leaves_every_committed_record_readable() 
         let mut writer = writer_of(&heap);
         // Enough to wrap, so that the last write moves `tail` and `half` as well.
         publish(&mut writer, 300);
-        let mut behind = reader_of(&heap, Start::Last);
+        let mut behind = reader_of(&heap, LAST);
         assert_eq!(take(&mut behind), item(299), "{stop:?}");
         writer.stop = stop;
         publish(&mut writer, 1);

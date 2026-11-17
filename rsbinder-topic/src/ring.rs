@@ -501,7 +501,12 @@ pub(crate) enum Start {
         index: u32,
     },
     /// At the newest record, so that the first receive returns the current value.
-    Last,
+    Last {
+        /// The index of the record an earlier connection to this ring returned last: when the
+        /// first record of a value or an end the reader reaches has it, the reader steps over it
+        /// unread, as the subscriber has that value already.
+        skip: Option<u32>,
+    },
     /// At the oldest record still in the ring.
     Oldest,
 }
@@ -601,6 +606,10 @@ pub(crate) struct Reader<M> {
     gave_up: bool,
     /// The payload of the record last returned, padded to 8.
     payload: Vec<u8>,
+    /// [`Start::Last`]'s `skip`, until the first record of a value or an end is reached.
+    skip: Option<u32>,
+    /// The index of the item or loan last returned, or the `skip` of the start before one is.
+    last_index: Option<u32>,
 }
 
 impl<M: Loads> Reader<M> {
@@ -614,6 +623,8 @@ impl<M: Loads> Reader<M> {
             lost: 0,
             gave_up: false,
             payload: Vec::new(),
+            skip: None,
+            last_index: None,
         };
         let view = reader.view()?;
         reader.cursor = match start {
@@ -623,9 +634,15 @@ impl<M: Loads> Reader<M> {
                 }
                 Cursor::attached(at, Some(index))
             }
-            // No record yet: `write` is zero, and so is the place the first one goes.
-            Start::Last if view.write == 0 => Cursor::attached(0, None),
-            Start::Last => Cursor::attached(reader.newest()?, None),
+            Start::Last { skip } => {
+                (reader.skip, reader.last_index) = (skip, skip);
+                // No record yet: `write` is zero, and so is the place the first one goes.
+                if view.write == 0 {
+                    Cursor::attached(0, None)
+                } else {
+                    Cursor::attached(reader.newest()?, None)
+                }
+            }
             Start::Oldest => {
                 // That `tail` was loaded after `write` and may be above it; a later `write` is not.
                 if view.tail > view.write {
@@ -646,6 +663,13 @@ impl<M: Loads> Reader<M> {
     /// [`count_lost_before`](Self::count_lost_before), so far.
     pub(crate) fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// The index of the item or loan the reader last moved past and returned, or, before it
+    /// returned one, the [`Start::Last`] `skip` it attached with: what a later attach to this
+    /// ring passes as its `skip`.
+    pub(crate) fn last_index(&self) -> Option<u32> {
+        self.last_index
     }
 
     /// Whether the last receive call gave up before it reached `write`: lapped again after
@@ -943,6 +967,21 @@ impl<M: Loads> Reader<M> {
                     judged.size
                 }
             };
+            if self.skips(header) {
+                // Not copied: stepped over once the header alone is judged whole.
+                let Some(judged) = self.judge(read, header)? else {
+                    self.skip = Some(header.index);
+                    if !self.lap(&mut laps)? {
+                        return Ok(self.give_up(lost));
+                    }
+                    continue;
+                };
+                lost += self.cursor.count_at(&judged);
+                if self.cursor.step(judged) {
+                    return Ok(self.settle(lost));
+                }
+                continue;
+            }
             if lost > 0 {
                 // The reader stays on this record: the next call returns it or finds it gone.
                 return Ok(self.settle(lost));
@@ -969,10 +1008,22 @@ impl<M: Loads> Reader<M> {
         }
     }
 
+    /// Whether the record of `header`, not judged yet, is the one to step over unread. The first
+    /// record of a value or an end reached clears the skip, as only that one can be it: once the
+    /// reader is past the newest record of its attach, every record is newer.
+    fn skips(&mut self, header: Header) -> bool {
+        if header.kind > Kind::Loan as u32 {
+            return false;
+        }
+        let skip = self.skip.take();
+        header.kind != Kind::End as u32 && skip == Some(header.index)
+    }
+
     /// An item or a loan, from the payload just copied and judged.
     fn outcome(&mut self, judged: Judged) -> Result<Outcome, Corrupted> {
         let header = judged.header;
         let len = header.len as usize;
+        self.last_index = Some(header.index);
         if header.kind != Kind::Loan as u32 {
             return Ok(Outcome::Item {
                 index: header.index,
@@ -1003,6 +1054,19 @@ impl<M: Loads> Reader<M> {
             // Above `last` only when the publisher has stored `write` and not `last` yet.
             let at = read.max(last);
             let header = self.header(at);
+            if self.skips(header) {
+                // Nothing newer than what the subscriber has: past it, then the `write` again.
+                if let Some(judged) = self.judge(at, header)? {
+                    self.cursor.skip_to(judged);
+                    continue;
+                }
+                self.skip = Some(header.index);
+                if laps == RETRIES {
+                    return Ok(self.give_up(0));
+                }
+                laps += 1;
+                continue;
+            }
             // `at` is below the `write` held either way, and the record there is committed.
             let judged = match header.extent(at, self.seen.write(), capacity) {
                 Ok(size) if header.kind <= Kind::Loan as u32 => {
