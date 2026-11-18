@@ -503,8 +503,8 @@ pub(crate) enum Start {
     /// At the newest record, so that the first receive returns the current value.
     Last {
         /// The index of the record an earlier connection to this ring returned last: when the
-        /// first record of a value or an end the reader reaches has it, the reader steps over it
-        /// unread, as the subscriber has that value already.
+        /// first record of a value or an end the reader reaches is a value with this index, the
+        /// reader steps over it unread, as the subscriber has that value already.
         skip: Option<u32>,
     },
     /// At the oldest record still in the ring.
@@ -640,7 +640,8 @@ impl<M: Loads> Reader<M> {
                 if view.write == 0 {
                     Cursor::attached(0, None)
                 } else {
-                    Cursor::attached(reader.newest()?, None)
+                    let newest = reader.newest()?;
+                    Cursor::attached(reader.value_at_or_before(newest)?, None)
                 }
             }
             Start::Oldest => {
@@ -721,7 +722,7 @@ impl<M: Loads> Reader<M> {
         Ok(self.lend(outcome))
     }
 
-    /// The newest record, without waiting; what lies before it is skipped and not counted as lost.
+    /// The newest value, then the end, without waiting; older records are skipped, not counted.
     pub(crate) fn try_latest(&mut self) -> Result<Taken<'_>, Corrupted> {
         let outcome = self.latest()?;
         Ok(self.lend(outcome))
@@ -1008,9 +1009,7 @@ impl<M: Loads> Reader<M> {
         }
     }
 
-    /// Whether the record of `header`, not judged yet, is the one to step over unread. The first
-    /// record of a value or an end reached clears the skip, as only that one can be it: once the
-    /// reader is past the newest record of its attach, every record is newer.
+    /// Whether `header`, not judged yet, is the record to skip: only the first value or end can be.
     fn skips(&mut self, header: Header) -> bool {
         if header.kind > Kind::Loan as u32 {
             return false;
@@ -1094,13 +1093,68 @@ impl<M: Loads> Reader<M> {
             }
             let len = header.len as usize;
             if header.kind == Kind::End as u32 {
-                self.cursor.rest_on(judged);
-                return Ok(Outcome::End { len });
+                let value = match judged.at > read {
+                    true => self.unread_before(judged.at)?,
+                    false => None,
+                };
+                let Some(value) = value else {
+                    self.cursor.rest_on(judged);
+                    return Ok(Outcome::End { len });
+                };
+                // The copy takes the buffer of the end's payload, which the next call reads again.
+                let Copied::Whole(value) = self.copy(value.at, value.header, value.size)? else {
+                    if laps == RETRIES {
+                        return Ok(self.give_up(0));
+                    }
+                    laps += 1;
+                    continue;
+                };
+                let outcome = self.outcome(value)?;
+                self.cursor.skip_to(value);
+                return Ok(outcome);
             }
             let outcome = self.outcome(judged)?;
             self.cursor.skip_to(judged);
             return Ok(outcome);
         }
+    }
+
+    /// `newest`, or, when that is an end record, the value before it this reader has not returned.
+    fn value_at_or_before(&mut self, newest: u64) -> Result<u64, Corrupted> {
+        let header = self.header(newest);
+        if header.kind != Kind::End as u32 {
+            return Ok(newest);
+        }
+        let Some(end) = self.judge(newest, header)? else {
+            return Ok(newest);
+        };
+        let value = self.unread_before(end.at)?;
+        Ok(value.map_or(newest, |value| value.at))
+    }
+
+    /// The newest item or loan from the reader on before the end record at `end`, if not returned.
+    fn unread_before(&mut self, end: u64) -> Result<Option<Judged>, Corrupted> {
+        let capacity = self.memory.capacity();
+        let tail = self.memory.tail();
+        let tail = self.seen.tail(tail, capacity);
+        let mut at = self.cursor.read().max(self.keep(tail)?);
+        let mut value = None;
+        // A ring holds at most this many records, so no more than that are walked over.
+        for _ in 0..capacity / rules::HEADER {
+            if at >= end {
+                break;
+            }
+            let header = self.header(at);
+            // Only a publisher that writes past its end record overtakes this walk.
+            let Some(judged) = self.judge(at, header)? else {
+                return Ok(None);
+            };
+            if header.kind == Kind::Item as u32 || header.kind == Kind::Loan as u32 {
+                value = Some(judged);
+            }
+            at += judged.size;
+        }
+        Ok(value.filter(|value: &Judged| Some(value.header.index) != self.last_index))
     }
 }
 

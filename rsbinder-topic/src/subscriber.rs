@@ -66,7 +66,10 @@ pub enum Start {
     #[default]
     Auto,
     /// At the next record: the first one published after the publisher took the subscription.
-    /// The records already in the ring are not returned.
+    /// The records already in the ring are not returned. A
+    /// [`NamedSubscriber`](crate::NamedSubscriber)'s later connection to a publisher it does not
+    /// remember starts at that ring's oldest record, or on a [`TopicKind::State`] topic at its
+    /// newest; one to a publisher it remembers starts here.
     Next,
     /// At the newest record, so that the first receive returns the current value, then on from
     /// there. On a topic with no record yet, as `Next`. A
@@ -75,7 +78,9 @@ pub enum Start {
     /// connection returned last: then at the record after it.
     Newest,
     /// At the oldest record still in the ring: as much history as the ring holds. On a
-    /// [`TopicKind::State`] topic, whose receives return the newest value, as `Newest`.
+    /// [`TopicKind::State`] topic, whose receives return the newest value, as `Newest`. A
+    /// [`NamedSubscriber`](crate::NamedSubscriber) connected again to an event topic's publisher
+    /// it remembers starts at [`Next`](Self::Next).
     Oldest,
 }
 
@@ -83,7 +88,7 @@ impl Start {
     /// This start on a topic of `kind`: never [`Auto`](Self::Auto).
     pub(crate) fn on(self, kind: TopicKind) -> Self {
         match (self, kind) {
-            (Self::Auto, TopicKind::State) => Self::Newest,
+            (Self::Auto | Self::Oldest, TopicKind::State) => Self::Newest,
             (Self::Auto, _) => Self::Next,
             (start, _) => start,
         }
@@ -200,6 +205,8 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     dead: Arc<Dead>,
     /// A look read the topic's end record: the publisher refuses every later subscription.
     read_end: bool,
+    /// The death notice of the publisher's binder tells of its process: on kernel binder alone.
+    death_ends_ring: bool,
     /// What keeps the session of an RPC binder open; dropped after the death link it serves.
     session: Option<Arc<dyn Any + Send + Sync>>,
     ring: RingId,
@@ -266,6 +273,7 @@ impl<T: Payload> Subscriber<T> {
         // The publisher's call on the token tells of an eviction, and needs a connection to go on.
         use rsbinder::TransportCaps as Caps;
         Caps::__require_of_binder(topic, Caps::CALLBACKS, "a topic subscription")?;
+        let death_ends_ring = Caps::__of_binder(topic).contains(Caps::KERNEL_KNOBS);
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
         let control = Closing(Arc::new(page));
         let local = Arc::new(Local::new());
@@ -365,6 +373,7 @@ impl<T: Payload> Subscriber<T> {
             _death: death,
             dead,
             read_end: false,
+            death_ends_ring,
             session: None,
             ring,
             kind,
@@ -436,6 +445,11 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// goes on to, as to any newer record. One call goes past at most four such values and
     /// reports a fifth as lost, [`RecvError::Lagged`]`(1)`, so a publisher that keeps publishing
     /// holds no call. A call that finds no newer record after such a value reports it lost as well.
+    /// On a [`TopicKind::State`] topic the call gives up with [`RecvError::Empty`] instead; the
+    /// next receive reads the newer value.
+    ///
+    /// On a topic that has ended, the newest value this subscriber has not returned comes first,
+    /// and the next call reports the end.
     pub fn try_latest(&mut self) -> Result<T, RecvError> {
         self.look(true)
     }
@@ -660,6 +674,11 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// socket that hung up is neither, nor is a result that failed a check.
     pub(crate) fn saw_publisher_end(&self) -> bool {
         self.read_end || self.dead.get()
+    }
+
+    /// Whether no later subscription reaches this ring: its end was read, or its process died.
+    pub(crate) fn ring_is_final(&self) -> bool {
+        self.read_end || (self.death_ends_ring && self.dead.get())
     }
 
     /// Clear [`NOTICE`], which a wait ends at and leaves up; whether it was up.
@@ -928,6 +947,7 @@ impl<T: Payload> Subscriber<T> {
             _death,
             dead,
             read_end,
+            death_ends_ring,
             session,
             ring,
             kind,
@@ -956,6 +976,7 @@ impl<T: Payload> Subscriber<T> {
             _death,
             dead,
             read_end,
+            death_ends_ring,
             session,
             ring,
             kind,
@@ -979,7 +1000,10 @@ impl<M: Trust> Subscriber<Bytes, M> {
     /// [`lossless`](crate::PublisherBuilder::lossless) publisher counts it: a publish that waits
     /// for this subscriber waits for the drop. A value that came through the ring is returned in
     /// the subscriber's buffer. The errors are `try_recv`'s; a lent slot the publisher took back
-    /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
+    /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`. On a
+    /// [`TopicKind::State`] topic the call goes on to the newer value, as
+    /// [`try_latest`](Self::try_latest) does, and gives up with [`RecvError::Empty`] at a fifth
+    /// value taken back, or when no newer record follows one.
     pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
         let held = self.look_held(false)?;
         Ok(self.sample(held))

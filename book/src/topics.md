@@ -10,8 +10,8 @@ travel through shared memory, and no binder transaction is made for them:
   memfd, and every subscriber maps it read-only. One copy into the ring serves
   all of them.
 - A publish does not wait for a subscriber. When the ring is full the oldest
-  records are overwritten, and a subscriber that had not read them is told how
-  many it lost.
+  records are overwritten. On an event topic a subscriber that had not read
+  them is told how many it lost; on a state topic it skips to the newest value.
 - A subscriber writes one small memfd of its own, its control page, which the
   publisher maps read-only. Nothing a subscriber does reaches the ring or
   another subscriber.
@@ -27,7 +27,7 @@ versions refuse each other (`ITopic::ERROR_VERSION`).
 |---|---|---|---|
 | Receivers | any number | one | one per registration |
 | Who allocates the shared memory | the publisher, once for all | the consumer | none: every value is a transaction |
-| A receiver that falls behind | loses the oldest records (`RecvError::Lagged`), or with backpressure holds the publisher up to a timeout and is then taken out | holds the sender back; nothing is lost | calls queue in the receiver's async buffer, and fail once it is full |
+| A receiver that falls behind | on an event topic loses the oldest records (`RecvError::Lagged`), or with backpressure holds the publisher up to a timeout and is then taken out; on a state topic skips to the newest value | holds the sender back; nothing is lost | calls queue in the receiver's async buffer, and fail once it is full |
 | Transports | kernel binder, and RPC on a Unix socket | kernel binder and RPC | kernel binder and RPC |
 
 A topic suits values that many processes read and where the newest matters
@@ -99,9 +99,12 @@ Both ends are made by a builder: `Publisher::events()` and
 `Subscriber::builder()`. The publisher's builder sizes the ring from the
 largest value, `max_value_bytes`, and the records a subscriber may fall behind
 by before it loses some, `keep`: `(keep + 1) × (max_value_bytes rounded up to
-8, plus 8)` bytes, no less than 4 KiB and no more than 1 GiB. A record is at
-most half the ring, so a topic made without `max_value_bytes` carries values
-of up to 2040 bytes. `ring_bytes` sets the size directly instead, and
+8, plus 8)` bytes, no less than 4 KiB, with a `keep` of 0 counted as 1, and
+`max_value_bytes` taken as 8 when it is not set and as 16 at least with `lend`.
+A size past 1 GiB makes `build` return `EX_ILLEGAL_ARGUMENT`.
+A record is at most half the ring, so a topic made with neither setting carries
+values of up to 2040 bytes.
+`ring_bytes` sets the size directly instead, and
 `Publisher::ring_bytes` reads it back.
 
 ### Handing a topic out from an interface
@@ -151,7 +154,8 @@ topic: a state topic has no way to read them all.
 
 `Start::Auto` is taken for each connection from that publisher's kind, so a
 subscriber's code does not depend on the kind. A start set with
-`SubscriberBuilder::start_at` comes first: a state topic read from `Start::Next`
+`SubscriberBuilder::start_at` comes first: a `Subscriber`, or the first
+connection of a `NamedSubscriber`, that reads a state topic from `Start::Next`
 returns nothing until the next publish, and an event topic read from
 `Start::Newest` returns its newest record first. `Start::Oldest` on a state
 topic reads as `Start::Newest` does, as its receives return the newest value.
@@ -163,6 +167,7 @@ into a slot of the pool with `build_with`:
 
 ```rust,ignore
 let frame = Publisher::<Bytes>::state()
+    .max_subscribers(4)
     .lend(4 << 20)
     .build_with(|publisher| {
         let mut slot = publisher.loan_slice(first.len())?;
@@ -176,11 +181,36 @@ being written, and no less than 4 KiB. A first value that does not fit, or an
 `init` that publishes nothing, makes no topic: the last call returns
 `EX_ILLEGAL_ARGUMENT`.
 
-A `NamedSubscriber` connected again to a state topic it read before returns
-the value published while it was away at once, and does not return again the
-value it already has. A publisher that ends takes its value with it: the
-subscriber gets the first value of the next publisher of the name, and a
+A `NamedSubscriber` with `Start::Auto` or `Start::Newest`, connected again to a
+state topic it read before, returns the value published while it was away at
+once, and does not return again the value it already has. A receive returns
+the last value of a closed topic before it reports the end. A publisher that
+ended takes its value with it: the
+subscriber gets the newest value of the next publisher of the name, and a
 publisher that has to carry the value over keeps it itself.
+
+### Connecting again
+
+A `NamedSubscriber` remembers the publishers it connected to, and each connection
+starts by whether it remembers that publisher. `Start::Auto` is read here as the
+topic's kind says, and `Start::Oldest` on a state topic as `Start::Newest`:
+
+| Start | First connection | Later, not remembered | Remembered |
+|---|---|---|---|
+| `Newest` | Newest record | Newest record | Newest record, skipped if returned last |
+| `Next` | Next record | Oldest record; on a state topic, newest | Next record |
+| `Oldest`, event topic | Oldest record | Oldest record | Next record |
+
+A publisher is forgotten when a connection to it reads its end record or, on
+kernel binder, gets the notice of its death, and once 170 other publishers were
+connected to after it. Over a socket that notice tells only that the session
+ended, and the publisher may live on:
+
+- A subscriber of a state topic, or one at `Start::Newest` on an event topic,
+  remembers the publisher, and returns no record it returned before.
+- A subscriber of an event topic at any other start forgets it, and reads the
+  ring again from its oldest record. It can receive a record twice, and misses
+  none the ring still holds.
 
 ### Getting and setting a value
 

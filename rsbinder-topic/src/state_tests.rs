@@ -13,9 +13,10 @@ use rsbinder::{ExceptionCode, Parcel, SIBinder, StatusCode};
 
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::MIN_RING;
+use crate::subscriber::Settings;
 use crate::{
-    Bytes, Encoding, Payload, PublishError, Publisher, Record, RecvError, Start, Subscriber,
-    TopicKind,
+    Bytes, Closed, Encoding, Payload, PublishError, Publisher, Record, RecvError, Start,
+    Subscriber, TopicKind,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -208,9 +209,7 @@ enum Receive {
     Sample,
 }
 
-/// A publisher thread that publishes `0..last` as fast as it can, and a subscriber that
-/// receives until it has the last value: every receive returns a value newer than the one
-/// before, and none is a loss.
+/// Receive from a thread publishing up to `last` until it comes: each value newer, none lost.
 fn races_a_publisher(publisher: Publisher<Bytes>, receive: Receive, last: u32) {
     let mut subscriber = subscribe(&publisher.as_binder());
     let done = Arc::new(AtomicBool::new(false));
@@ -278,8 +277,76 @@ fn a_subscriber_slower_than_its_lending_state_publisher_gets_newer_values_and_no
 }
 
 #[test]
+fn the_last_value_of_a_state_topic_comes_before_its_end() {
+    let state = Publisher::<Bytes>::state().build(&count(1)).unwrap();
+    let mut behind = subscribe(&state.as_binder());
+    let mut sampled = subscribe(&state.as_binder());
+    let mut caught_up = subscribe(&state.as_binder());
+    state.publish(&count(2)).unwrap();
+    assert_eq!(caught_up.recv_timeout(WAIT), Ok(count(2)));
+    state.close();
+    let ended = Err(RecvError::Closed(Closed::End));
+    assert_eq!(behind.recv_timeout(WAIT), Ok(count(2)));
+    assert_eq!(behind.recv_timeout(WAIT), ended);
+    assert_eq!(behind.recv_timeout(WAIT), ended);
+    let sample = sampled.recv_sample_timeout(WAIT).unwrap();
+    assert_eq!(counted(&sample.to_owned()), 2);
+    drop(sample);
+    assert_eq!(sampled.recv_timeout(WAIT), ended);
+    // Returned already: the end at once, and the value not again.
+    assert_eq!(caught_up.recv_timeout(WAIT), ended);
+}
+
+#[test]
+fn a_topic_closed_as_a_subscriber_attaches_returns_its_last_value_before_the_end() {
+    let settings = Settings::default();
+    let ended = Err(RecvError::Closed(Closed::End));
+    let state = Publisher::<Bytes>::state().build(&count(1)).unwrap();
+    let topic = state.as_binder();
+    let mut subscriber = Subscriber::<Bytes>::request_starting(&topic, &settings, |_, _| {
+        state.close();
+        (Start::Auto, None)
+    })
+    .unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(count(1)));
+    assert_eq!(subscriber.recv_timeout(WAIT), ended);
+
+    let events = Publisher::<Bytes>::events().build().unwrap();
+    events.publish(&count(2)).unwrap();
+    let topic = events.as_binder();
+    let mut subscriber = Subscriber::<Bytes>::request_starting(&topic, &settings, |_, _| {
+        events.close();
+        (Start::Newest, None)
+    })
+    .unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(count(2)));
+    assert_eq!(subscriber.recv_timeout(WAIT), ended);
+}
+
+#[test]
+fn the_last_value_lent_on_a_state_topic_comes_before_its_end() {
+    let state = Publisher::<Bytes>::state()
+        .max_subscribers(2)
+        .lend(64)
+        .build_with(|publisher| {
+            let mut slot = publisher.loan_slice(4)?;
+            slot.copy_from_slice(&1u32.to_le_bytes());
+            slot.publish()
+        })
+        .unwrap();
+    let mut subscriber = subscribe(&state.as_binder());
+    let mut slot = state.loan_slice(4).unwrap();
+    slot.copy_from_slice(&2u32.to_le_bytes());
+    slot.publish().unwrap();
+    state.close();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(count(2)));
+    let ended = Err(RecvError::Closed(Closed::End));
+    assert_eq!(subscriber.recv_timeout(WAIT), ended);
+}
+
+#[test]
 fn an_endpoint_without_a_kind_is_of_an_event_topic() {
-    // A publisher of a layout before kinds sends the parcelable without its last field.
+    // The parcelable ends before `topicKind`, which then reads as its default.
     let sent = TopicEndpoint {
         topicKind: TopicKind::State.wire(),
         ..Default::default()

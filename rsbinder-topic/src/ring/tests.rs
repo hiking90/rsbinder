@@ -380,12 +380,76 @@ fn a_last_start_skips_a_loan_but_never_an_end() {
         assert_eq!(read(&mut reader, newest), Got::Empty);
         assert_eq!(reader.position(), writer.position());
     }
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
     let end = writer.next_index();
     writer.put(Kind::End, b"closed").unwrap();
     for newest in [false, true] {
         let mut reader = reader_of(&heap, Start::Last { skip: Some(end) });
         assert_eq!(read(&mut reader, newest), Got::End(b"closed".to_vec()));
     }
+}
+
+#[test]
+fn a_last_start_on_an_end_reads_the_value_before_it_and_then_the_end() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    publish(&mut writer, 3);
+    writer.put(Kind::End, b"closed").unwrap();
+    let end = Got::End(b"closed".to_vec());
+    let read = |reader: &mut Reader<_>, newest| match newest {
+        true => latest(reader),
+        false => take(reader),
+    };
+    for newest in [false, true] {
+        for skip in [None, Some(1)] {
+            let mut reader = reader_of(&heap, Start::Last { skip });
+            assert_eq!(read(&mut reader, newest), item(2));
+            assert_eq!(read(&mut reader, newest), end);
+            assert_eq!(read(&mut reader, newest), end);
+        }
+        // Returned already, by the connection before this one.
+        let mut reader = reader_of(&heap, Start::Last { skip: Some(2) });
+        assert_eq!(read(&mut reader, newest), end);
+    }
+}
+
+#[test]
+fn a_last_start_on_an_end_with_no_value_in_the_ring_reads_the_end() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    writer.put(Kind::End, b"closed").unwrap();
+    let end = Got::End(b"closed".to_vec());
+    assert_eq!(take(&mut reader_of(&heap, LAST)), end);
+    assert_eq!(latest(&mut reader_of(&heap, LAST)), end);
+}
+
+#[test]
+fn latest_returns_the_value_an_end_was_written_after_and_then_the_end() {
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let mut behind = reader_of(&heap, Start::Oldest);
+    publish(&mut writer, 3);
+    let mut skipping = reader_of(&heap, Start::Last { skip: Some(2) });
+    let mut caught_up = reader_of(&heap, LAST);
+    assert_eq!(latest(&mut caught_up), item(2));
+    writer.put(Kind::End, b"closed").unwrap();
+    let end = Got::End(b"closed".to_vec());
+    assert_eq!(latest(&mut behind), item(2));
+    assert_eq!(latest(&mut behind), end);
+    assert_eq!(latest(&mut behind), end);
+    // Returned already, by this reader or by the connection before it.
+    assert_eq!(latest(&mut caught_up), end);
+    assert_eq!(latest(&mut skipping), end);
+
+    let heap = Heap::new(RING);
+    let mut writer = writer_of(&heap);
+    let mut lapped = reader_of(&heap, Start::Oldest);
+    publish(&mut writer, 1000);
+    writer.put(Kind::End, b"closed").unwrap();
+    assert_eq!(latest(&mut lapped), item(999));
+    assert_eq!(latest(&mut lapped), end);
+    assert_eq!(lapped.lost(), 0);
 }
 
 #[test]
@@ -489,6 +553,7 @@ fn the_end_record_is_the_last_and_every_call_returns_it() {
     assert_eq!(take(&mut lapped), Got::Lagged(237));
     assert_eq!(drain(&mut lapped)[63], end);
     let mut newest = reader_of(&heap, Start::Latest { at: 0, index: 0 });
+    assert_eq!(latest(&mut newest), item(299));
     assert_eq!(latest(&mut newest), end);
     assert_eq!(take(&mut newest), end);
     assert_eq!(newest.lost(), 0);

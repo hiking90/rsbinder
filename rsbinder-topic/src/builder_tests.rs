@@ -43,8 +43,24 @@ fn a_ring_is_no_smaller_than_4_kib() {
     assert_eq!(ring(events()), 4 << 10);
     assert_eq!(ring(events().keep(100)), 4 << 10);
     assert_eq!(ring(events().max_value_bytes(2040)), 4 << 10);
-    // Without `max_value_bytes` a kept record is the 8 bytes of a header and an empty value.
-    assert_eq!(ring(events().keep(1000)), 1001 * 8);
+    // Without `max_value_bytes` a kept record is the 8 bytes of a header and a value of 8.
+    assert_eq!(ring(events().keep(255)), 4 << 10);
+    assert_eq!(ring(events().keep(256)), 257 * 16);
+    assert_eq!(ring(events().keep(1000)), 1001 * 16);
+}
+
+#[test]
+fn a_topic_with_a_pool_keeps_as_many_records_of_lent_values() {
+    let events = Publisher::<Bytes>::events;
+    assert_eq!(ring(events().lend(64).keep(1000)), 1001 * 24);
+    assert_eq!(
+        ring(events().max_value_bytes(4).lend(64).keep(1000)),
+        1001 * 24
+    );
+    assert_eq!(
+        ring(events().max_value_bytes(100).lend(64).keep(1000)),
+        1001 * (104 + 8)
+    );
 }
 
 #[test]

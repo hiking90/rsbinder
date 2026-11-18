@@ -124,30 +124,36 @@ pub enum NamedState {
 /// was published between the two is not counted as lost (the `Disconnected` marks the gap). The
 /// first connection starts where the builder's [`start_at`](crate::SubscriberBuilder::start_at)
 /// says, and [`Start::Auto`] is taken for each connection as that publisher's kind says: below,
-/// [`Start::Newest`] on a state topic and [`Start::Next`] on an event topic.
-/// A later connection to a publisher this subscriber was not connected to before starts at
-/// the oldest record of the new ring, unless that start is [`Start::Newest`]: the subscription
-/// is older than that publisher, so all it published is news to it. A connection to a publisher
-/// it was connected to before, as when the name comes back to that publisher after another held
-/// it, returns no record an earlier connection to it returned. With [`Start::Newest`] it starts
-/// at that publisher's newest record, which is its current value, and steps over that record
-/// when it is the one the earlier connections returned last, so that a value published while the
-/// subscriber read another publisher is returned at once. With any other start it starts at
-/// [`Start::Next`]. A connection counts from the receive that takes it; one whose fd the
-/// subscriber's epoll instance refuses ([`Disconnected::Rejected`]) does not.
+/// [`Start::Newest`] on a state topic and [`Start::Next`] on an event topic. [`Start::Oldest`] on
+/// a state topic is taken below as [`Start::Newest`] too.
+/// A later connection to a publisher this subscriber does not remember starts at the oldest
+/// record of the new ring, or at its newest on a [`TopicKind::State`] topic or with
+/// [`Start::Newest`]: the subscription is older than that publisher, so all it published is news
+/// to it. A connection to a publisher it remembers, as when the name comes back to that publisher
+/// after another held it, returns no record an earlier connection to it returned. With
+/// [`Start::Newest`] it starts at that publisher's newest record, which is its current value,
+/// and steps over that record when it is the one the earlier connections returned last, so that a
+/// value published while the subscriber read another publisher is returned at once. With any other
+/// start it starts at [`Start::Next`]. A connection counts from the receive that takes it; one
+/// whose fd the subscriber's epoll instance refuses ([`Disconnected::Rejected`]) does not.
 ///
 /// The subscriber remembers a publisher it was connected to by its topic's memory, which stays
 /// the same however it is reached: a publisher a registry on a socket gave a new socket is still
-/// the publisher it read. It forgets one only on what a connection to it saw: the connection read
-/// the end record of its topic (what [`Closed::End`] and [`Closed::Status`] report), after which
-/// the publisher refuses every later subscription, or the notice of its binder's death arrived
-/// while the connection was held. How the connection ended does not decide it, so a publisher no
+/// the publisher it read. It forgets one on what a connection to it saw: the connection read the
+/// end record of its topic (what [`Closed::End`] and [`Closed::Status`] report), after which the
+/// publisher refuses every later subscription, or the notice of its binder's death arrived while
+/// the connection was held. How the connection ended does not decide it, so a publisher no
 /// connection saw end stays remembered, as it may take the name again, until a later connection
-/// to it sees its end or the subscriber drops. A connection sees the records its receives read,
-/// those of the drain before a [`Disconnected::Replaced`] included, and the death notice that
-/// arrives while it is held; an end it read no record of, or a notice that arrives once it is
-/// over, goes to none. Over a socket that notice is the end of the session, which a publisher can
-/// outlive: connected to it again, the subscriber can return records it returned before.
+/// to it sees its end, 170 other publishers were connected to after it, or the subscriber drops.
+/// A connection sees the records its receives read, those of the drain before a
+/// [`Disconnected::Replaced`] included, and the death notice that arrives while it is held; an
+/// end it read no record of, or a notice that arrives once it is over, goes to none.
+///
+/// Over a socket that notice is the end of the session, which a publisher can outlive. A
+/// subscriber of a [`TopicKind::State`] topic, or one that starts at [`Start::Newest`], remembers
+/// the publisher through it and connects to it again by the rules above. Any other subscriber
+/// of a [`TopicKind::Event`] topic forgets it: connected to it again, it starts at the oldest
+/// record of the ring, and can return records it returned before.
 ///
 /// A notice of the name is a oneway call, which fails when this process has no room left for
 /// one, so a subscriber can miss the binder a name was given. With a watch that has a lookup
@@ -262,6 +268,14 @@ impl<T: Payload, M: Trust> Connection<T, M> {
         self.drain = None;
         self.subscriber.stop_at(None);
     }
+
+    /// After an end it saw: whether a later connection reads this ring as one it never read.
+    fn forgets(&self, start: Start) -> bool {
+        let kind = self.subscriber.topic_kind();
+        // Short of that, a session ended: the publisher lives, and an event topic is read anew.
+        self.subscriber.ring_is_final()
+            || (kind == TopicKind::Event && start.on(kind) != Start::Newest)
+    }
 }
 
 /// A drain of the records a replaced publisher had committed when the replacement was seen.
@@ -371,7 +385,7 @@ struct State<T: Payload> {
     notices: VecDeque<Disconnected>,
     /// Ends the wait of the subscriber's connection when the state changes.
     wake: Option<Interrupter>,
-    /// Topics joined, each once; one leaves when its connection saw the topic's end or its death.
+    /// Topics joined, each once, oldest first; [`Connection::forgets`] says which one leaves.
     joined: Vec<Joined>,
     /// A connection has joined: a later one to a topic not joined starts at `Oldest`, or `Last`.
     later: bool,
@@ -379,6 +393,9 @@ struct State<T: Payload> {
     rejoin: Duration,
     find: Find,
 }
+
+/// The rings remembered, a page of them at most: past that, the one joined longest ago goes.
+const MAX_JOINED: usize = 4096 / std::mem::size_of::<Joined>();
 
 /// A topic a connection joined, and the record of it connections returned last.
 struct Joined {
@@ -429,6 +446,22 @@ impl<T: Payload> State<T> {
             rejoin: Duration::ZERO,
             find: Find::Unknown(false),
         }
+    }
+
+    /// Remember `ring` as the one joined last, with the record kept for it if it was known.
+    fn remember(&mut self, ring: RingId) {
+        let known = self.joined.iter().position(|joined| joined.ring == ring);
+        let joined = match known {
+            Some(at) => self.joined.remove(at),
+            None => Joined {
+                ring,
+                last_index: None,
+            },
+        };
+        if self.joined.len() == MAX_JOINED {
+            self.joined.remove(0);
+        }
+        self.joined.push(joined);
     }
 
     /// Take a pending interrupt for a receive to return, its kick with it; whether one was.
@@ -539,6 +572,23 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             _watch: watch,
             _host: host,
         })
+    }
+
+    /// What keeps the session of the connection taken open, for a test that ends it.
+    #[cfg(all(
+        test,
+        feature = "uds",
+        not(loom),
+        not(miri),
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_pointer_width = "64",
+            all(target_arch = "x86", target_feature = "sse2"),
+            all(target_arch = "arm", target_has_atomic = "64")
+        )
+    ))]
+    pub(crate) fn connection_session<G: Any + Send + Sync>(&self) -> Option<&G> {
+        self.current.as_ref()?.subscriber.session_guard()
     }
 }
 
@@ -897,13 +947,7 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
                 }
                 state.rejoin = Duration::ZERO;
                 state.later = true;
-                let ring = subscriber.ring();
-                if !state.joined.iter().any(|joined| joined.ring == ring) {
-                    state.joined.push(Joined {
-                        ring,
-                        last_index: None,
-                    });
-                }
+                state.remember(subscriber.ring());
                 let wake = subscriber.interrupter();
                 if state.interrupted {
                     wake.notice();
@@ -1087,7 +1131,7 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         state.corrupt = old.filter(|_| corrupt).cloned();
         // Not by `why`: an ended topic refuses every later subscription, a dead binder every call.
         let ended = gone.as_ref().filter(|c| c.subscriber.saw_publisher_end());
-        if let Some(connection) = ended {
+        if let Some(connection) = ended.filter(|c| c.forgets(self.named.policy.start)) {
             let ring = connection.subscriber.ring();
             state.joined.retain(|joined| joined.ring != ring);
         }
@@ -1347,15 +1391,15 @@ impl<T: Payload> Named<T> {
         }
     }
 
-    /// Where a connection to the topic of `ring` starts, as [`NamedSubscriber`] documents, and
-    /// for [`Start::Newest`] the record to skip; [`Start::Auto`] as the topic's `kind` says.
+    /// Where a connection to `ring` starts, and the record to skip; `Auto` as `kind` says.
     fn start_of(&self, ring: RingId, kind: TopicKind) -> (Start, Option<u32>) {
         let state = self.lock();
         let start = self.policy.start.on(kind);
         match state.joined.iter().find(|joined| joined.ring == ring) {
             Some(joined) if start == Start::Newest => (Start::Newest, joined.last_index),
             Some(_) => (Start::Next, None),
-            None if state.later && start != Start::Newest => (Start::Oldest, None),
+            None if start == Start::Newest => (Start::Newest, None),
+            None if state.later => (Start::Oldest, None),
             None => (start, None),
         }
     }
@@ -1721,6 +1765,56 @@ impl<T: Payload> Interrupt for Named<T> {
         if let Some(wake) = wake {
             wake.notice();
         }
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod joined_tests {
+    use super::{Bytes, State, MAX_JOINED};
+
+    /// A table with `MAX_JOINED` rings in it, ring 0 joined longest ago.
+    fn full() -> State<Bytes> {
+        let mut state = State::new();
+        (0..MAX_JOINED as u64).for_each(|ring| state.remember((0, ring)));
+        state
+    }
+
+    fn holds(state: &State<Bytes>, ring: u64) -> bool {
+        state.joined.iter().any(|joined| joined.ring == (0, ring))
+    }
+
+    #[test]
+    fn the_rings_remembered_stop_at_the_bound() {
+        // `NamedSubscriber`'s rustdoc gives this number.
+        assert_eq!(MAX_JOINED, 170);
+        let mut state = full();
+        assert_eq!(state.joined.len(), MAX_JOINED);
+        state.remember((0, MAX_JOINED as u64));
+        assert_eq!(state.joined.len(), MAX_JOINED);
+        assert!(!holds(&state, 0));
+        assert!(holds(&state, 1));
+        assert!(holds(&state, MAX_JOINED as u64));
+    }
+
+    #[test]
+    fn a_ring_joined_again_is_the_last_to_go() {
+        let mut state = full();
+        state.remember((0, 0));
+        assert_eq!(state.joined.len(), MAX_JOINED);
+        state.remember((0, MAX_JOINED as u64));
+        assert!(holds(&state, 0));
+        assert!(!holds(&state, 1));
+    }
+
+    #[test]
+    fn a_ring_joined_again_keeps_the_record_to_skip() {
+        let mut state = State::<Bytes>::new();
+        state.remember((0, 0));
+        state.joined[0].last_index = Some(7);
+        state.remember((0, 1));
+        state.remember((0, 0));
+        let last = state.joined.last().expect("a ring");
+        assert_eq!((last.ring, last.last_index), ((0, 0), Some(7)));
     }
 }
 

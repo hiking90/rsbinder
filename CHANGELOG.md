@@ -13,6 +13,106 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ## [Unreleased]
 
+### Migrating from 0.13.0
+
+Each item below breaks a build against rsbinder 0.13.0 or `rsbinder-topic`
+0.1.0, the version released with it, or changes what a program using them
+observes. `rsbinder-topic` goes to 0.2.0 with this release, as its API breaks.
+The book's
+[Migrating from 0.13 to 0.14](https://hiking90.github.io/rsbinder/migrating-0.14.html)
+says what to change for each. The item marked **wire** changes bytes between
+peers; peers of either release still subscribe to each other.
+
+- `try_get_interface_async`, `check_interface_async`,
+  `wait_for_interface_async` and `get_interface_async` are `fn`s returning
+  `impl Future + Send + 'static`. Called while handling a transaction, they
+  and `connect_async` do their binder work before they return, so a future
+  that is never polled has still made the lookup.
+- `connect_async` on a kernel endpoint initializes `ProcessState` and starts
+  the binder thread pool when it is called, wherever it is called, so a later
+  `ProcessState::init` with other settings returns `BadValue`. The wait for
+  the name still starts at the first poll.
+- `TokioRuntime::block_on` no longer panics inside a current-thread
+  `Handle::block_on`, or on a multi-threaded runtime's worker that entered a
+  current-thread handle. From a current-thread runtime's own
+  `Runtime::block_on` body or within a `LocalSet` it still panics, with
+  `block_in_place`'s message.
+- Stream `*_async` waits (a futex wait on the ring, and on RPC a wait that is
+  bounded or may ping) run on threads of rsbinder's own:
+  `max_blocking_threads` does not bound them, and they no longer panic outside
+  a Tokio runtime. An RPC stream's binder calls stay on the blocking pool, and
+  panic outside one.
+- `Reconnecting::connected`, called while handling a transaction, returns a
+  connection that is up; only a wait is `WouldBlock`.
+- `Reconnecting::current`, `connected`, `wait_connected` and `with`, finding
+  that an unwatched RPC peer has closed, go on before the session's death
+  recipients have run: those run on the session's reaper thread.
+- `end` after an awaited ring `send_async` whose record failed other than by
+  timing out sends the caller's end, where it sent `EX_ILLEGAL_STATE`.
+
+- **`rsbinder-topic` (breaking): both ends are made by a builder.**
+  `PublisherPolicy`, `PoolPolicy`, `Backpressure`, `Authorize`,
+  `SubscriberPolicy`, `Publisher::new`, `advertise`, `advertise_with`,
+  `Subscriber::request`, `NamedSubscriber::subscribe`/`subscribe_with` and
+  `uds::subscribe`/`subscribe_with` are gone, with no alias.
+  `Publisher::<T>::events()` returns a `PublisherBuilder<T, EventTopic>`
+  that sizes the ring from `max_value_bytes` and `keep`
+  (`(keep + 1) × (max_value_bytes rounded up to 8, plus 8)`, at least 4 KiB,
+  with a `keep` of 0 counted as 1, and `max_value_bytes` taken as 8 when it is
+  not set and as 16 at least with `lend`; `ring_bytes` sets it directly and
+  `Publisher::ring_bytes` reads it back),
+  and takes `max_subscribers`, `max_per_uid`, `authorize`, `lend` (with
+  `max_loans`, `lend_keep`, `lend_huge_pages`), `lossless(timeout)` and
+  `lossless_window(timeout, window)`; `build()` makes the topic. A pool
+  setting without `lend` is refused with `EX_ILLEGAL_ARGUMENT`.
+  `Subscriber::<T>::builder()` takes `start_at`, `wake`, `max_ring_bytes` and
+  `max_pool_bytes`, and subscribes in its last call: `subscribe(&binder)`,
+  `subscribe_named(name)`, `subscribe_named_on(name, &resolver)`, and with
+  `uds` `connect(endpoint)` and `connect_with(endpoint, &options)`.
+  `Start::Latest` and `Start::Last` are now `Start::Next` and
+  `Start::Newest`; `Start::Oldest` is unchanged. The default start is the new
+  `Start::Auto`, which on an event topic is `Start::Next`, the 0.1.0 default.
+  `UdsResolver::subscribe` takes a `SubscriberBuilder` in place of the
+  policy. A name is given with `advertise_on` after `build`. **The default
+  ring is 4 KiB, not 64 KiB**: a topic made with none of `max_value_bytes`,
+  `keep` and `ring_bytes` carries values of up to 2040 bytes, where
+  `PublisherPolicy::default()` carried 32760, and a larger value fails with
+  `PublishError::TooLarge`. With a sixteenth of the bytes, a subscriber that
+  falls behind loses records sooner, and a `lossless` publish waits sooner.
+- `rsbinder-topic`: on a 64-bit target a subscriber maps a ring of up to
+  256 MiB and a pool of up to 1 GiB by default, up from 16 MiB and 256 MiB,
+  which stay the defaults on a 32-bit target. `max_ring_bytes` and
+  `max_pool_bytes` still change them.
+- `rsbinder-topic`: `try_latest`, `recv_latest` and the sample calls beside
+  them, on a topic that has ended, return the newest value the subscriber has
+  not returned and report the end on the next call, where they reported the
+  end at once.
+- `rsbinder-topic`: a subscriber with `Start::Newest` whose topic is closed as
+  it subscribes returns the topic's last value and then the end, where it
+  reported the end at once.
+- `rsbinder-topic`: `recv_async` and `recv_sample_async` of a `Subscriber` or a
+  `NamedSubscriber`, with `Wake::Futex`, no longer panic outside a Tokio
+  runtime, and `max_blocking_threads` does not bound their waits.
+  `RecvError::Runtime(ErrorKind::Other)` means no thread could be started for
+  the wait, where it meant the blocking pool did not run it.
+- `rsbinder-topic`: a `NamedSubscriber` with `Start::Newest` connected again to
+  a publisher it read before starts at that publisher's newest record, and
+  steps over it when it is the record returned last, where it started at the
+  next record. The same holds after a session over a socket ends.
+- `rsbinder-topic`: a `NamedSubscriber` remembers the 170 publishers it connected
+  to last, where it remembered every publisher until a connection to it saw its
+  end. A publisher connected to before those is read as one it never connected
+  to, so a record it returned can be returned again.
+- **wire**: `rsbinder-topic`: `TopicEndpoint` has a new last field,
+  `topicKind`, with no change of the layout version. A publisher built on
+  `rsbinder-topic` 0.1.0 sends none and its topic is read as an event topic. A
+  subscriber built on 0.1.0 ignores it and reads a state topic as an event
+  topic: with its default start, `Start::Latest`, it does not get the current
+  value as it subscribes, and it can receive `RecvError::Lagged`. A struct
+  literal of `TopicEndpoint` names the field or ends in `..Default::default()`.
+- `rsbinder-topic`: a subscription whose `ITopic` reply has a `topicKind`
+  other than 0 or 1 is refused with `BadValue`.
+
 ### Added
 
 - `connect_async_with`, `connect_async` with `ClientOptions`. Without
@@ -29,11 +129,6 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
-- `rsbinder-topic`: on a 64-bit target a subscriber maps a ring of up to
-  256 MiB and a pool of up to 1 GiB by default, up from 16 MiB and 256 MiB,
-  which stay the defaults on a 32-bit target. `max_ring_bytes` and
-  `max_pool_bytes` still change them.
-
 - Stream `*_async` waits — a futex wait on the ring, for an item or for
   room, and on calls a credit or item wait that is bounded or may ping —
   run on rsbinder's own threads instead of the runtime's blocking pool.
@@ -43,35 +138,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   longer take the threads binder calls need. Latency, CPU per item and
   throughput measured the same as before. Binder calls (batches, grants,
   the terminator) stay on the blocking pool.
-- `rsbinder-topic`: `Subscriber::recv_async` and `recv_sample_async` with
-  `Wake::Futex` wait on the same threads, so their waits no longer queue
-  behind each other on a full blocking pool, and they no longer need a
-  Tokio runtime (they panicked outside one). `RecvError::Runtime` now means
-  no thread could be started for the wait, or the reactor refused the fd.
-- **`rsbinder-topic` (breaking): both ends are made by a builder.**
-  `PublisherPolicy`, `PoolPolicy`, `Backpressure`, `Authorize`,
-  `SubscriberPolicy`, `Publisher::new`, `advertise`, `advertise_with`,
-  `Subscriber::request`, `NamedSubscriber::subscribe`/`subscribe_with` and
-  `uds::subscribe`/`subscribe_with` are gone, with no alias.
-  `Publisher::<T>::events()` returns a `PublisherBuilder<T, EventTopic>`
-  that sizes the ring from `max_value_bytes` and `keep`
-  (`(keep + 1) × (max_value_bytes rounded up to 8, plus 8)`, at least 4 KiB;
-  `ring_bytes` sets it directly and `Publisher::ring_bytes` reads it back),
-  and takes `max_subscribers`, `max_per_uid`, `authorize`, `lend` (with
-  `max_loans`, `lend_keep`, `lend_huge_pages`), `lossless(timeout)` and
-  `lossless_window(timeout, window)`; `build()` makes the topic. A pool
-  setting without `lend` is refused with `EX_ILLEGAL_ARGUMENT`.
-  `Subscriber::<T>::builder()` takes `start_at`, `wake`, `max_ring_bytes` and
-  `max_pool_bytes`, and subscribes in its last call: `subscribe(&binder)`,
-  `subscribe_named(name)`, `subscribe_named_on(name, &resolver)`, and with
-  `uds` `connect(endpoint)` and `connect_with(endpoint, &options)`.
-  `Start::Latest` and `Start::Last` are now `Start::Next` and
-  `Start::Newest`; `Start::Oldest` is unchanged.
-  `UdsResolver::subscribe` takes a `SubscriberBuilder` in place of the
-  policy. A name is given with `advertise_on` after `build`. **The default
-  ring is 4 KiB, not 64 KiB**: a topic made without `max_value_bytes` or
-  `ring_bytes` carries values of up to 2040 bytes, where
-  `PublisherPolicy::default()` carried 32760.
+- `rsbinder-topic`: `recv_async` and `recv_sample_async` of a `Subscriber` or a
+  `NamedSubscriber`, with `Wake::Futex`, wait on the same threads, so their
+  waits no longer queue behind each other on a full blocking pool, and they no
+  longer need a Tokio runtime (they panicked outside one). `RecvError::Runtime`
+  now means no thread could be started for the wait, or the reactor refused the
+  fd.
 
 - `try_get_interface_async`, `check_interface_async`,
   `wait_for_interface_async`, `get_interface_async` and `connect_async`
@@ -79,15 +151,16 @@ This changelog starts at 0.9.0. For earlier releases, see the
   proxy does: called while handling a transaction, the work runs inline
   before the call returns, so a future made in a handler and then
   `tokio::spawn`ed no longer leaves the handler's transaction chain. Called
-  elsewhere, the first poll decides for the polling thread, as before. They
-  are now `fn`s returning `impl Future + Send + 'static`, so the future no
-  longer borrows `name`.
+  elsewhere, the first poll decides for the polling thread, as before, but
+  `connect_async` on a kernel endpoint initializes `ProcessState` and starts
+  the binder thread pool at the call. They are now `fn`s returning
+  `impl Future + Send + 'static`, so the future no longer borrows `name`.
 - `TokioRuntime::block_on` steps out with `block_in_place` from any runtime
   context, not only a multi-threaded one. A handler driven on a
   current-thread handle can now call a second local async service through
   its sync handle, which panicked before. A call from a current-thread
-  runtime's own `Runtime::block_on` body still panics, now with
-  `block_in_place`'s message.
+  runtime's own `Runtime::block_on` body or within a `LocalSet` still panics,
+  with `block_in_place`'s message.
 
 ### Fixed
 
@@ -96,11 +169,12 @@ This changelog starts at 0.9.0. For earlier releases, see the
   full pool: the ring path gives the record up at once, the RPC path sends
   the batch from the dropping thread. `end` past its deadline on the ring,
   and the sync `send`/`flush`/`end` on RPC, take the same route.
-- An awaited ring `send_async` whose record failed counts it as reported,
-  not lost, as a failed sync `send` does, so a later `end` sends the
-  caller's end rather than an `EX_ILLEGAL_STATE` naming that item.
-- `Reconnecting::current`, `connected` and `with`, finding that an
-  unwatched RPC peer has closed, end its session on the session's reaper
+- An awaited ring `send_async` whose record failed other than by timing out
+  counts it as reported, not lost, as a failed sync `send` does, so a later
+  `end` sends the caller's end rather than an `EX_ILLEGAL_STATE` naming that
+  item.
+- `Reconnecting::current`, `connected`, `wait_connected` and `with`, finding
+  that an unwatched RPC peer has closed, end its session on the session's reaper
   thread instead of the calling one, so a poll of `connected` no longer
   runs the transport shutdown (for TLS, a wait for a concurrent send),
   death recipients or the drops of local objects the peer held.
@@ -112,7 +186,7 @@ This changelog starts at 0.9.0. For earlier releases, see the
   to a publisher it read before returns that publisher's newest value at once,
   unless it is the value the earlier connection returned last. It started at
   `Start::Next` instead, so a value published while the name was elsewhere
-  was not returned until the next publish.
+  was never returned, and the subscriber got nothing until the next publish.
 
 ## [0.13.0]
 

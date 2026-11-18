@@ -40,11 +40,11 @@ use crate::{wake, Bytes, Payload, PublishError, PublisherStats, TopicKind};
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
 ///
-/// A builder makes it: [`events`](Self::events). A publish never waits for a subscriber, unless
-/// the topic is [`lossless`](crate::PublisherBuilder::lossless). When the ring is full the oldest
-/// records are overwritten, and a subscriber that had not read them is told how many it lost. Any
-/// thread may publish (`publish` takes `&self`): share the publisher in an `Arc` to publish from
-/// several.
+/// A builder makes it: [`events`](Self::events) or [`state`](Self::state). A publish never waits
+/// for a subscriber, unless the topic is [`lossless`](crate::PublisherBuilder::lossless). When the
+/// ring is full the oldest records are overwritten, and on an event topic a subscriber that had
+/// not read them is told how many it lost. Any thread may publish (`publish` takes `&self`): share
+/// the publisher in an `Arc` to publish from several.
 ///
 /// Subscribers reach the topic through a binder: [`as_binder`](Self::as_binder), which takes
 /// every subscription the topic has room for, or an `ITopic` of the
@@ -55,9 +55,11 @@ use crate::{wake, Bytes, Payload, PublishError, PublisherStats, TopicKind};
 /// binder, and later subscriptions are refused with [`ITopic::ERROR_CLOSED`].
 ///
 /// Dropping the publisher, like [`close`](Self::close), writes the topic's end record: a
-/// subscriber receives every record before it and then
+/// subscriber of an event topic receives every record before it, one of a state topic only the
+/// newest value it has not returned, with earlier ones skipped and not counted, and then
 /// [`Closed::End`](crate::Closed::End). A publisher whose process dies writes nothing; its
-/// subscribers learn of it through binder and read what was written before.
+/// subscribers learn of it through binder and read what was written before, as
+/// [`Closed::PublisherDied`](crate::Closed::PublisherDied) says.
 ///
 /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
 #[must_use = "dropping the publisher ends the topic at once: it writes the end record"]

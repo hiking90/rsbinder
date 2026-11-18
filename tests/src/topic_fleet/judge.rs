@@ -198,8 +198,6 @@ pub enum History {
     First,
     /// A later one, to a publisher no earlier connection was made to.
     NewPublisher,
-    /// A later one, to a publisher an earlier connection was made to.
-    Rejoined,
 }
 
 /// The seq the first record of a connection has, by `NamedSubscriber`'s rule of where a
@@ -209,7 +207,6 @@ pub fn first_seq(start: Start, history: History, at: Committed) -> u64 {
         History::First => start,
         History::NewPublisher if start == Start::Newest => Start::Newest,
         History::NewPublisher => Start::Oldest,
-        History::Rejoined => Start::Next,
     };
     match start {
         Start::Next => at.next,
@@ -510,7 +507,6 @@ mod tests {
             ),
             644
         );
-        assert_eq!(first_seq(Start::Oldest, History::Rejoined, at), 5);
         assert!(check_first(0, 0).is_ok());
         assert!(check_first(0, 5).is_err());
         assert!(check_first(4, 0).is_err());

@@ -78,8 +78,7 @@ pub fn topic_ring_for(size: usize) -> usize {
     ((depth.max(1) + 1) * record).max(4096)
 }
 
-/// `events` waiting `ms` for the topic's subscribers, `window` records ahead at most (none at 0);
-/// no wait below 0.
+/// `events` waiting `ms` (none below 0) for subscribers, at most `window` records ahead (0: none).
 fn backpressure(
     events: PublisherBuilder<Bytes, EventTopic>,
     ms: i32,

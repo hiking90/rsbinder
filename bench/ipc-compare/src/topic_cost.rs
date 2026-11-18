@@ -163,8 +163,7 @@ pub fn b6(a: &Args) {
     row("b6", "rsb-topic", &codec, n, size, 0, count, hist, note);
 }
 
-/// Time `count` publishes of `item`, or `count` receives of it, on a ring of 4 records of
-/// `max_value` bytes; whether the last received is it.
+/// Time `count` publishes or receives of `item`, 4 records in the ring; whether the last is it.
 fn cost<T: Payload + PartialEq + 'static>(
     item: T,
     receive: bool,

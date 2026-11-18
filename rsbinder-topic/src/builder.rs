@@ -18,6 +18,7 @@ use std::time::Duration;
 use rsbinder::{BinderResult, CallingContext, ExceptionCode, SIBinder, Status};
 
 use crate::backpressure::Lossless;
+use crate::pool::Loan;
 use crate::publish::{ring_for, Authorize, PoolSpec, Spec};
 use crate::resolve::{Resolver, ServiceManager};
 use crate::subscriber::Settings;
@@ -37,7 +38,7 @@ pub enum TopicKind {
     /// Each record tells of something that happened once: a subscriber reads them in order from
     /// the next one, and is told how many it lost when it falls behind
     /// ([`RecvError::Lagged`](crate::RecvError::Lagged)). [`Publisher::events`]; a publisher that
-    /// says nothing of its kind, as one of a layout before kinds, is taken as one.
+    /// sends no `TopicEndpoint.topicKind` is taken as one.
     Event,
     /// The newest record is the current value, and the ones before it are past values: a
     /// subscriber reads the current value as it subscribes, and every receive returns the newest
@@ -155,9 +156,10 @@ impl<T: Payload + 'static> Publisher<T> {
         PublisherBuilder::new()
     }
 
-    /// A builder of a state topic: one whose newest record is its current value, which every
-    /// subscriber reads as it subscribes ([`TopicKind::State`]). The last call writes the first
-    /// value, so the topic has one from before anyone can reach it.
+    /// A builder of a state topic: one whose newest record is its current value, which a
+    /// subscriber reads as it subscribes unless it chooses another [`Start`]
+    /// ([`TopicKind::State`]). The last call writes the first value, so the topic has one from
+    /// before anyone can reach it.
     ///
     /// ```no_run
     /// use rsbinder::hub;
@@ -214,16 +216,17 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
         }
     }
 
-    /// The most bytes a value encodes to, which sizes the ring. Without it the ring is the
-    /// smallest, 4 KiB, whose records carry at most 2040 bytes.
+    /// The most bytes a value encodes to, which sizes the ring. Without it the ring is sized for
+    /// values of 8 bytes: the smallest, 4 KiB, whose records carry at most 2040 bytes, unless
+    /// [`keep`](PublisherBuilder::keep) is 256 or more.
     ///
-    /// A record is at most half the ring, its payload at most `ring_bytes / 2 - 8` bytes; a
-    /// value encoded past that fails to publish with
+    /// A record is at most half the ring, its payload at most `ring_bytes / 2`, rounded down to a
+    /// multiple of 8, less 8 bytes; a value encoded past that fails to publish with
     /// [`PublishError::TooLarge`](crate::PublishError::TooLarge). The ring is one memfd the
     /// publisher allocates up front and every subscriber maps, so it is charged once, to the
     /// publisher, however many subscribers there are. A value lent from the pool
-    /// ([`lend`](Self::lend)) goes into a slot, and its ring record is 24 bytes whatever its size:
-    /// `max_value_bytes` sizes the records of [`publish`](Publisher::publish) alone.
+    /// ([`lend`](Self::lend)) goes into a slot, and its ring record is 24 bytes whatever its size,
+    /// so with a pool the ring is sized for records of 24 bytes at least.
     pub fn max_value_bytes(mut self, bytes: usize) -> Self {
         self.max_value_bytes = Some(bytes);
         self
@@ -298,6 +301,10 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
     /// are 68 MiB of the publisher's resident memory, whether or not anyone subscribes. Lower
     /// [`max_subscribers`](Self::max_subscribers) for a pool of large slots. A pool larger than
     /// 4 GiB is refused.
+    ///
+    /// Only a topic of [`Bytes`](crate::Bytes) can lend: [`Publisher::loan_slice`] is a method of
+    /// `Publisher<Bytes>`. On a topic of another payload the pool is made all the same, with its
+    /// pages written and every subscriber mapping it, and no value ever goes through it.
     pub fn lend(mut self, slot_bytes: usize) -> Self {
         self.lend = Some(slot_bytes);
         self
@@ -333,8 +340,7 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
         self
     }
 
-    /// A topic of `kind`: `depth` records of `max_value_bytes` in the ring, `lend_keep` values in
-    /// the pool.
+    /// A topic of `kind`: `depth` records of `max_value_bytes`, `lend_keep` values in the pool.
     fn spec(&self, kind: TopicKind, depth: usize, lend_keep: usize) -> BinderResult<Spec> {
         if self.lend.is_none() {
             let stray = [
@@ -348,9 +354,9 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
                 return Err(illegal(&why));
             }
         }
-        let ring_bytes = self
-            .ring_bytes
-            .unwrap_or_else(|| ring_for(self.max_value_bytes.unwrap_or(0), depth));
+        let smallest = if self.lend.is_some() { Loan::BYTES } else { 0 };
+        let value = self.max_value_bytes.unwrap_or(8).max(smallest);
+        let ring_bytes = self.ring_bytes.unwrap_or_else(|| ring_for(value, depth));
         Ok(Spec {
             kind,
             ring_bytes,
@@ -374,7 +380,9 @@ impl<T: Payload + 'static> PublisherBuilder<T, EventTopic> {
     ///
     /// The ring is `(keep + 1) × (max_value_bytes rounded up to 8, plus 8)` bytes, and no less
     /// than 4 KiB, so smaller records leave room for more. Without `max_value_bytes` the count
-    /// holds for values of up to 8 bytes only. Past 1 GiB the last call refuses the topic.
+    /// holds for values of up to 8 bytes only. With [`lend`](Self::lend), `max_value_bytes` counts
+    /// as 16 at least, the payload of a lent value's record, so the count holds for lent values
+    /// too. Past 1 GiB the last call refuses the topic.
     pub fn keep(mut self, records: usize) -> Self {
         self.keep = records;
         self
@@ -535,7 +543,7 @@ impl<T: Payload + 'static> PublisherBuilder<T, StateTopic> {
     /// a newer value. A value larger than half the ring
     /// ([`max_value_bytes`](PublisherBuilder::max_value_bytes)) does not fit a record; on a topic
     /// that lends ([`lend`](PublisherBuilder::lend)), [`build_with`](Self::build_with) writes a
-    /// first value of any size into a slot.
+    /// first value of up to a slot's bytes into a slot.
     ///
     /// The refusals of [`events`](Publisher::events)' `build`, and `EX_ILLEGAL_ARGUMENT` when
     /// `initial` does not fit a record, its message naming both sizes, or the status code of its
@@ -685,10 +693,10 @@ impl<T: Payload> SubscriberBuilder<T> {
     /// `EX_UNSUPPORTED_OPERATION` where topics cannot work (off Linux and Android, or on a kernel
     /// without `F_SEAL_FUTURE_WRITE`),
     /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
-    /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
-    /// sealed memfd of the expected layout, a ring larger than
-    /// [`max_ring_bytes`](Self::max_ring_bytes), or a pool that is not a sealed memfd of the
-    /// slots it states or is larger than [`max_pool_bytes`](Self::max_pool_bytes).
+    /// layout version, and `BadValue` for a reply it cannot use: a `topicKind` of no
+    /// [`TopicKind`], topic memory that is not a sealed memfd of the expected layout, a ring
+    /// larger than [`max_ring_bytes`](Self::max_ring_bytes), or a pool that is not a sealed memfd
+    /// of the slots it states or is larger than [`max_pool_bytes`](Self::max_pool_bytes).
     ///
     /// **The process has to run the binder thread pool**
     /// (`rsbinder::ProcessState::start_thread_pool`) for a publisher in another process: the

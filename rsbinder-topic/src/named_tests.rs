@@ -560,9 +560,7 @@ fn a_publisher_connected_to_again_returns_no_record_the_first_connection_returne
     connected_to_again(Start::Next);
 }
 
-/// As above, from a start that would return the records the first connection returned:
-/// `Newest` steps over the value returned last, which is still the newest, `Oldest` starts at
-/// `Next`.
+/// `Newest` steps over the value returned last, still the newest; `Oldest` starts at `Next`.
 #[test]
 fn a_publisher_connected_to_again_returns_no_record_whatever_the_policy_start() {
     connected_to_again(Start::Newest);
@@ -606,8 +604,7 @@ fn a_newest_start_connected_to_again_returns_the_value_published_meanwhile() {
     assert_eq!(subscriber.stats().received, 4);
 }
 
-/// A connection that returned nothing keeps the record the one before it returned last, so that
-/// a third connection does not return that record again.
+/// A connection that returned nothing keeps the record to skip for the connection after it.
 #[test]
 fn a_newest_start_connection_that_returned_nothing_keeps_the_record_to_skip() {
     let names = Names::default();
@@ -640,8 +637,7 @@ fn a_newest_start_connection_that_returned_nothing_keeps_the_record_to_skip() {
     assert_eq!(subscriber.stats().received, 3);
 }
 
-/// `Newest` connected again to a publisher that lends: the value lent meanwhile, as a sample; the
-/// value the earlier connection returned is stepped over without a pin of its slot.
+/// `Newest` connected again to a lending publisher: the value returned before is not pinned.
 #[test]
 fn a_newest_start_connected_to_again_returns_the_value_lent_meanwhile() {
     let names = Names::default();
@@ -1173,8 +1169,7 @@ impl ITopic for StateByHand {
     }
 }
 
-/// A drain of a state topic that gives up short of its end, the newest record written over at
-/// every judgment, counts what it left unread as past values and not as lost.
+/// A state topic's drain lapped at every judgment counts what it left unread as past values.
 #[test]
 fn a_state_drain_that_gives_up_short_of_its_end_reports_no_loss() {
     let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
@@ -3143,9 +3138,7 @@ fn a_state_topic_given_a_name_returns_its_value_to_a_subscriber_at_once() {
     assert_eq!(subscriber.topic_kind(), Some(crate::TopicKind::State));
 }
 
-/// `Start::Auto` is taken as each publisher's kind: a state topic seen first on a later
-/// connection starts at its newest record, an event topic connected to again at the next one,
-/// and a state topic connected to again returns no value an earlier connection returned.
+/// `Start::Auto` is taken from the kind of each publisher, on every connection to it.
 #[test]
 fn an_auto_start_follows_the_kind_of_each_publisher_the_name_moves_to() {
     use crate::TopicKind::{Event, State};
@@ -3197,8 +3190,148 @@ fn an_auto_start_follows_the_kind_of_each_publisher_the_name_moves_to() {
     assert_eq!(subscriber.stats().lost, 0);
 }
 
-/// A state topic's drain returns its newest value and ends with no `Lagged`, where an event
-/// topic's reports the records written over.
+/// `Oldest` reads a state topic as `Newest` does: back on it, the value published meanwhile.
+#[test]
+fn an_oldest_start_connected_to_a_state_topic_again_returns_the_value_published_meanwhile() {
+    let names = Names::default();
+    let first = state(&bytes(1));
+    names.give(NAME, first.as_binder());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Oldest);
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = state(&bytes(5));
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    first.publish(&bytes(3)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// The death notice of a kernel binder ends the ring's process, whatever the topic's kind.
+#[test]
+fn a_state_publisher_whose_death_notice_ran_is_forgotten() {
+    let names = Names::default();
+    let target = state(&bytes(1));
+    target.advertise_on(NAME, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    assert_eq!(subscriber.remembered(), 1);
+    let death = subscriber.connection_death().expect("a connection");
+    death.binder_died(&SIBinder::downgrade(&target.as_binder()));
+    assert!(matches!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(_)))
+    ));
+    assert_eq!(subscriber.remembered(), 0, "a dead publisher");
+}
+
+/// `Next` on a state topic comes before its kind on every connection to a publisher it read.
+#[test]
+fn a_state_subscriber_at_next_connected_again_waits_for_the_next_value() {
+    let names = Names::default();
+    let first = state(&bytes(1));
+    names.give(NAME, first.as_binder());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Next);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(2)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+    let other = state(&bytes(5));
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+
+    // Published while away: the connection starts past it.
+    first.publish(&bytes(3)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    // Away and back with no publish: nothing either.
+    names.give(NAME, other.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(4)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
+}
+
+/// A publisher new to a later connection is news to it, as far as its kind reads: its value.
+#[test]
+fn a_state_subscriber_at_next_returns_the_value_of_a_publisher_new_to_it() {
+    let names = Names::default();
+    let first = state(&bytes(1));
+    names.give(NAME, first.as_binder());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Next);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let other = state(&bytes(5));
+    other.publish(&bytes(6)).unwrap();
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// `Oldest` is the first connection's: back on a publisher it read, it starts at `Next`.
+#[test]
+fn an_event_subscriber_at_oldest_connected_again_returns_nothing_published_meanwhile() {
+    let names = Names::default();
+    let first = advertise(&names, policy());
+    first.publish(&bytes(1)).unwrap();
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Oldest);
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = policy().build().unwrap();
+    other.publish(&bytes(5)).unwrap();
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    first.publish(&bytes(2)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+}
+
+/// Two records in the new ring tell its newest from its oldest.
+#[test]
+fn an_event_subscriber_at_newest_reads_the_newest_of_a_publisher_new_to_it() {
+    let names = Names::default();
+    let _first = advertise(&names, policy());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Newest);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let other = policy().build().unwrap();
+    other.publish(&bytes(5)).unwrap();
+    other.publish(&bytes(6)).unwrap();
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// A state topic's drain returns its newest value and ends with no `Lagged`.
 #[test]
 fn a_state_publisher_replaced_after_a_lap_ends_its_drain_with_no_loss() {
     let names = Names::default();
