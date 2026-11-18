@@ -109,6 +109,19 @@ pub enum Wake {
     Fd,
 }
 
+/// The largest ring a subscriber maps unless its builder says otherwise (plan 15 field D12).
+#[cfg(target_pointer_width = "64")]
+pub(crate) const DEFAULT_MAX_RING: usize = 256 << 20;
+/// The largest ring a subscriber maps unless its builder says otherwise (plan 15 field D12).
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const DEFAULT_MAX_RING: usize = 16 << 20;
+/// The largest pool a subscriber maps unless its builder says otherwise (plan 15 field D12).
+#[cfg(target_pointer_width = "64")]
+pub(crate) const DEFAULT_MAX_POOL: usize = 1 << 30;
+/// The largest pool a subscriber maps unless its builder says otherwise (plan 15 field D12).
+#[cfg(not(target_pointer_width = "64"))]
+pub(crate) const DEFAULT_MAX_POOL: usize = 256 << 20;
+
 /// How a subscriber subscribes: the settings of a [`SubscriberBuilder`](crate::SubscriberBuilder).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Settings {
@@ -122,8 +135,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             start: Start::Auto,
-            max_ring_bytes: 16 << 20,
-            max_pool_bytes: 256 << 20,
+            max_ring_bytes: DEFAULT_MAX_RING,
+            max_pool_bytes: DEFAULT_MAX_POOL,
             wake: Wake::Futex,
         }
     }

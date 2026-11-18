@@ -543,7 +543,8 @@ waits for a slot instead.
   subscriber's process; the encoding refuses them (`BadType`,
   `FdsNotAllowed`).
 - **Bounded mappings.** The publisher sizes the ring and the pool, and a
-  subscriber maps them whole, so `SubscriberBuilder::max_ring_bytes` (16 MiB)
-  and `max_pool_bytes` (256 MiB) refuse larger ones.
+  subscriber maps them whole, so `SubscriberBuilder::max_ring_bytes` (256 MiB,
+  16 MiB on a 32-bit target) and `max_pool_bytes` (1 GiB, 256 MiB on a 32-bit
+  target) refuse larger ones.
 - **Do not copy the `.aidl`.** A topic is handed out as an `IBinder`; see
   [above](#handing-a-topic-out-from-an-interface).

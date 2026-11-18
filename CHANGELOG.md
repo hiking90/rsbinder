@@ -29,6 +29,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
 
 ### Changed
 
+- `rsbinder-topic`: on a 64-bit target a subscriber maps a ring of up to
+  256 MiB and a pool of up to 1 GiB by default, up from 16 MiB and 256 MiB,
+  which stay the defaults on a 32-bit target. `max_ring_bytes` and
+  `max_pool_bytes` still change them.
+
 - Stream `*_async` waits — a futex wait on the ring, for an item or for
   room, and on calls a credit or item wait that is bounded or may ping —
   run on rsbinder's own threads instead of the runtime's blocking pool.

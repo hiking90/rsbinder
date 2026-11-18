@@ -147,7 +147,11 @@ fn builders_are_shared_across_threads() {
     )
 ))]
 mod made {
+    use rsbinder::StatusCode;
+
     use super::*;
+    use crate::subscriber::Settings;
+    use crate::Subscriber;
 
     #[test]
     fn a_topic_has_the_ring_its_builder_worked_out() {
@@ -189,5 +193,78 @@ mod made {
                 max: 2040
             })
         );
+    }
+
+    fn refused(subscribed: rsbinder::BinderResult<Subscriber<Bytes>>) -> StatusCode {
+        subscribed
+            .map(drop)
+            .expect_err("refused")
+            .transaction_error()
+    }
+
+    #[test]
+    fn a_subscriber_maps_by_default_what_the_pointer_width_allows() {
+        let settings = Settings::default();
+        let expected = match cfg!(target_pointer_width = "64") {
+            true => (256 << 20, 1 << 30),
+            false => (16 << 20, 256 << 20),
+        };
+        assert_eq!((settings.max_ring_bytes, settings.max_pool_bytes), expected);
+    }
+
+    /// Past the limit of a 32-bit target and within that of a 64-bit one.
+    #[test]
+    fn a_ring_is_mapped_as_the_pointer_width_or_the_builder_allows() {
+        const RING: usize = 32 << 20;
+        let publisher = Publisher::<Bytes>::events()
+            .ring_bytes(RING)
+            .build()
+            .expect("a topic");
+        let topic = publisher.as_binder();
+        let builder = Subscriber::<Bytes>::builder;
+        let by_default = builder().subscribe(&topic);
+        match cfg!(target_pointer_width = "64") {
+            true => assert!(by_default.is_ok()),
+            false => assert_eq!(refused(by_default), StatusCode::BadValue),
+        }
+        assert!(builder().max_ring_bytes(RING).subscribe(&topic).is_ok());
+        let lower = builder().max_ring_bytes(RING - 8).subscribe(&topic);
+        assert_eq!(refused(lower), StatusCode::BadValue);
+    }
+
+    /// The limits themselves, with the memory they name.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[ignore = "writes over 2 GiB of memory, 1 GiB of it at once"]
+    fn a_default_subscriber_takes_rings_and_pools_up_to_its_limits() {
+        const RING: usize = 256 << 20;
+        const SLOT: usize = 256 << 20;
+        let builder = Subscriber::<Bytes>::builder;
+        let ring = |bytes| {
+            let builder = Publisher::<Bytes>::events().ring_bytes(bytes);
+            builder.build().expect("a topic")
+        };
+        assert!(builder().subscribe(&ring(RING).as_binder()).is_ok());
+        let past = ring(RING + 8);
+        let refusal = builder().subscribe(&past.as_binder());
+        assert_eq!(refused(refusal), StatusCode::BadValue);
+        let set = builder().max_ring_bytes(usize::MAX);
+        assert!(set.subscribe(&past.as_binder()).is_ok());
+        drop(past);
+
+        // One subscriber's slot, one to lend, one kept and one loan: four slots.
+        let pool = |slot_bytes| {
+            let builder = Publisher::<Bytes>::events().max_subscribers(1);
+            let builder = builder.lend(slot_bytes).lend_keep(1);
+            builder.build().expect("a topic")
+        };
+        let within = pool(SLOT - 4096);
+        assert!(builder().subscribe(&within.as_binder()).is_ok());
+        drop(within);
+        let past = pool(SLOT);
+        let refusal = builder().subscribe(&past.as_binder());
+        assert_eq!(refused(refusal), StatusCode::BadValue);
+        let set = builder().max_pool_bytes(usize::MAX);
+        assert!(set.subscribe(&past.as_binder()).is_ok());
     }
 }

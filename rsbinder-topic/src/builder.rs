@@ -644,22 +644,27 @@ impl<T: Payload> SubscriberBuilder<T> {
         self
     }
 
-    /// The largest ring this subscriber maps, in bytes. Default 16 MiB.
+    /// The largest ring this subscriber maps, in bytes. Default 256 MiB on a 64-bit target and
+    /// 16 MiB on a 32-bit one, whose address space is smaller.
     ///
     /// The publisher chooses the ring's size and the subscriber maps all of it read-only, so
-    /// this bounds the address space a publisher can make the subscriber's process give up. A
-    /// larger ring is refused with `BadValue`.
+    /// this bounds the address space a publisher can make the subscriber's process give up, and
+    /// the pages of the ring that a publisher can make it read, which count in its resident
+    /// memory. A larger ring is refused with `BadValue`, and so is one past 1 GiB, the largest a
+    /// topic has, whatever this says.
     pub fn max_ring_bytes(mut self, bytes: usize) -> Self {
         self.settings.max_ring_bytes = bytes;
         self
     }
 
-    /// The largest pool this subscriber maps, in bytes. Default 256 MiB.
+    /// The largest pool this subscriber maps, in bytes. Default 1 GiB on a 64-bit target and
+    /// 256 MiB on a 32-bit one.
     ///
     /// A publisher that lends slots ([`PublisherBuilder::lend`]) sends a pool besides the ring,
-    /// and the subscriber maps all of it read-only, so this bounds the address space it can make
-    /// the subscriber's process give up as [`max_ring_bytes`](Self::max_ring_bytes) does. A
-    /// larger pool is refused with `BadValue`.
+    /// and the subscriber maps all of it read-only, so this bounds what it can make the
+    /// subscriber's process give up as [`max_ring_bytes`](Self::max_ring_bytes) does. A larger
+    /// pool is refused with `BadValue`, and so is one past 4 GiB, the largest a topic has,
+    /// whatever this says.
     pub fn max_pool_bytes(mut self, bytes: usize) -> Self {
         self.settings.max_pool_bytes = bytes;
         self
