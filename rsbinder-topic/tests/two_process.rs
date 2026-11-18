@@ -298,8 +298,8 @@ fn without_notices(name: &str) -> bool {
         return false;
     }
     let refused = Subscriber::<Bytes>::builder().subscribe_named(name);
-    let refused = refused.err().map(|status| status.transaction_error());
-    assert_eq!(refused, Some(StatusCode::UnknownTransaction));
+    let refused = refused.err().map(|status| status.exception_code());
+    assert_eq!(refused, Some(ExceptionCode::UnsupportedOperation));
     true
 }
 
