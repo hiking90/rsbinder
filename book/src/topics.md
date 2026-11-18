@@ -129,6 +129,97 @@ how many subscriptions the topic holds. An application that wants more than a
 predicate implements `ITopic` itself and hands each admitted request to an
 `Acceptor` (see the `Acceptor` rustdoc).
 
+## Event topics and state topics
+
+The publisher says what its records are by the builder it starts, and every
+subscriber learns it as it subscribes (`topic_kind`):
+
+| | Event topic: `Publisher::events()` | State topic: `Publisher::state()` |
+|---|---|---|
+| A record is | something that happened once | the current value, until the next one |
+| The first value | none until the first publish | given to the last builder call |
+| Default start (`Start::Auto`) | `Start::Next`: what is published from now on | `Start::Newest`: the current value at once |
+| A receive returns | the next record | the newest value |
+| A subscriber that falls behind | `RecvError::Lagged(n)`, then the next record | skips to the newest value; nothing counts as lost |
+| Settings of its own | `keep`, `lend_keep`, `lossless`, `lossless_window` | none |
+
+Choose by what a subscriber that missed a record has to know. If it has to be
+told, as with button presses or log lines, the topic is an event topic. If the
+newest value says everything, as with a set point or a mode, it is a state
+topic. A subscriber that needs every transition of a state needs an event
+topic: a state topic has no way to read them all.
+
+`Start::Auto` is taken for each connection from that publisher's kind, so a
+subscriber's code does not depend on the kind. A start set with
+`SubscriberBuilder::start_at` comes first: a state topic read from `Start::Next`
+returns nothing until the next publish, and an event topic read from
+`Start::Newest` returns its newest record first. `Start::Oldest` on a state
+topic reads as `Start::Newest` does, as its receives return the newest value.
+
+A state topic always has a value. `build(&initial)` publishes the first value
+before the publisher is returned, so no subscriber finds the topic empty, by
+whichever path the binder goes out. A first value larger than a record goes
+into a slot of the pool with `build_with`:
+
+```rust,ignore
+let frame = Publisher::<Bytes>::state()
+    .lend(4 << 20)
+    .build_with(|publisher| {
+        let mut slot = publisher.loan_slice(first.len())?;
+        slot.copy_from_slice(first);
+        slot.publish()
+    })?;
+```
+
+The ring of a state topic holds two values of `max_value_bytes` besides the one
+being written, and no less than 4 KiB. A first value that does not fit, or an
+`init` that publishes nothing, makes no topic: the last call returns
+`EX_ILLEGAL_ARGUMENT`.
+
+A `NamedSubscriber` connected again to a state topic it read before returns
+the value published while it was away at once, and does not return again the
+value it already has. A publisher that ends takes its value with it: the
+subscriber gets the first value of the next publisher of the name, and a
+publisher that has to carry the value over keeps it itself.
+
+### Getting and setting a value
+
+A topic carries values one way, from the publisher to its subscribers, which
+map its memory read-only. A getter for a client that does not subscribe and a
+setter belong in the application's own interface, beside a method that hands
+the topic out:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:interface}}
+```
+
+The service decides what the value becomes and publishes it:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:service}}
+```
+
+- The setter publishes before it replies, so the caller's next receive returns
+  that value or a newer one.
+- A subscriber receives the value the service settled on, which may not be the
+  one a client asked for: here a target above 30 °C becomes 30 °C.
+- The service updates its own state and publishes under one lock. Done apart,
+  two setters that race can leave the getter with one's value and the topic
+  with the other's.
+
+A subscriber needs nothing of this. Its first receive returns the current
+value:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:watch}}
+```
+
+```text
+cargo run -p rsbinder-topic --example topic_thermostat -- serve
+cargo run -p rsbinder-topic --example topic_thermostat -- watch
+cargo run -p rsbinder-topic --example topic_thermostat -- set 23.5
+```
+
 ## Finding a topic by name
 
 `Publisher::advertise_on` registers a topic under a name, and a
@@ -412,10 +503,11 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
 
 ## Losing records, and backpressure
 
-Without backpressure a publish never waits. A subscriber that falls more than
-a ring behind gets `RecvError::Lagged(n)` for the `n` records written over and
-then the next record. `try_latest` and `recv_latest` skip to the newest
-record and report nothing skipped as lost.
+Without backpressure a publish never waits. A subscriber of an event topic that
+falls more than a ring behind gets `RecvError::Lagged(n)` for the `n` records
+written over and then the next record. `try_latest` and `recv_latest` skip to
+the newest record and report nothing skipped as lost, as every receive of a
+[state topic](#event-topics-and-state-topics) does.
 
 `PublisherBuilder::lossless(timeout)` makes a publish wait, up to `timeout`,
 for its subscribers to read what it would overwrite. Past the timeout the
