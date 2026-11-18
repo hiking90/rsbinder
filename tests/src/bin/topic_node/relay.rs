@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder::{BinderResult, Interface, Strong};
 use rsbinder_topic::registry::AllowAll;
-use rsbinder_topic::{Publisher, PublisherPolicy};
+use rsbinder_topic::Publisher;
 use tests::topic_fleet::event::Kind;
 use tests::topic_fleet::payload::{
     fleet_record, BnFleetStatus, FleetRecord, IFleetStatus, StatusReport,
@@ -73,9 +73,9 @@ pub fn relay(
     service: String,
     incarnation: Incarnation,
 ) -> Result<Running, String> {
-    let publisher: Publisher<FleetRecord> =
-        transport::advertise(&topic, &PublisherPolicy::default(), &Via::ServiceManager)
-            .map_err(|status| format!("advertise {topic}: {status}"))?;
+    let events = Publisher::<FleetRecord>::events().ring_bytes(64 << 10);
+    let publisher = transport::advertise(&topic, events.clone(), &Via::ServiceManager)
+        .map_err(|status| format!("advertise {topic}: {status}"))?;
     let relayed = Arc::new(Mutex::new(Relayed {
         publisher: Some(publisher),
         next: 0,
@@ -111,11 +111,7 @@ pub fn relay(
                     if let Some(old) = relayed.publisher.take() {
                         old.close();
                     }
-                    match transport::advertise(
-                        &topic,
-                        &PublisherPolicy::default(),
-                        &Via::ServiceManager,
-                    ) {
+                    match transport::advertise(&topic, events.clone(), &Via::ServiceManager) {
                         Ok(new) => relayed.publisher = Some(new),
                         Err(status) => out.fault(format!("advertise {topic}: {status}")),
                     }

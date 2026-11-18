@@ -16,11 +16,9 @@ pub struct PublisherStats {
     /// The subscriptions the topic holds, after taking out those that ended.
     pub subscribers: Vec<SubscriberInfo>,
     /// Subscriptions a wait for room took out
-    /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), each logged too.
+    /// ([`lossless`](crate::PublisherBuilder::lossless)), each logged too.
     pub evicted: u64,
     /// Whether the publisher holds a name now: one that
-    /// [`advertise`](crate::Publisher::advertise),
-    /// [`advertise_with`](crate::Publisher::advertise_with) or
     /// [`advertise_on`](crate::Publisher::advertise_on) gave, which
     /// [`close`](crate::Publisher::close) takes back.
     ///

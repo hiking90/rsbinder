@@ -6,9 +6,10 @@
 //!
 //! A [`NamedSubscriber`] watches its name through a [`Resolver`]. The resolver's callback only
 //! records the binder and starts a connection thread; the thread makes the subscription call
-//! (`Subscriber::request`) and hands the connection over. The receiving thread never makes the
-//! call, so a publisher that does not answer holds no receive, and dropping the subscriber does
-//! not wait for the thread: a connection the thread makes after the drop is dropped by it.
+//! (`Subscriber::request_starting`) and hands the connection over. The receiving thread never
+//! makes the call, so a publisher that does not answer holds no receive, and dropping the
+//! subscriber does not wait for the thread: a connection the thread makes after the drop is
+//! dropped by it.
 //!
 //! A notice of the watch can be lost (plan 15 §12.5): the thread also asks the watch's lookup,
 //! once when a publisher the lookup did not name refuses as ended and once when a connection's
@@ -32,12 +33,12 @@ use crate::connect::status_of;
 use crate::layout;
 use crate::poll::{Sealed, Wait};
 use crate::receive::Held;
-use crate::resolve::{Lookup, Resolved, Resolver, ServiceManager, Watch};
-use crate::subscriber::{Interrupt, RingId};
+use crate::resolve::{Lookup, Resolved, Resolver, Watch};
+use crate::subscriber::{Interrupt, RingId, Settings};
 use crate::wake::NamedFds;
 use crate::{
     Bytes, Closed, Disconnected, Interrupter, Payload, RecvError, Sample, Start, Subscriber,
-    SubscriberPolicy, SubscriberStats, Trust, Trusted, Untrusted, Wake,
+    SubscriberStats, Trust, Trusted, Untrusted, Wake,
 };
 
 /// The first wait before a refused subscription is asked again, doubled up to [`LAST_RETRY`].
@@ -80,10 +81,11 @@ pub enum NamedState {
 /// A subscriber of a topic name: it connects to the publisher the name is given to, and to the
 /// next one when that one ends or another takes the name.
 ///
-/// [`subscribe`](Self::subscribe) watches the name and returns at once, with or without a
-/// publisher. Each connection is a [`Subscriber`] made by a thread of its own, so receiving
-/// never makes a binder call. Between connections a receive waits for the next one;
-/// [`wait_connected`](Self::wait_connected) waits for one without receiving.
+/// [`SubscriberBuilder::subscribe_named`](crate::SubscriberBuilder::subscribe_named) watches the
+/// name and returns at once, with or without a publisher. Each connection is a [`Subscriber`]
+/// made by a thread of its own, so receiving never makes a binder call. Between connections a
+/// receive waits for the next one; [`wait_connected`](Self::wait_connected) waits for one
+/// without receiving.
 ///
 /// A receive returns what a [`Subscriber`]'s does, except that the end of a connection is
 /// [`RecvError::Disconnected`], returned once, after which the next receive goes on with the next
@@ -101,13 +103,12 @@ pub enum NamedState {
 ///
 /// ```no_run
 /// use rsbinder::ProcessState;
-/// use rsbinder_topic::{Bytes, NamedSubscriber, RecvError, SubscriberPolicy};
+/// use rsbinder_topic::{Bytes, RecvError, Subscriber};
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// ProcessState::init_default()?;
 /// ProcessState::start_thread_pool();
-/// let policy = SubscriberPolicy::default();
-/// let mut subscriber = NamedSubscriber::<Bytes>::subscribe("example.topic", &policy)?;
+/// let mut subscriber = Subscriber::<Bytes>::builder().subscribe_named("example.topic")?;
 /// loop {
 ///     match subscriber.recv() {
 ///         Ok(Bytes(value)) => println!("{value:?}"),
@@ -121,16 +122,16 @@ pub enum NamedState {
 ///
 /// Records do not carry over from one connection to the next: the index starts again, and what
 /// was published between the two is not counted as lost (the `Disconnected` marks the gap). The
-/// first connection starts where the policy's [`start`](SubscriberPolicy::start) says. A later
-/// connection to a publisher this subscriber was not connected to before starts at the oldest
-/// record of the new ring, unless that `start` is [`Start::Last`]: the subscription is older than
-/// that publisher, so all it published is news to it. A connection to a publisher it was
-/// connected to before, as when the name comes back to that publisher after another held it,
-/// returns no record an earlier connection to it returned. With [`Start::Last`] it starts at that
-/// publisher's newest record, which is its current value, and steps over that record when it is
-/// the one the earlier connections returned last, so that a value published while the subscriber
-/// read another publisher is returned at once. With any other `start` it starts at
-/// [`Start::Latest`]. A connection counts from the receive that takes it; one whose fd the
+/// first connection starts where the builder's [`start_at`](crate::SubscriberBuilder::start_at)
+/// says. A later connection to a publisher this subscriber was not connected to before starts at
+/// the oldest record of the new ring, unless that start is [`Start::Newest`]: the subscription
+/// is older than that publisher, so all it published is news to it. A connection to a publisher
+/// it was connected to before, as when the name comes back to that publisher after another held
+/// it, returns no record an earlier connection to it returned. With [`Start::Newest`] it starts
+/// at that publisher's newest record, which is its current value, and steps over that record
+/// when it is the one the earlier connections returned last, so that a value published while the
+/// subscriber read another publisher is returned at once. With any other start it starts at
+/// [`Start::Next`]. A connection counts from the receive that takes it; one whose fd the
 /// subscriber's epoll instance refuses ([`Disconnected::Rejected`]) does not.
 ///
 /// The subscriber remembers a publisher it was connected to by its topic's memory, which stays
@@ -181,12 +182,12 @@ pub enum NamedState {
 /// name meanwhile is seen by the next receive.
 ///
 /// `M` says whether the subscriber vouches for its publishers, as for a [`Subscriber`]: one made
-/// by [`subscribe`](Self::subscribe) is [`Untrusted`], and `unsafe`
+/// by a [`SubscriberBuilder`](crate::SubscriberBuilder) is [`Untrusted`], and `unsafe`
 /// [`trust_publisher`](NamedSubscriber::trust_publisher) makes it [`Trusted`] for every
 /// connection, those it makes later included.
 ///
-/// **With [`subscribe`](NamedSubscriber::subscribe) or any resolver whose notices come over
-/// kernel binder, the process has to run the binder thread pool**
+/// **With [`subscribe_named`](crate::SubscriberBuilder::subscribe_named) or any resolver whose
+/// notices come over kernel binder, the process has to run the binder thread pool**
 /// (`rsbinder::ProcessState::start_thread_pool`): the notice of the name is a call into it, and
 /// without the pool the subscriber never connects.
 ///
@@ -326,7 +327,7 @@ impl Drain {
 
 /// What the subscriber, the resolver's callback and the connection thread share.
 struct Named<T: Payload> {
-    policy: SubscriberPolicy,
+    policy: Settings,
     state: Mutex<State<T>>,
     /// Each change of `state` is signalled to every kind of wait: a thread's, a future's, a poll's.
     changed: Signal,
@@ -472,21 +473,10 @@ fn refusal(status: &Status) -> Refusal {
 }
 
 impl<T: Payload + 'static> NamedSubscriber<T> {
-    /// Subscribe to the topic the service manager gives `name` to, now or later.
-    ///
-    /// Returns once the name is watched (`rsbinder::hub::watch`), without waiting for a
-    /// publisher. Fails when the watch does: a name the service manager refuses, or Android
-    /// 10's service manager, which has no registration notices. `policy` is used for every
-    /// connection, but for where each connection after the first starts (see the type's
-    /// documentation).
-    pub fn subscribe(name: &str, policy: &SubscriberPolicy) -> BinderResult<Self> {
-        Self::subscribe_with(name, policy, &ServiceManager)
-    }
-
-    /// [`subscribe`](Self::subscribe) through `resolver` instead of the service manager.
-    pub fn subscribe_with(
+    /// [`SubscriberBuilder::subscribe_named_on`](crate::SubscriberBuilder::subscribe_named_on).
+    pub(crate) fn subscribe_with(
         name: &str,
-        policy: &SubscriberPolicy,
+        policy: Settings,
         resolver: &dyn Resolver,
     ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
@@ -495,7 +485,7 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             Wake::Fd => Some(NamedFds::new().map_err(StatusCode::from)?),
         };
         let named = Arc::new(Named {
-            policy: policy.clone(),
+            policy,
             state: Mutex::new(State::new()),
             changed: Signal::default(),
             fds,
@@ -572,11 +562,10 @@ impl NamedSubscriber<Bytes> {
     /// can change the bytes under a live `&[u8]`, which is undefined behavior.
     ///
     /// ```no_run
-    /// use rsbinder_topic::{Bytes, NamedSubscriber, SubscriberPolicy, Trusted};
+    /// use rsbinder_topic::{Bytes, NamedSubscriber, Subscriber, Trusted};
     ///
     /// fn checksum() -> rsbinder::BinderResult<u32> {
-    ///     let policy = SubscriberPolicy::default();
-    ///     let subscriber = NamedSubscriber::<Bytes>::subscribe("example.frames", &policy)?;
+    ///     let subscriber = Subscriber::<Bytes>::builder().subscribe_named("example.frames")?;
     ///     // SAFETY: only this system's own frame service may register the name.
     ///     let mut subscriber: NamedSubscriber<Bytes, Trusted> =
     ///         unsafe { subscriber.trust_publisher() };
@@ -1349,14 +1338,14 @@ impl<T: Payload> Named<T> {
     }
 
     /// Where a connection to the topic of `ring` starts, as [`NamedSubscriber`] documents, and
-    /// for [`Start::Last`] the record to skip.
+    /// for [`Start::Newest`] the record to skip.
     fn start_of(&self, ring: RingId) -> (Start, Option<u32>) {
         let state = self.lock();
         let start = self.policy.start;
         match state.joined.iter().find(|joined| joined.ring == ring) {
-            Some(joined) if start == Start::Last => (Start::Last, joined.last_index),
-            Some(_) => (Start::Latest, None),
-            None if state.later && start != Start::Last => (Start::Oldest, None),
+            Some(joined) if start == Start::Newest => (Start::Newest, joined.last_index),
+            Some(_) => (Start::Next, None),
+            None if state.later && start != Start::Newest => (Start::Oldest, None),
             None => (start, None),
         }
     }

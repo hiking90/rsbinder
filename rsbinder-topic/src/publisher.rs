@@ -32,20 +32,22 @@ use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::pool::LentSlot;
 use crate::pool::MAX_PINS;
+use crate::publish::{Authorize, Spec};
 use crate::publish::{PoolFd, TypedWriter};
-use crate::resolve::{Advertisement, Resolver, ServiceManager};
-use crate::{wake, Authorize, Bytes, Payload, PublishError, PublisherPolicy, PublisherStats};
+use crate::resolve::{Advertisement, Resolver};
+use crate::{wake, Bytes, Payload, PublishError, PublisherStats};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
 ///
-/// A publish never waits for a subscriber, unless the topic asks for
-/// [`backpressure`](PublisherPolicy::backpressure). When the ring is full the oldest records are
-/// overwritten, and a subscriber that had not read them is told how many it lost. Any thread may
-/// publish (`publish` takes `&self`): share the publisher in an `Arc` to publish from several.
+/// A builder makes it: [`events`](Self::events). A publish never waits for a subscriber, unless
+/// the topic is [`lossless`](crate::PublisherBuilder::lossless). When the ring is full the oldest
+/// records are overwritten, and a subscriber that had not read them is told how many it lost. Any
+/// thread may publish (`publish` takes `&self`): share the publisher in an `Arc` to publish from
+/// several.
 ///
 /// Subscribers reach the topic through a binder: [`as_binder`](Self::as_binder), which takes
-/// every subscription the [policy](PublisherPolicy) has room for, or an `ITopic` of the
+/// every subscription the topic has room for, or an `ITopic` of the
 /// application's own that checks the caller first and hands the request to an
 /// [`acceptor`](Self::acceptor). Register the binder with the service manager, or return it from
 /// a method of another interface as an `IBinder`. Neither holds the publisher: dropping the
@@ -90,24 +92,18 @@ struct Shared<T> {
 }
 
 impl<T: Payload + 'static> Publisher<T> {
-    /// Make a topic with `policy`.
-    ///
-    /// `EX_ILLEGAL_ARGUMENT` when `policy.ring_bytes` is outside 4 KiB to 1 GiB, or
-    /// `policy.pool` makes a pool larger than 4 GiB; the status's message names the check that
-    /// failed. `EX_UNSUPPORTED_OPERATION` off Linux and Android, on a target where a 64-bit word
-    /// of a read-only mapping cannot be loaded, and on a kernel without `F_SEAL_FUTURE_WRITE`.
-    /// The status code of the OS error when the memory cannot be made (`NoMemory` for `ENOMEM`).
-    pub fn new(policy: &PublisherPolicy) -> BinderResult<Self> {
-        let (fd, pool, writer) = TypedWriter::create(policy).map_err(policy_status)?;
+    /// Make a topic with `spec`: the last call of a [`PublisherBuilder`](crate::PublisherBuilder).
+    pub(crate) fn from_spec(spec: &Spec) -> BinderResult<Self> {
+        let (fd, pool, writer) = TypedWriter::create(spec).map_err(policy_status)?;
         let capacity = writer.lock().writer.capacity();
         let shared = Arc::new(Shared {
             writer,
             fd,
             pool,
             capacity,
-            max_subscribers: policy.max_subscribers,
-            max_per_uid: policy.max_per_uid,
-            authorize: policy.authorize.clone(),
+            max_subscribers: spec.max_subscribers,
+            max_per_uid: spec.max_per_uid,
+            authorize: spec.authorize.clone(),
         });
         let acceptor = Acceptor {
             topic: Arc::downgrade(&shared) as Weak<dyn Accept>,
@@ -121,41 +117,23 @@ impl<T: Payload + 'static> Publisher<T> {
         })
     }
 
-    /// Make a topic with `policy` and register its binder with the service manager under
-    /// `name`, for [`NamedSubscriber`](crate::NamedSubscriber)s of the name to find.
+    /// Give `name` to this topic through `resolver`, for
+    /// [`NamedSubscriber`](crate::NamedSubscriber)s of the name to find: the service manager
+    /// with [`ServiceManager`](crate::ServiceManager). A topic made and published to first
+    /// has what a subscriber starting at [`Start::Newest`](crate::Start::Newest) or
+    /// [`Start::Oldest`](crate::Start::Oldest) reads before anyone can find it. A call through
+    /// the resolver of a registry host that was started again gives the name again (plan 15 D8),
+    /// keeping the subscribers already connected.
     ///
-    /// The name follows the service manager's rules for a service name; a name it refuses, or a
-    /// caller it does not let add a service, fails here, as do the errors of
-    /// [`new`](Self::new). Who may subscribe is [`PublisherPolicy::authorize`].
-    ///
-    /// Dropping the publisher ends the topic but leaves the name registered until the process
-    /// ends; a subscriber that reaches it after that is refused with
-    /// [`ITopic::ERROR_CLOSED`](crate::aidl::ITopic::ERROR_CLOSED) and waits for the next
-    /// registration of the name.
-    pub fn advertise(name: &str, policy: &PublisherPolicy) -> BinderResult<Self> {
-        Self::advertise_with(name, policy, &ServiceManager)
-    }
-
-    /// [`advertise`](Self::advertise) through `resolver` instead of the service manager.
-    ///
-    /// The publisher holds the [`Advertisement`] the resolver returns and drops it in
-    /// [`close`](Self::close), or as it drops, before it writes the end record. A resolver
-    /// that takes the name back then has, by the time a subscriber reads the end, been told to.
-    pub fn advertise_with(
-        name: &str,
-        policy: &PublisherPolicy,
-        resolver: &dyn Resolver,
-    ) -> BinderResult<Self> {
-        let publisher = Self::new(policy)?;
-        publisher.advertise_on(name, resolver)?;
-        Ok(publisher)
-    }
-
-    /// Give `name` to this topic through `resolver`, after it was made: to publish what a
-    /// subscriber starting at [`Start::Last`](crate::Start::Last) or
-    /// [`Start::Oldest`](crate::Start::Oldest) reads before anyone can find the topic, or to
-    /// give the name again through the resolver of a registry host that was started again
-    /// (plan 15 D8), keeping the subscribers already connected.
+    /// The name follows the resolver's rules: for the service manager, those of a service name,
+    /// and a name it refuses, or a caller it does not let add a service, fails here. Who may
+    /// subscribe is [`PublisherBuilder::authorize`](crate::PublisherBuilder::authorize). The
+    /// publisher holds the [`Advertisement`] the resolver returns and drops it in
+    /// [`close`](Self::close), or as it drops, before it writes the end record. A resolver that
+    /// takes the name back then has, by the time a subscriber reads the end, been told to. The
+    /// service manager does not take a name back: it stays registered until the process ends,
+    /// and a subscriber that reaches it after the publisher is dropped is refused with
+    /// [`ITopic::ERROR_CLOSED`] and waits for the next registration of the name.
     ///
     /// The publisher holds one name. The advertisement it held before is dropped once the
     /// resolver has given this one, so the name moves without a gap. When `resolver` has a
@@ -299,13 +277,11 @@ impl<T: Payload + 'static> Publisher<T> {
     /// later subscriptions are refused with [`ITopic::ERROR_CLOSED`]. Closing again does
     /// nothing; dropping the publisher closes it so.
     ///
-    /// A name the publisher holds ([`advertise_with`](Self::advertise_with),
-    /// [`advertise_on`](Self::advertise_on)) is taken back first, as its resolver does it: the
-    /// service manager does not.
+    /// A name the publisher holds ([`advertise_on`](Self::advertise_on)) is taken back first, as
+    /// its resolver does it: the service manager does not.
     ///
-    /// With [`backpressure`](PublisherPolicy::backpressure) the end record waits for room as a
-    /// value does, so this call, and dropping the publisher, can take up to
-    /// [`publish_timeout`](crate::Backpressure::publish_timeout).
+    /// On a [`lossless`](crate::PublisherBuilder::lossless) topic the end record waits for room
+    /// as a value does, so this call, and dropping the publisher, can take up to its timeout.
     ///
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     pub fn close(&self) {
@@ -331,11 +307,18 @@ impl<T: Payload + 'static> Publisher<T> {
         }
     }
 
-    /// An `ITopic` binder that takes every subscription the policy has room for.
+    /// An `ITopic` binder that takes every subscription the topic has room for.
     ///
     /// The same binder every time. It refers to the publisher without keeping it.
     pub fn as_binder(&self) -> SIBinder {
         self.binder.clone()
+    }
+
+    /// Bytes of the topic's ring: what its builder worked out from
+    /// [`max_value_bytes`](crate::PublisherBuilder::max_value_bytes) and the records to keep, or
+    /// set with [`ring_bytes`](crate::PublisherBuilder::ring_bytes), rounded up to a multiple of 8.
+    pub fn ring_bytes(&self) -> usize {
+        usize::try_from(self.shared.capacity).unwrap_or(usize::MAX)
     }
 }
 
@@ -347,26 +330,26 @@ impl Publisher<Bytes> {
     /// value as it receives a [`Bytes`] published with [`publish`](Self::publish), and the two
     /// mix on one topic. Taking a loan takes the topic's lock once.
     ///
-    /// Without [`PublisherPolicy::backpressure`] nothing waits for a subscriber. With it, the
-    /// loan waits for a slot that every subscriber has read past and no [`Sample`](crate::Sample)
-    /// holds, and past the timeout takes out the subscribers furthest behind, one at a time,
-    /// until there is one; a sample that a subscriber taken out holds keeps its slot.
+    /// Unless the topic is [`lossless`](crate::PublisherBuilder::lossless) nothing waits for a
+    /// subscriber. If it is, the loan waits for a slot that every subscriber has read past and no
+    /// [`Sample`](crate::Sample) holds, and past the timeout takes out the subscribers furthest
+    /// behind, one at a time, until there is one; a sample that a subscriber taken out holds
+    /// keeps its slot.
     ///
-    /// [`PublishError::NoPool`] for a topic made without [`PublisherPolicy::pool`],
-    /// [`PublishError::TooLarge`] past [`PoolPolicy::slot_bytes`](crate::PoolPolicy::slot_bytes),
-    /// [`PublishError::TooManyLoans`] while [`PoolPolicy::max_loans`](crate::PoolPolicy::max_loans)
-    /// loans are held, [`PublishError::Closed`] once the topic is closed.
+    /// [`PublishError::NoPool`] for a topic made without
+    /// [`lend`](crate::PublisherBuilder::lend), [`PublishError::TooLarge`] past its slot's bytes,
+    /// [`PublishError::TooManyLoans`] while
+    /// [`max_loans`](crate::PublisherBuilder::max_loans) loans are held,
+    /// [`PublishError::Closed`] once the topic is closed.
     ///
     /// ```no_run
-    /// use rsbinder_topic::{Bytes, PoolPolicy, Publisher, PublisherPolicy};
+    /// use rsbinder_topic::{Bytes, Publisher};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let policy = PublisherPolicy {
-    ///     max_subscribers: 4,
-    ///     pool: Some(PoolPolicy::default()),
-    ///     ..PublisherPolicy::default()
-    /// };
-    /// let publisher = Publisher::<Bytes>::new(&policy)?;
+    /// let publisher = Publisher::<Bytes>::events()
+    ///     .max_subscribers(4)
+    ///     .lend(1 << 20)
+    ///     .build()?;
     /// let mut frame = publisher.loan_slice(640 * 480)?;
     /// frame.fill(0x80);
     /// frame.publish()?;
@@ -390,9 +373,9 @@ impl Publisher<Bytes> {
 /// that took it, and a future that holds one across an `.await` can be given to
 /// `tokio::spawn`.
 ///
-/// **The calls block.** With [`PublisherPolicy::backpressure`], [`Publisher::loan_slice`] waits
-/// for a free slot and [`publish`](Self::publish) for room in the ring, each up to
-/// [`publish_timeout`](crate::Backpressure::publish_timeout), holding the topic's lock, which
+/// **The calls block.** On a [`lossless`](crate::PublisherBuilder::lossless) topic,
+/// [`Publisher::loan_slice`] waits for a free slot and [`publish`](Self::publish) for room in the
+/// ring, each up to the topic's timeout, holding the topic's lock, which
 /// blocks the thread they run on; on an async executor, that is one of its worker threads.
 /// Dropping the loan takes the same lock, so it waits behind a call that holds it. In async code
 /// with backpressure, make these calls where blocking is allowed, as `tokio::task::spawn_blocking`
@@ -484,7 +467,7 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 /// use rsbinder_topic::aidl::ITopic::{BnTopic, ITopic};
 /// use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 /// use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
-/// use rsbinder_topic::{Acceptor, Bytes, Publisher, PublisherPolicy};
+/// use rsbinder_topic::{Acceptor, Bytes, Publisher};
 ///
 /// struct Guarded {
 ///     acceptor: Acceptor,
@@ -502,7 +485,7 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 /// }
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default())?;
+/// let publisher = Publisher::<Bytes>::events().build()?;
 /// let topic = BnTopic::new_binder(Guarded { acceptor: publisher.acceptor() });
 /// // Register `topic.as_binder()`, then publish.
 /// # Ok(()) }
@@ -520,7 +503,8 @@ pub struct Acceptor {
 impl Acceptor {
     /// Take the subscription `request` asks for, or say why not.
     ///
-    /// Refusals: `EX_SECURITY` when [`PublisherPolicy::authorize`] does not admit the caller,
+    /// Refusals: `EX_SECURITY` when the topic's
+    /// [`authorize`](crate::PublisherBuilder::authorize) does not admit the caller,
     /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
     /// request names another payload type; `UnexpectedNull` for a null `token` or `control`;
     /// `BadValue` for a token of this process that came through binder (its death would say
@@ -528,13 +512,16 @@ impl Acceptor {
     /// a `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
     /// not a unix stream socket for `WAKE_FD` or not null for `WAKE_FUTEX`, or a control page
     /// that is not a sealed memfd of the size, magic, version and pin count the request states;
-    /// [`ITopic::ERROR_FULL`] when the publisher holds as many subscriptions as its policy allows,
-    /// in all or from the caller's uid; [`ITopic::ERROR_CLOSED`] once the publisher is closed or
-    /// dropped; `DeadObject` when the caller died during the call.
+    /// [`ITopic::ERROR_FULL`] when the publisher holds as many subscriptions as its builder's
+    /// [`max_subscribers`](crate::PublisherBuilder::max_subscribers) allows in all, or
+    /// [`max_per_uid`](crate::PublisherBuilder::max_per_uid) from the caller's uid;
+    /// [`ITopic::ERROR_CLOSED`] once the publisher is closed or dropped; `DeadObject` when the
+    /// caller died during the call.
     ///
     /// A token of a third process cannot be told from the caller's own: its subscription lasts
-    /// until that process dies or the publisher does, and `max_per_uid` bounds how many a caller
-    /// holds that way.
+    /// until that process dies or the publisher does, and
+    /// [`max_per_uid`](crate::PublisherBuilder::max_per_uid) bounds how many a caller holds that
+    /// way.
     ///
     /// Call it from the handler of the subscription call, on the thread the call arrived on,
     /// with the `request` the handler was given: the uid it counts against `max_per_uid` is
@@ -573,7 +560,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             if !authorize.admits(&CallingContext::current()) {
                 return Err(Status::from((
                     ExceptionCode::Security,
-                    "the publisher's policy does not admit the caller",
+                    "the publisher's `authorize` does not admit the caller",
                 )));
             }
         }

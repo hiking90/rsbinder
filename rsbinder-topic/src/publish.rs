@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder::{CallingContext, Status, StatusCode};
 
+use crate::backpressure::Lossless;
 use crate::backpressure::{wait_for, wait_until, Room};
 use crate::layout::{self, Stored, StoredPool, MIN_RING};
 use crate::link::{Eviction, Link, Links};
@@ -20,76 +21,25 @@ use crate::payload::{relabel, Piece};
 use crate::pool::LentSlot;
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
-use crate::{end, Backpressure, Encoding, Payload, PublisherStats};
+use crate::{end, Encoding, Payload, PublisherStats};
 
-/// What a topic is made with.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublisherPolicy {
-    /// Bytes of ring, from 4 KiB to 1 GiB, rounded up to a multiple of 8. Default 64 KiB.
-    ///
-    /// The ring is one memfd the publisher allocates up front and every subscriber maps, so it
-    /// is charged once, to the publisher, however many subscribers there are. A record is at most
-    /// half the ring: the payload of one is at most `ring_bytes / 2 - 8` bytes, 32760 in the
-    /// default ring. How many records a subscriber can fall behind by before it loses some is the
-    /// ring's size over the size of a record; [`for_payload`](Self::for_payload) works the size
-    /// out from that.
-    pub ring_bytes: usize,
-    /// Subscriptions the topic holds at once. Default 64.
-    ///
-    /// The publisher maps each subscriber's control page and, after every commit, loads a word of
-    /// it, so the bound limits both the mappings a subscriber can make this process hold and the
-    /// work of a publish. One more is refused with [`ITopic::ERROR_FULL`]; subscriptions that
-    /// ended (the subscriber dropped it, or its process died) are taken out first. With 0 every
-    /// subscription is refused so, and a [`NamedSubscriber`](crate::NamedSubscriber) retries
-    /// `ERROR_FULL` for as long as it lives; to refuse callers for good, use
-    /// [`authorize`](Self::authorize), whose refusal it does not retry.
-    ///
-    /// A publish wakes the subscribers it finds waiting before it lets go of the topic's lock,
-    /// so the bound is also the longest a publish holds it and the other publishers wait. The
-    /// wake grows with the subscribers that wait: one futex wake for all those of
-    /// [`Wake::Futex`], whose kernel time grows with each one it wakes, and one `send` for each
-    /// of [`Wake::Fd`]. Measured on an x86_64 desktop (plan 15 §8.4), a publish took about
-    /// 0.25 µs with no subscriber waiting, and with 64 waiting about 0.17 ms on futex wakes and
-    /// 0.28 ms on fd wakes: about 1–3 µs and 4.5 µs for each subscriber that waits. Lower the
-    /// bound where a publish must not stall that long, raise it for more subscribers at that
-    /// cost.
-    ///
-    /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
-    /// [`Wake::Futex`]: crate::Wake::Futex
-    /// [`Wake::Fd`]: crate::Wake::Fd
-    pub max_subscribers: usize,
-    /// Subscriptions one uid holds at once, refused past it as `max_subscribers` is. Default 64,
-    /// which with the default `max_subscribers` limits nothing: lower it so that one uid allowed
-    /// to subscribe cannot take every place. With 0 every subscription is refused, as with a
-    /// `max_subscribers` of 0.
-    pub max_per_uid: usize,
-    /// Who may subscribe. Default `None`: any caller that can reach the topic's binder, which
-    /// for a topic registered with the service manager is any caller it lets find the name.
-    ///
-    /// Checked first for every subscription, from the publisher's own binder
-    /// ([`Publisher::as_binder`](crate::Publisher::as_binder)) and from an
-    /// [`Acceptor`](crate::Acceptor) alike, with the caller of the subscription call; a
-    /// refusal is `EX_SECURITY`, which a [`NamedSubscriber`](crate::NamedSubscriber) does not
-    /// retry on the same publisher. A subscriber in the publisher's process is seen with the
-    /// process's own uid and pid.
-    pub authorize: Option<Authorize>,
-    /// The pool of slots values are lent from. Default `None`: every value goes through the
-    /// ring.
-    pub pool: Option<PoolPolicy>,
-    /// Whether a publish waits for its subscribers to read what it would overwrite, and a loan
-    /// for a slot they have read past, and for how long. Default `None`: neither waits, and a
-    /// subscriber that falls more than a ring or [`depth`](PoolPolicy::depth) loans behind loses
-    /// the oldest values ([`RecvError::Lagged`](crate::RecvError::Lagged)).
-    ///
-    /// The wait holds the topic's lock and sleeps the calling thread; [`Backpressure`] says what
-    /// waits with it, and what it asks of the binder thread pools.
-    pub backpressure: Option<Backpressure>,
+/// What a topic is made with: the settings of a [`PublisherBuilder`](crate::PublisherBuilder),
+/// worked out.
+#[derive(Clone, Debug)]
+pub(crate) struct Spec {
+    /// Bytes of ring, 4 KiB to 1 GiB, rounded up to a multiple of 8 when the topic is made.
+    pub(crate) ring_bytes: usize,
+    pub(crate) max_subscribers: usize,
+    pub(crate) max_per_uid: usize,
+    pub(crate) authorize: Option<Authorize>,
+    pub(crate) pool: Option<PoolSpec>,
+    pub(crate) backpressure: Option<Lossless>,
 }
 
-impl Default for PublisherPolicy {
+impl Default for Spec {
     fn default() -> Self {
         Self {
-            ring_bytes: 64 << 10,
+            ring_bytes: MIN_RING,
             max_subscribers: 64,
             max_per_uid: 64,
             authorize: None,
@@ -99,73 +49,19 @@ impl Default for PublisherPolicy {
     }
 }
 
-/// The pool of a topic that lends slots: [`PublisherPolicy::pool`] (plan 15 §6).
-///
-/// A loaned value is written straight into a slot of a second memfd that every subscriber maps
-/// read-only, and the ring carries only a record of 24 bytes that names the slot. A subscriber
-/// pins the slot while it reads it, and the publisher never lends a pinned slot, so a value
-/// larger than a cache, which costs its size twice to copy through the ring, is written once.
-///
-/// The pool has `max_subscribers + 1 + depth + max_loans` slots of `slot_bytes` each: every
-/// subscriber pinning one still leaves a slot to lend, with `depth` values kept for subscribers
-/// that have not pinned them yet. All of its pages are written when the topic is made and stay
-/// the publisher's memory: the default `max_subscribers` of 64 with the default 1 MiB slots is
-/// 68 MiB of the publisher's resident memory, whether or not anyone subscribes. Lower
-/// `max_subscribers` for a pool of large slots. A pool larger than 4 GiB is refused.
+/// The pool of a topic that lends slots (plan 15 §6).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolPolicy {
-    /// Bytes of a slot, the largest value a loan holds, rounded up to a multiple of 64. Default
-    /// 1 MiB.
-    pub slot_bytes: usize,
-    /// The newest values published that stay readable for a subscriber behind. Default 2; 0
-    /// counts as 1.
-    ///
-    /// Each publish takes back the values older than these once its own value is readable, so a
-    /// subscriber that falls more than `depth` values behind loses the older ones, as one that
-    /// falls behind the ring does, and receives no value older than `depth` publishes.
-    /// [`Subscriber::try_latest`](crate::Subscriber::try_latest) goes on to the newer value
-    /// instead. A value a subscriber holds as a [`Sample`](crate::Sample) stays its own however
-    /// old it grows. The slot lent next is one that every subscriber has read past: the one
-    /// published second last of those, or the one published last when it is the only one; with
-    /// none, the oldest. A slot that has held no value counts as read past and as published
-    /// before every other. A busy pool thus reuses the slots still in the cache but not the one
-    /// its subscribers read last, whose lines their cores still hold. Passing that one over saves
-    /// at most what a subscriber core's private cache holds of the value, and only for a
-    /// subscriber that reads the value whole; with values from about a fifth to three-eighths of
-    /// the last-level cache upward, by how the value is read, the two slots written in turn and
-    /// the buffers copied from and into no longer stay in it, and each fill reads part of the
-    /// slot from memory instead (plan 15).
-    ///
-    /// With [`PublisherPolicy::backpressure`] no value is taken back: a loan waits instead for a
-    /// slot every subscriber has read past, and a subscriber can fall at least `depth + 1` values
-    /// behind before a loan waits for it.
-    pub depth: usize,
-    /// Loans held at once and not yet published, past which a loan is refused. Default 1; 0
-    /// counts as 1.
-    pub max_loans: usize,
-    /// Ask the kernel for transparent huge pages for the pool (`MADV_HUGEPAGE`). Default
-    /// `false`.
-    ///
-    /// Copying out of a slot then takes fewer TLB misses: on an x86_64 desktop with 4 KiB pages
-    /// otherwise, a 1 MiB value copied about 6–10 µs faster (plan 15 §8.4). The pool's resident
-    /// memory then grows in steps of 2 MiB. Where the system turns huge pages for shared memory
-    /// off (`/sys/kernel/mm/transparent_hugepage/shmem_enabled` is `never` or `deny`), it changes
-    /// nothing.
-    pub huge_pages: bool,
+pub(crate) struct PoolSpec {
+    /// Bytes of a slot, rounded up to a multiple of 64.
+    pub(crate) slot_bytes: usize,
+    /// The newest values that stay readable; 0 counts as 1.
+    pub(crate) depth: usize,
+    /// Loans held at once; 0 counts as 1.
+    pub(crate) max_loans: usize,
+    pub(crate) huge_pages: bool,
 }
 
-impl Default for PoolPolicy {
-    fn default() -> Self {
-        Self {
-            slot_bytes: 1 << 20,
-            depth: 2,
-            max_loans: 1,
-            huge_pages: false,
-        }
-    }
-}
-
-impl PoolPolicy {
+impl PoolSpec {
     /// `depth` as the pool keeps it: 0 counts as 1. The slot count and the pool read only this.
     pub(crate) fn kept(&self) -> usize {
         self.depth.max(1)
@@ -192,42 +88,19 @@ impl PoolPolicy {
 }
 
 /// A check of the caller that a topic runs before it takes a subscription:
-/// [`PublisherPolicy::authorize`].
-///
-/// ```
-/// use rsbinder_topic::{Authorize, PublisherPolicy};
-///
-/// let policy = PublisherPolicy {
-///     authorize: Some(Authorize::new(|caller| caller.uid == 1000)),
-///     ..PublisherPolicy::default()
-/// };
-/// # drop(policy);
-/// ```
-///
-/// Two values are equal when they are clones of one check.
+/// [`PublisherBuilder::authorize`](crate::PublisherBuilder::authorize).
 #[derive(Clone)]
-pub struct Authorize(Arc<dyn Fn(&CallingContext) -> bool + Send + Sync>);
+pub(crate) struct Authorize(Arc<dyn Fn(&CallingContext) -> bool + Send + Sync>);
 
 impl Authorize {
-    /// A check that admits the callers for which `admit` returns `true`. It runs on the binder
-    /// thread the subscription call arrived on, while the call waits.
-    pub fn new(admit: impl Fn(&CallingContext) -> bool + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(admit: impl Fn(&CallingContext) -> bool + Send + Sync + 'static) -> Self {
         Self(Arc::new(admit))
     }
 
-    /// Whether the check admits `caller`.
-    pub fn admits(&self, caller: &CallingContext) -> bool {
+    pub(crate) fn admits(&self, caller: &CallingContext) -> bool {
         (self.0)(caller)
     }
 }
-
-impl PartialEq for Authorize {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for Authorize {}
 
 impl fmt::Debug for Authorize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -235,22 +108,14 @@ impl fmt::Debug for Authorize {
     }
 }
 
-impl PublisherPolicy {
-    /// The default policy with a ring that keeps the newest `depth` records of up to `max_payload`
-    /// bytes each, including while the next one is being written: `(depth + 1) × (8 +
-    /// max_payload rounded up to 8)` bytes, and no less than 4 KiB. A `depth` of zero is taken as
-    /// one.
-    ///
-    /// Smaller records take less of the ring, so more of them are kept. A size above 1 GiB is
-    /// refused when the topic is made.
-    pub fn for_payload(max_payload: usize, depth: usize) -> Self {
-        let record = max_payload.div_ceil(8).saturating_mul(8).saturating_add(8);
-        let records = depth.max(1).saturating_add(1);
-        Self {
-            ring_bytes: records.saturating_mul(record).max(MIN_RING),
-            ..Self::default()
-        }
-    }
+/// Bytes of a ring that keeps the newest `depth` records of up to `max_payload` bytes each,
+/// including while the next one is being written: `(depth + 1) × (8 + max_payload rounded up to
+/// 8)`, and no less than 4 KiB. A `depth` of zero is taken as one. Saturates: a size past 1 GiB
+/// is refused when the topic is made.
+pub(crate) fn ring_for(max_payload: usize, depth: usize) -> usize {
+    let record = max_payload.div_ceil(8).saturating_mul(8).saturating_add(8);
+    let records = depth.max(1).saturating_add(1);
+    records.saturating_mul(record).max(MIN_RING)
 }
 
 /// Why a publish wrote nothing.
@@ -269,11 +134,13 @@ pub enum PublishError {
     Encode(StatusCode),
     /// The topic has been closed.
     Closed,
-    /// A loan from a topic made without a pool ([`PublisherPolicy::pool`] is `None`).
+    /// A loan from a topic made without a pool
+    /// ([`lend`](crate::PublisherBuilder::lend) was not called).
     NoPool,
-    /// As many loans as [`PoolPolicy::max_loans`] are held and not yet published or dropped.
+    /// As many loans as [`max_loans`](crate::PublisherBuilder::max_loans) are held and not yet
+    /// published or dropped.
     TooManyLoans {
-        /// The policy's bound.
+        /// The topic's bound.
         max: usize,
     },
 }
@@ -337,7 +204,7 @@ pub(crate) struct State<S> {
     pub(crate) writer: Writer<S>,
     pub(crate) links: Links,
     pub(crate) lending: Option<Lending>,
-    /// [`PublisherPolicy::backpressure`]: the wait for room; `window`, how far ahead a record goes.
+    /// [`Lossless`]: the wait for room; `window`, how far ahead a record goes.
     backpressure: Option<Duration>,
     window: Option<NonZeroUsize>,
     /// Subscriptions a wait took out, told after [`TypedWriter::unlock`] lets go; `evicted` counts.
@@ -466,29 +333,24 @@ pub(crate) struct TypedWriter<T, S> {
 }
 
 impl<T: Payload> TypedWriter<T, Stored> {
-    /// Make topic memory for `policy`, and its pool if it has one: the fds to hand to
+    /// Make topic memory for `spec`, and its pool if it has one: the fds to hand to
     /// subscribers, and the writer. `BadValue` for a pool past 4 GiB.
-    pub(crate) fn create(
-        policy: &PublisherPolicy,
-    ) -> rsbinder::fmq::Result<(OwnedFd, Option<PoolFd>, Self)> {
-        let (fd, stored) = layout::create_topic(policy.ring_bytes)?;
+    pub(crate) fn create(spec: &Spec) -> rsbinder::fmq::Result<(OwnedFd, Option<PoolFd>, Self)> {
+        let (fd, stored) = layout::create_topic(spec.ring_bytes)?;
         let writer = Self::new(Writer::new(stored));
         {
             let mut state = writer.lock();
-            state.backpressure = policy
-                .backpressure
-                .as_ref()
-                .map(|wait| wait.publish_timeout);
-            state.window = policy.backpressure.as_ref().and_then(|wait| wait.window);
+            state.backpressure = spec.backpressure.as_ref().map(|wait| wait.timeout);
+            state.window = spec.backpressure.as_ref().and_then(|wait| wait.window);
         }
-        let Some(pool) = &policy.pool else {
+        let Some(pool) = &spec.pool else {
             return Ok((fd, None, writer));
         };
         let (slots, slot_bytes) = pool
-            .shape(policy.max_subscribers)
+            .shape(spec.max_subscribers)
             .ok_or(rsbinder::fmq::Error::BadValue("pool larger than 4 GiB"))?;
         let (pool_fd, memory) = layout::create_pool(slots, slot_bytes, pool.huge_pages)?;
-        let lossless = policy.backpressure.is_some();
+        let lossless = spec.backpressure.is_some();
         writer.lock().lending = Some(Lending {
             memory,
             slots: Slots::new(slots, pool.kept(), pool.loans(), lossless),

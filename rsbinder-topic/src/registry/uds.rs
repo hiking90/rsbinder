@@ -16,8 +16,8 @@
 //!
 //! The host side is [`UdsRegistry`], which `rsb_hub --topic-socket` serves; a program of its own
 //! can serve one on any [`RpcServer`]. The client side is [`UdsResolver`], which
-//! [`Publisher::advertise_with`](crate::Publisher::advertise_with) and
-//! [`NamedSubscriber::subscribe_with`](crate::NamedSubscriber::subscribe_with) take.
+//! [`Publisher::advertise_on`](crate::Publisher::advertise_on) and
+//! [`SubscriberBuilder::subscribe_named_on`](crate::SubscriberBuilder::subscribe_named_on) take.
 //!
 //! # What differs from a kernel registry
 //!
@@ -97,7 +97,7 @@ use crate::named::{FIRST_RETRY, LAST_RETRY};
 use crate::registry::TopicListing;
 use crate::resolve::{Advertisement, OnResolved, Resolved, Resolver, Watch};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
-use crate::{Payload, Subscriber, SubscriberPolicy};
+use crate::{Payload, Subscriber, SubscriberBuilder};
 
 /// The directory a [`UdsRegistry`] makes its sockets in, held by a descriptor.
 ///
@@ -1141,15 +1141,15 @@ impl UdsResolver {
 
     /// A subscription to the topic `name` has now: `NameNotFound` when it has none, or the host's
     /// policy does not let this process subscribe to it. It holds a session of its own and goes
-    /// on after this resolver drops.
+    /// on after this resolver drops. `builder`'s settings are those of the subscription.
     pub fn subscribe<T: Payload>(
         &self,
         name: &str,
-        policy: &SubscriberPolicy,
+        builder: SubscriberBuilder<T>,
     ) -> BinderResult<Subscriber<T>> {
         let (address, _) = parts(self.host.registry.r#lookup(name)?);
         let address = address.ok_or(StatusCode::NameNotFound)?;
-        uds::subscribe_with(Endpoint::Fd(address), policy, &self.host.publisher)
+        builder.connect_with(Endpoint::Fd(address), &self.host.publisher)
     }
 
     /// A watch the host knows nothing of: a test tells it of a notice with `heard`.

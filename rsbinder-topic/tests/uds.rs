@@ -21,10 +21,7 @@ use common::{eventually, say, wait_for_eof, Peer, NAME, ROLE, WAIT};
 use rsbinder::rpc::{PeerIdentity, RpcClientConfig, RpcServer, RpcServerHandle, RpcSession};
 use rsbinder::StatusCode;
 use rsbinder_topic::uds::{self, Endpoint, Options};
-use rsbinder_topic::{
-    wait_any, Backpressure, Bytes, Closed, Publisher, PublisherPolicy, RecvError, Subscriber,
-    SubscriberPolicy, Wait, Wake,
-};
+use rsbinder_topic::{wait_any, Bytes, Closed, Publisher, RecvError, Subscriber, Wait, Wake};
 
 fn path(tag: &str) -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -73,7 +70,10 @@ fn serve(publisher: &Publisher<Bytes>, tag: &str) -> (PathBuf, RpcServerHandle) 
 }
 
 fn publish(tag: &str) -> (PathBuf, Publisher<Bytes>, RpcServerHandle) {
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = Publisher::<Bytes>::events()
+        .ring_bytes(64 << 10)
+        .build()
+        .unwrap();
     let (path, handle) = serve(&publisher, tag);
     (path, publisher, handle)
 }
@@ -84,7 +84,7 @@ fn to_str(path: &std::path::Path) -> &str {
 
 fn subscribe(path: &std::path::Path) -> Subscriber<Bytes> {
     let endpoint = Endpoint::Path(path.to_owned());
-    uds::subscribe(endpoint, &SubscriberPolicy::default()).unwrap()
+    Subscriber::builder().connect(endpoint).unwrap()
 }
 
 /// Receive until the topic ends: the values, and how it ended.
@@ -197,7 +197,9 @@ fn a_publisher_that_closes_and_exits_ends_with_its_end_record() {
     let status = peer.child.wait().unwrap();
     assert!(status.success(), "{status}");
     assert!(
-        uds::subscribe::<Bytes>(Endpoint::Path(path), &SubscriberPolicy::default()).is_err(),
+        Subscriber::<Bytes>::builder()
+            .connect(Endpoint::Path(path))
+            .is_err(),
         "the path of a publisher that exited takes no connection"
     );
 }
@@ -206,12 +208,11 @@ fn sleepers_learn_within_a_second(wake: Wake) {
     let path = path("sleep");
     let mut peer = Peer::spawn("publish", to_str(&path));
     assert_eq!(peer.says(), "ready");
-    let policy = SubscriberPolicy {
-        wake,
-        ..SubscriberPolicy::default()
-    };
     let endpoint = Endpoint::Path(path);
-    let mut subscriber = uds::subscribe::<Bytes>(endpoint, &policy).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .wake(wake)
+        .connect(endpoint)
+        .unwrap();
     let sleeping = std::thread::spawn(move || {
         let ended = subscriber.recv_timeout(WAIT);
         (ended, Instant::now())
@@ -242,12 +243,9 @@ fn fd_subscribers_wait_on_one_thread_and_learn_of_a_death() {
     let peer_b = Peer::spawn("publish", to_str(&path_b));
     assert_eq!(peer_a.says(), "ready");
     assert_eq!(peer_b.says(), "ready");
-    let policy = SubscriberPolicy {
-        wake: Wake::Fd,
-        ..SubscriberPolicy::default()
-    };
-    let mut a = uds::subscribe::<Bytes>(Endpoint::Path(path_a), &policy).unwrap();
-    let mut b = uds::subscribe::<Bytes>(Endpoint::Path(path_b), &policy).unwrap();
+    let builder = Subscriber::<Bytes>::builder().wake(Wake::Fd);
+    let mut a = builder.clone().connect(Endpoint::Path(path_a)).unwrap();
+    let mut b = builder.connect(Endpoint::Path(path_b)).unwrap();
     peer_a.kill();
     assert!(wait_any(&mut [&mut a as &mut dyn Wait, &mut b], Some(WAIT)).unwrap());
     assert_eq!(a.try_recv(), Err(RecvError::Closed(Closed::PublisherDied)));
@@ -265,11 +263,8 @@ fn a_stopped_publisher_is_given_up_on_at_the_timeout() {
         timeout: Some(Duration::from_millis(200)),
         ..Options::default()
     };
-    let refused = uds::subscribe_with::<Bytes>(
-        Endpoint::Path(path.clone()),
-        &SubscriberPolicy::default(),
-        &options,
-    );
+    let refused =
+        Subscriber::<Bytes>::builder().connect_with(Endpoint::Path(path.clone()), &options);
     assert_eq!(
         refused.err().map(|status| status.transaction_error()),
         Some(StatusCode::TimedOut)
@@ -287,9 +282,9 @@ fn a_publisher_stopped_after_the_setup_is_not_a_death() {
         timeout: Some(Duration::from_millis(100)),
         ..Options::default()
     };
-    let mut subscriber =
-        uds::subscribe_with::<Bytes>(Endpoint::Path(path), &SubscriberPolicy::default(), &options)
-            .unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .connect_with(Endpoint::Path(path), &options)
+        .unwrap();
     let stopped = peer.stop();
     assert_eq!(
         subscriber.recv_timeout(Duration::from_millis(400)),
@@ -305,15 +300,11 @@ fn a_publisher_stopped_after_the_setup_is_not_a_death() {
 
 #[test]
 fn a_subscriber_stopped_past_the_timeout_is_taken_out_and_told() {
-    let policy = PublisherPolicy {
-        backpressure: Some(Backpressure {
-            publish_timeout: Duration::from_millis(100),
-            ..Backpressure::default()
-        }),
-        ring_bytes: 4096,
-        ..PublisherPolicy::default()
-    };
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let publisher = Publisher::<Bytes>::events()
+        .lossless(Duration::from_millis(100))
+        .ring_bytes(4096)
+        .build()
+        .unwrap();
     let (path, _handle) = serve(&publisher, "evict");
     let mut peer = Peer::spawn("subscribe-idle", to_str(&path));
     assert_eq!(peer.says(), "subscribed");
@@ -355,11 +346,11 @@ fn a_subscriber_sees_the_process_that_listens() {
 fn child() {
     let path = PathBuf::from(std::env::var(NAME).unwrap());
     let endpoint = || Endpoint::Path(path.clone());
-    let policy = SubscriberPolicy::default();
+    let builder = Subscriber::<Bytes>::builder();
     let lines = || std::io::stdin().lock().lines().map_while(Result::ok);
     match std::env::var(ROLE).unwrap().as_str() {
         "subscribe" => {
-            let subscriber = uds::subscribe::<Bytes>(endpoint(), &policy).unwrap();
+            let subscriber = builder.clone().connect(endpoint()).unwrap();
             say("subscribed");
             if lines().next().as_deref() == Some("drop") {
                 drop(subscriber);
@@ -368,7 +359,7 @@ fn child() {
             wait_for_eof();
         }
         "subscribe-idle" => {
-            let mut subscriber = uds::subscribe::<Bytes>(endpoint(), &policy).unwrap();
+            let mut subscriber = builder.clone().connect(endpoint()).unwrap();
             say("subscribed");
             for line in lines() {
                 match line.as_str() {
@@ -395,11 +386,14 @@ fn child() {
         "subscribe-loop" => {
             say("looping");
             loop {
-                let _ = uds::subscribe::<Bytes>(endpoint(), &policy);
+                let _ = builder.clone().connect(endpoint());
             }
         }
         "publish" => {
-            let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+            let publisher = Publisher::<Bytes>::events()
+                .ring_bytes(64 << 10)
+                .build()
+                .unwrap();
             let server = RpcServer::setup_unix_server(&path).unwrap();
             let handle = uds::serve(&server, publisher.as_binder()).unwrap();
             say("ready");

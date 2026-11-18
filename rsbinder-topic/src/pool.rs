@@ -6,11 +6,11 @@
 //!
 //! # The pool
 //!
-//! A topic made with [`PoolPolicy`](crate::PoolPolicy) has a second memfd besides topic memory:
-//! a fixed number of slots of a fixed size, and one 64-bit generation per slot (`layout.rs` has
-//! the bytes). Only the publisher writes it; subscribers map it read-only. A loaned value is
-//! written into a slot, and the ring carries a `LOAN` record that names the slot, the length and
-//! the generation the slot had when it was published.
+//! A topic made with [`lend`](crate::PublisherBuilder::lend) has a second memfd besides topic
+//! memory: a fixed number of slots of a fixed size, and one 64-bit generation per slot
+//! (`layout.rs` has the bytes). Only the publisher writes it; subscribers map it read-only. A
+//! loaned value is written into a slot, and the ring carries a `LOAN` record that names the slot,
+//! the length and the generation the slot had when it was published.
 //!
 //! # Generations
 //!
@@ -183,7 +183,7 @@ pub(crate) trait Pin {
 /// Why a loan was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LendError {
-    /// As many loans as the policy allows are held and not published.
+    /// As many loans as `max_loans` allows are held and not published.
     TooMany,
     /// Every slot not lent is pinned, which is more pins than the pool was made for, or, in a
     /// lossless pool, pinned or not read past yet, which a wait for room waits out.

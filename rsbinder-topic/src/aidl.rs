@@ -7,9 +7,9 @@
 //! it does to decide who may subscribe: its `subscribe` checks the caller
 //! (`rsbinder::CallingContext`) and hands the request to an [`Acceptor`](crate::Acceptor). Its
 //! `.aidl` does not import this package: a method that offers a topic returns `IBinder`, and the
-//! subscriber passes that binder to [`Subscriber::request`](crate::Subscriber::request). Copying
-//! these files into another crate's AIDL build makes types of the same names that this crate does
-//! not take.
+//! subscriber passes that binder to
+//! [`SubscriberBuilder::subscribe`](crate::SubscriberBuilder::subscribe). Copying these files into
+//! another crate's AIDL build makes types of the same names that this crate does not take.
 //!
 //! [`ITopicRegistry`](ITopicRegistry::ITopicRegistry) is the interface of a registry of topic
 //! names, which [`registry::Registry`](crate::registry::Registry) serves and

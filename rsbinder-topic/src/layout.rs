@@ -59,8 +59,7 @@
 //!
 //! # Pool memory
 //!
-//! A publisher whose policy has a pool makes one per topic and every subscriber maps it
-//! (`pool.rs`).
+//! A publisher made with `lend` makes one per topic and every subscriber maps it (`pool.rs`).
 //!
 //! | offset | size | word |
 //! |---|---|---|

@@ -36,6 +36,30 @@ This changelog starts at 0.9.0. For earlier releases, see the
   behind each other on a full blocking pool, and they no longer need a
   Tokio runtime (they panicked outside one). `RecvError::Runtime` now means
   no thread could be started for the wait, or the reactor refused the fd.
+- **`rsbinder-topic` (breaking): both ends are made by a builder.**
+  `PublisherPolicy`, `PoolPolicy`, `Backpressure`, `Authorize`,
+  `SubscriberPolicy`, `Publisher::new`, `advertise`, `advertise_with`,
+  `Subscriber::request`, `NamedSubscriber::subscribe`/`subscribe_with` and
+  `uds::subscribe`/`subscribe_with` are gone, with no alias.
+  `Publisher::<T>::events()` returns a `PublisherBuilder<T, EventTopic>`
+  that sizes the ring from `max_value_bytes` and `keep`
+  (`(keep + 1) × (max_value_bytes rounded up to 8, plus 8)`, at least 4 KiB;
+  `ring_bytes` sets it directly and `Publisher::ring_bytes` reads it back),
+  and takes `max_subscribers`, `max_per_uid`, `authorize`, `lend` (with
+  `max_loans`, `lend_keep`, `lend_huge_pages`), `lossless(timeout)` and
+  `lossless_window(timeout, window)`; `build()` makes the topic. A pool
+  setting without `lend` is refused with `EX_ILLEGAL_ARGUMENT`.
+  `Subscriber::<T>::builder()` takes `start_at`, `wake`, `max_ring_bytes` and
+  `max_pool_bytes`, and subscribes in its last call: `subscribe(&binder)`,
+  `subscribe_named(name)`, `subscribe_named_on(name, &resolver)`, and with
+  `uds` `connect(endpoint)` and `connect_with(endpoint, &options)`.
+  `Start::Latest` and `Start::Last` are now `Start::Next` and
+  `Start::Newest`; `Start::Oldest` is unchanged.
+  `UdsResolver::subscribe` takes a `SubscriberBuilder` in place of the
+  policy. A name is given with `advertise_on` after `build`. **The default
+  ring is 4 KiB, not 64 KiB**: a topic made without `max_value_bytes` or
+  `ring_bytes` carries values of up to 2040 bytes, where
+  `PublisherPolicy::default()` carried 32760.
 
 - `try_get_interface_async`, `check_interface_async`,
   `wait_for_interface_async`, `get_interface_async` and `connect_async`
@@ -72,6 +96,11 @@ This changelog starts at 0.9.0. For earlier releases, see the
   a transaction, as `wait_connected` does; only a wait is `WouldBlock`.
 - `#[rsbinder::interface]`: an argument type with `&` inside a fixed-array
   length expression no longer breaks the async half of the expansion.
+- `rsbinder-topic`: a `NamedSubscriber` with `Start::Newest` connected again
+  to a publisher it read before returns that publisher's newest value at once,
+  unless it is the value the earlier connection returned last. It started at
+  `Start::Next` instead, so a value published while the name was elsewhere
+  was not returned until the next publish.
 
 ## [0.13.0]
 

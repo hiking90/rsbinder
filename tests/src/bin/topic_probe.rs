@@ -15,7 +15,7 @@
 //!   flood:NAME:N             N advertises of NAME, each a new topic that refuses subscribers
 //!   fill:PREFIX:N            one such advertise of each of PREFIX0 .. PREFIX<N-1>
 //!   watchmany:PREFIX:N       a watch of each of PREFIX0 .. PREFIX<N-1>, told nothing
-//!   subscribe:NAME           a NamedSubscriber (`Start::Last`), a `GOT` line per new value
+//!   subscribe:NAME           a NamedSubscriber (`Start::Newest`), a `GOT` line per new value
 //!   addreserved              addService of the registry's own name
 //!   capture:NAME             advertise NAME as a topic that keeps the first subscriber's token
 //!   relay:CALL:TARGET        hand the kept token to the hub under TARGET: CALL is `add`
@@ -58,10 +58,7 @@ use rsbinder_topic::aidl::ITopicWatcher::ITopicWatcher;
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
 use rsbinder_topic::registry::RegistryResolver;
-use rsbinder_topic::{
-    Bytes, NamedSubscriber, Publisher, PublisherPolicy, RecvError, Resolver, Start,
-    SubscriberPolicy,
-};
+use rsbinder_topic::{Bytes, Publisher, RecvError, Resolver, Start, Subscriber};
 
 /// A topic that refuses every subscriber as ended: the many advertises of a flood make no ring.
 struct Ended;
@@ -219,11 +216,9 @@ fn resolver() -> BinderResult<RegistryResolver> {
 }
 
 fn subscribe(name: &str, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
-    let policy = SubscriberPolicy {
-        start: Start::Last,
-        ..SubscriberPolicy::default()
-    };
-    let mut subscriber = NamedSubscriber::<Bytes>::subscribe_with(name, &policy, &resolver()?)?;
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .start_at(Start::Newest)
+        .subscribe_named_on(name, &resolver()?)?;
     let name = name.to_owned();
     kept.push(Box::new(std::thread::spawn(move || {
         let mut last = None;
@@ -245,8 +240,8 @@ fn subscribe(name: &str, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
 }
 
 fn publish(name: &str, value: &str, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
-    let publisher =
-        Publisher::<Bytes>::advertise_with(name, &PublisherPolicy::default(), &resolver()?)?;
+    let publisher = Publisher::<Bytes>::events().ring_bytes(64 << 10).build()?;
+    publisher.advertise_on(name, &resolver()?)?;
     let value = Bytes(value.as_bytes().to_vec());
     kept.push(Box::new(std::thread::spawn(move || loop {
         let _ = publisher.publish(&value);

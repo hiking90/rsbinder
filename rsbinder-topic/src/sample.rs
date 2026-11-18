@@ -17,13 +17,13 @@ use crate::{Trust, Trusted, Untrusted};
 /// A value the publisher lent ([`Publisher::loan_slice`](crate::Publisher::loan_slice)) stays in
 /// its slot of the topic's pool, which the sample pins: the publisher lends no pinned slot, and
 /// dropping the sample lets go. The subscriber reports a lent value read only then, so a
-/// publisher with [`Backpressure`](crate::Backpressure) that waits for it waits for the drop. A
-/// value that came through the ring is in the subscriber's buffer. Either way the sample borrows
-/// the subscriber, so it holds one at a time.
+/// [`lossless`](crate::PublisherBuilder::lossless) publisher that waits for it waits for the
+/// drop. A value that came through the ring is in the subscriber's buffer. Either way the sample
+/// borrows the subscriber, so it holds one at a time.
 ///
 /// How a lent value is read depends on whether the subscriber vouches for its publisher, `M`:
 ///
-/// - [`Untrusted`], the subscriber [`Subscriber::request`](crate::Subscriber::request) makes:
+/// - [`Untrusted`], the subscriber [`Subscriber::builder`](crate::Subscriber::builder) makes:
 ///   [`copy_to`](Self::copy_to) and [`to_owned`](Self::to_owned) copy the value out with atomic
 ///   loads, so a publisher that does not keep the pin protocol and writes the slot meanwhile
 ///   makes the copy wrong, and nothing worse. `unsafe` [`as_slice`](Self::as_slice) reads it in

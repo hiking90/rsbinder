@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::thread;
 
 use rsbinder::{Deserialize, Parcel, ParcelableMetadata, Result, Serialize};
-use rsbinder_topic::{Bytes, Encoding, Payload, Publisher, PublisherPolicy, Record, RecvError};
-use rsbinder_topic::{Subscriber, SubscriberPolicy, Wake};
+use rsbinder_topic::{Bytes, Encoding, Payload, Publisher, Record, RecvError};
+use rsbinder_topic::{Subscriber, Wake};
 
 use crate::common::*;
 
@@ -94,20 +94,20 @@ pub fn b5(a: &Args) {
     let count = a.num("count", 5000);
     let warmup = count / 10;
     pin(a.num("producer-cpu", 1) as usize);
-    let policy = PublisherPolicy {
-        max_subscribers: n.max(1),
-        max_per_uid: n.max(1),
-        ..PublisherPolicy::for_payload(64, 64)
-    };
-    let publisher = Arc::new(Publisher::<Bytes>::new(&policy).expect("a publisher"));
-    let subscribing = SubscriberPolicy {
-        wake,
-        ..SubscriberPolicy::default()
-    };
+    let publisher = Publisher::<Bytes>::events()
+        .max_value_bytes(64)
+        .keep(64)
+        .max_subscribers(n.max(1))
+        .max_per_uid(n.max(1))
+        .build();
+    let publisher = Arc::new(publisher.expect("a publisher"));
+    let subscribing = Subscriber::<Bytes>::builder().wake(wake);
     let receiving: Vec<_> = (0..n)
         .map(|_| {
-            let mut subscriber =
-                Subscriber::<Bytes>::request(&publisher.as_binder(), &subscribing).expect("a subscription");
+            let mut subscriber = subscribing
+                .clone()
+                .subscribe(&publisher.as_binder())
+                .expect("a subscription");
             thread::spawn(move || loop {
                 match subscriber.recv() {
                     Ok(_) | Err(RecvError::Lagged(_)) => {}
@@ -150,30 +150,36 @@ pub fn b6(a: &Args) {
     let count = a.num("count", (1u64 << 30) / (size as u64).max(64)).clamp(10_000, 200_000);
     pin(a.num("producer-cpu", 1) as usize);
     let receive = a.str("side", "publish") == "receive";
-    let policy = PublisherPolicy::for_payload(size + 8, 4);
+    let max_value = size + 8;
     let value = vec![7u8; size];
     let mut hist = histogram();
     let checked = match codec.as_str() {
-        "alloc" => cost(AllocBlob(Blob(value.clone())), receive, &policy, count, &mut hist),
-        "bytes" => cost(Bytes(value.clone()), receive, &policy, count, &mut hist),
-        _ => cost(Blob(value.clone()), receive, &policy, count, &mut hist),
+        "alloc" => cost(AllocBlob(Blob(value.clone())), receive, max_value, count, &mut hist),
+        "bytes" => cost(Bytes(value.clone()), receive, max_value, count, &mut hist),
+        _ => cost(Blob(value.clone()), receive, max_value, count, &mut hist),
     };
     let (side, n) = if receive { ("receive", 1) } else { ("publish", 0) };
     let note = format!("{side}; received what was published: {checked}");
     row("b6", "rsb-topic", &codec, n, size, 0, count, hist, note);
 }
 
-/// Time `count` publishes of `item`, or `count` receives of it; whether the last received is it.
+/// Time `count` publishes of `item`, or `count` receives of it, on a ring of 4 records of
+/// `max_value` bytes; whether the last received is it.
 fn cost<T: Payload + PartialEq + 'static>(
     item: T,
     receive: bool,
-    policy: &PublisherPolicy,
+    max_value: usize,
     count: u64,
     hist: &mut hdrhistogram::Histogram<u64>,
 ) -> bool {
-    let publisher = Publisher::<T>::new(policy).expect("a publisher");
+    let publisher = Publisher::<T>::events()
+        .max_value_bytes(max_value)
+        .keep(4)
+        .build()
+        .expect("a publisher");
     let mut subscriber = receive.then(|| {
-        Subscriber::<T>::request(&publisher.as_binder(), &SubscriberPolicy::default())
+        Subscriber::<T>::builder()
+            .subscribe(&publisher.as_binder())
             .expect("a subscription")
     });
     let mut same = true;

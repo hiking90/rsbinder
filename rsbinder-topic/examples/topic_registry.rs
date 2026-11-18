@@ -23,9 +23,7 @@ use std::time::Duration;
 
 use rsbinder::ProcessState;
 use rsbinder_topic::registry::RegistryResolver;
-use rsbinder_topic::{
-    Bytes, NamedSubscriber, Publisher, PublisherPolicy, RecvError, SubscriberPolicy,
-};
+use rsbinder_topic::{Bytes, Publisher, RecvError, Subscriber};
 
 const NAME: &str = "example.topic.counter";
 
@@ -45,8 +43,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ANCHOR: advertise
 fn publish(registry: &RegistryResolver) -> Result<(), Box<dyn std::error::Error>> {
-    let publisher =
-        Publisher::<Bytes>::advertise_with(NAME, &PublisherPolicy::default(), registry)?;
+    let publisher = Publisher::<Bytes>::events().build()?;
+    publisher.advertise_on(NAME, registry)?;
     for n in 0..50u32 {
         publisher.publish(&Bytes(n.to_le_bytes().to_vec()))?;
         std::thread::sleep(Duration::from_millis(100));
@@ -58,8 +56,7 @@ fn publish(registry: &RegistryResolver) -> Result<(), Box<dyn std::error::Error>
 
 // ANCHOR: subscribe
 fn subscribe(registry: &RegistryResolver) -> Result<(), Box<dyn std::error::Error>> {
-    let policy = SubscriberPolicy::default();
-    let mut subscriber = NamedSubscriber::<Bytes>::subscribe_with(NAME, &policy, registry)?;
+    let mut subscriber = Subscriber::<Bytes>::builder().subscribe_named_on(NAME, registry)?;
     loop {
         match subscriber.recv() {
             Ok(Bytes(value)) => println!("{value:?}"),

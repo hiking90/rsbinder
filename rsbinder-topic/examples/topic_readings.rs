@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use rsbinder::{hub, ProcessState};
-use rsbinder_topic::{Closed, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy};
+use rsbinder_topic::{Closed, Publisher, RecvError, Subscriber};
 
 // ANCHOR: payload
 #[derive(rsbinder::Parcelable, Debug, Default)]
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ANCHOR: publish
 fn publish() -> Result<(), Box<dyn std::error::Error>> {
-    let publisher = Publisher::<Reading>::new(&PublisherPolicy::default())?;
+    let publisher = Publisher::<Reading>::events().build()?;
     hub::add_service(NAME, publisher.as_binder())?;
     for seq in 0..100 {
         let celsius = 20.0 + (seq % 10) as f64 / 10.0;
@@ -56,7 +56,7 @@ fn publish() -> Result<(), Box<dyn std::error::Error>> {
 // ANCHOR: subscribe
 fn subscribe() -> Result<(), Box<dyn std::error::Error>> {
     let topic = hub::check_service(NAME).ok_or("no publisher has registered the topic")?;
-    let mut subscriber = Subscriber::<Reading>::request(&topic, &SubscriberPolicy::default())?;
+    let mut subscriber = Subscriber::<Reading>::builder().subscribe(&topic)?;
     loop {
         match subscriber.recv() {
             Ok(reading) => println!("{reading:?}"),

@@ -3,9 +3,9 @@
 
 //! The receiving end of a topic (plan 15 §5.1a, §5.4a, §5.5, §5.8).
 //!
-//! [`Subscriber::request`] takes the steps SUB1–SUB8 of the plan: it checks the binder, makes
-//! the control page and the token, links to the publisher's death, makes the call, checks the
-//! reply, maps the topic memory and sets the read position. From the call on, every way out
+//! [`Subscriber::request_starting`] takes the steps SUB1–SUB8 of the plan: it checks the binder,
+//! makes the control page and the token, links to the publisher's death, makes the call, checks
+//! the reply, maps the topic memory and sets the read position. From the call on, every way out
 //! that is not a subscriber drops the control page with `CLOSED` set in it, so a publisher that
 //! added the subscription before its reply was lost takes it out at its next publish.
 //!
@@ -54,19 +54,21 @@ use crate::{
     poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats, Trust, Trusted, Untrusted,
 };
 
-/// Where a subscription starts reading.
+/// Where a subscription starts reading:
+/// [`SubscriberBuilder::start_at`](crate::SubscriberBuilder::start_at).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Start {
-    /// At the first record published after the publisher took the subscription.
+    /// At the next record: the first one published after the publisher took the subscription.
+    /// The records already in the ring are not returned.
     #[default]
-    Latest,
+    Next,
     /// At the newest record, so that the first receive returns the current value, then on from
-    /// there. On a topic with no record yet, as `Latest`. A
+    /// there. On a topic with no record yet, as `Next`. A
     /// [`NamedSubscriber`](crate::NamedSubscriber) connected again to a publisher it read before
     /// starts at that publisher's newest record as well, unless that is the record the earlier
     /// connection returned last: then at the record after it.
-    Last,
+    Newest,
     /// At the oldest record still in the ring: as much history as the ring holds.
     Oldest,
 }
@@ -90,32 +92,19 @@ pub enum Wake {
     Fd,
 }
 
-/// How a subscriber subscribes.
+/// How a subscriber subscribes: the settings of a [`SubscriberBuilder`](crate::SubscriberBuilder).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SubscriberPolicy {
-    /// Where to start reading. Default [`Start::Latest`].
-    pub start: Start,
-    /// The largest ring this subscriber maps, in bytes. Default 16 MiB.
-    ///
-    /// The publisher chooses the ring's size and the subscriber maps all of it read-only, so
-    /// this bounds the address space a publisher can make the subscriber's process give up. A
-    /// larger ring is refused with `BadValue`.
-    pub max_ring_bytes: usize,
-    /// The largest pool this subscriber maps, in bytes. Default 256 MiB.
-    ///
-    /// A publisher that lends slots ([`PoolPolicy`](crate::PoolPolicy)) sends a pool besides the
-    /// ring, and the subscriber maps all of it read-only, so this bounds the address space it
-    /// can make the subscriber's process give up as `max_ring_bytes` does. A larger pool is
-    /// refused with `BadValue`.
-    pub max_pool_bytes: usize,
-    /// How the publisher wakes this subscriber. Default [`Wake::Futex`].
-    pub wake: Wake,
+pub(crate) struct Settings {
+    pub(crate) start: Start,
+    pub(crate) max_ring_bytes: usize,
+    pub(crate) max_pool_bytes: usize,
+    pub(crate) wake: Wake,
 }
 
-impl Default for SubscriberPolicy {
+impl Default for Settings {
     fn default() -> Self {
         Self {
-            start: Start::Latest,
+            start: Start::Next,
             max_ring_bytes: 16 << 20,
             max_pool_bytes: 256 << 20,
             wake: Wake::Futex,
@@ -123,7 +112,9 @@ impl Default for SubscriberPolicy {
     }
 }
 
-/// The receiving end of a topic of `T`, made by [`request`](Self::request).
+/// The receiving end of a topic of `T`, made by a [`builder`](Self::builder):
+/// [`subscribe`](crate::SubscriberBuilder::subscribe) for a topic's binder, `connect` for a
+/// publisher's socket (feature `uds`).
 ///
 /// It maps the topic's memory read-only and reads records at its own pace; nothing it does
 /// reaches the publisher or another subscriber. Dropping it ends the subscription: the publisher
@@ -141,15 +132,15 @@ impl Default for SubscriberPolicy {
 ///
 /// A wait first looks at the ring for up to 20 µs, the policy of
 /// `rsbinder::fmq::shm::spin`, then sleeps until the publisher commits, as
-/// [`SubscriberPolicy::wake`] says: on a word of the topic's memory, for which the publisher
-/// makes one wake system call per commit when some subscriber sleeps, whatever their number, and
-/// none when none does; or on file descriptors of the subscription. An [`Interrupter`] ends a
-/// wait from another thread.
+/// [`wake`](crate::SubscriberBuilder::wake) says: on a word of the topic's memory, for which the
+/// publisher makes one wake system call per commit when some subscriber sleeps, whatever their
+/// number, and none when none does; or on file descriptors of the subscription. An
+/// [`Interrupter`] ends a wait from another thread.
 ///
 /// # Vouching for the publisher
 ///
 /// `M` says whether this subscriber vouches for its publisher, which decides how a value the
-/// publisher lent is read ([`Sample`]). `request` makes an [`Untrusted`] subscriber; on a topic of
+/// publisher lent is read ([`Sample`]). A builder makes an [`Untrusted`] subscriber; on a topic of
 /// [`Bytes`], `unsafe` [`trust_publisher`](Subscriber::trust_publisher) makes it
 /// [`Trusted`](crate::Trusted).
 #[must_use = "dropping the subscriber at once ends the subscription at once"]
@@ -221,43 +212,22 @@ impl Drop for Closing {
 }
 
 impl<T: Payload> Subscriber<T> {
-    /// Subscribe to the topic behind `topic`, an `ITopic` binder: a kernel binder proxy, a binder
-    /// of this process, or an RPC binder of a Unix-socket session that passes fds and has an
-    /// incoming connection. The subscriber does not vouch for the publisher ([`Untrusted`]).
-    ///
-    /// One twoway call; after it, receiving makes none. The refusals of the publisher come back
-    /// as it sent them ([`Acceptor::accept`](crate::Acceptor::accept) lists them, and an
-    /// application's `ITopic` may refuse with `EX_SECURITY`). Of its own, `request` returns
-    /// `InvalidOperation` for an RPC binder of a live session with no callback connection
-    /// (`TransportCaps::CALLBACKS`: one the publisher can call on, whichever end opened it), which
-    /// the publisher could not tell of an eviction, `DeadObject` for one of a session that has
-    /// ended, what the parcel answers to the fds of a session that
-    /// passes none, `EX_UNSUPPORTED_OPERATION` where topics cannot work
-    /// (off Linux and Android, or on a kernel without `F_SEAL_FUTURE_WRITE`),
-    /// [`ITopic::ERROR_VERSION`](crate::aidl::ITopic::ERROR_VERSION) for a publisher of another
-    /// layout version, and `BadValue` for a reply it cannot use: topic memory that is not a
-    /// sealed memfd of the expected layout, a ring larger than
-    /// [`max_ring_bytes`](SubscriberPolicy::max_ring_bytes), or a pool that is not a sealed memfd
-    /// of the slots it states or is larger than
-    /// [`max_pool_bytes`](SubscriberPolicy::max_pool_bytes).
-    ///
-    /// **The process has to run the binder thread pool**
-    /// (`rsbinder::ProcessState::start_thread_pool`) for a publisher in another process: the
-    /// notice of its death arrives on a pool thread, and without it a subscriber never learns
-    /// that its publisher died, and a wait for a record never ends. Over RPC the notice arrives
-    /// through the session's incoming connection instead, and the caller keeps the session open
-    /// for as long as the subscriber.
-    pub fn request(topic: &SIBinder, policy: &SubscriberPolicy) -> BinderResult<Self> {
-        Self::request_starting(topic, policy, |_| (policy.start, None))
+    /// A builder of a subscriber of `T`, which subscribes in its last call: one topic's binder
+    /// ([`subscribe`](crate::SubscriberBuilder::subscribe)), a name
+    /// ([`subscribe_named`](crate::SubscriberBuilder::subscribe_named)), or a publisher's socket
+    /// (`connect`, feature `uds`).
+    pub fn builder() -> crate::SubscriberBuilder<T> {
+        crate::SubscriberBuilder::new()
     }
 
-    /// [`request`](Self::request), with where it starts chosen once the reply says which topic
-    /// it is. Nothing of the subscription call depends on it: the start is this side's to apply.
-    /// With [`Start::Last`], the index beside it is that of a record an earlier connection to the
-    /// same ring returned last, which the subscriber steps over unread when it is still the newest.
+    /// [`SubscriberBuilder::subscribe`](crate::SubscriberBuilder::subscribe), with where it
+    /// starts chosen once the reply says which topic it is. Nothing of the subscription call
+    /// depends on it: the start is this side's to apply. With [`Start::Newest`], the index beside
+    /// it is that of a record an earlier connection to the same ring returned last, which the
+    /// subscriber steps over unread when it is still the newest.
     pub(crate) fn request_starting(
         topic: &SIBinder,
-        policy: &SubscriberPolicy,
+        policy: &Settings,
         start: impl FnOnce(RingId) -> (Start, Option<u32>),
     ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
@@ -322,11 +292,11 @@ impl<T: Payload> Subscriber<T> {
         });
         let start = match start(ring) {
             // The bits of the position and the index, as the publisher wrote them.
-            (Start::Latest, _) => ring::Start::Latest {
+            (Start::Next, _) => ring::Start::Latest {
                 at: endpoint.start as u64,
                 index: endpoint.startIndex as u32,
             },
-            (Start::Last, skip) => ring::Start::Last { skip },
+            (Start::Newest, skip) => ring::Start::Last { skip },
             (Start::Oldest, _) => ring::Start::Oldest,
         };
         let reader = Reader::attach(memory, start).map_err(|ring::Corrupted(what)| {
@@ -859,10 +829,10 @@ impl Subscriber<Bytes> {
     /// undefined behavior.
     ///
     /// ```no_run
-    /// use rsbinder_topic::{Bytes, Subscriber, SubscriberPolicy, Trusted};
+    /// use rsbinder_topic::{Bytes, Subscriber, Trusted};
     ///
     /// fn checksum(topic: &rsbinder::SIBinder) -> rsbinder::BinderResult<u32> {
-    ///     let subscriber = Subscriber::<Bytes>::request(topic, &SubscriberPolicy::default())?;
+    ///     let subscriber = Subscriber::<Bytes>::builder().subscribe(topic)?;
     ///     // SAFETY: the topic is this system's own service, an rsbinder-topic Publisher.
     ///     let mut subscriber: Subscriber<Bytes, Trusted> = unsafe { subscriber.trust_publisher() };
     ///     let sample = subscriber.recv_sample().expect("a value");
@@ -945,8 +915,8 @@ impl<M: Trust> Subscriber<Bytes, M> {
     ///
     /// The [`Sample`] pins the value's slot until it is dropped, and borrows the subscriber, so
     /// nothing else is received meanwhile. Until then the subscriber has not read the value as a
-    /// publisher with [`Backpressure`](crate::Backpressure) counts it: a publish that waits for
-    /// this subscriber waits for the drop. A value that came through the ring is returned in
+    /// [`lossless`](crate::PublisherBuilder::lossless) publisher counts it: a publish that waits
+    /// for this subscriber waits for the drop. A value that came through the ring is returned in
     /// the subscriber's buffer. The errors are `try_recv`'s; a lent slot the publisher took back
     /// before this call pinned it is a loss of one record, [`RecvError::Lagged`]`(1)`.
     pub fn try_recv_sample(&mut self) -> Result<Sample<'_, M>, RecvError> {
@@ -959,8 +929,9 @@ impl<M: Trust> Subscriber<Bytes, M> {
     ///
     /// The records before the newest are skipped and not reported as lost, lent values among them
     /// too: their slots are not pinned. Until the [`Sample`] of a lent value drops, the subscriber
-    /// has read up to the start of its record, so a publisher with
-    /// [`Backpressure`](crate::Backpressure) waits for that record alone, not for those skipped; a
+    /// has read up to the start of its record, so a
+    /// [`lossless`](crate::PublisherBuilder::lossless) publisher waits for that record alone, not
+    /// for those skipped; a
     /// value that came through the ring is read when the call returns. A lent value taken back
     /// before this call pinned its slot is gone past as `try_latest` goes past one, and the errors
     /// are `try_latest`'s.

@@ -13,7 +13,8 @@
 use rsbinder::{hub, BinderResult, ProcessState, SIBinder, StatusCode, Strong};
 use rsbinder_topic::registry::{Registry, RegistryAccess, RegistryResolver, RegistryStats};
 use rsbinder_topic::{
-    NamedSubscriber, Payload, Publisher, PublisherPolicy, Subscriber, SubscriberPolicy,
+    EventTopic, NamedSubscriber, Payload, Publisher, PublisherBuilder, ServiceManager, Subscriber,
+    SubscriberBuilder,
 };
 
 use super::payload::IFleetStatus;
@@ -126,17 +127,20 @@ pub fn registry(service: &str) -> BinderResult<RegistryResolver> {
 /// A publisher found under `name` through `via`.
 pub fn advertise<T: Payload + 'static>(
     name: &str,
-    policy: &PublisherPolicy,
+    builder: PublisherBuilder<T, EventTopic>,
     via: &Via,
 ) -> BinderResult<Publisher<T>> {
+    let publisher = builder.build()?;
     #[cfg(feature = "topic-uds")]
     if let Some(dir) = sockets() {
-        return Publisher::advertise_with(name, policy, &socket::resolver(&dir, via)?);
+        publisher.advertise_on(name, &socket::resolver(&dir, via)?)?;
+        return Ok(publisher);
     }
     match via {
-        Via::ServiceManager => Publisher::advertise(name, policy),
-        Via::Registry(service) => Publisher::advertise_with(name, policy, &registry(service)?),
+        Via::ServiceManager => publisher.advertise_on(name, &ServiceManager)?,
+        Via::Registry(service) => publisher.advertise_on(name, &registry(service)?)?,
     }
+    Ok(publisher)
 }
 
 /// Give `name` to the topic of `publisher`, as one made before it was found by name is, or one
@@ -152,30 +156,31 @@ pub fn register<T: Payload + 'static>(name: &str, publisher: &Publisher<T>) -> B
 
 /// A subscription to the topic registered under `name` with the service manager now;
 /// `NameNotFound` when none is.
-pub fn subscribe<T: Payload>(name: &str, policy: &SubscriberPolicy) -> BinderResult<Subscriber<T>> {
+pub fn subscribe<T: Payload>(
+    name: &str,
+    builder: SubscriberBuilder<T>,
+) -> BinderResult<Subscriber<T>> {
     #[cfg(feature = "topic-uds")]
     if let Some(dir) = sockets() {
-        return socket::resolver(&dir, &Via::ServiceManager)?.subscribe(name, policy);
+        return socket::resolver(&dir, &Via::ServiceManager)?.subscribe(name, builder);
     }
     let topic = hub::check_service(name).ok_or(StatusCode::NameNotFound)?;
-    Subscriber::request(&topic, policy)
+    builder.subscribe(&topic)
 }
 
 /// A subscriber that follows whichever publisher holds `name` through `via`.
 pub fn subscribe_named<T: Payload + 'static>(
     name: &str,
-    policy: &SubscriberPolicy,
+    builder: SubscriberBuilder<T>,
     via: &Via,
 ) -> BinderResult<NamedSubscriber<T>> {
     #[cfg(feature = "topic-uds")]
     if let Some(dir) = sockets() {
-        return NamedSubscriber::subscribe_with(name, policy, &socket::resolver(&dir, via)?);
+        return builder.subscribe_named_on(name, &socket::resolver(&dir, via)?);
     }
     match via {
-        Via::ServiceManager => NamedSubscriber::subscribe(name, policy),
-        Via::Registry(service) => {
-            NamedSubscriber::subscribe_with(name, policy, &registry(service)?)
-        }
+        Via::ServiceManager => builder.subscribe_named(name),
+        Via::Registry(service) => builder.subscribe_named_on(name, &registry(service)?),
     }
 }
 

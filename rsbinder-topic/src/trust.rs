@@ -4,7 +4,7 @@
 //! Whether a subscriber vouches for its publisher (plan 15 §6.3).
 
 /// Whether a [`Subscriber`](crate::Subscriber) vouches for its topic's publisher: [`Untrusted`],
-/// what [`Subscriber::request`](crate::Subscriber::request) makes, or [`Trusted`], what
+/// what a [`SubscriberBuilder`](crate::SubscriberBuilder) makes, or [`Trusted`], what
 /// [`trust_publisher`](crate::Subscriber::trust_publisher) makes of one.
 ///
 /// It decides how a lent value is read. A [`Sample`](crate::Sample) of an untrusted subscriber is
@@ -18,7 +18,7 @@ pub trait Trust: sealed::Sealed + 'static {
 }
 
 /// A subscriber that does not vouch for its publisher, the kind
-/// [`Subscriber::request`](crate::Subscriber::request) makes.
+/// [`SubscriberBuilder`](crate::SubscriberBuilder) makes.
 ///
 /// A publisher that breaks the pin protocol and writes a slot while it is read makes this
 /// subscriber's copy wrong, and nothing worse.

@@ -99,7 +99,7 @@
 //! A public type whose drop ends what the value was made for (a stream, a
 //! subscription, a registration) carries a type-level `#[must_use = "..."]`
 //! that says what ends, so `add_accessor_provider(..)?;` or
-//! `Publisher::advertise(..)?;` in statement position warns: a type-level
+//! `Publisher::events().build()?;` in statement position warns: a type-level
 //! `must_use` reaches through `?`, a `Future`'s does not reach the concrete
 //! type. `types_whose_drop_ends_something_are_must_use` scans `rsbinder`,
 //! `rsbinder-fmq` and `rsbinder-topic`. Each listed type must exist, each in

@@ -140,7 +140,7 @@ pub enum Closed {
     /// protocol writes. Nothing more is read from it.
     Corrupted,
     /// The publisher took the subscription out: its topic waits for subscribers
-    /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), and waited for
+    /// ([`lossless`](crate::PublisherBuilder::lossless)), and waited for
     /// this one past its timeout. The records it had not read are not returned, as the publisher
     /// no longer keeps them; those before the notice arrived were.
     Evicted,

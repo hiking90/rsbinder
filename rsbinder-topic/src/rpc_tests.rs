@@ -21,9 +21,7 @@ use crate::layout::{ControlPage, MIN_RING, VERSION};
 use crate::link::{link_death, Dead};
 use crate::pool::MAX_PINS;
 use crate::registry::{AllowAll, Registry, RegistryResolver};
-use crate::{
-    Bytes, Closed, Payload, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy,
-};
+use crate::{Bytes, Closed, Payload, Publisher, RecvError, Subscriber};
 
 const WIRE: u32 = 2;
 const WAIT: Duration = Duration::from_secs(10);
@@ -56,7 +54,7 @@ fn connect(name: &[u8], incoming: u32) -> RpcSession {
     RpcSession::setup_client_android13plus_with_config(config).unwrap()
 }
 
-/// A request as `Subscriber::request` makes it, with `token` given.
+/// A request as `SubscriberBuilder::subscribe` makes it, with `token` given.
 fn request(token: SIBinder) -> (SubscribeRequest, ControlPage) {
     let (fd, page) = ControlPage::create(MAX_PINS).unwrap();
     let request = SubscribeRequest {
@@ -72,11 +70,7 @@ fn request(token: SIBinder) -> (SubscribeRequest, ControlPage) {
 }
 
 fn publisher() -> Publisher<Bytes> {
-    let policy = PublisherPolicy {
-        ring_bytes: MIN_RING,
-        ..PublisherPolicy::default()
-    };
-    Publisher::new(&policy).unwrap()
+    Publisher::events().ring_bytes(MIN_RING).build().unwrap()
 }
 
 #[test]
@@ -111,7 +105,7 @@ fn a_session_with_no_incoming_connection_is_refused_a_subscription() {
     let (name, server) = serve(publisher.as_binder());
     let session = connect(&name, 0);
     let topic = session.get_root().unwrap();
-    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    let refused = Subscriber::<Bytes>::builder().subscribe(&topic);
     assert_eq!(
         refused.err().map(|e| e.transaction_error()),
         Some(StatusCode::InvalidOperation)
@@ -129,7 +123,7 @@ fn a_session_that_has_ended_answers_a_subscription_with_dead_object() {
     let session = connect(&name, 1);
     let topic = session.get_root().unwrap();
     session.close_session();
-    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    let refused = Subscriber::<Bytes>::builder().subscribe(&topic);
     assert_eq!(
         refused.err().map(|e| e.transaction_error()),
         Some(StatusCode::DeadObject)
@@ -168,14 +162,14 @@ fn a_token_of_the_publishers_own_process_from_over_rpc_is_refused() {
     server.terminate();
 }
 
-/// `Subscriber::request` over a session of the caller's: it keeps the session open.
+/// `SubscriberBuilder::subscribe` over a session of the caller's: it keeps the session open.
 #[test]
 fn a_session_that_passes_fds_and_has_an_incoming_connection_subscribes() {
     let publisher = publisher();
     let (name, server) = serve(publisher.as_binder());
     let session = connect(&name, 1);
     let topic = session.get_root().unwrap();
-    let mut subscriber = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic);
     let subscriber = subscriber.as_mut().unwrap();
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
@@ -195,7 +189,7 @@ fn a_unix_session_that_passes_no_fds_cannot_subscribe() {
     let config = RpcClientConfig::unix_abstract(name, WIRE).incoming_connections(1);
     let session = RpcSession::setup_client_android13plus_with_config(config).unwrap();
     let topic = session.get_root().unwrap();
-    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    let refused = Subscriber::<Bytes>::builder().subscribe(&topic);
     assert_eq!(
         refused.err().map(|status| status.transaction_error()),
         Some(StatusCode::FdsNotAllowed)
@@ -223,7 +217,7 @@ fn a_session_over_tcp_cannot_subscribe() {
     let config = RpcClientConfig::tcp_debug(address, WIRE).incoming_connections(1);
     let session = RpcSession::setup_client_android13plus_with_config(config).unwrap();
     let topic = session.get_root().unwrap();
-    let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+    let refused = Subscriber::<Bytes>::builder().subscribe(&topic);
     assert_eq!(
         refused.err().map(|status| status.transaction_error()),
         Some(StatusCode::FdsNotAllowed)

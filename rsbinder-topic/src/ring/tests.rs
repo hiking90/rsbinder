@@ -149,7 +149,7 @@ fn a_batch_is_admitted_only_if_put_takes_every_record_of_it() {
 #[test]
 fn a_ring_sized_for_a_payload_keeps_that_many_of_the_largest_records_while_it_writes() {
     for (max, depth) in [(2000, 1), (1000, 3), (300, 16), (8, 2), (0, 0)] {
-        let ring = crate::PublisherPolicy::for_payload(max, depth).ring_bytes;
+        let ring = crate::publish::ring_for(max, depth);
         let heap = Heap::new(ring);
         let mut writer = writer_of(&heap);
         let record = 8 + max.div_ceil(8) * 8;

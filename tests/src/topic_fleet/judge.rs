@@ -207,14 +207,14 @@ pub enum History {
 pub fn first_seq(start: Start, history: History, at: Committed) -> u64 {
     let start = match history {
         History::First => start,
-        History::NewPublisher if start == Start::Last => Start::Last,
+        History::NewPublisher if start == Start::Newest => Start::Newest,
         History::NewPublisher => Start::Oldest,
-        History::Rejoined => Start::Latest,
+        History::Rejoined => Start::Next,
     };
     match start {
-        Start::Latest => at.next,
-        // On a topic with no record yet, as `Latest`.
-        Start::Last => at.next.saturating_sub(1),
+        Start::Next => at.next,
+        // On a topic with no record yet, as `Next`.
+        Start::Newest => at.next.saturating_sub(1),
         Start::Oldest if at.next == 0 => 0,
         Start::Oldest => at.oldest,
         // `Start` is `#[non_exhaustive]`: a start the judge has no rule for is the harness's bug.
@@ -487,13 +487,13 @@ mod tests {
     fn the_start_of_a_restarted_paused_publisher() {
         // X1: a producer that published K records before it registered, then paused.
         let at = Committed { next: 5, oldest: 0 };
-        assert_eq!(first_seq(Start::Latest, History::NewPublisher, at), 0);
+        assert_eq!(first_seq(Start::Next, History::NewPublisher, at), 0);
         assert_eq!(first_seq(Start::Oldest, History::NewPublisher, at), 0);
-        assert_eq!(first_seq(Start::Last, History::NewPublisher, at), 4);
-        assert_eq!(first_seq(Start::Latest, History::First, at), 5);
+        assert_eq!(first_seq(Start::Newest, History::NewPublisher, at), 4);
+        assert_eq!(first_seq(Start::Next, History::First, at), 5);
         assert_eq!(
             first_seq(
-                Start::Last,
+                Start::Newest,
                 History::First,
                 Committed { next: 0, oldest: 0 }
             ),

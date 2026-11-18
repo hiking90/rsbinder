@@ -5,15 +5,15 @@
 //! never left this process is told from one that came through binder.
 //!
 //! A publisher takes a token that lives in its own process only from a call that never left
-//! it: [`Subscriber::request`](crate::Subscriber::request) marks the thread with the request it
-//! sends ([`Asking`]) and a local `ITopic` runs on that thread with that very request. A token of
-//! this process that came through binder is one the caller got from this process, so its death
-//! says nothing about the caller, and it is refused. The pid of the call cannot tell the two
-//! apart: a handler that subscribes to a topic of its own process still sees its caller's pid.
-//! Nor can the token alone: while the thread waits for the reply of a remote `ITopic`, the
-//! kernel runs on it a call that remote process makes back into this one, and that call can
-//! carry the token it was just sent. Its request is one read from a parcel, never the request
-//! the thread is sending, so the address of the request tells the two apart.
+//! it: [`Subscriber::request_starting`](crate::Subscriber::request_starting) marks the thread with
+//! the request it sends ([`Asking`]) and a local `ITopic` runs on that thread with that very
+//! request. A token of this process that came through binder is one the caller got from this
+//! process, so its death says nothing about the caller, and it is refused. The pid of the call
+//! cannot tell the two apart: a handler that subscribes to a topic of its own process still sees
+//! its caller's pid. Nor can the token alone: while the thread waits for the reply of a remote
+//! `ITopic`, the kernel runs on it a call that remote process makes back into this one, and that
+//! call can carry the token it was just sent. Its request is one read from a parcel, never the
+//! request the thread is sending, so the address of the request tells the two apart.
 
 use std::cell::Cell;
 use std::sync::Weak;
@@ -101,7 +101,7 @@ pub(crate) fn status_of(error: rsbinder::fmq::Error) -> Status {
     }
 }
 
-/// [`status_of`] for a check of the caller's own policy: `EX_ILLEGAL_ARGUMENT` with the check
+/// [`status_of`] for a check of the caller's own settings: `EX_ILLEGAL_ARGUMENT` with the check
 /// that failed. A status carries a message only with an exception, as AOSP's does.
 pub(crate) fn policy_status(error: rsbinder::fmq::Error) -> Status {
     match error {

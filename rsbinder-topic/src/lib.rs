@@ -10,8 +10,9 @@
 //! * The publisher allocates the topic's memory, a ring of records in a sealed memfd, and
 //!   every subscriber maps it read-only. One copy into the ring serves all of them.
 //! * A publish does not wait for a subscriber. When the ring is full the oldest records are
-//!   overwritten, and a subscriber that had not read them is told how many it lost. A topic
-//!   with [`Backpressure`] waits instead, up to a timeout, for its subscribers to read what a
+//!   overwritten, and a subscriber that had not read them is told how many it lost. A
+//!   [`lossless`](PublisherBuilder::lossless) topic waits instead, up to a timeout, for its
+//!   subscribers to read what a
 //!   publish would overwrite, and then takes out the ones still in the way
 //!   ([`Closed::Evicted`]). A receiver that must see every value however slow it is uses a
 //!   stream (`rsbinder::stream`), which holds the sender back and takes no receiver out.
@@ -24,13 +25,14 @@
 //! none ([`RecvError`]): nothing was unread, records were lost, one failed to decode, or the topic
 //! ended.
 //!
-//! A value too large to copy twice goes through a pool instead ([`PoolPolicy`]): the publisher
-//! writes it straight into a slot of a second memfd ([`Publisher::loan_slice`], [`LoanMut`]) and
-//! the ring carries only a record that names the slot. A [`Bytes`] subscriber receives it as any
-//! other value, or where it lies with [`Subscriber::recv_sample`]: the [`Sample`] pins the slot,
-//! and the publisher lends no pinned slot. A subscriber copies a lent value out with atomic loads
-//! unless it vouches for its publisher ([`Subscriber::trust_publisher`], [`Trusted`]); then its
-//! samples deref to `[u8]` in place and its copies are plain memory copies.
+//! A value too large to copy twice goes through a pool instead ([`PublisherBuilder::lend`]): the
+//! publisher writes it straight into a slot of a second memfd ([`Publisher::loan_slice`],
+//! [`LoanMut`]) and the ring carries only a record that names the slot. A [`Bytes`] subscriber
+//! receives it as any other value, or where it lies with [`Subscriber::recv_sample`]: the
+//! [`Sample`] pins the slot, and the publisher lends no pinned slot. A subscriber copies a lent
+//! value out with atomic loads unless it vouches for its publisher
+//! ([`Subscriber::trust_publisher`], [`Trusted`]); then its samples deref to `[u8]` in place and
+//! its copies are plain memory copies.
 //!
 //! A receive may wait for a record ([`Subscriber::recv`], `recv_timeout`, `recv_latest`, and
 //! `recv_async` with the `tokio` feature). A waiting subscriber sleeps on a futex word in the
@@ -41,27 +43,28 @@
 //! [`wait_any`] or an event loop ([`Wait`]), and `recv_async` holds no thread while it waits.
 //!
 //! A [`Publisher`] makes the topic and hands out an `ITopic` binder; a [`Subscriber`] takes a
-//! subscription through it with one twoway call. Each end learns of the other's end: a
+//! subscription through it with one twoway call. Both are made by a builder
+//! ([`Publisher::events`], [`Subscriber::builder`]). Each end learns of the other's end: a
 //! subscriber that is dropped marks its control page, one whose process dies is reported to the
 //! publisher through binder, and a publisher that is dropped or closed writes an end record,
 //! while one whose process dies is reported to its subscribers.
 //!
 //! ```no_run
 //! use rsbinder::{hub, ProcessState};
-//! use rsbinder_topic::{Bytes, Publisher, PublisherPolicy, Subscriber, SubscriberPolicy};
+//! use rsbinder_topic::{Bytes, Publisher, Subscriber};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! ProcessState::init_default()?;
 //! ProcessState::start_thread_pool();
 //!
 //! // The publishing process.
-//! let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default())?;
+//! let publisher = Publisher::<Bytes>::events().max_value_bytes(64).keep(16).build()?;
 //! hub::add_service("example.topic", publisher.as_binder())?;
 //! publisher.publish(&Bytes(b"hello".to_vec()))?;
 //!
 //! // A subscribing process.
 //! let topic = hub::check_service("example.topic").ok_or("no topic")?;
-//! let mut subscriber = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default())?;
+//! let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic)?;
 //! match subscriber.recv() {
 //!     Ok(Bytes(value)) => println!("{value:?}"),
 //!     Err(why) => println!("{why}"),
@@ -70,14 +73,14 @@
 //! ```
 //!
 //! A topic can also be found by name, the publisher and the subscriber starting in either
-//! order: [`Publisher::advertise`] registers the binder with the service manager, and a
+//! order: [`Publisher::advertise_on`] registers the binder with the service manager, and a
 //! [`NamedSubscriber`] watches the name and connects to whichever publisher holds it, again and
 //! again. Where a `Subscriber`'s topic ends with [`RecvError::Closed`], a `NamedSubscriber`
 //! returns [`RecvError::Disconnected`] once and waits for the next publisher, except after
 //! [`Closed::Evicted`] and [`Closed::ResolverDied`], which end it;
 //! [`NamedSubscriber::state`] tells which wait it is in. Names come from a
 //! [`Resolver`], the service manager by default ([`ServiceManager`]). Who may subscribe is
-//! [`PublisherPolicy::authorize`].
+//! [`PublisherBuilder::authorize`].
 //!
 //! The subscription call never leaves a process whose publisher is in it, so a subscriber of a
 //! publisher of its own process needs no binder device. Over RPC on a Unix domain socket neither
@@ -102,6 +105,7 @@
 
 pub mod aidl;
 mod backpressure;
+mod builder;
 mod connect;
 mod end;
 mod layout;
@@ -125,17 +129,17 @@ pub mod uds;
 mod wait;
 mod wake;
 
-pub use backpressure::Backpressure;
+pub use builder::{EventTopic, PublisherBuilder, SubscriberBuilder};
 pub use named::{NamedState, NamedSubscriber};
 pub use payload::{Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
-pub use publish::{Authorize, PoolPolicy, PublishError, PublisherPolicy};
+pub use publish::PublishError;
 pub use publisher::{Acceptor, LoanMut, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
 pub use resolve::{Advertisement, OnResolved, Resolved, Resolver, ServiceManager, Watch};
 pub use sample::Sample;
 pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
-pub use subscriber::{Interrupter, Start, Subscriber, SubscriberPolicy, Wake};
+pub use subscriber::{Interrupter, Start, Subscriber, Wake};
 pub use trust::{Trust, Trusted, Untrusted};
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -221,6 +225,9 @@ mod loan_tests;
 ))]
 mod backpressure_tests;
 
+#[cfg(all(test, not(loom), not(miri)))]
+mod builder_tests;
+
 #[cfg(all(
     test,
     not(loom),
@@ -264,17 +271,17 @@ mod fd_wait_tests;
 mod unsupported_tests {
     use rsbinder::ExceptionCode;
 
-    use crate::{Bytes, Publisher, PublisherPolicy, Subscriber, SubscriberPolicy};
+    use crate::{Bytes, Publisher, Subscriber};
 
     #[test]
     fn neither_end_of_a_topic_is_made_on_a_target_without_memfd() {
-        let made = Publisher::<Bytes>::new(&PublisherPolicy::default());
+        let made = Publisher::<Bytes>::events().build();
         assert_eq!(
             made.err().map(|status| status.exception_code()),
             Some(ExceptionCode::UnsupportedOperation)
         );
         let topic = crate::connect::Token::detached();
-        let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+        let refused = Subscriber::<Bytes>::builder().subscribe(&topic);
         assert_eq!(
             refused.err().map(|status| status.exception_code()),
             Some(ExceptionCode::UnsupportedOperation)

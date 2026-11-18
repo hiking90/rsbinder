@@ -802,7 +802,7 @@ impl Planned {
             topic: topic.into(),
             named: false,
             mode: Mode::Counted,
-            start: Start::Latest,
+            start: Start::Next,
             sample: false,
         }
     }
@@ -988,10 +988,10 @@ impl Topology {
                 };
                 let fd = s % 2 == 1;
                 // Not `s % 3`, which is `named`'s: every named subscription would start at
-                // `Last`, and X1 would see no other start rule. A topic's subscriptions of one
+                // `Newest`, and X1 would see no other start rule. A topic's subscriptions of one
                 // API recur every 18 `s` (6 nodes, 3 a node), so this turns within them.
                 let start_at = (s / 18) % 3;
-                let start = ["latest", "last", "oldest"][start_at];
+                let start = ["next", "newest", "oldest"][start_at];
                 let mut spec = format!(
                     "topic={topic},payload={payload},api={},recv={recv},wake={},start={start}",
                     if named { "named" } else { "plain" },
@@ -1015,7 +1015,7 @@ impl Topology {
                     } else {
                         Mode::Counted
                     },
-                    start: [Start::Latest, Start::Last, Start::Oldest][start_at],
+                    start: [Start::Next, Start::Newest, Start::Oldest][start_at],
                     sample: recv == "sample",
                     ..Planned::new(&node, topic)
                 });
@@ -1463,7 +1463,7 @@ fn steady_state_fleet() {
 }
 
 /// How many records T2's ring holds, from the payload its publisher has written: a record takes
-/// its payload rounded up to 8 bytes, and 8 more (`PublisherPolicy::for_payload`).
+/// its payload rounded up to 8 bytes, and 8 more (`PublisherBuilder::max_value_bytes`).
 fn report_t2_depth(fleet: &mut Fleet, topology: &Topology) -> Result<(), Failure> {
     const RING: u64 = 16384;
     let readings = topology.topic_of("p-readings");
@@ -1732,12 +1732,12 @@ fn x1_killed_producer_restarts_with_records(
     let topic = topology.topic_of(node);
     let of_topic = |p: &Planned| p.topic == topic;
     // The rule for a named subscriber's later connection is seen only on one that counts its
-    // records and does not start at `Last`, which keeps its start.
+    // records and does not start at `Newest`, which keeps its start.
     assert!(
         !topology.notices
             || topology
                 .of(&topic)
-                .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Last),
+                .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Newest),
         "X1: no subscription of T2 shows the start rule of a named subscriber"
     );
     let since = now_ns();

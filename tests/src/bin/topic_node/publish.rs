@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rsbinder_topic::{Backpressure, Bytes, PoolPolicy, Publisher, PublisherPolicy, PublisherStats};
+use rsbinder_topic::{Bytes, EventTopic, Payload, Publisher, PublisherBuilder, PublisherStats};
 use tests::topic_fleet::event::{Kind, Subscribed};
 use tests::topic_fleet::payload::{FleetPayload, FleetRecord};
 use tests::topic_fleet::record::{topic_id, Incarnation, Stamp};
@@ -18,28 +18,22 @@ use tests::topic_fleet::transport;
 
 use crate::node::{Command, Out, Request, Running};
 
-pub fn policy(spec: &PubSpec) -> PublisherPolicy {
-    let mut policy = PublisherPolicy::default();
-    if let Some(ring_bytes) = spec.ring_bytes {
-        policy.ring_bytes = ring_bytes;
-    }
+pub fn builder<T: Payload + 'static>(spec: &PubSpec) -> PublisherBuilder<T, EventTopic> {
+    let mut builder = Publisher::<T>::events().ring_bytes(spec.ring_bytes.unwrap_or(64 << 10));
     if let Some(max) = spec.max_subscribers {
-        policy.max_subscribers = max;
-        policy.max_per_uid = max;
+        builder = builder.max_subscribers(max).max_per_uid(max);
     }
     if spec.pool {
-        policy.pool = Some(PoolPolicy {
-            slot_bytes: spec.size,
-            ..PoolPolicy::default()
-        });
+        builder = builder.lend(spec.size);
     }
     if let Some(ms) = spec.backpressure_ms {
-        policy.backpressure = Some(Backpressure {
-            publish_timeout: Duration::from_millis(ms),
-            window: spec.window.and_then(NonZeroUsize::new),
-        });
+        let timeout = Duration::from_millis(ms);
+        builder = match spec.window.and_then(NonZeroUsize::new) {
+            Some(window) => builder.lossless_window(timeout, window),
+            None => builder.lossless(timeout),
+        };
     }
-    policy
+    builder
 }
 
 /// A `PSTATS` of `stats`.
@@ -102,14 +96,16 @@ fn make<T: FleetPayload>(
     incarnation: Incarnation,
     write: &Write<T>,
 ) -> Result<(Publisher<T>, u64), String> {
-    let policy = policy(spec);
+    let builder = builder(spec);
     let topic = &spec.topic;
     let Some(records) = spec.prepublish else {
-        let publisher = transport::advertise(topic, &policy, &spec.via)
+        let publisher = transport::advertise(topic, builder, &spec.via)
             .map_err(|status| format!("advertise {topic}: {status}"))?;
         return Ok((publisher, 0));
     };
-    let publisher = Publisher::new(&policy).map_err(|err| format!("make {topic}: {err:?}"))?;
+    let publisher = builder
+        .build()
+        .map_err(|err| format!("make {topic}: {err:?}"))?;
     let id = topic_id(topic);
     for seq in 0..records {
         let stamp = Stamp {
@@ -229,7 +225,7 @@ fn run<T: FleetPayload>(
                     if let Some(old) = publisher.take() {
                         old.close();
                     }
-                    match transport::advertise(&spec.topic, &policy(&spec), &spec.via) {
+                    match transport::advertise(&spec.topic, builder(&spec), &spec.via) {
                         Ok(new) => {
                             publisher = Some(new);
                             state = State::Publishing;
