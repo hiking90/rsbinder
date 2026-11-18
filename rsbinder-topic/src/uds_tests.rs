@@ -18,7 +18,7 @@ use crate::aidl::ITopic::{ITopic, WAKE_FUTEX};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::connect::Token;
 use crate::connect_tests::{alone, memfds};
-use crate::layout::{ControlPage, MIN_RING, VERSION};
+use crate::layout::{ControlPage, VERSION};
 use crate::pool::MAX_PINS;
 use crate::uds::{self, Endpoint, Options, SessionGuard};
 use crate::{
@@ -41,7 +41,7 @@ fn bytes(byte: u8) -> Bytes {
 }
 
 fn policy() -> PublisherBuilder<Bytes, EventTopic> {
-    Publisher::<Bytes>::events().ring_bytes(MIN_RING)
+    Publisher::<Bytes>::events()
 }
 
 fn path(tag: &str) -> PathBuf {

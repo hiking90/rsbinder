@@ -119,7 +119,7 @@ fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicListing> {
 
 /// A topic advertised as `name` through `resolver`.
 fn advertised(name: &str, resolver: &dyn Resolver) -> BinderResult<Publisher<Bytes>> {
-    let publisher = Publisher::<Bytes>::events().ring_bytes(64 << 10).build()?;
+    let publisher = Publisher::<Bytes>::events().build()?;
     publisher.advertise_on(name, resolver)?;
     Ok(publisher)
 }

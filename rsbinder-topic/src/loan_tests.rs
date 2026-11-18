@@ -14,7 +14,7 @@ use rsbinder::ParcelFileDescriptor;
 use crate::aidl::ITopic::WAKE_FUTEX;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::connect::{Asking, Token};
-use crate::layout::{self, ControlPage, LoadedPool, MIN_RING, VERSION};
+use crate::layout::{self, ControlPage, LoadedPool, VERSION};
 use crate::pool::{Pin, MAX_PINS};
 use crate::publish::AFTER_LOAN_RECORD;
 use crate::receive::LATEST_RETRIES;
@@ -33,7 +33,6 @@ fn pooled(
     max_loans: usize,
 ) -> PublisherBuilder<Bytes, EventTopic> {
     Publisher::<Bytes>::events()
-        .ring_bytes(64 << 10)
         .max_subscribers(max_subscribers)
         .max_per_uid(max_subscribers)
         .lend(SLOT)
@@ -87,10 +86,7 @@ fn a_loaned_value_reaches_every_subscriber_between_the_rings_values() {
 
 #[test]
 fn a_loan_is_refused_without_a_pool_past_a_slot_past_the_bound_and_once_closed() {
-    let plain = Publisher::<Bytes>::events()
-        .ring_bytes(MIN_RING)
-        .build()
-        .unwrap();
+    let plain = Publisher::<Bytes>::events().build().unwrap();
     assert_eq!(plain.loan_slice(1).err(), Some(PublishError::NoPool));
 
     let publisher = pooled(1, 1, 1).build().unwrap();

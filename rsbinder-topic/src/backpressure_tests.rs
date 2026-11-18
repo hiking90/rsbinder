@@ -22,7 +22,7 @@ fn waiting(timeout: Duration) -> Publisher<Bytes> {
 
 /// [`waiting`], for a subscriber more than `window` records behind as well.
 fn within(timeout: Duration, window: Option<NonZeroUsize>) -> Publisher<Bytes> {
-    lossless(Publisher::events().ring_bytes(MIN_RING), timeout, window)
+    lossless(Publisher::events(), timeout, window)
         .build()
         .unwrap()
 }
@@ -292,7 +292,6 @@ fn pooled_within(
     window: Option<NonZeroUsize>,
 ) -> Publisher<Bytes> {
     let builder = Publisher::events()
-        .ring_bytes(MIN_RING)
         .max_subscribers(max_subscribers)
         .max_per_uid(max_subscribers)
         .lend(SLOT)

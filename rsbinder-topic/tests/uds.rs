@@ -70,10 +70,7 @@ fn serve(publisher: &Publisher<Bytes>, tag: &str) -> (PathBuf, RpcServerHandle) 
 }
 
 fn publish(tag: &str) -> (PathBuf, Publisher<Bytes>, RpcServerHandle) {
-    let publisher = Publisher::<Bytes>::events()
-        .ring_bytes(64 << 10)
-        .build()
-        .unwrap();
+    let publisher = Publisher::<Bytes>::events().build().unwrap();
     let (path, handle) = serve(&publisher, tag);
     (path, publisher, handle)
 }
@@ -406,10 +403,7 @@ fn child() {
             }
         }
         "publish" => {
-            let publisher = Publisher::<Bytes>::events()
-                .ring_bytes(64 << 10)
-                .build()
-                .unwrap();
+            let publisher = Publisher::<Bytes>::events().build().unwrap();
             let server = RpcServer::setup_unix_server(&path).unwrap();
             let handle = uds::serve(&server, publisher.as_binder()).unwrap();
             say("ready");

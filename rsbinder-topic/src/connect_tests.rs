@@ -69,7 +69,7 @@ pub(crate) fn memfds() -> (usize, usize) {
 }
 
 fn events<T: Payload + 'static>() -> PublisherBuilder<T, EventTopic> {
-    Publisher::<T>::events().ring_bytes(MIN_RING)
+    Publisher::<T>::events()
 }
 
 fn subscribe<T: Payload>(topic: &SIBinder, start: Start) -> BinderResult<Subscriber<T>> {

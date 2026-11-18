@@ -17,7 +17,7 @@ use crate::aidl::ITopicRegistry::ITopicRegistry;
 use crate::aidl::ITopicWatcher::BnTopicWatcher;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::connect::Token;
-use crate::layout::{ControlPage, MIN_RING, VERSION};
+use crate::layout::{ControlPage, VERSION};
 use crate::link::{link_death, Dead};
 use crate::pool::MAX_PINS;
 use crate::registry::{AllowAll, Registry, RegistryResolver};
@@ -70,7 +70,7 @@ fn request(token: SIBinder) -> (SubscribeRequest, ControlPage) {
 }
 
 fn publisher() -> Publisher<Bytes> {
-    Publisher::events().ring_bytes(MIN_RING).build().unwrap()
+    Publisher::events().build().unwrap()
 }
 
 #[test]

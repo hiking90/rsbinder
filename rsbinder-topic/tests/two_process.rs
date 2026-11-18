@@ -120,7 +120,6 @@ fn a_slot_a_killed_subscriber_pinned_is_lent_again() {
     init();
     // 2 pins, one to write, a depth of 1 and 1 loan: 5 slots.
     let publisher = Publisher::<Bytes>::events()
-        .ring_bytes(64 << 10)
         .max_subscribers(2)
         .max_per_uid(2)
         .lend(4096)
@@ -785,10 +784,7 @@ fn child() {
             wait_for_eof();
         }
         role @ ("publish" | "advertise") => {
-            let publisher = Publisher::<Bytes>::events()
-                .ring_bytes(64 << 10)
-                .build()
-                .unwrap();
+            let publisher = Publisher::<Bytes>::events().build().unwrap();
             if role == "advertise" {
                 publisher.advertise_on(&name, &ServiceManager).unwrap();
             } else {

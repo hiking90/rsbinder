@@ -156,7 +156,7 @@ impl Drop for Unwatch {
 }
 
 fn policy() -> PublisherBuilder<Bytes, EventTopic> {
-    Publisher::events().ring_bytes(MIN_RING)
+    Publisher::events()
 }
 
 fn bytes(byte: u8) -> Bytes {

@@ -131,7 +131,7 @@ struct Raw {
 }
 
 fn events() -> PublisherBuilder<Bytes, EventTopic> {
-    Publisher::<Bytes>::events().ring_bytes(64 << 10)
+    Publisher::<Bytes>::events()
 }
 
 fn advertised(name: &str, resolver: &dyn Resolver) -> BinderResult<Publisher<Bytes>> {
