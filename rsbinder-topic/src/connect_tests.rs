@@ -387,6 +387,7 @@ fn endpoint(fd: OwnedFd, capacity: u64) -> TopicEndpoint {
         start: 0,
         startIndex: 0,
         pool: None,
+        topicKind: crate::TopicKind::Event.wire(),
     }
 }
 
@@ -506,6 +507,17 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
             }),
             Some(ERROR_VERSION),
             "another version",
+        ),
+        (
+            Box::new({
+                let good = good.clone();
+                move || TopicEndpoint {
+                    topicKind: 2,
+                    ..endpoint(dup(&good), capacity)
+                }
+            }),
+            None,
+            "a topic of no kind",
         ),
         (
             Box::new({

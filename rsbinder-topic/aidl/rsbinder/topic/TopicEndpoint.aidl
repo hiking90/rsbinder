@@ -51,4 +51,11 @@ parcelable TopicEndpoint {
      * page.
      */
     @nullable Pool pool;
+
+    /**
+     * What the records are: ITopic.TOPIC_EVENT or ITopic.TOPIC_STATE. A
+     * publisher that sends no such field is read as TOPIC_EVENT; the
+     * subscriber refuses any other value with `BAD_VALUE`.
+     */
+    int topicKind;
 }

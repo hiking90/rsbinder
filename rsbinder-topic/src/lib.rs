@@ -72,6 +72,12 @@
 //! # Ok(()) }
 //! ```
 //!
+//! A publisher declares what its records are ([`TopicKind`]). The records of an event topic
+//! ([`Publisher::events`]) each tell of something that happened once, and a subscriber reads them
+//! in order from the next one. The newest record of a state topic ([`Publisher::state`]) is its
+//! current value: the topic is made with a first value, a subscriber reads the current value as
+//! it subscribes, and every receive returns the newest value, with no [`RecvError::Lagged`].
+//!
 //! A topic can also be found by name, the publisher and the subscriber starting in either
 //! order: [`Publisher::advertise_on`] registers the binder with the service manager, and a
 //! [`NamedSubscriber`] watches the name and connects to whichever publisher holds it, again and
@@ -129,7 +135,7 @@ pub mod uds;
 mod wait;
 mod wake;
 
-pub use builder::{EventTopic, PublisherBuilder, SubscriberBuilder};
+pub use builder::{EventTopic, PublisherBuilder, StateTopic, SubscriberBuilder, TopicKind};
 pub use named::{NamedState, NamedSubscriber};
 pub use payload::{Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
@@ -227,6 +233,19 @@ mod backpressure_tests;
 
 #[cfg(all(test, not(loom), not(miri)))]
 mod builder_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod state_tests;
 
 #[cfg(all(
     test,

@@ -51,7 +51,8 @@ use crate::wait::{
 use crate::wait::{on_pool, Armed, Leftover, REACTOR_ENDS};
 use crate::wake::{self, FdWake};
 use crate::{
-    poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats, Trust, Trusted, Untrusted,
+    poll, Bytes, Closed, Payload, RecvError, Sample, SubscriberStats, TopicKind, Trust, Trusted,
+    Untrusted,
 };
 
 /// Where a subscription starts reading:
@@ -59,9 +60,13 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Start {
+    /// As the topic's kind says, for each connection: [`Newest`](Self::Newest) on a
+    /// [`TopicKind::State`] topic, whose newest record is its current value, and
+    /// [`Next`](Self::Next) on a [`TopicKind::Event`] topic.
+    #[default]
+    Auto,
     /// At the next record: the first one published after the publisher took the subscription.
     /// The records already in the ring are not returned.
-    #[default]
     Next,
     /// At the newest record, so that the first receive returns the current value, then on from
     /// there. On a topic with no record yet, as `Next`. A
@@ -69,8 +74,20 @@ pub enum Start {
     /// starts at that publisher's newest record as well, unless that is the record the earlier
     /// connection returned last: then at the record after it.
     Newest,
-    /// At the oldest record still in the ring: as much history as the ring holds.
+    /// At the oldest record still in the ring: as much history as the ring holds. On a
+    /// [`TopicKind::State`] topic, whose receives return the newest value, as `Newest`.
     Oldest,
+}
+
+impl Start {
+    /// This start on a topic of `kind`: never [`Auto`](Self::Auto).
+    pub(crate) fn on(self, kind: TopicKind) -> Self {
+        match (self, kind) {
+            (Self::Auto, TopicKind::State) => Self::Newest,
+            (Self::Auto, _) => Self::Next,
+            (start, _) => start,
+        }
+    }
 }
 
 /// How the publisher wakes a subscriber that waits.
@@ -104,7 +121,7 @@ pub(crate) struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            start: Start::Next,
+            start: Start::Auto,
             max_ring_bytes: 16 << 20,
             max_pool_bytes: 256 << 20,
             wake: Wake::Futex,
@@ -173,6 +190,7 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     /// What keeps the session of an RPC binder open; dropped after the death link it serves.
     session: Option<Arc<dyn Any + Send + Sync>>,
     ring: RingId,
+    kind: TopicKind,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -221,14 +239,15 @@ impl<T: Payload> Subscriber<T> {
     }
 
     /// [`SubscriberBuilder::subscribe`](crate::SubscriberBuilder::subscribe), with where it
-    /// starts chosen once the reply says which topic it is. Nothing of the subscription call
-    /// depends on it: the start is this side's to apply. With [`Start::Newest`], the index beside
-    /// it is that of a record an earlier connection to the same ring returned last, which the
-    /// subscriber steps over unread when it is still the newest.
+    /// starts chosen once the reply says which topic it is and of what kind. Nothing of the
+    /// subscription call depends on it: the start is this side's to apply. With
+    /// [`Start::Newest`], the index beside it is that of a record an earlier connection to the
+    /// same ring returned last, which the subscriber steps over unread when it is still the
+    /// newest. [`Start::Auto`] is taken as the kind says.
     pub(crate) fn request_starting(
         topic: &SIBinder,
         policy: &Settings,
-        start: impl FnOnce(RingId) -> (Start, Option<u32>),
+        start: impl FnOnce(RingId, TopicKind) -> (Start, Option<u32>),
     ) -> BinderResult<Self> {
         layout::check_target().map_err(status_of)?;
         // The publisher's call on the token tells of an eviction, and needs a connection to go on.
@@ -277,6 +296,13 @@ impl<T: Payload> Subscriber<T> {
         };
         // The publisher holds its own fds now; this side keeps the mapping and a duplicate.
         drop(request);
+        let kind = TopicKind::from_wire(endpoint.topicKind).ok_or_else(|| {
+            log::error!(
+                "topic: cannot subscribe, a topic of kind {}",
+                endpoint.topicKind
+            );
+            StatusCode::BadValue
+        })?;
         let (memory, ring) = map_endpoint(&endpoint, policy.max_ring_bytes)?;
         let pool = match &endpoint.pool {
             Some(pool) => {
@@ -290,14 +316,15 @@ impl<T: Payload> Subscriber<T> {
             control: control.0.clone(),
             fd: fd_wake,
         });
-        let start = match start(ring) {
+        let (chosen, skip) = start(ring, kind);
+        let start = match chosen.on(kind) {
             // The bits of the position and the index, as the publisher wrote them.
-            (Start::Next, _) => ring::Start::Latest {
+            Start::Next | Start::Auto => ring::Start::Latest {
                 at: endpoint.start as u64,
                 index: endpoint.startIndex as u32,
             },
-            (Start::Newest, skip) => ring::Start::Last { skip },
-            (Start::Oldest, _) => ring::Start::Oldest,
+            Start::Newest => ring::Start::Last { skip },
+            Start::Oldest => ring::Start::Oldest,
         };
         let reader = Reader::attach(memory, start).map_err(|ring::Corrupted(what)| {
             log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
@@ -307,7 +334,10 @@ impl<T: Payload> Subscriber<T> {
             _abandon: Abandon {
                 local: local.clone(),
             },
-            reader: TypedReader::new(reader, pool),
+            reader: match kind {
+                TopicKind::State => TypedReader::new(reader, pool).skipping_lost(),
+                _ => TypedReader::new(reader, pool),
+            },
             control,
             #[cfg(feature = "tokio")]
             reactor: None,
@@ -324,6 +354,7 @@ impl<T: Payload> Subscriber<T> {
             read_end: false,
             session: None,
             ring,
+            kind,
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -360,11 +391,26 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         self.reader.last_index()
     }
 
+    /// The kind of the topic, as its publisher declared it.
+    pub fn topic_kind(&self) -> TopicKind {
+        self.kind
+    }
+
+    /// Whether a receive that asked for the newest value with `latest` returns the newest:
+    /// always on a state topic (plan 15 field §3.7).
+    pub(crate) fn reads_latest(&self, latest: bool) -> bool {
+        latest || self.kind == TopicKind::State
+    }
+
     /// The next value, without waiting.
     ///
     /// [`RecvError::Empty`] when no record is unread. After the publisher's process died, every
     /// record it committed is still returned, and then
     /// [`Closed::PublisherDied`](crate::Closed::PublisherDied).
+    ///
+    /// On a [`TopicKind::State`] topic every receive returns the newest value, as
+    /// [`try_latest`](Self::try_latest) does: the values before it are past values, skipped and
+    /// not counted as lost, and no receive returns [`RecvError::Lagged`].
     pub fn try_recv(&mut self) -> Result<T, RecvError> {
         self.look(false)
     }
@@ -616,7 +662,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         }
         let before = self.before_look();
         let died = self.local.died();
-        let received = match (M::TRUSTED, latest) {
+        let received = match (M::TRUSTED, self.reads_latest(latest)) {
             // SAFETY: `Trusted`, which only `trust_publisher` makes, on its caller's word.
             (true, latest) => unsafe { self.reader.recv_vouched(latest) },
             (false, true) => self.reader.try_latest(),
@@ -871,6 +917,7 @@ impl<T: Payload> Subscriber<T> {
             read_end,
             session,
             ring,
+            kind,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -898,6 +945,7 @@ impl<T: Payload> Subscriber<T> {
             read_end,
             session,
             ring,
+            kind,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -988,7 +1036,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
         }
         let before = self.before_look();
         let died = self.local.died();
-        let held = self.reader.take_held(latest);
+        let held = self.reader.take_held(self.reads_latest(latest));
         // A pinned slot is still being read: its record counts as read once the sample drops.
         let read = match held {
             Ok(Held::Slot { at, .. }) => at,

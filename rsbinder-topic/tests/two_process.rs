@@ -92,6 +92,18 @@ fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     assert_eq!(memfds(), before);
 }
 
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_subscriber_of_another_process_reads_a_state_topics_value_at_once() {
+    init();
+    let first = Bytes(b"first".to_vec());
+    let publisher = Publisher::<Bytes>::state().build(&first).unwrap();
+    let name = name("state");
+    hub::add_service(&name, publisher.as_binder()).unwrap();
+    let peer = Peer::spawn("state", &name);
+    assert_eq!(peer.says(), "State first");
+}
+
 /// Lend a slot for `value` and publish it; the slot's address, which names it.
 fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> usize {
     let mut loan = publisher.loan_slice(value.len()).unwrap();
@@ -677,6 +689,14 @@ fn child() {
             assert_eq!(line.trim(), "drop");
             drop(subscriber);
             say("dropped");
+            wait_for_eof();
+        }
+        "state" => {
+            let topic = hub::check_service(&name).unwrap();
+            let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
+            let Bytes(value) = subscriber.try_recv().unwrap();
+            let value = String::from_utf8(value).unwrap();
+            say(&format!("{:?} {value}", subscriber.topic_kind()));
             wait_for_eof();
         }
         "pin" => {

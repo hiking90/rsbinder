@@ -87,10 +87,13 @@ cargo run -p rsbinder-topic --example topic_readings -- publish
 cargo run -p rsbinder-topic --example topic_readings -- subscribe
 ```
 
-A subscriber starts at the first record published after its subscription
-(`Start::Next`), so it misses what came before. `SubscriberBuilder::start_at`
-also takes `Start::Newest`, whose first receive returns the newest record, and
-`Start::Oldest`, which reads everything the ring still holds.
+A subscriber of an event topic, which `Publisher::events()` makes, starts at
+the first record published after its subscription (`Start::Next`), so it misses
+what came before. `SubscriberBuilder::start_at` also takes `Start::Newest`,
+whose first receive returns the newest record, and `Start::Oldest`, which reads
+everything the ring still holds. The default, `Start::Auto`, follows the topic's
+kind: on a state topic, which `Publisher::state()` makes with a first value, it
+is `Start::Newest`, and every receive returns the newest value.
 
 Both ends are made by a builder: `Publisher::events()` and
 `Subscriber::builder()`. The publisher's builder sizes the ring from the

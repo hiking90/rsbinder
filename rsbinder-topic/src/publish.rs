@@ -21,12 +21,13 @@ use crate::payload::{relabel, Piece};
 use crate::pool::LentSlot;
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
-use crate::{end, Encoding, Payload, PublisherStats};
+use crate::{end, Encoding, Payload, PublisherStats, TopicKind};
 
 /// What a topic is made with: the settings of a [`PublisherBuilder`](crate::PublisherBuilder),
 /// worked out.
 #[derive(Clone, Debug)]
 pub(crate) struct Spec {
+    pub(crate) kind: TopicKind,
     /// Bytes of ring, 4 KiB to 1 GiB, rounded up to a multiple of 8 when the topic is made.
     pub(crate) ring_bytes: usize,
     pub(crate) max_subscribers: usize,
@@ -39,6 +40,7 @@ pub(crate) struct Spec {
 impl Default for Spec {
     fn default() -> Self {
         Self {
+            kind: TopicKind::Event,
             ring_bytes: MIN_RING,
             max_subscribers: 64,
             max_per_uid: 64,

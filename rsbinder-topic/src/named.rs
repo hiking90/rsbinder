@@ -38,7 +38,7 @@ use crate::subscriber::{Interrupt, RingId, Settings};
 use crate::wake::NamedFds;
 use crate::{
     Bytes, Closed, Disconnected, Interrupter, Payload, RecvError, Sample, Start, Subscriber,
-    SubscriberStats, Trust, Trusted, Untrusted, Wake,
+    SubscriberStats, TopicKind, Trust, Trusted, Untrusted, Wake,
 };
 
 /// The first wait before a refused subscription is asked again, doubled up to [`LAST_RETRY`].
@@ -123,7 +123,9 @@ pub enum NamedState {
 /// Records do not carry over from one connection to the next: the index starts again, and what
 /// was published between the two is not counted as lost (the `Disconnected` marks the gap). The
 /// first connection starts where the builder's [`start_at`](crate::SubscriberBuilder::start_at)
-/// says. A later connection to a publisher this subscriber was not connected to before starts at
+/// says, and [`Start::Auto`] is taken for each connection as that publisher's kind says: below,
+/// [`Start::Newest`] on a state topic and [`Start::Next`] on an event topic.
+/// A later connection to a publisher this subscriber was not connected to before starts at
 /// the oldest record of the new ring, unless that start is [`Start::Newest`]: the subscription
 /// is older than that publisher, so all it published is news to it. A connection to a publisher
 /// it was connected to before, as when the name comes back to that publisher after another held
@@ -679,6 +681,14 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         }
     }
 
+    /// The kind of the topic of the connection receives read from, as its publisher declared it;
+    /// `None` until a receive has taken a connection, and once that connection has ended. Each
+    /// publisher of the name declares its own, so it can change with the connection.
+    pub fn topic_kind(&self) -> Option<TopicKind> {
+        let connection = self.current.as_ref()?;
+        Some(connection.subscriber.topic_kind())
+    }
+
     /// What this subscriber has received over all its connections since it was made (plan 15
     /// §5.9a); see [`SubscriberStats`] for what that counts and what it does not.
     pub fn stats(&self) -> SubscriberStats {
@@ -944,8 +954,8 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
                 }
             }
             if settle {
-                // `try_latest` skips what it does not return; `try_recv` counts it as lost.
-                let lost = if latest {
+                // `try_latest`, and any receive of a state topic, skips what it does not return.
+                let lost = if subscriber.reads_latest(latest) {
                     0
                 } else {
                     subscriber.count_lost_before()
@@ -1338,10 +1348,10 @@ impl<T: Payload> Named<T> {
     }
 
     /// Where a connection to the topic of `ring` starts, as [`NamedSubscriber`] documents, and
-    /// for [`Start::Newest`] the record to skip.
-    fn start_of(&self, ring: RingId) -> (Start, Option<u32>) {
+    /// for [`Start::Newest`] the record to skip; [`Start::Auto`] as the topic's `kind` says.
+    fn start_of(&self, ring: RingId, kind: TopicKind) -> (Start, Option<u32>) {
         let state = self.lock();
-        let start = self.policy.start;
+        let start = self.policy.start.on(kind);
         match state.joined.iter().find(|joined| joined.ring == ring) {
             Some(joined) if start == Start::Newest => (Start::Newest, joined.last_index),
             Some(_) => (Start::Next, None),
@@ -1473,8 +1483,8 @@ impl<T: Payload + 'static> Named<T> {
                     return;
                 }
             }
-            let result = Subscriber::<T>::request_starting(&binder, &self.policy, |ring| {
-                self.start_of(ring)
+            let result = Subscriber::<T>::request_starting(&binder, &self.policy, |ring, kind| {
+                self.start_of(ring, kind)
             });
             let mut state = self.lock();
             let newer = state.latest.clone().filter(|latest| *latest != binder);

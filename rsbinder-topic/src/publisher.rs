@@ -35,7 +35,7 @@ use crate::pool::MAX_PINS;
 use crate::publish::{Authorize, Spec};
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Advertisement, Resolver};
-use crate::{wake, Bytes, Payload, PublishError, PublisherStats};
+use crate::{wake, Bytes, Payload, PublishError, PublisherStats, TopicKind};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -86,6 +86,7 @@ struct Shared<T> {
     /// The pool memory, duplicated into every reply, for a topic that lends slots.
     pool: Option<PoolFd>,
     capacity: u64,
+    kind: TopicKind,
     max_subscribers: usize,
     max_per_uid: usize,
     authorize: Option<Authorize>,
@@ -101,6 +102,7 @@ impl<T: Payload + 'static> Publisher<T> {
             fd,
             pool,
             capacity,
+            kind: spec.kind,
             max_subscribers: spec.max_subscribers,
             max_per_uid: spec.max_per_uid,
             authorize: spec.authorize.clone(),
@@ -257,6 +259,16 @@ impl<T: Payload + 'static> Publisher<T> {
         let mut stats = self.shared.writer.stats();
         stats.advertised = self.lock_advertised().is_some();
         stats
+    }
+
+    /// Whether the topic's end record is written.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.shared.writer.lock().writer.ended()
+    }
+
+    /// The kind the topic was made as: [`Publisher::events`] or [`Publisher::state`].
+    pub fn topic_kind(&self) -> TopicKind {
+        self.shared.kind
     }
 
     /// The subscriptions the topic holds, after taking out those that ended.
@@ -657,6 +669,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             start: start as i64,
             startIndex: index as i32,
             pool,
+            topicKind: self.kind.wire(),
         })
     }
 }

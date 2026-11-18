@@ -100,6 +100,15 @@ fn drain(subscriber: &mut Subscriber<Bytes>) -> (Vec<Bytes>, Closed) {
 }
 
 #[test]
+fn a_subscriber_of_another_process_reads_a_state_topics_value_at_once() {
+    let first = Bytes(b"first".to_vec());
+    let publisher = Publisher::<Bytes>::state().build(&first).unwrap();
+    let (path, _handle) = serve(&publisher, "state");
+    let peer = Peer::spawn("state", to_str(&path));
+    assert_eq!(peer.says(), "State first");
+}
+
+#[test]
 fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     if !alone("a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped") {
         return;
@@ -356,6 +365,13 @@ fn child() {
                 drop(subscriber);
                 say("dropped");
             }
+            wait_for_eof();
+        }
+        "state" => {
+            let mut subscriber = builder.clone().connect(endpoint()).unwrap();
+            let Bytes(value) = subscriber.try_recv().unwrap();
+            let value = String::from_utf8(value).unwrap();
+            say(&format!("{:?} {value}", subscriber.topic_kind()));
             wait_for_eof();
         }
         "subscribe-idle" => {

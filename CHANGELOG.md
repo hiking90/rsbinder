@@ -19,6 +19,13 @@ This changelog starts at 0.9.0. For earlier releases, see the
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds
   a blocking-pool thread that a `timeout` around the future cannot release,
   and `Runtime::drop` then waits for it.
+- `rsbinder-topic`: state topics. `Publisher::state()` makes a topic whose
+  newest record is its current value, with a first value given to `build` or
+  written by `build_with`. A subscriber learns the kind as it subscribes
+  (`TopicKind`, `TopicEndpoint.topicKind`, `topic_kind()`). The new default
+  `Start::Auto` starts a state topic at its newest record and an event topic
+  at the next one, and every receive of a state topic returns the newest value
+  with no `RecvError::Lagged`.
 
 ### Changed
 

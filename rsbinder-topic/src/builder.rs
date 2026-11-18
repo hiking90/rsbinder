@@ -21,7 +21,48 @@ use crate::backpressure::Lossless;
 use crate::publish::{ring_for, Authorize, PoolSpec, Spec};
 use crate::resolve::{Resolver, ServiceManager};
 use crate::subscriber::Settings;
-use crate::{NamedSubscriber, Payload, Publisher, Start, Subscriber, Wake};
+use crate::{NamedSubscriber, Payload, PublishError, Publisher, Start, Subscriber, Wake};
+
+/// The records of a state topic's ring besides the one being written (plan 15 field D11).
+const STATE_DEPTH: usize = 2;
+
+/// What a topic's records are, which its publisher declares by the builder it starts and every
+/// subscriber learns as it subscribes ([`Subscriber::topic_kind`]).
+///
+/// The kind decides how a subscriber reads when it does not say: where
+/// [`Start::Auto`] starts, and whether a receive returns each record or the newest one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TopicKind {
+    /// Each record tells of something that happened once: a subscriber reads them in order from
+    /// the next one, and is told how many it lost when it falls behind
+    /// ([`RecvError::Lagged`](crate::RecvError::Lagged)). [`Publisher::events`]; a publisher that
+    /// says nothing of its kind, as one of a layout before kinds, is taken as one.
+    Event,
+    /// The newest record is the current value, and the ones before it are past values: a
+    /// subscriber reads the current value as it subscribes, and every receive returns the newest
+    /// value, skipping older ones without counting them as lost. [`Publisher::state`].
+    State,
+}
+
+impl TopicKind {
+    /// The value of `TopicEndpoint.topicKind` for this kind.
+    pub(crate) fn wire(self) -> i32 {
+        match self {
+            Self::Event => crate::aidl::ITopic::TOPIC_EVENT,
+            Self::State => crate::aidl::ITopic::TOPIC_STATE,
+        }
+    }
+
+    /// The kind `TopicEndpoint.topicKind` names; `None` for a value of no kind.
+    pub(crate) fn from_wire(wire: i32) -> Option<Self> {
+        match wire {
+            crate::aidl::ITopic::TOPIC_EVENT => Some(Self::Event),
+            crate::aidl::ITopic::TOPIC_STATE => Some(Self::State),
+            _ => None,
+        }
+    }
+}
 
 /// The kind of a topic whose records are events: each one happened once, and a subscriber that
 /// fell behind is told how many it lost. The type parameter of a [`PublisherBuilder`] that
@@ -29,7 +70,13 @@ use crate::{NamedSubscriber, Payload, Publisher, Start, Subscriber, Wake};
 #[derive(Debug)]
 pub enum EventTopic {}
 
-/// A builder of a [`Publisher`] of `T`, for a topic of the kind `K`: [`Publisher::events`].
+/// The kind of a topic whose newest record is its current value ([`TopicKind::State`]). The type
+/// parameter of a [`PublisherBuilder`] that [`Publisher::state`] starts.
+#[derive(Debug)]
+pub enum StateTopic {}
+
+/// A builder of a [`Publisher`] of `T`, for a topic of the kind `K`: [`Publisher::events`] or
+/// [`Publisher::state`].
 ///
 /// Setting the same thing twice keeps the last call. The settings that only one kind of topic
 /// has, and the call that makes the publisher, are in the `impl` block of that kind.
@@ -105,6 +152,45 @@ impl<T: Payload + 'static> Publisher<T> {
     /// so that a subscriber that falls behind is told how many it lost
     /// ([`RecvError::Lagged`](crate::RecvError::Lagged)).
     pub fn events() -> PublisherBuilder<T, EventTopic> {
+        PublisherBuilder::new()
+    }
+
+    /// A builder of a state topic: one whose newest record is its current value, which every
+    /// subscriber reads as it subscribes ([`TopicKind::State`]). The last call writes the first
+    /// value, so the topic has one from before anyone can reach it.
+    ///
+    /// ```no_run
+    /// use rsbinder::hub;
+    /// use rsbinder_topic::{Bytes, Publisher};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let target = Publisher::<Bytes>::state()
+    ///     .max_value_bytes(64)
+    ///     .build(&Bytes(b"21.0".to_vec()))?;
+    /// hub::add_service("example.target", target.as_binder())?;
+    /// target.publish(&Bytes(b"21.5".to_vec()))?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The builder has no setting of records to keep and no
+    /// [`lossless`](PublisherBuilder::lossless): a subscriber that falls behind skips to the
+    /// newest value, so there is nothing to keep for it or to wait for.
+    ///
+    /// ```compile_fail
+    /// use rsbinder_topic::{Bytes, Publisher};
+    /// let _ = Publisher::<Bytes>::state().keep(8);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use rsbinder_topic::{Bytes, Publisher};
+    /// let _ = Publisher::<Bytes>::state().lossless(std::time::Duration::from_secs(1));
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use rsbinder_topic::{Bytes, Publisher};
+    /// let _ = Publisher::<Bytes>::state().lend(1 << 20).lend_keep(4);
+    /// ```
+    pub fn state() -> PublisherBuilder<T, StateTopic> {
         PublisherBuilder::new()
     }
 }
@@ -247,8 +333,9 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
         self
     }
 
-    /// `depth` records of `max_value_bytes` in the ring, `lend_keep` values in the pool.
-    fn spec(&self, depth: usize, lend_keep: usize) -> BinderResult<Spec> {
+    /// A topic of `kind`: `depth` records of `max_value_bytes` in the ring, `lend_keep` values in
+    /// the pool.
+    fn spec(&self, kind: TopicKind, depth: usize, lend_keep: usize) -> BinderResult<Spec> {
         if self.lend.is_none() {
             let stray = [
                 (self.max_loans.is_some(), "max_loans"),
@@ -258,13 +345,14 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
             if let Some((_, setting)) = stray.iter().find(|(set, _)| *set) {
                 let why =
                     format!("`{setting}` is a setting of the pool, and `lend` was not called");
-                return Err(Status::from((ExceptionCode::IllegalArgument, why.as_str())));
+                return Err(illegal(&why));
             }
         }
         let ring_bytes = self
             .ring_bytes
             .unwrap_or_else(|| ring_for(self.max_value_bytes.unwrap_or(0), depth));
         Ok(Spec {
+            kind,
             ring_bytes,
             max_subscribers: self.max_subscribers,
             max_per_uid: self.max_per_uid,
@@ -433,8 +521,66 @@ impl<T: Payload + 'static> PublisherBuilder<T, EventTopic> {
     }
 
     pub(crate) fn event_spec(&self) -> BinderResult<Spec> {
-        self.spec(self.keep, self.lend_keep.unwrap_or(2))
+        self.spec(TopicKind::Event, self.keep, self.lend_keep.unwrap_or(2))
     }
+}
+
+impl<T: Payload + 'static> PublisherBuilder<T, StateTopic> {
+    /// Make the topic with `initial` as its first value, published before the publisher is
+    /// returned, so that no subscriber finds the topic without a value.
+    ///
+    /// The ring holds two values of `max_value_bytes` besides the one being written, the newest
+    /// and the one before it, and no less than 4 KiB: a subscriber that copies the newest value
+    /// while the publisher writes the next one reads it whole, and one slower than that skips to
+    /// a newer value. A value larger than half the ring
+    /// ([`max_value_bytes`](PublisherBuilder::max_value_bytes)) does not fit a record; on a topic
+    /// that lends ([`lend`](PublisherBuilder::lend)), [`build_with`](Self::build_with) writes a
+    /// first value of any size into a slot.
+    ///
+    /// The refusals of [`events`](Publisher::events)' `build`, and `EX_ILLEGAL_ARGUMENT` when
+    /// `initial` does not fit a record, its message naming both sizes, or the status code of its
+    /// failed encoding ([`PublishError::Encode`]).
+    pub fn build(self, initial: &T) -> BinderResult<Publisher<T>> {
+        self.build_with(|publisher| publisher.publish(initial))
+    }
+
+    /// Make the topic, and have `init` publish its first value, before the publisher is returned:
+    /// with [`publish`](Publisher::publish), or into a slot of the pool with
+    /// [`loan_slice`](Publisher::loan_slice) for a value larger than a record.
+    ///
+    /// The refusals of [`build`](Self::build), for what `init` returns: its
+    /// [`PublishError::Encode`] as the status code, any other error as `EX_ILLEGAL_ARGUMENT`.
+    /// Also `EX_ILLEGAL_ARGUMENT` when `init` returns `Ok` with nothing published, or with the
+    /// topic closed. The topic made is dropped on each, before anyone could reach it.
+    pub fn build_with(
+        self,
+        init: impl FnOnce(&Publisher<T>) -> Result<(), PublishError>,
+    ) -> BinderResult<Publisher<T>> {
+        let publisher = Publisher::from_spec(&self.state_spec()?)?;
+        if let Err(error) = init(&publisher) {
+            log::error!("topic: the first value of a state topic was not published: {error}");
+            return Err(match error {
+                PublishError::Encode(code) => code.into(),
+                other => illegal(&format!("the first value was not published: {other}")),
+            });
+        }
+        if publisher.is_closed() {
+            return Err(illegal("the first value's `init` closed the topic"));
+        }
+        if publisher.stats().published == 0 {
+            return Err(illegal("the first value's `init` published nothing"));
+        }
+        Ok(publisher)
+    }
+
+    pub(crate) fn state_spec(&self) -> BinderResult<Spec> {
+        self.spec(TopicKind::State, STATE_DEPTH, 1)
+    }
+}
+
+/// `EX_ILLEGAL_ARGUMENT` with `why` as its message.
+fn illegal(why: &str) -> Status {
+    Status::from((ExceptionCode::IllegalArgument, why))
 }
 
 /// A builder of a [`Subscriber`] or a [`NamedSubscriber`] of `T`: [`Subscriber::builder`].
@@ -486,7 +632,7 @@ impl<T: Payload> SubscriberBuilder<T> {
         }
     }
 
-    /// Where each connection starts reading. Default [`Start::Next`].
+    /// Where each connection starts reading. Default [`Start::Auto`]: as the topic's kind says.
     pub fn start_at(mut self, start: Start) -> Self {
         self.settings.start = start;
         self
@@ -547,7 +693,7 @@ impl<T: Payload> SubscriberBuilder<T> {
     /// for as long as the subscriber.
     pub fn subscribe(self, topic: &SIBinder) -> BinderResult<Subscriber<T>> {
         let start = self.settings.start;
-        Subscriber::request_starting(topic, &self.settings, |_| (start, None))
+        Subscriber::request_starting(topic, &self.settings, |_, _| (start, None))
     }
 
     /// Subscribe to the topic of the publisher at `endpoint`, with

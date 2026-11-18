@@ -729,6 +729,7 @@ impl ITopic for ByHand {
             start: 0,
             startIndex: 0,
             pool: None,
+            topicKind: crate::TopicKind::Event.wire(),
         })
     }
 }
@@ -1153,6 +1154,51 @@ fn a_latest_drain_lapped_at_every_look_ends_without_a_loss() {
         subscriber.try_latest(),
         Err(RecvError::Disconnected(Disconnected::Replaced))
     );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
+/// [`ByHand`] that says its topic is a state topic.
+struct StateByHand(ByHand);
+
+impl Interface for StateByHand {}
+
+impl ITopic for StateByHand {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        let endpoint = self.0.r#subscribe(request)?;
+        Ok(TopicEndpoint {
+            topicKind: crate::TopicKind::State.wire(),
+            ..endpoint
+        })
+    }
+}
+
+/// A drain of a state topic that gives up short of its end, the newest record written over at
+/// every judgment, counts what it left unread as past values and not as lost.
+#[test]
+fn a_state_drain_that_gives_up_short_of_its_end_reports_no_loss() {
+    let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
+    let stored = Rc::new(stored);
+    let writer: Old = Rc::new(RefCell::new(Writer::new(Shared(stored))));
+    publish_items(&writer, 4);
+    let names = Names::default();
+    let old = StateByHand(ByHand(memory));
+    names.give(NAME, BnTopic::new_binder(old).as_binder());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(Vec::new())));
+    assert_eq!(subscriber.topic_kind(), Some(crate::TopicKind::State));
+    publish_items(&writer, 4);
+    let new = state(&bytes(9));
+    names.give(NAME, new.as_binder());
+    let chasing = writer.clone();
+    judging(move || {
+        let written = chasing.borrow().position();
+        lap(&chasing, written);
+    });
+    let got = subscriber.try_recv();
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Err(RecvError::Disconnected(Disconnected::Replaced)));
     assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
     assert_eq!(subscriber.stats().lost, 0);
 }
@@ -3074,4 +3120,111 @@ fn a_name_subscriber_and_its_interrupter_move_between_threads() {
     shared::<crate::Interrupter>();
     shared::<PublisherBuilder<Bytes, EventTopic>>();
     shared::<SubscriberBuilder<Bytes>>();
+}
+
+fn state(first: &Bytes) -> Publisher<Bytes> {
+    Publisher::state().build(first).unwrap()
+}
+
+/// A value of a sequence long enough to lap a 4 KiB ring.
+fn count(n: u32) -> Bytes {
+    Bytes(n.to_le_bytes().to_vec())
+}
+
+#[test]
+fn a_state_topic_given_a_name_returns_its_value_to_a_subscriber_at_once() {
+    let names = Names::default();
+    let target = state(&bytes(1));
+    target.advertise_on(NAME, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    assert_eq!(subscriber.topic_kind(), None);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Ok(bytes(1)));
+    assert_eq!(subscriber.topic_kind(), Some(crate::TopicKind::State));
+}
+
+/// `Start::Auto` is taken as each publisher's kind: a state topic seen first on a later
+/// connection starts at its newest record, an event topic connected to again at the next one,
+/// and a state topic connected to again returns no value an earlier connection returned.
+#[test]
+fn an_auto_start_follows_the_kind_of_each_publisher_the_name_moves_to() {
+    use crate::TopicKind::{Event, State};
+    let names = Names::default();
+    let events = advertise(&names, policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.topic_kind(), Some(Event));
+    events.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+
+    let target = state(&bytes(10));
+    target.publish(&bytes(11)).unwrap();
+    target.publish(&bytes(12)).unwrap();
+    names.give(NAME, target.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(12)));
+    assert_eq!(subscriber.topic_kind(), Some(State));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    // Back to the event topic: what it published meanwhile is not returned.
+    events.publish(&bytes(2)).unwrap();
+    names.give(NAME, events.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.topic_kind(), Some(Event));
+    events.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+
+    // Back to the state topic: its value of meanwhile at once, and once.
+    target.publish(&bytes(13)).unwrap();
+    names.give(NAME, target.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(13)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    // Away and back with no publish: the value returned last is not returned again.
+    names.give(NAME, events.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    names.give(NAME, target.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
+/// A state topic's drain returns its newest value and ends with no `Lagged`, where an event
+/// topic's reports the records written over.
+#[test]
+fn a_state_publisher_replaced_after_a_lap_ends_its_drain_with_no_loss() {
+    let names = Names::default();
+    let first = state(&count(0));
+    first.advertise_on(NAME, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Ok(count(0)));
+    for n in 1..=1000 {
+        first.publish(&count(n)).unwrap();
+    }
+    let second = state(&count(5000));
+    names.give(NAME, second.as_binder());
+    assert_eq!(recv(&mut subscriber), Ok(count(1000)));
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(count(5000)));
+    assert_eq!(subscriber.stats().lost, 0);
+
+    let events = advertise(&names, policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    for n in 1..=1000 {
+        events.publish(&count(n)).unwrap();
+    }
+    names.give(NAME, second.as_binder());
+    assert!(matches!(recv(&mut subscriber), Err(RecvError::Lagged(_))));
 }

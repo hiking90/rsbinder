@@ -71,7 +71,9 @@ pub struct SubscriberInfo {
 pub struct SubscriberStats {
     /// Values returned.
     pub received: u64,
-    /// Records reported lost, as [`RecvError::Lagged`](crate::RecvError::Lagged) counts them.
+    /// Records reported lost, as [`RecvError::Lagged`](crate::RecvError::Lagged) counts them. Stays
+    /// 0 on a [`TopicKind::State`](crate::TopicKind::State) topic, whose receives skip past values
+    /// without reporting them.
     pub lost: u64,
     /// Records that failed to decode, each one a [`RecvError::Decode`](crate::RecvError::Decode).
     pub decode_errors: u64,

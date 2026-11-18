@@ -218,7 +218,7 @@ pub(crate) fn connect_with<T: Payload>(
     let session = connect(endpoint, options)?;
     let start = policy.start;
     let subscriber =
-        Subscriber::request_starting(&session.0.get_root()?, policy, |_| (start, None))?;
+        Subscriber::request_starting(&session.0.get_root()?, policy, |_, _| (start, None))?;
     session.0.set_reply_timeout(None)?;
     Ok(subscriber.with_session(Arc::new(session)))
 }

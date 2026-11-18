@@ -348,6 +348,40 @@ fn a_publisher_that_keeps_taking_the_newest_value_back_holds_no_try_latest() {
     );
 }
 
+/// The same on a state topic: the receive gives up with no loss, and a wait would look again.
+#[test]
+fn a_state_publisher_that_keeps_taking_the_newest_value_back_reports_no_loss() {
+    let first = |publisher: &Publisher<Bytes>| {
+        lend(publisher, &pattern(0, 64));
+        Ok(())
+    };
+    let publisher = Publisher::<Bytes>::state()
+        .max_subscribers(1)
+        .lend(SLOT)
+        .build_with(first)
+        .unwrap();
+    let publisher = Rc::new(publisher);
+    let mut subscriber = subscribe(&publisher);
+    let published = Rc::new(Cell::new(1u8));
+    let (lending, count) = (publisher.clone(), published.clone());
+    BEFORE_JUDGING.set(Some(Box::new(move || {
+        let n = count.get();
+        if n < 64 {
+            lend(&lending, &pattern(n, 64));
+            count.set(n + 1);
+        }
+    })));
+    let got = subscriber.try_recv();
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Err(RecvError::Empty));
+    assert!(subscriber.gave_up());
+    assert_eq!(subscriber.stats().lost, 0);
+    let published = published.get();
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(published - 1, 64))));
+    assert!(!subscriber.gave_up());
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
 /// The newest value, lent, is received copied or where it lies; the values skipped are not lost.
 #[test]
 fn the_newest_lent_value_is_received_past_the_values_before_it_with_no_loss() {

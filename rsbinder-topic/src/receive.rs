@@ -204,6 +204,10 @@ pub(crate) struct TypedReader<T, L> {
     loaned: Vec<u8>,
     /// Loans whose slot was taken back before this reader pinned it.
     lost_loans: u64,
+    /// A state topic's: a loan taken back is a past value, not a loss to report.
+    skips_lost: bool,
+    /// The last call gave up on loans taken back, with `skips_lost`.
+    gave_up_loans: bool,
     /// A loan named what no pool of the publisher's has: nothing more is read.
     corrupted: bool,
     _payload: PhantomData<fn() -> T>,
@@ -216,9 +220,19 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
             pool,
             loaned: Vec::new(),
             lost_loans: 0,
+            skips_lost: false,
+            gave_up_loans: false,
             corrupted: false,
             _payload: PhantomData,
         }
+    }
+
+    /// This reader for a state topic: a call that finds only loans taken back gives up with
+    /// [`RecvError::Empty`], as one the publisher keeps lapping does, instead of reporting one
+    /// lost; a newer value is committed by then, which the next call reads.
+    pub(crate) fn skipping_lost(mut self) -> Self {
+        self.skips_lost = true;
+        self
     }
 
     /// The next value, without waiting.
@@ -257,6 +271,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
+        self.gave_up_loans = false;
         let mut retries = 0;
         loop {
             let taken = if latest {
@@ -291,6 +306,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
+        self.gave_up_loans = false;
         let mut retries = 0;
         loop {
             let taken = if latest {
@@ -351,8 +367,13 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         }
     }
 
-    /// A loan whose slot was taken back before this reader pinned it, counted.
+    /// A loan whose slot was taken back before this reader pinned it: counted, or with
+    /// [`skipping_lost`](Self::skipping_lost) a give-up.
     fn lost_loan(&mut self) -> RecvError {
+        if self.skips_lost {
+            self.gave_up_loans = true;
+            return RecvError::Empty;
+        }
         self.lost_loans += 1;
         RecvError::Lagged(1)
     }
@@ -383,9 +404,10 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         self.reader.pending()
     }
 
-    /// Whether the ring reader's last call gave up short of `write` ([`Reader::gave_up`]).
+    /// Whether the last call gave up short of `write`: the ring reader's ([`Reader::gave_up`]),
+    /// or on loans taken back ([`skipping_lost`](Self::skipping_lost)).
     pub(crate) fn gave_up(&self) -> bool {
-        self.reader.gave_up()
+        self.reader.gave_up() || self.gave_up_loans
     }
 
     /// [`Reader::count_lost_before`]; none when the reader has failed a check, after which nothing
