@@ -1067,7 +1067,7 @@ impl Topology {
 }
 
 /// What a stop point found of each process: memfds open, memfd mappings, threads outside the
-/// binder and tokio pools; and the service manager's open files.
+/// binder, tokio and wait-thread pools; and the service manager's open files.
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     /// Keyed by node and start count: a restarted node is another process.
@@ -1110,15 +1110,17 @@ fn memfd_counts(pid: i32) -> (usize, usize, usize) {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|maps| maps.lines().filter(|line| line.contains("/memfd:")).count())
         .unwrap_or(0);
-    // The binder pool and tokio's blocking pool start threads on demand and the latter ends idle
-    // ones, so neither count is fixed; what a leak leaves (a connect or retry thread of
-    // rsbinder-topic, a role's) is named otherwise.
+    // The binder pool, tokio's blocking pool and rsbinder's wait threads start threads on demand
+    // and the last two end idle ones, so no such count is fixed; what a leak leaves (a connect or
+    // retry thread of rsbinder-topic, a role's) is named otherwise.
     let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |tasks| {
         tasks
             .filter_map(Result::ok)
             .filter(|task| {
                 let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
-                !comm.starts_with("binder:") && !comm.starts_with("tokio-")
+                !["binder:", "tokio-", "rsbinder-wait"]
+                    .iter()
+                    .any(|pool| comm.starts_with(pool))
             })
             .count()
     });
