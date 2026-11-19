@@ -229,6 +229,8 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     kind: TopicKind,
     /// The publisher's number for the subscription; `None` from a publisher that sends none.
     id: Option<u64>,
+    /// The name of the topic's payload type, as the publisher compares it.
+    type_name: String,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -427,6 +429,11 @@ impl<T: Payload> Subscriber<T> {
             kind,
             // The bits of a `u64`, as the publisher wrote them.
             id: Some(endpoint.id as u64).filter(|&id| id != 0),
+            // A publisher that names none took only this side's own name.
+            type_name: match endpoint.typeName.as_str() {
+                "" => T::type_name().to_owned(),
+                named => named.to_owned(),
+            },
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -473,6 +480,13 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// `rsbinder-topic` 0.1, which gives none.
     pub fn id(&self) -> Option<u64> {
         self.id
+    }
+
+    /// The name of the topic's payload type, as its publisher compares it: for a subscriber of
+    /// [`AnyType`](crate::AnyType), what its records are. A publisher of `rsbinder-topic` 0.1
+    /// names none and took only this subscriber's own name, which this is then.
+    pub fn topic_type(&self) -> &str {
+        &self.type_name
     }
 
     /// Whether a receive that asked for the newest value with `latest` returns the newest:
@@ -1009,6 +1023,7 @@ impl<T: Payload> Subscriber<T> {
             ring,
             kind,
             id,
+            type_name,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1039,6 +1054,7 @@ impl<T: Payload> Subscriber<T> {
             ring,
             kind,
             id,
+            type_name,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]

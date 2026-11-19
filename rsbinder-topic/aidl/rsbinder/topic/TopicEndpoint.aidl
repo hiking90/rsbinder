@@ -72,4 +72,12 @@ parcelable TopicEndpoint {
      * knows. A publisher that sends no such field took none.
      */
     int flags;
+
+    /**
+     * The name of the payload type, as the publisher compares it with
+     * SubscribeRequest.type: what a subscriber that asked for any type
+     * (an empty SubscribeRequest.type) reads to learn it. A publisher that
+     * sends no such field is read as "", and took only its own name.
+     */
+    String typeName;
 }

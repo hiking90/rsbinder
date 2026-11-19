@@ -23,7 +23,9 @@ parcelable SubscribeRequest {
      * The name of the payload type the subscriber decodes. The publisher
      * compares it with the name of its own type and refuses a different one
      * with `BAD_TYPE`. In rsbinder it is the parcelable's descriptor, or
-     * the name a custom `Payload` gives.
+     * the name a custom `Payload` gives. The empty name asks for a topic of
+     * any type, which TopicEndpoint.typeName then names; no publisher has
+     * it as its own.
      */
     String type;
 

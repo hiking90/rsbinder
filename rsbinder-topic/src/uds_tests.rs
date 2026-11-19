@@ -161,6 +161,21 @@ fn an_unwaited_subscription_over_a_socket_is_one_the_publisher_does_not_wait_for
     assert!(matches!(subscriber.try_recv(), Err(RecvError::Lagged(_))));
 }
 
+#[test]
+fn a_subscriber_of_any_type_reads_over_a_socket() {
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "any");
+    let mut subscriber = Subscriber::<crate::AnyType>::builder()
+        .connect(Endpoint::Path(path))
+        .unwrap();
+    assert_eq!(subscriber.topic_type(), "bytes");
+    publisher.publish(&bytes(9)).unwrap();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Ok(crate::AnyType(vec![9; 3]))
+    );
+}
+
 /// The drop's notice and the session's end both reach the publisher; one subscription goes once.
 #[test]
 fn a_dropped_subscriber_changes_the_list_once() {

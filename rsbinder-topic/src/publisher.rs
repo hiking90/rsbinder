@@ -98,6 +98,12 @@ struct Shared<T> {
 impl<T: Payload + 'static> Publisher<T> {
     /// Make a topic with `spec`: the last call of a [`PublisherBuilder`](crate::PublisherBuilder).
     pub(crate) fn from_spec(spec: &Spec) -> BinderResult<Self> {
+        if T::type_name().is_empty() {
+            return Err(Status::from((
+                ExceptionCode::IllegalArgument,
+                "the empty type name is a subscriber's of any type, and no publisher's",
+            )));
+        }
         let (fd, pool, writer) = TypedWriter::create(spec).map_err(policy_status)?;
         let capacity = writer.lock().writer.capacity();
         let shared = Arc::new(Shared {
@@ -592,7 +598,8 @@ impl Acceptor {
     /// Refusals: `EX_SECURITY` when the topic's
     /// [`authorize`](crate::PublisherBuilder::authorize) does not admit the caller,
     /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
-    /// request names another payload type; `UnexpectedNull` for a null `token` or `control`;
+    /// request names another payload type (the empty name, [`AnyType`](crate::AnyType)'s, names
+    /// any); `UnexpectedNull` for a null `token` or `control`;
     /// `BadValue` for a token of this process that came through binder (its death would say
     /// nothing about the caller) or that is not an `ISubscription`, a pin count other than 0 or 1,
     /// a `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
@@ -677,7 +684,8 @@ impl<T: Payload + 'static> Accept for Shared<T> {
                 "subscriber of another layout version",
             ));
         }
-        if request.r#type != T::type_name() {
+        // The empty name is a subscriber's that takes any type (`AnyType`).
+        if !request.r#type.is_empty() && request.r#type != T::type_name() {
             return Err(StatusCode::BadType.into());
         }
         let pins = u32::try_from(request.pins)
@@ -769,6 +777,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             topicKind: self.kind.wire(),
             id: id as i64,
             flags,
+            typeName: T::type_name().to_owned(),
         })
     }
 }

@@ -353,11 +353,12 @@ fn an_endpoint_without_a_kind_is_of_an_event_topic() {
         topicKind: TopicKind::State.wire(),
         id: 7,
         flags: FLAG_UNWAITED,
+        typeName: "bytes".to_owned(),
         ..Default::default()
     };
     let read = cut_from_kind(&sent);
     assert_eq!(TopicKind::from_wire(read.topicKind), Some(TopicKind::Event));
-    assert_eq!((read.id, read.flags), (0, 0));
+    assert_eq!((read.id, read.flags, read.typeName.as_str()), (0, 0, ""));
 }
 
 /// `sent` as a subscriber reads it from a publisher that writes no field from `topicKind` on.
@@ -367,6 +368,7 @@ fn cut_from_kind(sent: &TopicEndpoint) -> TopicEndpoint {
     tail.write(&sent.topicKind).unwrap();
     tail.write(&sent.id).unwrap();
     tail.write(&sent.flags).unwrap();
+    tail.write(&sent.typeName).unwrap();
     let tail = tail.data_size() as i32;
     let mut parcel = Parcel::new();
     parcel.write(&sent).unwrap();
