@@ -58,6 +58,10 @@ pub struct Subscribers {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SubscriberInfo {
+    /// The publisher's number for the subscription, from 1 and never given twice by one
+    /// publisher: two subscriptions of one process differ in it. The subscriber reads the same
+    /// number from [`Subscriber::id`](crate::Subscriber::id).
+    pub id: u64,
     /// The uid of the process that made the subscription call.
     pub uid: u32,
     /// Its pid; within the publisher's process, this process's.

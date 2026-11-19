@@ -306,6 +306,33 @@ fn a_full_publisher_refuses_until_a_subscriber_goes() {
 }
 
 #[test]
+fn each_subscription_has_the_number_its_publisher_names_it_by() {
+    let publisher = events::<Bytes>().build().unwrap();
+    let topic = publisher.as_binder();
+    let a = subscribe::<Bytes>(&topic, Start::Next).unwrap();
+    let b = subscribe::<Bytes>(&topic, Start::Next).unwrap();
+    let named: Vec<_> = publisher.stats().subscribers.iter().map(|s| s.id).collect();
+    assert_eq!(named, [a.id().unwrap(), b.id().unwrap()]);
+    assert!(a.id() < b.id());
+    drop(a);
+    // Not given again once its subscription is gone.
+    let c = subscribe::<Bytes>(&topic, Start::Next).unwrap();
+    assert!(c.id() > b.id());
+}
+
+/// A publisher of `rsbinder-topic` 0.1: it answers with none of the fields added since.
+fn predating_topic() -> SIBinder {
+    let (topic, _writer) = lapped_topic();
+    topic
+}
+
+#[test]
+fn a_publisher_that_gives_no_number_leaves_the_subscription_without_one() {
+    let subscriber = subscribe::<Bytes>(&predating_topic(), Start::Next).unwrap();
+    assert_eq!(subscriber.id(), None);
+}
+
+#[test]
 fn a_closed_publisher_takes_no_subscription() {
     let publisher = events::<Bytes>().build().unwrap();
     let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Next).unwrap();
@@ -397,6 +424,8 @@ fn endpoint(fd: OwnedFd, capacity: u64) -> TopicEndpoint {
         startIndex: 0,
         pool: None,
         topicKind: crate::TopicKind::Event.wire(),
+        // The fields a publisher of `rsbinder-topic` 0.1 does not send.
+        ..Default::default()
     }
 }
 

@@ -118,6 +118,8 @@ pub(crate) struct Link {
     hung_up: AtomicBool,
     /// Where the subscription started: no record before it is one the subscriber reads.
     start: AtomicU64,
+    /// The publisher's number for it, from 1: given with `start` as the list takes it in.
+    id: AtomicU64,
     /// The subscriber's token, told through when the subscription is taken out.
     subscription: Strong<dyn ISubscription>,
     /// Taken out by a wait for room (plan 15 §6.5): no longer waited for, its pin still kept.
@@ -160,6 +162,7 @@ impl Link {
             socket,
             hung_up: AtomicBool::new(false),
             start: AtomicU64::new(0),
+            id: AtomicU64::new(0),
             subscription,
             evicted: AtomicBool::new(false),
         })
@@ -228,6 +231,7 @@ impl Link {
     /// The subscription as its control page reports it, against the publisher's `write`.
     fn info(&self, write: u64) -> SubscriberInfo {
         SubscriberInfo {
+            id: self.id.load(Ordering::Relaxed),
             uid: self.uid,
             pid: self.pid,
             // The subscriber writes `read`: one ahead of `write` is a wrong report, not a lag.
@@ -276,6 +280,8 @@ pub(crate) struct Links {
     /// Bumped by every change of `links`; `changed` is raised with it until the unlock takes it.
     generation: u64,
     changed: bool,
+    /// The number the last subscription taken in was given; the first is 1.
+    last_id: u64,
     /// Wake bytes sent.
     #[cfg(test)]
     sends: u64,
@@ -295,11 +301,14 @@ impl Links {
         self.links.iter().map(|link| link.info(write)).collect()
     }
 
-    /// Add a subscription that starts at `start`.
-    pub(crate) fn push(&mut self, link: Arc<Link>, start: u64) {
+    /// Add a subscription that starts at `start`; the number it is given.
+    pub(crate) fn push(&mut self, link: Arc<Link>, start: u64) -> u64 {
+        self.last_id += 1;
         link.start.store(start, Ordering::Relaxed);
+        link.id.store(self.last_id, Ordering::Relaxed);
         self.links.push(link);
         self.bump();
+        self.last_id
     }
 
     /// The list as it is now: its generation and its length.

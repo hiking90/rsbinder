@@ -748,13 +748,13 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             ))
         } else {
             let start = state.writer.position();
-            state.links.push(link.clone(), start);
-            Ok((start, state.writer.next_index()))
+            let id = state.links.push(link.clone(), start);
+            Ok((start, state.writer.next_index(), id))
         };
         // Unmapped and unlinked after the lock: `link` too, when it was refused.
         self.writer.unlock(state, gone);
         drop(link);
-        let (start, index) = taken?;
+        let (start, index, id) = taken?;
         Ok(TopicEndpoint {
             version: VERSION as i32,
             ring,
@@ -764,6 +764,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             startIndex: index as i32,
             pool,
             topicKind: self.kind.wire(),
+            id: id as i64,
         })
     }
 }

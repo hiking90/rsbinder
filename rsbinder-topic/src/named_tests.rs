@@ -726,6 +726,7 @@ impl ITopic for ByHand {
             startIndex: 0,
             pool: None,
             topicKind: crate::TopicKind::Event.wire(),
+            ..Default::default()
         })
     }
 

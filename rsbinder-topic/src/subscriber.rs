@@ -214,6 +214,8 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     session: Option<Arc<dyn Any + Send + Sync>>,
     ring: RingId,
     kind: TopicKind,
+    /// The publisher's number for the subscription; `None` from a publisher that sends none.
+    id: Option<u64>,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -400,6 +402,8 @@ impl<T: Payload> Subscriber<T> {
             session: None,
             ring,
             kind,
+            // The bits of a `u64`, as the publisher wrote them.
+            id: Some(endpoint.id as u64).filter(|&id| id != 0),
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -439,6 +443,13 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// The kind of the topic, as its publisher declared it.
     pub fn topic_kind(&self) -> TopicKind {
         self.kind
+    }
+
+    /// The publisher's number for this subscription, as its
+    /// [`SubscriberInfo::id`](crate::SubscriberInfo::id) names it. `None` from a publisher of
+    /// `rsbinder-topic` 0.1, which gives none.
+    pub fn id(&self) -> Option<u64> {
+        self.id
     }
 
     /// Whether a receive that asked for the newest value with `latest` returns the newest:
@@ -974,6 +985,7 @@ impl<T: Payload> Subscriber<T> {
             session,
             ring,
             kind,
+            id,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1003,6 +1015,7 @@ impl<T: Payload> Subscriber<T> {
             session,
             ring,
             kind,
+            id,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
