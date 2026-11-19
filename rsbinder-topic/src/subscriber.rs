@@ -17,9 +17,9 @@ use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(feature = "tokio")]
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 #[cfg(feature = "tokio")]
@@ -44,8 +44,8 @@ use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET
 use crate::link::{link_death, Dead};
 use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
-use crate::trace::event;
 use crate::ring::{self, Loads, Reader};
+use crate::trace::event;
 use crate::wait::{
     decide, Died, Local, Looked, Next, Parts, Slept, Until, Words, ABANDON, ALL, INTERRUPTED,
     NOTICE,
@@ -169,8 +169,10 @@ impl Settings {
 ///
 /// It maps the topic's memory read-only and reads records at its own pace; nothing it does
 /// reaches the publisher or another subscriber. Dropping it ends the subscription and tells the
-/// publisher with a one-way call, which takes it out then. A publisher of `rsbinder-topic` 0.1
-/// does not know the call and takes it out at its next publish or subscription.
+/// publisher with a one-way call, which takes it out then. The drop does not wait for the
+/// publisher's lock: a publisher of this process that holds it, as a lossless publish waiting for
+/// room does, takes the subscription out as it lets go. A publisher of `rsbinder-topic` 0.1 does
+/// not know the call and takes it out at its next publish or subscription.
 ///
 /// # Receiving
 ///

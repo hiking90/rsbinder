@@ -156,7 +156,11 @@ fn an_unwaited_subscription_over_a_socket_is_one_the_publisher_does_not_wait_for
     for byte in 0..=255 {
         publisher.publish(&Bytes(vec![byte; 64])).unwrap();
     }
-    assert!(started.elapsed() < WAIT / 2, "waited {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < WAIT / 2,
+        "waited {:?}",
+        started.elapsed()
+    );
     assert!(publisher.stats().subscribers[0].unwaited);
     assert!(matches!(subscriber.try_recv(), Err(RecvError::Lagged(_))));
 }

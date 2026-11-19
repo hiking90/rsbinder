@@ -7,8 +7,8 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{fence, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use rsbinder::__sync::Signal;
@@ -344,6 +344,8 @@ pub(crate) struct TypedWriter<T, S> {
     state: Mutex<State<S>>,
     /// Woken by [`unlock`](Self::unlock) after a change of the list of subscriptions.
     subscribers: Signal,
+    /// A subscriber dropped a subscription while the lock was held: the next unlock prunes.
+    prune_owed: AtomicBool,
     /// Sleeps a thread's wait for the list began, each counted under the lock before it.
     #[cfg(test)]
     pub(crate) list_sleeps: std::sync::atomic::AtomicUsize,
@@ -407,11 +409,40 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 after_bump: None,
             }),
             subscribers: Signal::default(),
+            prune_owed: AtomicBool::new(false),
             #[cfg(test)]
             list_sleeps: std::sync::atomic::AtomicUsize::new(0),
             scratch: Mutex::new(Vec::new()),
             _payload: PhantomData,
         }
+    }
+
+    /// Take out the subscriptions that ended: now if the lock is free, else as its holder lets
+    /// go. Never waits for the lock, which a lossless publish holds while it waits for room: a
+    /// subscriber of this process that drops one subscription and reads another on the same
+    /// thread would be taken out of the other.
+    pub(crate) fn unsubscribed(&self) {
+        // After the subscriber's `CLOSED`, which the prune that takes the flag then sees.
+        self.prune_owed.store(true, Ordering::Release);
+        // With the one in `unlock`: a holder this `try_lock` finds sees the flag after it lets go.
+        fence(Ordering::SeqCst);
+        self.settle_owed();
+    }
+
+    /// Prune for an owed [`unsubscribed`](Self::unsubscribed) if the lock is free.
+    fn settle_owed(&self) {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            // The holder's `unlock` looks at the flag after it lets go.
+            Err(TryLockError::WouldBlock) => return,
+            Err(TryLockError::Poisoned(_)) => panic!("lock poisoned"),
+        };
+        let gone = if self.prune_owed.swap(false, Ordering::AcqRel) {
+            state.links.prune()
+        } else {
+            Vec::new()
+        };
+        self.unlock(state, gone);
     }
 
     /// The list of subscriptions now, after taking out those that ended.
@@ -503,9 +534,20 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         #[cfg(feature = "tracing")]
         for link in &gone {
             let (id, reason) = (link.id(), link.end_reason());
-            event!(debug, payload = T::type_name(), id, reason, "subscription ended");
+            event!(
+                debug,
+                payload = T::type_name(),
+                id,
+                reason,
+                "subscription ended"
+            );
         }
         drop(gone);
+        // With the one in `unsubscribed`: a drop whose `try_lock` found this lock held is seen.
+        fence(Ordering::SeqCst);
+        if self.prune_owed.load(Ordering::Relaxed) {
+            self.settle_owed();
+        }
     }
 
     /// The futex wakes this topic has sent.

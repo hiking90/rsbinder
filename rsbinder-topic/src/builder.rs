@@ -690,9 +690,10 @@ impl<T: Payload> SubscriberBuilder<T> {
     /// [`max_subscribers`](crate::PublisherBuilder::max_subscribers) and
     /// [`max_per_uid`](crate::PublisherBuilder::max_per_uid) as any other, so it can be refused
     /// with [`ITopic::ERROR_FULL`](crate::aidl::ITopic::ERROR_FULL), and it takes a place another
-    /// subscriber could have had. A publisher of `rsbinder-topic` 0.1 does not know the request;
-    /// the subscription is then refused with `InvalidOperation` and the publisher told to take
-    /// it out.
+    /// subscriber could have had. A publisher of `rsbinder-topic` 0.1 does not know the request
+    /// and takes the subscription as one it waits for: this side refuses it with
+    /// `InvalidOperation` and marks its control page closed, so the publisher waits for it no
+    /// more and takes it out at its next publish or subscription.
     pub fn unwaited(mut self) -> Self {
         self.settings.unwaited = true;
         self

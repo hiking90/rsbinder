@@ -34,7 +34,7 @@ use rsbinder::{hub, BinderResult, ExceptionCode, SIBinder, Status, StatusCode, S
 use rsbinder_topic::aidl::ITopic::{ITopic, TOPIC_EVENT, TOPIC_STATE};
 use rsbinder_topic::aidl::TopicStatus::TopicStatus;
 use rsbinder_topic::registry::RegistryResolver;
-use rsbinder_topic::{AnyType, RecvError, Start, Subscriber, SubscriberBuilder, TopicKind};
+use rsbinder_topic::{AnyType, Closed, RecvError, Start, Subscriber, SubscriberBuilder, TopicKind};
 
 /// The exit codes of `rsb_service`: answered, the name has no topic, not answerable.
 const OK: u8 = 0;
@@ -174,7 +174,9 @@ pub fn stat(name: &str, source: &Source, timeout: Duration) -> u8 {
         Ok(Err(status)) => failed("ITopic.status", &status),
         // The thread is left waiting; the process ends with it.
         Err(_) => {
-            eprintln!("rsb_service: {name}: no answer within {timeout:?} (is the publisher stopped?)");
+            eprintln!(
+                "rsb_service: {name}: no answer within {timeout:?} (is the publisher stopped?)"
+            );
             ERR
         }
     }
@@ -279,6 +281,11 @@ fn receive(mut subscriber: Subscriber<AnyType>, mut sink: Box<dyn Sink>, count: 
     }
     match ended {
         None => OK,
+        // The topic's memory failed a check: what was received is not all there was.
+        Some(error @ RecvError::Closed(Closed::Corrupted)) => {
+            eprintln!("rsb_service: {error}");
+            ERR
+        }
         Some(error @ RecvError::Closed(_)) => {
             eprintln!("rsb_service: {error}");
             OK

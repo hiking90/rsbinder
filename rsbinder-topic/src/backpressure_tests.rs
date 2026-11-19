@@ -326,7 +326,11 @@ fn an_unwaited_subscriber_holds_up_no_publish_and_loses_what_it_did_not_read() {
     for n in 0..1000 {
         publisher.publish(&value(n)).unwrap();
     }
-    assert!(started.elapsed() < SPAN / 2, "waited {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < SPAN / 2,
+        "waited {:?}",
+        started.elapsed()
+    );
     let stats = publisher.stats();
     assert_eq!(stats.evicted, 0);
     assert!(stats.subscribers[0].unwaited);
@@ -352,7 +356,11 @@ fn a_waited_subscriber_beside_an_unwaited_one_still_holds_up_a_publish() {
     assert!(started.elapsed() >= timeout);
     let stats = publisher.stats();
     assert_eq!(stats.evicted, 1);
-    let evicted: Vec<_> = stats.subscribers.iter().map(|s| (s.unwaited, s.evicted)).collect();
+    let evicted: Vec<_> = stats
+        .subscribers
+        .iter()
+        .map(|s| (s.unwaited, s.evicted))
+        .collect();
     assert_eq!(evicted, [(true, false), (false, true)]);
 }
 

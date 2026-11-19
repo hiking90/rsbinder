@@ -264,6 +264,15 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.lock().after_bump = Some(pause);
     }
 
+    /// Run `f` with the topic's lock held, as a publish that waits for room holds it.
+    #[cfg(test)]
+    pub(crate) fn with_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let state = self.shared.writer.lock();
+        let done = f();
+        self.shared.writer.unlock(state, Vec::new());
+        done
+    }
+
     /// Sleeps a thread's wait for the list began; one counted holds the lock until it sleeps.
     #[cfg(test)]
     pub(crate) fn list_sleeps(&self) -> usize {
@@ -670,7 +679,9 @@ impl Acceptor {
     /// [`ITopic::ERROR_CLOSED`] once the publisher is dropped. A closed publisher still answers.
     ///
     /// Call it from the handler of the call, on the thread the call arrived on: the caller it
-    /// checks is that call's.
+    /// checks is that call's. For an admitted caller it takes the topic's lock, which a publish on
+    /// a [`lossless`](crate::PublisherBuilder::lossless) topic holds while it waits for room, so
+    /// the answer can wait up to that timeout; a refused caller is answered without it.
     ///
     /// [`ITopic::status`]: crate::aidl::ITopic::ITopic::status
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
@@ -687,8 +698,9 @@ impl Acceptor {
     /// publisher dropped writes that it is. `args` are not read.
     ///
     /// An `ITopic` of the application's own calls it from its `rsbinder::Interface::dump`.
-    /// The text is made with the topic's lock let go, then written in one call; the writer is the
-    /// caller's fd, which a caller that does not read can hold up.
+    /// The status is read under the topic's lock, as [`status`](Self::status) reads it, waiting
+    /// for it as that does; the text is made once the lock is let go and written in one call. The
+    /// writer is the caller's fd, which a caller that does not read can hold up.
     pub fn dump(&self, writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> {
         let text = match self.status() {
             Ok(status) => format!("{status}"),
@@ -742,9 +754,7 @@ trait Accept: Send + Sync {
 
 impl<T: Payload + 'static> Accept for Shared<T> {
     fn unsubscribed(&self) {
-        let mut state = self.writer.lock();
-        let gone = state.links.prune();
-        self.writer.unlock(state, gone);
+        self.writer.unsubscribed();
     }
 
     fn inspected(&self) -> BinderResult<()> {

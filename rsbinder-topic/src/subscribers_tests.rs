@@ -99,7 +99,11 @@ fn a_wait_returns_at_once_when_the_list_changed_since_seen() {
     let _subscriber = subscribe(&publisher);
     let started = Instant::now();
     let now = publisher.wait_subscribers(seen, Some(LONG));
-    assert!(started.elapsed() < LONG / 2, "waited {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < LONG / 2,
+        "waited {:?}",
+        started.elapsed()
+    );
     assert_eq!((now.generation, now.count), (seen + 1, 1));
 }
 
@@ -141,6 +145,29 @@ fn a_dropped_subscriber_tells_the_publisher_and_wakes_a_wait_without_a_publish()
     let mut subscriber = Some(subscribe(&publisher));
     let (now, took) = woken_by(&publisher, || drop(subscriber.take()));
     assert!(took < LONG / 2, "not woken: {took:?}");
+    assert_eq!(now.count, 0);
+}
+
+#[test]
+fn a_drop_while_the_lock_is_held_waits_for_nothing_and_is_seen_as_the_lock_goes() {
+    let publisher = publisher();
+    let subscriber = subscribe(&publisher);
+    let mut dropped_in_time = None;
+    let (now, took) = woken_by(&publisher, || {
+        // Another thread, joined once the lock is let go: a drop that waited would fail, not hang.
+        let (dropped, done) = mpsc::channel();
+        let dropping = publisher.with_lock(|| {
+            let dropping = std::thread::spawn(move || {
+                drop(subscriber);
+                dropped.send(()).unwrap();
+            });
+            dropped_in_time = Some(done.recv_timeout(LONG / 4).is_ok());
+            dropping
+        });
+        dropping.join().unwrap();
+    });
+    assert_eq!(dropped_in_time, Some(true), "the drop waited for the lock");
+    assert!(took < LONG / 2, "not seen as the lock went: {took:?}");
     assert_eq!(now.count, 0);
 }
 
