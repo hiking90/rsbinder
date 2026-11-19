@@ -22,6 +22,7 @@ use crate::payload::{relabel, Piece};
 use crate::pool::LentSlot;
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
+use crate::trace::event;
 use crate::{end, Encoding, Payload, PublisherStats, Subscribers, TopicKind};
 
 /// What a topic is made with: the settings of a [`PublisherBuilder`](crate::PublisherBuilder),
@@ -499,6 +500,11 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         for eviction in evictions {
             eviction.tell(T::type_name(), waited);
         }
+        #[cfg(feature = "tracing")]
+        for link in &gone {
+            let (id, reason) = (link.id(), link.end_reason());
+            event!(debug, payload = T::type_name(), id, reason, "subscription ended");
+        }
         drop(gone);
     }
 
@@ -644,12 +650,15 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         let mut state = self.lock();
         let payload = end::payload(status);
         // A 4 KiB ring takes the longest end record, so only an end already written refuses it.
-        if state.make_room(payload.len(), false).is_ok()
-            && state.writer.put(Kind::End, &payload).is_ok()
-        {
+        let ended = state.make_room(payload.len(), false).is_ok()
+            && state.writer.put(Kind::End, &payload).is_ok();
+        if ended {
             state.announce();
         }
         self.unlock(state, Vec::new());
+        if ended {
+            event!(debug, payload = T::type_name(), "topic ended");
+        }
     }
 
     fn encode<'a, I>(

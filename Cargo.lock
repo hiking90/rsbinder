@@ -977,6 +977,7 @@ dependencies = [
  "rsbinder-aidl",
  "rustix",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

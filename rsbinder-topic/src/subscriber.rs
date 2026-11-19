@@ -44,6 +44,7 @@ use crate::layout::{self, ControlPage, Loaded, LoadedPool, CLOSED, HEADER_OFFSET
 use crate::link::{link_death, Dead};
 use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
+use crate::trace::event;
 use crate::ring::{self, Loads, Reader};
 use crate::wait::{
     decide, Died, Local, Looked, Next, Parts, Slept, Until, Words, ABANDON, ALL, INTERRUPTED,
@@ -231,6 +232,9 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     id: Option<u64>,
     /// The name of the topic's payload type, as the publisher compares it.
     type_name: String,
+    /// A receive has returned a [`RecvError::Closed`], whose event is then emitted.
+    #[cfg(feature = "tracing")]
+    told_closed: bool,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -401,6 +405,13 @@ impl<T: Payload> Subscriber<T> {
             log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
             StatusCode::BadValue
         })?;
+        event!(
+            debug,
+            payload = T::type_name(),
+            id = endpoint.id as u64,
+            kind = ?kind,
+            "subscribed"
+        );
         Ok(Self {
             _abandon: Abandon {
                 local: local.clone(),
@@ -434,6 +445,8 @@ impl<T: Payload> Subscriber<T> {
                 "" => T::type_name().to_owned(),
                 named => named.to_owned(),
             },
+            #[cfg(feature = "tracing")]
+            told_closed: false,
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -761,7 +774,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     pub(crate) fn look(&mut self, latest: bool) -> Result<T, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
-            return Err(RecvError::Closed(Closed::Evicted));
+            return self.closing(Err(RecvError::Closed(Closed::Evicted)));
         }
         let before = self.before_look();
         let died = self.local.died();
@@ -917,10 +930,23 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             Err(RecvError::Closed(Closed::End | Closed::Status(_))) => self.read_end = true,
             Err(_) => {}
         }
-        match received {
+        let result = match received {
             Err(RecvError::Empty) if died => Err(RecvError::Closed(Closed::PublisherDied)),
             other => other,
+        };
+        self.closing(result)
+    }
+
+    /// `result`, with an event for the first [`RecvError::Closed`] a receive returns: every
+    /// receive after it returns it again.
+    fn closing<V>(&mut self, result: Result<V, RecvError>) -> Result<V, RecvError> {
+        #[cfg(feature = "tracing")]
+        if let Err(RecvError::Closed(why)) = &result {
+            if !std::mem::replace(&mut self.told_closed, true) {
+                event!(debug, payload = T::type_name(), why = ?why, "subscription closed");
+            }
         }
+        result
     }
 
     /// The publisher's pool as this subscriber mapped it, for tests of the subscription.
@@ -1024,6 +1050,8 @@ impl<T: Payload> Subscriber<T> {
             kind,
             id,
             type_name,
+            #[cfg(feature = "tracing")]
+            told_closed,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1055,6 +1083,8 @@ impl<T: Payload> Subscriber<T> {
             kind,
             id,
             type_name,
+            #[cfg(feature = "tracing")]
+            told_closed,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1144,7 +1174,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
     pub(crate) fn look_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
-            return Err(RecvError::Closed(Closed::Evicted));
+            return self.closing(Err(RecvError::Closed(Closed::Evicted)));
         }
         let before = self.before_look();
         let died = self.local.died();

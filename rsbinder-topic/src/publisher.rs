@@ -38,6 +38,8 @@ use crate::pool::MAX_PINS;
 use crate::publish::{may_inspect, Authorize, Spec};
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Advertisement, Resolver};
+#[cfg(feature = "tracing")]
+use crate::trace::event;
 use crate::{wake, Bytes, Payload, PublishError, PublisherStats, Subscribers, TopicKind};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
@@ -711,7 +713,22 @@ impl fmt::Debug for Acceptor {
 
 /// [`Shared`] without its payload type, which the acceptor does not have.
 trait Accept: Send + Sync {
-    fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint>;
+    /// [`take`](Self::take), and its event once the lock is let go.
+    fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        #[cfg(feature = "tracing")]
+        let payload = self.payload();
+        let taken = self.take(request);
+        #[cfg(feature = "tracing")]
+        trace_taken(payload, &taken);
+        taken
+    }
+
+    /// Refuse the subscription `request` asks for, or take it.
+    fn take(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint>;
+
+    /// The name of the payload type.
+    #[cfg(feature = "tracing")]
+    fn payload(&self) -> &'static str;
 
     /// Take out the subscriptions that ended.
     fn unsubscribed(&self);
@@ -774,7 +791,12 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         }
     }
 
-    fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+    #[cfg(feature = "tracing")]
+    fn payload(&self) -> &'static str {
+        T::type_name()
+    }
+
+    fn take(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         if let Some(authorize) = &self.authorize {
             if !authorize.admits(&CallingContext::current()) {
                 return Err(Status::from((
@@ -892,6 +914,21 @@ impl<T: Payload> Forget for Shared<T> {
         let mut state = self.writer.lock();
         let gone = state.links.remove(dead);
         self.writer.unlock(state, gone.into_iter().collect());
+    }
+}
+
+/// The event of a subscription call to a topic of `payload`, taken or refused.
+#[cfg(feature = "tracing")]
+fn trace_taken(payload: &str, taken: &BinderResult<TopicEndpoint>) {
+    let caller = CallingContext::current();
+    let (uid, pid) = (caller.uid, caller.pid);
+    match taken {
+        Ok(endpoint) => {
+            let id = endpoint.id as u64;
+            let unwaited = endpoint.flags & FLAG_UNWAITED != 0;
+            event!(debug, payload, id, uid, pid, unwaited, "subscription taken");
+        }
+        Err(status) => event!(debug, payload, uid, pid, reason = %status, "subscription refused"),
     }
 }
 

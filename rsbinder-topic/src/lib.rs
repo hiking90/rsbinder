@@ -130,6 +130,7 @@ mod ring;
 mod sample;
 mod stats;
 mod subscriber;
+mod trace;
 mod trust;
 #[cfg(feature = "uds")]
 pub mod uds;
@@ -230,6 +231,20 @@ mod any_type_tests;
     )
 ))]
 mod status_tests;
+
+#[cfg(all(
+    test,
+    feature = "tracing",
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod trace_tests;
 
 #[cfg(all(
     test,

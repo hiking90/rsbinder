@@ -14,6 +14,7 @@ use crate::aidl::ISubscription::ISubscription;
 use crate::backpressure::Readers;
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::pool::{self, Pins};
+use crate::trace::event;
 use crate::wake::{send_wake, Sent};
 use crate::{SubscriberInfo, Subscribers};
 
@@ -184,8 +185,27 @@ impl Link {
         self.evicted.store(true, Ordering::Relaxed);
         Eviction {
             subscription: self.subscription.clone(),
+            id: self.id.load(Ordering::Relaxed),
             uid: self.uid,
             pid: self.pid,
+        }
+    }
+
+    /// The publisher's number for the subscription.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn id(&self) -> u64 {
+        self.id.load(Ordering::Relaxed)
+    }
+
+    /// Why an ended subscription ended, the first of its reasons.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn end_reason(&self) -> &'static str {
+        if self.dead.get() {
+            "death"
+        } else if self.hung_up.load(Ordering::Relaxed) {
+            "hung up"
+        } else {
+            "closed"
         }
     }
 
@@ -262,6 +282,7 @@ impl Link {
 /// is let go: a binder call made under it could run a death notice that takes the lock.
 pub(crate) struct Eviction {
     subscription: Strong<dyn ISubscription>,
+    id: u64,
     uid: u32,
     pid: i32,
 }
@@ -270,10 +291,20 @@ impl Eviction {
     /// Tell the subscriber, and log it for the topic of `payload` that waited `waited`.
     pub(crate) fn tell(self, payload: &str, waited: Duration) {
         log::warn!(
-            "rsbinder-topic {payload}: took out the subscription of uid {} pid {}, which kept a \
+            "rsbinder-topic {payload}: took out subscription #{} of uid {} pid {}, which kept a \
              publish waiting {waited:?}",
+            self.id,
             self.uid,
             self.pid
+        );
+        event!(
+            warn,
+            payload,
+            id = self.id,
+            uid = self.uid,
+            pid = self.pid,
+            waited = ?waited,
+            "subscription taken out"
         );
         // One way: nothing to wait for, and a subscriber gone already needs no telling.
         let _ = self.subscription.r#evicted();
