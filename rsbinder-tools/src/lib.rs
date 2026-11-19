@@ -8,7 +8,8 @@
 //! service manager's configuration ([`config`] — access control, service
 //! declarations, on-demand activation), its readiness notification
 //! ([`notify`]), and how each binary writes to stderr, as a command or as a
-//! daemon ([`logging`]). See `plans/6-rsb-hub-linux.md`.
+//! daemon ([`logging`]). See `plans/6-rsb-hub-linux.md`. With the `topic`
+//! feature, the commands of `rsb_service topic` too (`topic_cmd`).
 
 // Library code returns errors; tests may unwrap (plan 13).
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
@@ -19,3 +20,5 @@ pub mod config;
 pub mod logging;
 pub mod notify;
 pub mod nss;
+#[cfg(feature = "topic")]
+pub mod topic_cmd;

@@ -7,8 +7,12 @@
 //! registered, who registered it, what is declared but not started, and
 //! what a service says about itself when asked to dump.
 //!
+//! `topic` (feature `topic`) looks at a topic of `rsbinder-topic` from
+//! outside its publisher: its status, the rate of its records, the records
+//! themselves (`rsbinder_tools::topic_cmd`).
+//!
 //! Every question goes over binder, or over the hub's Unix socket for
-//! `topics --topic-socket`, as an ordinary client, so `rsb_hub`'s
+//! `--topic-socket`, as an ordinary client, so `rsb_hub`'s
 //! policy applies to `rsb_service` exactly as it does to anything else —
 //! running it does not grant a view a normal caller would not have. Where
 //! the policy withholds an answer, the tool says so rather than reporting
@@ -363,33 +367,154 @@ fn cli() -> clap::Command {
         )
         // Also without the feature, hidden: a usage error would exit 2 with nothing said of why.
         .subcommand(
-            clap::Command::new("topics")
+            list_command("topics")
                 .about(
-                    "List the topic names of rsb_hub's topic registry: name uid pid age watchers",
+                    "List the topic names of rsb_hub's topic registry: name uid pid age watchers \
+                     (as `topic list`)",
                 )
-                .hide(!cfg!(feature = "topic"))
-                .arg(
-                    clap::Arg::new("prefix")
-                        .value_name("PREFIX")
-                        .index(1)
-                        .default_value("")
-                        .help("Only list the names that start with this"),
-                )
-                .arg(
-                    clap::Arg::new("topic-socket")
-                        .long("topic-socket")
-                        .value_name("PATH")
-                        .hide(!cfg!(all(
-                            feature = "topic",
-                            feature = "rpc",
-                            any(target_os = "linux", target_os = "android")
-                        )))
-                        .help(
-                            "Ask the hub at this Unix socket (rsb_hub --topic-socket), with no \
-                             binder device",
-                        ),
-                ),
+                .hide(!cfg!(feature = "topic")),
         )
+        .subcommand(
+            clap::Command::new("topic")
+                .about("Look at a topic from outside its publisher")
+                .hide(!cfg!(feature = "topic"))
+                .subcommand_required(true)
+                .subcommand(list_command("list").about(
+                    "List the topic names of rsb_hub's topic registry: name uid pid age watchers",
+                ))
+                .subcommand(
+                    named_topic("stat")
+                        .about("Print the topic's status: one line, then one per subscriber")
+                        .arg(
+                            clap::Arg::new("timeout")
+                                .long("timeout")
+                                .value_name("SECS")
+                                .default_value("2")
+                                .value_parser(clap::value_parser!(f64))
+                                .help("Exit 2 if the publisher has not answered by then"),
+                        ),
+                )
+                .subcommand(counted(named_topic("hz").about(
+                    "Each second, the records received, their intervals and those lost",
+                )))
+                .subcommand(counted(
+                    named_topic("echo").about("Print each record's length and bytes"),
+                ))
+                .subcommand(counted(
+                    named_topic("record")
+                        .about("Write each record to FILE (see `rsbinder_tools::topic_cmd`)")
+                        .arg(
+                            clap::Arg::new("file")
+                                .value_name("FILE")
+                                .index(2)
+                                .required(true)
+                                .help("The file to write"),
+                        ),
+                )),
+        )
+}
+
+/// The `--topic-socket` option of every topic command.
+fn topic_socket() -> clap::Arg {
+    clap::Arg::new("topic-socket")
+        .long("topic-socket")
+        .value_name("PATH")
+        .hide(!cfg!(all(
+            feature = "topic",
+            feature = "rpc",
+            any(target_os = "linux", target_os = "android")
+        )))
+        .help("Ask the hub at this Unix socket (rsb_hub --topic-socket), with no binder device")
+}
+
+/// `topics` and `topic list`.
+fn list_command(name: &'static str) -> clap::Command {
+    clap::Command::new(name)
+        .arg(
+            clap::Arg::new("prefix")
+                .value_name("PREFIX")
+                .index(1)
+                .default_value("")
+                .help("Only list the names that start with this"),
+        )
+        .arg(topic_socket())
+}
+
+/// A topic command that takes a topic's name and where to look it up.
+fn named_topic(name: &'static str) -> clap::Command {
+    clap::Command::new(name)
+        .arg(
+            clap::Arg::new("name")
+                .value_name("NAME")
+                .help("The topic's name: in rsb_hub's topic registry unless an option says")
+                .required(true)
+                .index(1),
+        )
+        .arg(
+            clap::Arg::new("service")
+                .long("service")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("topic-socket")
+                .help("NAME is a service manager name, not a topic registry one"),
+        )
+        .arg(topic_socket())
+}
+
+/// A topic command that receives, up to `--count` records.
+fn counted(command: clap::Command) -> clap::Command {
+    command.arg(
+        clap::Arg::new("count")
+            .long("count")
+            .value_name("N")
+            .value_parser(clap::value_parser!(u64))
+            .help("Stop after N records; without it, run until the topic ends"),
+    )
+}
+
+/// What a `topic` subcommand names: its topic, and where to look it up.
+#[cfg(feature = "topic")]
+fn topic_source(m: &clap::ArgMatches) -> rsbinder_tools::topic_cmd::Source {
+    use rsbinder_tools::topic_cmd::Source;
+    if let Some(socket) = m.get_one::<String>("topic-socket") {
+        Source::Socket(socket.into())
+    } else if m.get_flag("service") {
+        Source::Service
+    } else {
+        Source::Registry
+    }
+}
+
+/// `topic stat|hz|echo|record`, once the binder device is open where one is needed.
+#[cfg(feature = "topic")]
+fn cmd_topic(command: &str, m: &clap::ArgMatches) -> ExitCode {
+    use rsbinder_tools::topic_cmd::{self, Watch};
+    let name = m
+        .get_one::<String>("name")
+        .expect("name is a required argument");
+    let source = topic_source(m);
+    let count = || m.get_one::<u64>("count").copied();
+    let code = match command {
+        "stat" => {
+            let secs = *m
+                .get_one::<f64>("timeout")
+                .expect("timeout has a default value");
+            let Ok(timeout) = std::time::Duration::try_from_secs_f64(secs) else {
+                eprintln!("rsb_service: --timeout {secs} is not a duration");
+                return ExitCode::from(exit::ERR);
+            };
+            topic_cmd::stat(name, &source, timeout)
+        }
+        "hz" => topic_cmd::watch(name, &source, &Watch::Hz, count()),
+        "echo" => topic_cmd::watch(name, &source, &Watch::Echo, count()),
+        "record" => {
+            let file = m
+                .get_one::<String>("file")
+                .expect("file is a required argument");
+            topic_cmd::watch(name, &source, &Watch::Record(file.into()), count())
+        }
+        _ => exit::ERR,
+    };
+    ExitCode::from(code)
 }
 
 fn main() -> ExitCode {
@@ -398,12 +523,30 @@ fn main() -> ExitCode {
     rsbinder_tools::logging::init_command();
 
     #[cfg(not(feature = "topic"))]
-    if matches.subcommand_name() == Some("topics") {
-        eprintln!("rsb_service: built without the `topic` feature, so it has no `topics`");
+    if let Some(command @ ("topics" | "topic")) = matches.subcommand_name() {
+        eprintln!("rsb_service: built without the `topic` feature, so it has no `{command}`");
         return ExitCode::from(exit::ERR);
     }
 
-    if let Some(("topics", m)) = matches.subcommand() {
+    // `topic list` is `topics`; the other topic commands are `(command, matches)`.
+    let (listing, topic) = match matches.subcommand() {
+        Some(("topics", m)) => (Some(m), None),
+        Some(("topic", m)) => match m.subcommand() {
+            Some(("list", m)) => (Some(m), None),
+            Some((command, m)) => (None, Some((command, m))),
+            None => (None, None),
+        },
+        _ => (None, None),
+    };
+    // Over the hub's socket, with no binder device to open.
+    #[cfg(feature = "topic")]
+    if let Some((command, m)) = topic {
+        if m.get_one::<String>("topic-socket").is_some() {
+            return cmd_topic(command, m);
+        }
+    }
+
+    if let Some(m) = listing {
         if let Some(socket) = m.get_one::<String>("topic-socket") {
             #[cfg(all(
                 feature = "topic",
@@ -451,6 +594,20 @@ fn main() -> ExitCode {
             .expect("name is a required argument")
     }
 
+    #[cfg(feature = "topic")]
+    if let Some(m) = listing {
+        return cmd_topics(
+            m.get_one::<String>("prefix")
+                .expect("prefix has a default value"),
+        );
+    }
+    #[cfg(feature = "topic")]
+    if let Some((command, m)) = topic {
+        return cmd_topic(command, m);
+    }
+    #[cfg(not(feature = "topic"))]
+    let _ = (listing, topic);
+
     match matches.subcommand() {
         Some(("list", m)) => {
             let spec = m
@@ -479,11 +636,6 @@ fn main() -> ExitCode {
                 .unwrap_or_default();
             cmd_dump(name_of(m), &args)
         }
-        #[cfg(feature = "topic")]
-        Some(("topics", m)) => cmd_topics(
-            m.get_one::<String>("prefix")
-                .expect("prefix has a default value"),
-        ),
         // Unreachable: `subcommand_required` rejects this before we get here.
         _ => ExitCode::from(exit::ERR),
     }
