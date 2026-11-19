@@ -657,7 +657,7 @@ impl Acceptor {
     /// application's own calls it from its `unsubscribed`, for any caller: it takes out only
     /// subscriptions that ended already. Nothing once the publisher is dropped.
     ///
-    /// [`ITopic::unsubscribed`]: crate::aidl::ITopic::ITopic::r#unsubscribed
+    /// [`ITopic::unsubscribed`]: crate::aidl::ITopic::ITopic::unsubscribed
     pub fn unsubscribed(&self) {
         if let Some(topic) = self.topic.upgrade() {
             topic.unsubscribed();
@@ -672,7 +672,7 @@ impl Acceptor {
     /// Call it from the handler of the call, on the thread the call arrived on: the caller it
     /// checks is that call's.
     ///
-    /// [`ITopic::status`]: crate::aidl::ITopic::ITopic::r#status
+    /// [`ITopic::status`]: crate::aidl::ITopic::ITopic::status
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
     pub fn status(&self) -> BinderResult<TopicStatus> {
         let topic = self.topic.upgrade();

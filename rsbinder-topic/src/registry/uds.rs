@@ -1153,7 +1153,7 @@ impl UdsResolver {
     }
 
     /// The status of the topic `name` has now, as its publisher answers
-    /// [`ITopic::status`](crate::aidl::ITopic::ITopic::r#status) over a session opened and
+    /// [`ITopic::status`] over a session opened and
     /// closed for the call: `NameNotFound` as for [`subscribe`](Self::subscribe), `EX_SECURITY`
     /// when the publisher's [`inspect`](crate::PublisherBuilder::inspect) does not admit this
     /// process.

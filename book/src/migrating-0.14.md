@@ -3,8 +3,8 @@
 Every change that can break a program built against rsbinder 0.13.0 or
 `rsbinder-topic` 0.1.0, the version released with it: a compile error, a
 different value on the wire, or behavior a running program can observe.
-`rsbinder-topic` goes to 0.2.0 with this release, as its API breaks. One entry
-changes the bytes between peers and says so, under *Wire*.
+`rsbinder-topic` goes to 0.2.0 with this release, as its API breaks. The entries
+that change the bytes between peers say so, under *Wire*.
 
 The additions and fixes themselves are listed in
 [`CHANGELOG.md`](https://github.com/hiking90/rsbinder/blob/master/CHANGELOG.md).
@@ -127,6 +127,45 @@ publisher connected to before those is read as one it never connected to, so a
 record it returned can be returned again. 0.1.0 remembered every publisher until
 a connection to it saw its end.
 
+A dropped `Subscriber` tells its publisher at once (`ITopic.unsubscribed`), so
+the publisher's count goes down without a publish; 0.1.0 waited for the next
+publish or subscription. A reply the subscriber refuses tells the publisher
+too.
+
+## Implementing `ITopic` yourself
+
+`ITopic` has two more methods, `unsubscribed` and `status`, and a type of the
+application's own that implements it does not compile until it has them. Each
+hands over to the `Acceptor` method of the same name, as `subscribe` hands over
+to `accept`, and the type's `rsbinder::Interface::dump` to `Acceptor::dump`:
+
+```rust,ignore
+impl rsbinder::Interface for Guarded {
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+        self.acceptor.dump(writer, args)
+    }
+}
+
+impl ITopic for Guarded {
+    // `r#subscribe` as before.
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.acceptor.unsubscribed();
+        Ok(())
+    }
+    fn r#status(&self) -> BinderResult<TopicStatus> {
+        self.acceptor.status()
+    }
+}
+```
+
+A type that implements `ITopic` only to check the caller needs none of this:
+`PublisherBuilder::authorize` runs that check in the publisher's own binder.
+
+`SubscriberInfo` has the fields `id` and `unwaited`; it is `#[non_exhaustive]`,
+so only a pattern that names every field breaks. `Payload::type_name` reserves
+the empty name, which `AnyType` sends, and a publisher of a type with it is
+refused with `EX_ILLEGAL_ARGUMENT`.
+
 ## Wire
 
 - **wire**: `TopicEndpoint` has a new last field, `topicKind`: `0` for an event
@@ -140,3 +179,16 @@ a connection to it saw its end.
   field or ends in `..Default::default()`.
 - A subscription whose `ITopic` reply has a `topicKind` other than `0` or `1`
   is refused with `BadValue`.
+- **wire**: `SubscribeRequest` has a new last field, `flags`, and
+  `TopicEndpoint` the last fields `id`, `flags` and `typeName`, in that order.
+  `ITopic` has two more methods, `unsubscribed` (one way, code 1) and `status`
+  (code 2). The layout version is unchanged, so peers of either release still
+  subscribe to each other. Against a publisher built on 0.1.0: `unsubscribed`
+  and `status` are `UNKNOWN_TRANSACTION`, the first never seen by its one-way
+  caller; `Subscriber::id` is `None` and `topic_type` the subscriber's own type
+  name; an `AnyType` subscriber is refused with `BadType`; and an `unwaited`
+  subscriber is refused with `InvalidOperation` by its own side, which then
+  tells the publisher to take the subscription out. A subscriber built on 0.1.0
+  sends none of the fields, and its drop is seen at the publisher's next
+  publish. A struct literal of either parcelable names the fields or ends in
+  `..Default::default()`.

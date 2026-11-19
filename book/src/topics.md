@@ -132,6 +132,30 @@ how many subscriptions the topic holds. An application that wants more than a
 predicate implements `ITopic` itself and hands each admitted request to an
 `Acceptor` (see the `Acceptor` rustdoc).
 
+Who may look at the topic from outside — its status and its dump, which name
+every subscriber's uid and pid — is a check of its own,
+`PublisherBuilder::inspect`; see [Inspecting a topic](#inspecting-a-topic).
+
+### Working only while someone listens
+
+`Publisher::subscribers` reads the list of subscriptions as a generation and a
+count, and `wait_subscribers` waits for the generation to move: a sensor that
+runs only while a subscriber is there needs no polling of `subscriber_count`.
+
+```rust,ignore
+let mut now = publisher.subscribers();
+loop {
+    if now.count > 0 { sensor.start() } else { sensor.stop() }
+    now = publisher.wait_subscribers(now.generation, Some(Duration::from_secs(1)));
+}
+```
+
+A subscriber tells its publisher when it drops a subscription, which wakes the
+wait at once, and a subscriber process that dies is seen through binder. One
+that does not tell (an `rsbinder-topic` 0.1 subscriber) is seen at the next
+publish, or when the wait starts or times out. `wait_subscribers_async` is the
+same for a future, with no thread of its own.
+
 ## Event topics and state topics
 
 The publisher says what its records are by the builder it starts, and every
@@ -553,6 +577,48 @@ which the publish rate decides, plus the timeout. The wait holds the topic's
 lock and sleeps the publishing thread, so from async code a publish runs on a
 blocking thread. The `PublisherBuilder::lossless` rustdoc lists what waits
 with it.
+
+A subscriber that should never hold a publish up — a tool that watches the
+topic — asks with `SubscriberBuilder::unwaited`. No publish waits for it and no
+wait for room takes it out; it loses what it has not read when the ring comes
+round, as on a topic without backpressure, and a slot of a pool it has not read
+past is lent again unless it pins it. It still counts against
+`max_subscribers` and `max_per_uid`, so leave room for such tools in them.
+
+## Inspecting a topic
+
+`ITopic.status` answers with the topic's type, kind, ring size, what it has
+published, and each subscription: its number, uid, pid, lag, losses, and
+whether it waits, was taken out, is unwaited or pins a slot. The publisher's
+binder answers a binder dump with the same as text, so `adb shell dumpsys NAME`
+reads a topic registered with Android's service manager, and `rsb_service dump
+NAME` one on Linux. The lag, losses and pins are what each subscriber wrote in
+its control page: what it reports.
+
+Both name other processes, so `PublisherBuilder::inspect` decides who may ask.
+Without it the publisher's uid, root, and on Android `shell` (uid 2000, which
+`dumpsys` runs as) may; any other caller gets `EX_SECURITY`, and a dump says so.
+
+`rsb_service topic` (`rsbinder-tools`, feature `topic`) looks at a topic by
+name — in `rsb_hub`'s topic registry, or with `--service` the service manager's,
+or with `--topic-socket` a hub's registry on a Unix socket:
+
+| Command | What it prints |
+|---|---|
+| `topic list [PREFIX]` | the registry's names, as `topics` |
+| `topic stat NAME` | the status: a line for the topic, one per subscriber |
+| `topic hz NAME` | each second, records received, their intervals, records lost |
+| `topic echo NAME` | each record's length and bytes, and text for `bytes` |
+| `topic record NAME FILE` | each record with its receive time, into a file |
+
+`hz`, `echo` and `record` subscribe as an `AnyType` subscriber that is
+`unwaited`, so they hold up none of the topic's subscribers and say what they
+lose. `stat` gives a publisher that does not answer `--timeout` (2 s) and exits 2.
+
+The `tracing` feature of `rsbinder-topic` emits an event, under the target
+`rsbinder_topic`, for each subscription taken, refused, taken out or ended, the
+end of a topic, and each connection a subscriber makes or loses; none per
+record.
 
 ## Waiting
 

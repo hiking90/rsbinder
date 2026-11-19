@@ -290,7 +290,7 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
     }
 
     /// Who may look at the topic from outside its process: the callers of
-    /// [`ITopic::status`](crate::aidl::ITopic::ITopic::r#status) and of a binder dump (`dumpsys`
+    /// [`ITopic::status`](crate::aidl::ITopic::ITopic::status) and of a binder dump (`dumpsys`
     /// on Android) for which `admit` returns `true`. Both name the uid and pid of every
     /// subscriber, so this is a check of its own, apart from
     /// [`authorize`](Self::authorize).

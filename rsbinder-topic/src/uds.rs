@@ -226,7 +226,7 @@ pub(crate) fn connect_with<T: Payload>(
 }
 
 /// The status of the topic of the publisher at `endpoint`, over a session of its own that is
-/// closed before this returns: what [`ITopic::status`](crate::aidl::ITopic::ITopic::r#status)
+/// closed before this returns: what [`ITopic::status`]
 /// answers. The publisher checks the caller by the session's peer credentials. The errors of
 /// connecting are those of [`SubscriberBuilder::connect`](crate::SubscriberBuilder::connect).
 pub fn status(endpoint: Endpoint, options: &Options) -> BinderResult<TopicStatus> {

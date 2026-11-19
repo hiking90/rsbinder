@@ -46,9 +46,12 @@
 //! A [`Publisher`] makes the topic and hands out an `ITopic` binder; a [`Subscriber`] takes a
 //! subscription through it with one twoway call. Both are made by a builder
 //! ([`Publisher::events`], [`Subscriber::builder`]). Each end learns of the other's end: a
-//! subscriber that is dropped marks its control page, one whose process dies is reported to the
-//! publisher through binder, and a publisher that is dropped or closed writes an end record,
-//! while one whose process dies is reported to its subscribers.
+//! subscriber that is dropped marks its control page and tells the publisher with a one-way
+//! call, one whose process dies is reported to the publisher through binder, and a publisher that
+//! is dropped or closed writes an end record, while one whose process dies is reported to its
+//! subscribers. A publisher waits for its list of subscriptions to change with
+//! [`Publisher::wait_subscribers`], and answers a status call and a binder dump for the callers
+//! its [`inspect`](PublisherBuilder::inspect) admits.
 //!
 //! ```no_run
 //! use rsbinder::{hub, ProcessState};
