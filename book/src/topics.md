@@ -10,8 +10,8 @@ travel through shared memory, and no binder transaction is made for them:
   memfd, and every subscriber maps it read-only. One copy into the ring serves
   all of them.
 - A publish does not wait for a subscriber. When the ring is full the oldest
-  records are overwritten, and a subscriber that had not read them is told how
-  many it lost.
+  records are overwritten. On an event topic a subscriber that had not read
+  them is told how many it lost; on a state topic it skips to the newest value.
 - A subscriber writes one small memfd of its own, its control page, which the
   publisher maps read-only. Nothing a subscriber does reaches the ring or
   another subscriber.
@@ -27,7 +27,7 @@ versions refuse each other (`ITopic::ERROR_VERSION`).
 |---|---|---|---|
 | Receivers | any number | one | one per registration |
 | Who allocates the shared memory | the publisher, once for all | the consumer | none: every value is a transaction |
-| A receiver that falls behind | loses the oldest records (`RecvError::Lagged`), or with backpressure holds the publisher up to a timeout and is then taken out | holds the sender back; nothing is lost | calls queue in the receiver's async buffer, and fail once it is full |
+| A receiver that falls behind | on an event topic loses the oldest records (`RecvError::Lagged`), or with backpressure holds the publisher up to a timeout and is then taken out; on a state topic skips to the newest value | holds the sender back; nothing is lost | calls queue in the receiver's async buffer, and fail once it is full |
 | Transports | kernel binder, and RPC on a Unix socket | kernel binder and RPC | kernel binder and RPC |
 
 A topic suits values that many processes read and where the newest matters
@@ -72,7 +72,7 @@ thread may publish: `publish` takes `&self`.
 {{#include ../../rsbinder-topic/examples/topic_readings.rs:publish}}
 ```
 
-A subscriber takes a subscription with one twoway call, `Subscriber::request`.
+A subscriber takes a subscription with one twoway call, `SubscriberBuilder::subscribe`.
 After it, receiving makes no binder call. `recv` waits for a record; every
 error but `Closed` leaves the subscription as it was:
 
@@ -87,21 +87,31 @@ cargo run -p rsbinder-topic --example topic_readings -- publish
 cargo run -p rsbinder-topic --example topic_readings -- subscribe
 ```
 
-A subscriber starts at the first record published after its subscription
-(`Start::Latest`), so it misses what came before. `SubscriberPolicy::start`
-also offers `Start::Last`, whose first receive returns the newest record, and
-`Start::Oldest`, which reads everything the ring still holds.
+A subscriber of an event topic, which `Publisher::events()` makes, starts at
+the first record published after its subscription (`Start::Next`), so it misses
+what came before. `SubscriberBuilder::start_at` also takes `Start::Newest`,
+whose first receive returns the newest record, and `Start::Oldest`, which reads
+everything the ring still holds. The default, `Start::Auto`, follows the topic's
+kind: on a state topic, which `Publisher::state()` makes with a first value, it
+is `Start::Newest`, and every receive returns the newest value.
 
-`PublisherPolicy::ring_bytes` sizes the ring (64 KiB by default). A record is
-at most half the ring, and how far a subscriber can fall behind before it
-loses records is the ring's size over a record's. `PublisherPolicy::for_payload`
-works the size out from the largest value and the number of records to keep.
+Both ends are made by a builder: `Publisher::events()` and
+`Subscriber::builder()`. The publisher's builder sizes the ring from the
+largest value, `max_value_bytes`, and the records a subscriber may fall behind
+by before it loses some, `keep`: `(keep + 1) × (max_value_bytes rounded up to
+8, plus 8)` bytes, no less than 4 KiB, with a `keep` of 0 counted as 1, and
+`max_value_bytes` taken as 8 when it is not set and as 16 at least with `lend`.
+A size past 1 GiB makes `build` return `EX_ILLEGAL_ARGUMENT`.
+A record is at most half the ring, so a topic made with neither setting carries
+values of up to 2040 bytes.
+`ring_bytes` sets the size directly instead, and
+`Publisher::ring_bytes` reads it back.
 
 ### Handing a topic out from an interface
 
 A topic does not have to be a service of its own. A method of another
 interface can return it as an `IBinder`, and the client passes that binder to
-`Subscriber::request`:
+`SubscriberBuilder::subscribe`:
 
 ```aidl
 interface ISensors {
@@ -115,18 +125,136 @@ that `rsbinder-topic` does not take.
 
 ### Who may subscribe
 
-`PublisherPolicy::authorize` takes a check on the caller of the subscription
+`PublisherBuilder::authorize` takes a check on the caller of the subscription
 call (`rsbinder::CallingContext`: uid, pid, SELinux context); a refused caller
 gets `EX_SECURITY`. `max_subscribers` (64 by default) and `max_per_uid` bound
 how many subscriptions the topic holds. An application that wants more than a
 predicate implements `ITopic` itself and hands each admitted request to an
 `Acceptor` (see the `Acceptor` rustdoc).
 
+## Event topics and state topics
+
+The publisher says what its records are by the builder it starts, and every
+subscriber learns it as it subscribes (`topic_kind`):
+
+| | Event topic: `Publisher::events()` | State topic: `Publisher::state()` |
+|---|---|---|
+| A record is | something that happened once | the current value, until the next one |
+| The first value | none until the first publish | given to the last builder call |
+| Default start (`Start::Auto`) | `Start::Next`: what is published from now on | `Start::Newest`: the current value at once |
+| A receive returns | the next record | the newest value |
+| A subscriber that falls behind | `RecvError::Lagged(n)`, then the next record | skips to the newest value; nothing counts as lost |
+| Settings of its own | `keep`, `lend_keep`, `lossless`, `lossless_window` | none |
+
+Choose by what a subscriber that missed a record has to know. If it has to be
+told, as with button presses or log lines, the topic is an event topic. If the
+newest value says everything, as with a set point or a mode, it is a state
+topic. A subscriber that needs every transition of a state needs an event
+topic: a state topic has no way to read them all.
+
+`Start::Auto` is taken for each connection from that publisher's kind, so a
+subscriber's code does not depend on the kind. A start set with
+`SubscriberBuilder::start_at` comes first: a `Subscriber`, or the first
+connection of a `NamedSubscriber`, that reads a state topic from `Start::Next`
+returns nothing until the next publish, and an event topic read from
+`Start::Newest` returns its newest record first. `Start::Oldest` on a state
+topic reads as `Start::Newest` does, as its receives return the newest value.
+
+A state topic always has a value. `build(&initial)` publishes the first value
+before the publisher is returned, so no subscriber finds the topic empty, by
+whichever path the binder goes out. A first value larger than a record goes
+into a slot of the pool with `build_with`:
+
+```rust,ignore
+let frame = Publisher::<Bytes>::state()
+    .max_subscribers(4)
+    .lend(4 << 20)
+    .build_with(|publisher| {
+        let mut slot = publisher.loan_slice(first.len())?;
+        slot.copy_from_slice(first);
+        slot.publish()
+    })?;
+```
+
+The ring of a state topic holds two values of `max_value_bytes` besides the one
+being written, and no less than 4 KiB. A first value that does not fit, or an
+`init` that publishes nothing, makes no topic: the last call returns
+`EX_ILLEGAL_ARGUMENT`.
+
+A `NamedSubscriber` with `Start::Auto` or `Start::Newest`, connected again to a
+state topic it read before, returns the value published while it was away at
+once, and does not return again the value it already has. A receive returns
+the last value of a closed topic before it reports the end. A publisher that
+ended takes its value with it: the
+subscriber gets the newest value of the next publisher of the name, and a
+publisher that has to carry the value over keeps it itself.
+
+### Connecting again
+
+A `NamedSubscriber` remembers the publishers it connected to, and each connection
+starts by whether it remembers that publisher. `Start::Auto` is read here as the
+topic's kind says, and `Start::Oldest` on a state topic as `Start::Newest`:
+
+| Start | First connection | Later, not remembered | Remembered |
+|---|---|---|---|
+| `Newest` | Newest record | Newest record | Newest record, skipped if returned last |
+| `Next` | Next record | Oldest record; on a state topic, newest | Next record |
+| `Oldest`, event topic | Oldest record | Oldest record | Next record |
+
+A publisher is forgotten when a connection to it reads its end record or, on
+kernel binder, gets the notice of its death, and once 170 other publishers were
+connected to after it. Over a socket that notice tells only that the session
+ended, and the publisher may live on:
+
+- A subscriber of a state topic, or one at `Start::Newest` on an event topic,
+  remembers the publisher, and returns no record it returned before.
+- A subscriber of an event topic at any other start forgets it, and reads the
+  ring again from its oldest record. It can receive a record twice, and misses
+  none the ring still holds.
+
+### Getting and setting a value
+
+A topic carries values one way, from the publisher to its subscribers, which
+map its memory read-only. A getter for a client that does not subscribe and a
+setter belong in the application's own interface, beside a method that hands
+the topic out:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:interface}}
+```
+
+The service decides what the value becomes and publishes it:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:service}}
+```
+
+- The setter publishes before it replies, so the caller's next receive returns
+  that value or a newer one.
+- A subscriber receives the value the service settled on, which may not be the
+  one a client asked for: here a target above 30 °C becomes 30 °C.
+- The service updates its own state and publishes under one lock. Done apart,
+  two setters that race can leave the getter with one's value and the topic
+  with the other's.
+
+A subscriber needs nothing of this. Its first receive returns the current
+value:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:watch}}
+```
+
+```text
+cargo run -p rsbinder-topic --example topic_thermostat -- serve
+cargo run -p rsbinder-topic --example topic_thermostat -- watch
+cargo run -p rsbinder-topic --example topic_thermostat -- set 23.5
+```
+
 ## Finding a topic by name
 
-`Publisher::advertise` makes the topic and registers it under a name, and a
-`NamedSubscriber` watches the name and connects to whichever publisher holds
-it, the two started in either order:
+`Publisher::advertise_on` registers a topic under a name, and a
+`NamedSubscriber`, which `SubscriberBuilder::subscribe_named` makes, watches the name
+and connects to whichever publisher holds it, the two started in either order:
 
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_named.rs:advertise}}
@@ -147,7 +275,7 @@ registry's host (`Closed::ResolverDied`; the service manager's death is not
 reported). `NamedSubscriber::state` tells a wait for a publisher from a wait
 only a new registration of the name ends. The watch uses the service
 manager's registration notices, which Android 10's service manager does not
-have: there `NamedSubscriber::subscribe` fails. A notice is a oneway call,
+have: there `SubscriberBuilder::subscribe_named` fails. A notice is a oneway call,
 which the kernel fails when the subscriber's process has no room left for one;
 when a publisher ends, or refuses as ended, with no other binder for the name,
 the subscriber asks the service manager (`check_service`) for the binder the
@@ -159,11 +287,11 @@ service manager does:
 
 | How a subscriber finds it | Starts the publisher? |
 |---|---|
-| `wait_for_interface` and the like (`getService`), then `Subscriber::request` | yes: [on-demand start](./service-manager.md#starting-a-service-on-demand) |
+| `wait_for_interface` and the like (`getService`), then `SubscriberBuilder::subscribe` | yes: [on-demand start](./service-manager.md#starting-a-service-on-demand) |
 | `NamedSubscriber` through the service manager | `rsb_hub`: no, it uses `check_service` and registration notices; on Android 15 from `android-15.0.0_r6`, `check_service` is `getService` and can start a declared service |
 | `NamedSubscriber` through a kernel registry | no: `lookup` and `watch` start nothing |
 | `NamedSubscriber` through a hub on a socket | no, for the same reason; that hub starts no service at all |
-| `uds::subscribe` | no: a publisher has to be at the endpoint |
+| `SubscriberBuilder::connect` (`uds`) | no: a publisher has to be at the endpoint |
 
 ## A registry of topic names
 
@@ -183,8 +311,8 @@ in [Service Manager](./service-manager.md#topic-names)):
   watchers.
 
 `RegistryResolver` is that registry as a `Resolver`, which
-`Publisher::advertise_with` and `NamedSubscriber::subscribe_with` take where
-`advertise` and `subscribe` use the service manager:
+`Publisher::advertise_on` and `SubscriberBuilder::subscribe_named_on` take in
+place of `ServiceManager`, which `SubscriberBuilder::subscribe_named` uses:
 
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_registry.rs:find}}
@@ -218,7 +346,7 @@ feature.
   runs with `--allow-cross-uid-overwrite`. A name is 1 to 127 bytes of
   `[A-Za-z0-9._/-]`, as a service name.
 - **Refusals.** An advertise or watch the policy refuses is `EX_SECURITY`
-  (so `NamedSubscriber::subscribe_with` fails), as is a `list` by a caller
+  (so `SubscriberBuilder::subscribe_named_on` fails), as is a `list` by a caller
   `[global] topics` leaves out. A lookup it refuses answers no topic, as for
   a name that has none, and `list` leaves out the names the caller may not
   subscribe to.
@@ -289,7 +417,7 @@ publisher of any other uid, by `SO_PEERCRED` of the process that called
 `listen`. Kernel binder has no such check, and at a socket path it is the one
 way for a subscriber to know who listens there.
 
-A session of your own also works: `Subscriber::request` takes the root binder of
+A session of your own also works: `SubscriberBuilder::subscribe` takes the root binder of
 a session opened with an incoming connection and `FileDescriptorTransportMode::Unix`,
 and refuses what cannot work: `InvalidOperation` for a session with no incoming
 connection, on which the publisher could not tell it of an eviction, and
@@ -303,7 +431,7 @@ the registry of topic names on a Unix socket and opens no binder device. Its
 `[[topic]]` and `[global] topics` rules are the same ones
 ([Service Manager](./service-manager.md#a-hub-on-a-unix-socket)), judged by the
 caller's `SO_PEERCRED`. `UdsResolver` is that registry as a `Resolver`, with
-`advertise_with` and `subscribe_with` as above:
+`advertise_on` and `subscribe_named_on` as above:
 
 ```rust,ignore
 {{#include ../../rsbinder-topic/examples/topic_uds.rs:hub}}
@@ -337,7 +465,7 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
 ### What differs from kernel binder
 
 - **The caller's identity is fixed at connect.** Kernel binder names the caller
-  of each transaction. Here `Authorize` and `SubscriberInfo` see `SO_PEERCRED`
+  of each transaction. Here `authorize` and `SubscriberInfo` see `SO_PEERCRED`
   of the connection: a process that hands its connected socket to another makes
   that one's calls look like its own.
 - **Resources grow per subscriber.** Kernel binder serves every peer with one
@@ -357,7 +485,7 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   death, and a deadline that runs out on a session ends it too, which reads as
   `Closed::PublisherDied`. The sessions topics make have a deadline while they
   are set up (`Options::timeout`, 10 s) and none afterwards; one you give
-  `Subscriber::request` keeps what you set. A `NamedSubscriber`'s subscription call
+  `SubscriberBuilder::subscribe` keeps what you set. A `NamedSubscriber`'s subscription call
   has no deadline, so that a publisher that stopped in it is subscribed to once it
   goes on; a new publisher of the name ends the wait. A hub keeps a 10 s deadline
   on what it sends: a process that stopped with its socket full loses its session
@@ -397,7 +525,7 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
   such a listener wait in `connect(2)` until the publisher accepts or ends. A
   stopped publisher with room in its queue is found out by the handshake instead.
 - **`uid` and `pid` depend on the namespaces.** Across user namespaces a uid with
-  no mapping reads 65534 to `Authorize`, `Options::expect_uid` and a hub's policy,
+  no mapping reads 65534 to `authorize`, `Options::expect_uid` and a hub's policy,
   and a pid outside this pid namespace reads -1 (`PeerIdentity::pid()` returns
   `None`).
 - **`/proc` has to be mounted** for a hub and for `Endpoint::Fd`: a sandbox that
@@ -405,24 +533,26 @@ names and watches end with it, as [a kernel registry's do](#when-the-hub-restart
 
 ## Losing records, and backpressure
 
-Without backpressure a publish never waits. A subscriber that falls more than
-a ring behind gets `RecvError::Lagged(n)` for the `n` records written over and
-then the next record. `try_latest` and `recv_latest` skip to the newest
-record and report nothing skipped as lost.
+Without backpressure a publish never waits. A subscriber of an event topic that
+falls more than a ring behind gets `RecvError::Lagged(n)` for the `n` records
+written over and then the next record. `try_latest` and `recv_latest` skip to
+the newest record and report nothing skipped as lost, as every receive of a
+[state topic](#event-topics-and-state-topics) does.
 
-`PublisherPolicy::backpressure` makes a publish wait, up to
-`Backpressure::publish_timeout`, for its subscribers to read what it would
-overwrite. Past the timeout the subscribers in the way are taken out: each is
-told, and its receives return `Closed::Evicted`. `Backpressure::window` also
-bounds how many records a subscriber may be behind. The same timeout bounds a
-loan's wait for a slot and the end record's wait in `close` or the drop.
+`PublisherBuilder::lossless(timeout)` makes a publish wait, up to `timeout`,
+for its subscribers to read what it would overwrite. Past the timeout the
+subscribers in the way are taken out: each is told, and its receives return
+`Closed::Evicted`. `lossless_window(timeout, window)` also bounds how many
+records a subscriber may be behind. The same timeout bounds a loan's wait for
+a slot and the end record's wait in `close` or the drop.
 
 The timeout is the publisher's, not a subscriber's: a subscriber that stops
 reading is taken out only once it holds up a publish, and the time until then
 is the time the publisher takes to fill the ring (or the window) behind it,
 which the publish rate decides, plus the timeout. The wait holds the topic's
 lock and sleeps the publishing thread, so from async code a publish runs on a
-blocking thread. The `Backpressure` rustdoc lists what waits with it.
+blocking thread. The `PublisherBuilder::lossless` rustdoc lists what waits
+with it.
 
 ## Waiting
 
@@ -452,7 +582,7 @@ every one; those look at the ring and sleep again. A publish wakes every bit.
 ## Large values: loans and samples
 
 A value too large to copy twice goes through a pool. With
-`PublisherPolicy::pool` the publisher writes a value straight into a slot of a
+`PublisherBuilder::lend` the publisher writes a value straight into a slot of a
 second memfd, and the ring carries only a record that names the slot:
 
 ```rust,ignore
@@ -464,7 +594,7 @@ A loan (`LoanMut`) is `Send`, so a spawned task can hold one across an
 backpressure, `loan_slice` waits for a free slot and `publish` for room in
 the ring, under the topic's lock as a publish does, up to the timeout; both
 block that worker thread meanwhile. A `loan_slice` while
-`PoolPolicy::max_loans` loans are held is refused with
+`PublisherBuilder::max_loans` loans are held is refused with
 `PublishError::TooManyLoans` at once, without that wait.
 
 A `Bytes` subscriber receives a lent value as any other, or where it lies with
@@ -502,7 +632,7 @@ cargo run -p rsbinder-topic --example topic_frames -- publish
 cargo run -p rsbinder-topic --example topic_frames -- subscribe-trusted
 ```
 
-`PoolPolicy::depth` (2 by default) is how many of the newest values stay
+`PublisherBuilder::lend_keep` (2 by default) is how many of the newest values stay
 readable for a subscriber behind: each publish takes back the older ones,
 which such a subscriber then gets as `Lagged`. A held `Sample` keeps its value
 however old it grows. With backpressure nothing is taken back, and a loan
@@ -515,7 +645,7 @@ waits for a slot instead.
   subscribers out.
 - **One publisher.** Any thread of the publisher's process may publish; no
   other process writes the topic.
-- **Kernel binder, or RPC on a Unix socket.** `Subscriber::request` refuses an
+- **Kernel binder, or RPC on a Unix socket.** `SubscriberBuilder::subscribe` refuses an
   RPC session that cannot pass fds or has no incoming connection; see
   [Topics without a binder device](#topics-without-a-binder-device). A subscriber
   of a publisher in its own process makes no binder call and needs no binder
@@ -535,7 +665,8 @@ waits for a slot instead.
   subscriber's process; the encoding refuses them (`BadType`,
   `FdsNotAllowed`).
 - **Bounded mappings.** The publisher sizes the ring and the pool, and a
-  subscriber maps them whole, so `SubscriberPolicy::max_ring_bytes` (16 MiB)
-  and `max_pool_bytes` (256 MiB) refuse larger ones.
+  subscriber maps them whole, so `SubscriberBuilder::max_ring_bytes` (256 MiB,
+  16 MiB on a 32-bit target) and `max_pool_bytes` (1 GiB, 256 MiB on a 32-bit
+  target) refuse larger ones.
 - **Do not copy the `.aidl`.** A topic is handed out as an `IBinder`; see
   [above](#handing-a-topic-out-from-an-interface).

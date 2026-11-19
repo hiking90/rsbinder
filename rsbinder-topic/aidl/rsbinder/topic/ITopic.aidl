@@ -22,6 +22,17 @@ interface ITopic {
     /** SubscribeRequest.wake: a byte on SubscribeRequest.wakeFd. */
     const int WAKE_FD = 1;
 
+    /**
+     * TopicEndpoint.topicKind: each record tells of something that happened
+     * once, and a subscriber reads them in order.
+     */
+    const int TOPIC_EVENT = 0;
+    /**
+     * TopicEndpoint.topicKind: the newest record is the current value, and a
+     * subscriber reads the newest.
+     */
+    const int TOPIC_STATE = 1;
+
     /** ServiceSpecific: the request's layout version is not the publisher's. */
     const int ERROR_VERSION = 1;
     /**

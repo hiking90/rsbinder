@@ -32,9 +32,7 @@ use rsbinder_topic::registry::uds::{ResolverOptions, UdsResolver};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rsbinder_topic::uds::{self, Endpoint, Options};
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use rsbinder_topic::{
-    Bytes, NamedSubscriber, Publisher, PublisherPolicy, RecvError, SubscriberPolicy,
-};
+use rsbinder_topic::{Bytes, Publisher, RecvError, Subscriber};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn publish(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR: serve
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default())?;
+    let publisher = Publisher::<Bytes>::events().build()?;
     let server = RpcServer::setup_unix_server(path)?;
     let serving = uds::serve(&server, publisher.as_binder())?;
     let mut published = Ok(());
@@ -82,8 +80,8 @@ fn subscribe(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
         expect_uid: Some(own_uid()),
         ..Options::default()
     };
-    let policy = SubscriberPolicy::default();
-    let mut subscriber = uds::subscribe_with::<Bytes>(Endpoint::Path(path), &policy, &options)?;
+    let mut subscriber =
+        Subscriber::<Bytes>::builder().connect_with(Endpoint::Path(path), &options)?;
     loop {
         match subscriber.recv() {
             Ok(Bytes(value)) => println!("{value:?}"),
@@ -110,11 +108,8 @@ fn own_uid() -> u32 {
 fn hub_publish(hub: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR: hub
     let resolver = UdsResolver::connect(Endpoint::Path(hub), &ResolverOptions::default())?;
-    let publisher = Publisher::<Bytes>::advertise_with(
-        "example.readings",
-        &PublisherPolicy::default(),
-        &resolver,
-    )?;
+    let publisher = Publisher::<Bytes>::events().build()?;
+    publisher.advertise_on("example.readings", &resolver)?;
     // ANCHOR_END: hub
     for n in 0u64.. {
         publisher.publish(&Bytes(n.to_le_bytes().to_vec()))?;
@@ -126,9 +121,8 @@ fn hub_publish(hub: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn hub_subscribe(hub: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let resolver = UdsResolver::connect(Endpoint::Path(hub), &ResolverOptions::default())?;
-    let policy = SubscriberPolicy::default();
     let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("example.readings", &policy, &resolver)?;
+        Subscriber::<Bytes>::builder().subscribe_named_on("example.readings", &resolver)?;
     loop {
         match subscriber.recv() {
             Ok(Bytes(value)) => println!("{value:?}"),

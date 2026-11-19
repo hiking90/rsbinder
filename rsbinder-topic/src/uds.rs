@@ -12,11 +12,11 @@
 //!
 //! ```no_run
 //! use rsbinder::rpc::RpcServer;
-//! use rsbinder_topic::{uds, Bytes, Publisher, PublisherPolicy, SubscriberPolicy};
+//! use rsbinder_topic::{uds, Bytes, Publisher, Subscriber};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // The publishing process.
-//! let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default())?;
+//! let publisher = Publisher::<Bytes>::events().build()?;
 //! let server = RpcServer::setup_unix_server("/run/example/topic.sock")?;
 //! let serving = uds::serve(&server, publisher.as_binder())?;
 //! publisher.publish(&Bytes(b"hello".to_vec()))?;
@@ -26,7 +26,7 @@
 //!
 //! // A subscribing process.
 //! let endpoint = uds::Endpoint::Path("/run/example/topic.sock".into());
-//! let mut subscriber = uds::subscribe::<Bytes>(endpoint, &SubscriberPolicy::default())?;
+//! let mut subscriber = Subscriber::<Bytes>::builder().connect(endpoint)?;
 //! # let _ = subscriber.recv();
 //! # Ok(()) }
 //! ```
@@ -34,7 +34,7 @@
 //! # What differs from kernel binder
 //!
 //! - **The caller's identity is fixed at connect.** Kernel binder names the caller of each
-//!   transaction. Here [`Authorize`](crate::Authorize) and
+//!   transaction. Here [`authorize`](crate::PublisherBuilder::authorize) and
 //!   [`SubscriberInfo`](crate::SubscriberInfo) see `SO_PEERCRED` of the connection: a process
 //!   that hands its connected socket to another makes that one's calls look like its own.
 //! - **Resources grow per subscriber.** Kernel binder serves every peer with one descriptor and
@@ -44,12 +44,14 @@
 //!   while a subscriber's second socket attaches.
 //! - **Death is the session's end.** The loss of any connection of a session is a death: a
 //!   deadline on the session that runs out on a slow callback reads as
-//!   [`Closed::PublisherDied`](crate::Closed::PublisherDied). The session [`subscribe`] makes has
-//!   a deadline during setup and none afterwards ([`Options::timeout`]); one the caller
-//!   gives [`Subscriber::request`] keeps what the caller set.
+//!   [`Closed::PublisherDied`](crate::Closed::PublisherDied). The session
+//!   [`connect`](crate::SubscriberBuilder::connect) makes has a deadline during setup and none
+//!   afterwards ([`Options::timeout`]); one the caller gives
+//!   [`subscribe`](crate::SubscriberBuilder::subscribe) keeps what the caller set.
 //! - **`uid` and `pid` depend on the namespaces.** Across user namespaces a uid with no mapping
-//!   reads 65534 to [`Authorize`](crate::Authorize) and to [`Options::expect_uid`], and a pid
-//!   outside this pid namespace reads -1 ([`PeerIdentity::pid`] returns `None`).
+//!   reads 65534 to [`authorize`](crate::PublisherBuilder::authorize) and to
+//!   [`Options::expect_uid`], and a pid outside this pid namespace reads -1
+//!   ([`PeerIdentity::pid`] returns `None`).
 //! - **A publisher serves one name at a time.** [`Publisher`](crate::Publisher) holds one
 //!   advertisement, and `advertise_on` with any resolver replaces the one it has, so one publisher
 //!   is not advertised to a kernel registry and over a socket at once. `rsbinder::hub::add_service`
@@ -71,9 +73,10 @@ use rsbinder::StatusCode;
 use rsbinder::{BinderResult, ExceptionCode, SIBinder, Status};
 
 use crate::connect::status_of;
-use crate::{layout, Payload, Subscriber, SubscriberPolicy};
+use crate::subscriber::Settings;
+use crate::{layout, Payload, Subscriber};
 
-/// The android-13+ wire version [`subscribe`] offers: its incoming connections are what death
+/// The android-13+ wire version [`connect_with`] offers: its incoming connections are what death
 /// notices arrive on, and only that wire has them.
 pub(crate) const WIRE: u32 = rsbinder::entry::WireVersion::MAX.get();
 
@@ -88,7 +91,8 @@ pub enum Endpoint {
     /// it say who may connect.
     Path(PathBuf),
     /// A Linux abstract socket: no file, so **any process of the network namespace can connect**.
-    /// Prefer [`Path`](Self::Path) unless the publisher's [`Authorize`](crate::Authorize) checks
+    /// Prefer [`Path`](Self::Path) unless the publisher's
+    /// [`authorize`](crate::PublisherBuilder::authorize) checks
     /// its callers.
     Abstract(Vec<u8>),
     /// An `O_PATH` descriptor of the socket's file, as a registry hands them out: the file may
@@ -97,7 +101,7 @@ pub enum Endpoint {
     Fd(OwnedFd),
 }
 
-/// How [`subscribe_with`] connects.
+/// How [`connect_with`](crate::SubscriberBuilder::connect_with) connects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// The bound on each step of connecting and on the subscription call. Default 10 s. `None`
@@ -204,28 +208,17 @@ fn check_uid(session: &RpcSession, expected: Option<u32>) -> BinderResult<()> {
     }
 }
 
-/// Subscribe to the topic of the publisher at `endpoint`, with [`Options`]' defaults.
-///
-/// The returned [`Subscriber`] holds the session and closes it as it drops, so nothing is left
-/// to end. Its errors are those of [`Subscriber::request`] and of connecting: the code of the
-/// kernel's answer (`NameNotFound` for no file, `Errno(-ECONNREFUSED)` for no listener,
-/// `Errno(-EACCES)` for the socket file's mode) and `TimedOut` past [`Options::timeout`].
-pub fn subscribe<T: Payload>(
+/// [`SubscriberBuilder::connect_with`](crate::SubscriberBuilder::connect_with).
+pub(crate) fn connect_with<T: Payload>(
     endpoint: Endpoint,
-    policy: &SubscriberPolicy,
-) -> BinderResult<Subscriber<T>> {
-    subscribe_with(endpoint, policy, &Options::default())
-}
-
-/// [`subscribe`] with `options`.
-pub fn subscribe_with<T: Payload>(
-    endpoint: Endpoint,
-    policy: &SubscriberPolicy,
+    policy: &Settings,
     options: &Options,
 ) -> BinderResult<Subscriber<T>> {
     layout::check_target().map_err(status_of)?;
     let session = connect(endpoint, options)?;
-    let subscriber = Subscriber::request(&session.0.get_root()?, policy)?;
+    let start = policy.start;
+    let subscriber =
+        Subscriber::request_starting(&session.0.get_root()?, policy, |_, _| (start, None))?;
     session.0.set_reply_timeout(None)?;
     Ok(subscriber.with_session(Arc::new(session)))
 }

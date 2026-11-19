@@ -802,7 +802,7 @@ impl Planned {
             topic: topic.into(),
             named: false,
             mode: Mode::Counted,
-            start: Start::Latest,
+            start: Start::Next,
             sample: false,
         }
     }
@@ -987,11 +987,9 @@ impl Topology {
                     _ => "recv",
                 };
                 let fd = s % 2 == 1;
-                // Not `s % 3`, which is `named`'s: every named subscription would start at
-                // `Last`, and X1 would see no other start rule. A topic's subscriptions of one
-                // API recur every 18 `s` (6 nodes, 3 a node), so this turns within them.
+                // Not `s % 3`, `named`'s: X1 would see named subscriptions start at `Newest` only.
                 let start_at = (s / 18) % 3;
-                let start = ["latest", "last", "oldest"][start_at];
+                let start = ["next", "newest", "oldest"][start_at];
                 let mut spec = format!(
                     "topic={topic},payload={payload},api={},recv={recv},wake={},start={start}",
                     if named { "named" } else { "plain" },
@@ -1015,7 +1013,7 @@ impl Topology {
                     } else {
                         Mode::Counted
                     },
-                    start: [Start::Latest, Start::Last, Start::Oldest][start_at],
+                    start: [Start::Next, Start::Newest, Start::Oldest][start_at],
                     sample: recv == "sample",
                     ..Planned::new(&node, topic)
                 });
@@ -1066,8 +1064,7 @@ impl Topology {
     }
 }
 
-/// What a stop point found of each process: memfds open, memfd mappings, threads outside the
-/// binder and tokio pools; and the service manager's open files.
+/// Each process's memfds, memfd mappings and threads outside the pools; the hub's open files.
 #[derive(Debug, PartialEq)]
 struct Snapshot {
     /// Keyed by node and start count: a restarted node is another process.
@@ -1110,15 +1107,15 @@ fn memfd_counts(pid: i32) -> (usize, usize, usize) {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
         .map(|maps| maps.lines().filter(|line| line.contains("/memfd:")).count())
         .unwrap_or(0);
-    // The binder pool and tokio's blocking pool start threads on demand and the latter ends idle
-    // ones, so neither count is fixed; what a leak leaves (a connect or retry thread of
-    // rsbinder-topic, a role's) is named otherwise.
+    // The binder, tokio and wait pools vary in size; a wait that never ends stays in `maps`.
     let threads = fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |tasks| {
         tasks
             .filter_map(Result::ok)
             .filter(|task| {
                 let comm = fs::read_to_string(task.path().join("comm")).unwrap_or_default();
-                !comm.starts_with("binder:") && !comm.starts_with("tokio-")
+                !["binder:", "tokio-", "rsbinder-wait"]
+                    .iter()
+                    .any(|pool| comm.starts_with(pool))
             })
             .count()
     });
@@ -1462,8 +1459,7 @@ fn steady_state_fleet() {
     usage.report(&mut fleet, "steady state");
 }
 
-/// How many records T2's ring holds, from the payload its publisher has written: a record takes
-/// its payload rounded up to 8 bytes, and 8 more (`PublisherPolicy::for_payload`).
+/// How many records T2's ring holds, from the payload size its publisher has written.
 fn report_t2_depth(fleet: &mut Fleet, topology: &Topology) -> Result<(), Failure> {
     const RING: u64 = 16384;
     let readings = topology.topic_of("p-readings");
@@ -1731,13 +1727,12 @@ fn x1_killed_producer_restarts_with_records(
     let node = "p-readings";
     let topic = topology.topic_of(node);
     let of_topic = |p: &Planned| p.topic == topic;
-    // The rule for a named subscriber's later connection is seen only on one that counts its
-    // records and does not start at `Last`, which keeps its start.
+    // A later connection's rule shows only where records are counted and `Newest` is not kept.
     assert!(
         !topology.notices
             || topology
                 .of(&topic)
-                .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Last),
+                .any(|p| p.named && p.mode == Mode::Counted && p.start != Start::Newest),
         "X1: no subscription of T2 shows the start rule of a named subscriber"
     );
     let since = now_ns();

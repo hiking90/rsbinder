@@ -38,8 +38,8 @@ use rsbinder::{hub, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, St
 use rsbinder_topic::aidl::ITopic::{ITopic, ERROR_VERSION};
 use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 use rsbinder_topic::{
-    wait_any, Backpressure, Bytes, Closed, Disconnected, NamedSubscriber, Payload, PoolPolicy,
-    Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, Wait, Wake,
+    wait_any, Bytes, Closed, Disconnected, NamedSubscriber, Payload, Publisher, RecvError,
+    ServiceManager, Subscriber, Wait, Wake,
 };
 
 /// This process's memfds: the fds open on one, and the mappings of one.
@@ -58,7 +58,10 @@ fn memfds() -> (usize, usize) {
 
 fn publish(tag: &str) -> (String, Publisher<Bytes>) {
     init();
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = Publisher::<Bytes>::events()
+        .ring_bytes(64 << 10)
+        .build()
+        .unwrap();
     let name = name(tag);
     hub::add_service(&name, publisher.as_binder()).unwrap();
     (name, publisher)
@@ -89,6 +92,18 @@ fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     assert_eq!(memfds(), before);
 }
 
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_subscriber_of_another_process_reads_a_state_topics_value_at_once() {
+    init();
+    let first = Bytes(b"first".to_vec());
+    let publisher = Publisher::<Bytes>::state().build(&first).unwrap();
+    let name = name("state");
+    hub::add_service(&name, publisher.as_binder()).unwrap();
+    let peer = Peer::spawn("state", &name);
+    assert_eq!(peer.says(), "State first");
+}
+
 /// Lend a slot for `value` and publish it; the slot's address, which names it.
 fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> usize {
     let mut loan = publisher.loan_slice(value.len()).unwrap();
@@ -104,23 +119,20 @@ fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> usize {
 fn a_slot_a_killed_subscriber_pinned_is_lent_again() {
     init();
     // 2 pins, one to write, a depth of 1 and 1 loan: 5 slots.
-    let policy = PublisherPolicy {
-        max_subscribers: 2,
-        max_per_uid: 2,
-        pool: Some(PoolPolicy {
-            slot_bytes: 4096,
-            depth: 1,
-            max_loans: 1,
-            huge_pages: false,
-        }),
-        ..PublisherPolicy::default()
-    };
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let publisher = Publisher::<Bytes>::events()
+        .max_subscribers(2)
+        .max_per_uid(2)
+        .lend(4096)
+        .lend_keep(1)
+        .max_loans(1)
+        .build()
+        .unwrap();
     let name = name("pinned");
     hub::add_service(&name, publisher.as_binder()).unwrap();
     // A subscriber that reads nothing: no slot is read by everyone, so the oldest go round.
-    let idle = SubscriberPolicy::default();
-    let _idle = Subscriber::<Bytes>::request(&publisher.as_binder(), &idle).unwrap();
+    let _idle = Subscriber::<Bytes>::builder()
+        .subscribe(&publisher.as_binder())
+        .unwrap();
     let mut peer = Peer::spawn("pin", &name);
     assert_eq!(peer.says(), "subscribed");
     let pinned = lend(&publisher, b"held");
@@ -254,8 +266,7 @@ fn a_subscriber_reads_what_a_dead_publisher_committed_then_learns_it_died() {
     let mut peer = Peer::spawn("publish", &name);
     assert_eq!(peer.says(), "ready");
     let topic = hub::check_service(&name).expect("the publisher's binder");
-    let mut subscriber =
-        Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
     peer.tell("publish 3");
     assert_eq!(peer.says(), "published");
     peer.kill();
@@ -285,9 +296,9 @@ fn without_notices(name: &str) -> bool {
     if rsbinder::sdk_at_least(30) {
         return false;
     }
-    let refused = NamedSubscriber::<Bytes>::subscribe(name, &SubscriberPolicy::default());
-    let refused = refused.err().map(|status| status.transaction_error());
-    assert_eq!(refused, Some(StatusCode::UnknownTransaction));
+    let refused = Subscriber::<Bytes>::builder().subscribe_named(name);
+    let refused = refused.err().map(|status| status.exception_code());
+    assert_eq!(refused, Some(ExceptionCode::UnsupportedOperation));
     true
 }
 
@@ -300,8 +311,9 @@ fn a_name_subscriber_outlives_a_killed_publisher_and_reads_the_next_from_its_fir
     if without_notices(&name) {
         return;
     }
-    let policy = SubscriberPolicy::default();
-    let mut subscriber = NamedSubscriber::<Bytes>::subscribe(&name, &policy).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .subscribe_named(&name)
+        .unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(100)));
     let mut peer = Peer::spawn("advertise", &name);
     assert_eq!(peer.says(), "ready");
@@ -374,13 +386,10 @@ fn name_subscribers_on_one_poll_loop_go_on_through_a_killed_publisher() {
     for peer in &peers {
         assert_eq!(peer.says(), "ready");
     }
-    let policy = SubscriberPolicy {
-        wake: Wake::Fd,
-        ..SubscriberPolicy::default()
-    };
+    let builder = Subscriber::<Bytes>::builder().wake(Wake::Fd);
     let mut subscribers: Vec<_> = names
         .iter()
-        .map(|name| NamedSubscriber::<Bytes>::subscribe(name, &policy).unwrap())
+        .map(|name| builder.clone().subscribe_named(name).unwrap())
         .collect();
     for subscriber in &subscribers {
         assert!(subscriber.wait_connected(WAIT));
@@ -441,10 +450,7 @@ fn sleepers_of_a_killed_publisher(wake: Wake) {
         .ok()
         .and_then(|deaths| deaths.parse().ok())
         .unwrap_or(1000);
-    let policy = SubscriberPolicy {
-        wake,
-        ..SubscriberPolicy::default()
-    };
+    let builder = Subscriber::<Bytes>::builder().wake(wake);
     for death in 0..deaths {
         let name = name(&format!("deaths.{death}"));
         let mut peer = Peer::spawn("publish", &name);
@@ -452,7 +458,7 @@ fn sleepers_of_a_killed_publisher(wake: Wake) {
         let topic = hub::check_service(&name).expect("the publisher's binder");
         let receiving: Vec<_> = (0..8)
             .map(|_| {
-                let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+                let mut subscriber = builder.clone().subscribe(&topic).unwrap();
                 std::thread::spawn(move || {
                     let first = subscriber.recv();
                     let killed = subscriber.recv();
@@ -489,13 +495,10 @@ fn fd_subscribers_of_two_publishers_wait_on_one_thread_and_learn_of_a_death() {
     for peer in &peers {
         assert_eq!(peer.says(), "ready");
     }
-    let policy = SubscriberPolicy {
-        wake: Wake::Fd,
-        ..SubscriberPolicy::default()
-    };
+    let builder = Subscriber::<Bytes>::builder().wake(Wake::Fd);
     let [mut first, mut second] = names.map(|name| {
         let topic = hub::check_service(&name).expect("the publisher's binder");
-        Subscriber::<Bytes>::request(&topic, &policy).unwrap()
+        builder.clone().subscribe(&topic).unwrap()
     });
     for round in 0..200 {
         let from = round % 2;
@@ -549,8 +552,7 @@ fn a_receive_after_a_dropped_async_receive_learns_that_the_publisher_died() {
     let mut peer = Peer::spawn("publish", &name);
     assert_eq!(peer.says(), "ready");
     let topic = hub::check_service(&name).expect("the publisher's binder");
-    let mut subscriber =
-        Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
     let abandon = |subscriber: &mut Subscriber<Bytes>| {
         let _enter = runtime.enter();
         let mut future = std::pin::pin!(subscriber.recv_async());
@@ -585,15 +587,11 @@ fn a_receive_after_a_dropped_async_receive_learns_that_the_publisher_died() {
 /// A topic of the smallest ring that waits up to `timeout`, registered with the hub.
 fn waiting(tag: &str, timeout: Duration) -> (String, Publisher<Bytes>) {
     init();
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy {
-        ring_bytes: 4096,
-        backpressure: Some(Backpressure {
-            publish_timeout: timeout,
-            ..Backpressure::default()
-        }),
-        ..PublisherPolicy::default()
-    })
-    .unwrap();
+    let publisher = Publisher::<Bytes>::events()
+        .ring_bytes(4096)
+        .lossless(timeout)
+        .build()
+        .unwrap();
     let name = name(tag);
     hub::add_service(&name, publisher.as_binder()).unwrap();
     (name, publisher)
@@ -626,8 +624,9 @@ fn a_subscriber_stopped_past_the_timeout_is_taken_out_and_told() {
     let (name, publisher) = waiting("stall", timeout);
     let mut peer = Peer::spawn("stall", &name);
     assert_eq!(peer.says(), "subscribed");
-    let mut keeper =
-        Subscriber::<Bytes>::request(&publisher.as_binder(), &SubscriberPolicy::default()).unwrap();
+    let mut keeper = Subscriber::<Bytes>::builder()
+        .subscribe(&publisher.as_binder())
+        .unwrap();
     signal(&peer, rustix::process::Signal::STOP);
     let longest = std::thread::scope(|scope| {
         let receiving = scope.spawn(move || {
@@ -682,8 +681,7 @@ fn child() {
     match role.to_str().unwrap() {
         "subscribe" => {
             let topic = hub::check_service(&name).unwrap();
-            let subscriber =
-                Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+            let subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
             say("subscribed");
             let mut line = String::new();
             std::io::stdin().read_line(&mut line).unwrap();
@@ -692,10 +690,17 @@ fn child() {
             say("dropped");
             wait_for_eof();
         }
+        "state" => {
+            let topic = hub::check_service(&name).unwrap();
+            let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
+            let Bytes(value) = subscriber.try_recv().unwrap();
+            let value = String::from_utf8(value).unwrap();
+            say(&format!("{:?} {value}", subscriber.topic_kind()));
+            wait_for_eof();
+        }
         "pin" => {
             let topic = hub::check_service(&name).unwrap();
-            let mut subscriber =
-                Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default()).unwrap();
+            let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
             say("subscribed");
             let sample = subscriber.recv_sample().unwrap();
             let value = String::from_utf8(sample.to_owned()).unwrap();
@@ -706,8 +711,7 @@ fn child() {
         }
         "stall" => {
             let topic = hub::check_service(&name).unwrap();
-            let policy = SubscriberPolicy::default();
-            let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+            let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
             say("subscribed");
             // Reads nothing until told, then receives until the subscription ends.
             let mut told = String::new();
@@ -730,11 +734,11 @@ fn child() {
         }
         "subscribe-loop" => {
             let topic = hub::check_service(&name).unwrap();
-            let policy = SubscriberPolicy::default();
-            drop(Subscriber::<Bytes>::request(&topic, &policy).unwrap());
+            let builder = Subscriber::<Bytes>::builder();
+            drop(builder.clone().subscribe(&topic).unwrap());
             say("looping");
             loop {
-                drop(Subscriber::<Bytes>::request(&topic, &policy));
+                drop(builder.clone().subscribe(&topic));
             }
         }
         "refuse" => {
@@ -747,7 +751,7 @@ fn child() {
                 "version: {}",
                 verdict(service.r#subscribe(&request))
             ));
-            let other = Subscriber::<Other>::request(&topic, &SubscriberPolicy::default());
+            let other = Subscriber::<Other>::builder().subscribe(&topic);
             say(&format!("type: {}", verdict(other)));
             let request = raw_request(topic.clone());
             say(&format!(
@@ -767,29 +771,25 @@ fn child() {
                 maximum: limit.maximum,
             };
             rustix::process::setrlimit(rustix::process::Resource::Nofile, lowered).unwrap();
-            let refused = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default());
+            let refused = Subscriber::<Bytes>::builder().subscribe(&topic);
             say(&format!("failed: {}", verdict(refused)));
             wait_for_eof();
         }
         "small-ring" => {
             let topic = hub::check_service(&name).unwrap();
-            let policy = SubscriberPolicy {
-                max_ring_bytes: 4096,
-                ..SubscriberPolicy::default()
-            };
-            let refused = Subscriber::<Bytes>::request(&topic, &policy);
+            let refused = Subscriber::<Bytes>::builder()
+                .max_ring_bytes(4096)
+                .subscribe(&topic);
             say(&format!("refused: {}", verdict(refused)));
             wait_for_eof();
         }
         role @ ("publish" | "advertise") => {
-            let policy = PublisherPolicy::default();
-            let publisher = if role == "advertise" {
-                Publisher::<Bytes>::advertise(&name, &policy).unwrap()
+            let publisher = Publisher::<Bytes>::events().build().unwrap();
+            if role == "advertise" {
+                publisher.advertise_on(&name, &ServiceManager).unwrap();
             } else {
-                let publisher = Publisher::<Bytes>::new(&policy).unwrap();
                 hub::add_service(&name, publisher.as_binder()).unwrap();
-                publisher
-            };
+            }
             say("ready");
             // `publish N` publishes the bytes 0 to N - 1, as many times as told, until EOF.
             for line in std::io::stdin().lines().map_while(Result::ok) {
@@ -823,7 +823,7 @@ fn verdict<T>(result: rsbinder::BinderResult<T>) -> String {
 /// The crate's layout version (`layout.rs`), which a test outside it cannot name.
 const LAYOUT: u32 = 3;
 
-/// A request as `Subscriber::request` makes it for `Bytes`, with `token` given.
+/// A request as `SubscriberBuilder::subscribe` makes it for `Bytes`, with `token` given.
 fn raw_request(token: SIBinder) -> SubscribeRequest {
     SubscribeRequest {
         version: LAYOUT as i32,

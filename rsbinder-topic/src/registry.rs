@@ -21,15 +21,15 @@
 //! most once in 30 seconds after a few failures, and for at most 256 watches at a time. Once one
 //! of these ends, the notice is not sent again.
 //!
-//! A [`RegistryResolver`] is the client side: [`Publisher::advertise_with`] and
-//! [`NamedSubscriber::subscribe_with`] take it in place of the service manager.
+//! A [`RegistryResolver`] is the client side: [`Publisher::advertise_on`] and
+//! [`SubscriberBuilder::subscribe_named_on`] take it in place of the service manager.
 //!
 //! The module `uds` (feature `uds`, Linux and Android) is the same registry on a Unix socket, for
 //! a host with no binder device: `rsb_hub --topic-socket`.
 //!
 //! [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
-//! [`Publisher::advertise_with`]: crate::Publisher::advertise_with
-//! [`NamedSubscriber::subscribe_with`]: crate::NamedSubscriber::subscribe_with
+//! [`Publisher::advertise_on`]: crate::Publisher::advertise_on
+//! [`SubscriberBuilder::subscribe_named_on`]: crate::SubscriberBuilder::subscribe_named_on
 
 mod resolver;
 mod table;

@@ -18,8 +18,7 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 
 use crate::wait::Words;
 use crate::{
-    wait_any, Bytes, Closed, Payload, Publisher, PublisherPolicy, RecvError, Start, Subscriber,
-    SubscriberPolicy, Wait, Wake,
+    wait_any, Bytes, Closed, Payload, Publisher, RecvError, Start, Subscriber, Wait, Wake,
 };
 
 fn num(n: u32) -> Bytes {
@@ -58,20 +57,15 @@ fn topic(ring_bytes: usize) -> Publisher<Bytes> {
 }
 
 fn topic_of<T: Payload + 'static>(ring_bytes: usize) -> Publisher<T> {
-    Publisher::new(&PublisherPolicy {
-        ring_bytes,
-        ..PublisherPolicy::default()
-    })
-    .unwrap()
+    Publisher::events().ring_bytes(ring_bytes).build().unwrap()
 }
 
 fn woken_by<T: Payload + 'static>(publisher: &Publisher<T>, wake: Wake) -> Subscriber<T> {
-    let policy = SubscriberPolicy {
-        start: Start::Latest,
-        wake,
-        ..SubscriberPolicy::default()
-    };
-    Subscriber::request(&publisher.as_binder(), &policy).unwrap()
+    Subscriber::<T>::builder()
+        .start_at(Start::Next)
+        .wake(wake)
+        .subscribe(&publisher.as_binder())
+        .unwrap()
 }
 
 fn fd_subscriber<T: Payload + 'static>(publisher: &Publisher<T>) -> Subscriber<T> {

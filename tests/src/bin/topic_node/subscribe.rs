@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use rsbinder::{BinderResult, ExceptionCode, Status};
 use rsbinder_topic::aidl::ITopic::ERROR_FULL;
 use rsbinder_topic::{
-    wait_any, Bytes, Closed, Disconnected, Interrupter, NamedSubscriber, Publisher,
-    PublisherPolicy, RecvError, Subscriber, SubscriberPolicy, SubscriberStats, Trust, Trusted,
-    Untrusted, Wait, Wake,
+    wait_any, Bytes, Closed, Disconnected, Interrupter, NamedSubscriber, Payload, Publisher,
+    RecvError, Subscriber, SubscriberBuilder, SubscriberStats, Trust, Trusted, Untrusted, Wait,
+    Wake,
 };
 use tests::topic_fleet::event::{closed_reason, disconnected_reason, Kind};
 use tests::topic_fleet::judge::{self, Mode, Reports, Subscription};
@@ -85,7 +85,7 @@ struct Plain<T: FleetPayload> {
     subscriber: Subscriber<T>,
     runtime: Option<tokio::runtime::Runtime>,
     name: String,
-    policy: SubscriberPolicy,
+    builder: SubscriberBuilder<T>,
     id: u32,
 }
 
@@ -124,7 +124,7 @@ impl<T: FleetPayload> Source for Plain<T> {
     }
 
     fn resubscribe(&mut self) -> BinderResult<()> {
-        self.subscriber = transport::subscribe(&self.name, &self.policy)?;
+        self.subscriber = transport::subscribe(&self.name, self.builder.clone())?;
         Ok(())
     }
 }
@@ -134,7 +134,7 @@ struct Named<T: FleetPayload> {
     runtime: Option<tokio::runtime::Runtime>,
     id: u32,
     name: String,
-    policy: SubscriberPolicy,
+    builder: SubscriberBuilder<T>,
     via: Via,
 }
 
@@ -178,7 +178,7 @@ impl<T: FleetPayload> Source for Named<T> {
 
     /// After its registry's host or the service manager started again (plan 15 D8; X9, X10).
     fn rebind(&mut self) -> BinderResult<()> {
-        self.subscriber = transport::subscribe_named(&self.name, &self.policy, &self.via)?;
+        self.subscriber = transport::subscribe_named(&self.name, self.builder.clone(), &self.via)?;
         Ok(())
     }
 }
@@ -206,16 +206,16 @@ impl SampleTrust for Trusted {
 struct Samples<M: SampleTrust> {
     subscriber: Subscriber<Bytes, M>,
     name: String,
-    policy: SubscriberPolicy,
+    builder: SubscriberBuilder<Bytes>,
     id: u32,
 }
 
 impl<M: SampleTrust> Samples<M> {
-    fn new(name: &str, policy: SubscriberPolicy) -> BinderResult<Self> {
+    fn new(name: &str, builder: SubscriberBuilder<Bytes>) -> BinderResult<Self> {
         Ok(Self {
-            subscriber: M::trust(transport::subscribe(name, &policy)?),
+            subscriber: M::trust(transport::subscribe(name, builder.clone())?),
             name: name.into(),
-            policy,
+            builder,
             id: topic_id(name),
         })
     }
@@ -264,51 +264,54 @@ impl<M: SampleTrust> Source for Samples<M> {
     }
 
     fn resubscribe(&mut self) -> BinderResult<()> {
-        self.subscriber = M::trust(transport::subscribe(&self.name, &self.policy)?);
+        self.subscriber = M::trust(transport::subscribe(&self.name, self.builder.clone())?);
         Ok(())
     }
 }
 
 fn typed<T: FleetPayload>(
     spec: &SubSpec,
-    policy: SubscriberPolicy,
+    builder: SubscriberBuilder<T>,
 ) -> BinderResult<Box<dyn Source>> {
     let id = topic_id(&spec.topic);
     let runtime = runtime(spec);
     Ok(match spec.api {
         Api::Plain => Box::new(Plain::<T> {
-            subscriber: transport::subscribe(&spec.topic, &policy)?,
+            subscriber: transport::subscribe(&spec.topic, builder.clone())?,
             runtime,
             name: spec.topic.clone(),
-            policy,
+            builder,
             id,
         }),
         Api::Named => Box::new(Named::<T> {
-            subscriber: transport::subscribe_named(&spec.topic, &policy, &spec.via)?,
+            subscriber: transport::subscribe_named(&spec.topic, builder.clone(), &spec.via)?,
             runtime,
             id,
             name: spec.topic.clone(),
-            policy,
+            builder,
             via: spec.via.clone(),
         }),
     })
 }
 
+fn builder<T: Payload>(spec: &SubSpec) -> SubscriberBuilder<T> {
+    Subscriber::<T>::builder()
+        .start_at(spec.start)
+        .wake(spec.wake)
+}
+
 fn source(spec: &SubSpec) -> Result<Box<dyn Source>, String> {
-    let policy = SubscriberPolicy {
-        start: spec.start,
-        wake: spec.wake,
-        ..SubscriberPolicy::default()
-    };
     let made = match (spec.payload, spec.recv, spec.trust) {
         (PayloadKind::Bytes, Recv::Sample, false) => {
-            Samples::<Untrusted>::new(&spec.topic, policy).map(|s| Box::new(s) as Box<dyn Source>)
+            Samples::<Untrusted>::new(&spec.topic, builder(spec))
+                .map(|s| Box::new(s) as Box<dyn Source>)
         }
         (PayloadKind::Bytes, Recv::Sample, true) => {
-            Samples::<Trusted>::new(&spec.topic, policy).map(|s| Box::new(s) as Box<dyn Source>)
+            Samples::<Trusted>::new(&spec.topic, builder(spec))
+                .map(|s| Box::new(s) as Box<dyn Source>)
         }
-        (PayloadKind::Bytes, _, _) => typed::<Bytes>(spec, policy),
-        (PayloadKind::Record, _, _) => typed::<FleetRecord>(spec, policy),
+        (PayloadKind::Bytes, _, _) => typed::<Bytes>(spec, builder(spec)),
+        (PayloadKind::Record, _, _) => typed::<FleetRecord>(spec, builder(spec)),
     };
     made.map_err(|status| format!("subscribe {}: {status}", spec.topic))
 }
@@ -788,7 +791,7 @@ fn fuse_input(topic: String, payload: PayloadKind) -> SubSpec {
         api: Api::Plain,
         recv: Recv::Recv,
         wake: Wake::Fd,
-        start: rsbinder_topic::Start::Latest,
+        start: rsbinder_topic::Start::Next,
         trust: false,
         group: Some("fuse".into()),
         via: Via::ServiceManager,
@@ -820,8 +823,12 @@ pub fn fuse(
 ) -> Result<Running, String> {
     let topic_name = topic.clone();
     let publisher: Arc<Publisher<FleetRecord>> = Arc::new(
-        transport::advertise(&topic, &PublisherPolicy::default(), &Via::ServiceManager)
-            .map_err(|status| format!("advertise {topic}: {status}"))?,
+        transport::advertise(
+            &topic,
+            Publisher::events().ring_bytes(64 << 10),
+            &Via::ServiceManager,
+        )
+        .map_err(|status| format!("advertise {topic}: {status}"))?,
     );
     let mut frames = made(fuse_input(frames, PayloadKind::Bytes))?;
     let mut readings = made(fuse_input(readings, PayloadKind::Record))?;

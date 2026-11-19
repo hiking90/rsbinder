@@ -14,35 +14,36 @@ use rsbinder::ParcelFileDescriptor;
 use crate::aidl::ITopic::WAKE_FUTEX;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::connect::{Asking, Token};
-use crate::layout::{self, ControlPage, LoadedPool, MIN_RING, VERSION};
+use crate::layout::{self, ControlPage, LoadedPool, VERSION};
 use crate::pool::{Pin, MAX_PINS};
 use crate::publish::AFTER_LOAN_RECORD;
 use crate::receive::LATEST_RETRIES;
 use crate::ring::BEFORE_JUDGING;
 use crate::{
-    Bytes, Encoding, Payload, PoolPolicy, PublishError, Publisher, PublisherPolicy, Record,
-    RecvError, Subscriber, SubscriberPolicy,
+    Bytes, Encoding, EventTopic, Payload, PublishError, Publisher, PublisherBuilder, Record,
+    RecvError, Subscriber,
 };
 
 const SLOT: usize = 4096;
 
 /// A topic of `max_subscribers` with a pool of 4 KiB slots.
-fn pooled(max_subscribers: usize, depth: usize, max_loans: usize) -> PublisherPolicy {
-    PublisherPolicy {
-        max_subscribers,
-        max_per_uid: max_subscribers,
-        pool: Some(PoolPolicy {
-            slot_bytes: SLOT,
-            depth,
-            max_loans,
-            huge_pages: false,
-        }),
-        ..PublisherPolicy::default()
-    }
+fn pooled(
+    max_subscribers: usize,
+    depth: usize,
+    max_loans: usize,
+) -> PublisherBuilder<Bytes, EventTopic> {
+    Publisher::<Bytes>::events()
+        .max_subscribers(max_subscribers)
+        .max_per_uid(max_subscribers)
+        .lend(SLOT)
+        .lend_keep(depth)
+        .max_loans(max_loans)
 }
 
 fn subscribe(publisher: &Publisher<Bytes>) -> Subscriber<Bytes> {
-    Subscriber::request(&publisher.as_binder(), &SubscriberPolicy::default()).unwrap()
+    Subscriber::<Bytes>::builder()
+        .subscribe(&publisher.as_binder())
+        .unwrap()
 }
 
 fn pattern(seed: u8, len: usize) -> Vec<u8> {
@@ -61,7 +62,7 @@ fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> u32 {
 #[test]
 fn a_loaned_value_reaches_every_subscriber_between_the_rings_values() {
     // A depth of 3: the three loans stay readable until the subscribers come.
-    let publisher = Publisher::<Bytes>::new(&pooled(2, 3, 1)).unwrap();
+    let publisher = pooled(2, 3, 1).build().unwrap();
     let mut subscribers = [subscribe(&publisher), subscribe(&publisher)];
     publisher.publish(&Bytes(vec![1, 2, 3])).unwrap();
     lend(&publisher, &pattern(7, 1000));
@@ -85,14 +86,10 @@ fn a_loaned_value_reaches_every_subscriber_between_the_rings_values() {
 
 #[test]
 fn a_loan_is_refused_without_a_pool_past_a_slot_past_the_bound_and_once_closed() {
-    let plain = Publisher::<Bytes>::new(&PublisherPolicy {
-        ring_bytes: MIN_RING,
-        ..PublisherPolicy::default()
-    })
-    .unwrap();
+    let plain = Publisher::<Bytes>::events().build().unwrap();
     assert_eq!(plain.loan_slice(1).err(), Some(PublishError::NoPool));
 
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let too_large = PublishError::TooLarge {
         bytes: SLOT + 1,
         max: SLOT,
@@ -110,7 +107,7 @@ fn a_loan_is_refused_without_a_pool_past_a_slot_past_the_bound_and_once_closed()
 
 #[test]
 fn a_dropped_loan_publishes_nothing_and_its_slot_is_lent_again() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     let loan = publisher.loan_slice(16).unwrap();
     let slot = loan.slot();
@@ -123,7 +120,7 @@ fn a_dropped_loan_publishes_nothing_and_its_slot_is_lent_again() {
 #[test]
 fn two_slots_read_by_everyone_are_lent_in_turn_and_a_subscriber_behind_gets_the_newest_depth() {
     // 2 pins, one to write, a depth of 2 and 1 loan: 6 slots.
-    let publisher = Publisher::<Bytes>::new(&pooled(2, 2, 1)).unwrap();
+    let publisher = pooled(2, 2, 1).build().unwrap();
     // With nobody subscribed every slot is read: the one published second last comes back.
     let first = lend(&publisher, &[1; 8]);
     let second = lend(&publisher, &[1; 8]);
@@ -178,9 +175,10 @@ impl Payload for InPlace {
 
 #[test]
 fn loaned_values_copied_into_a_kept_buffer_hold_their_own_bytes_alone() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 3, 1)).unwrap();
-    let policy = SubscriberPolicy::default();
-    let mut subscriber = Subscriber::<InPlace>::request(&publisher.as_binder(), &policy).unwrap();
+    let publisher = pooled(1, 3, 1).build().unwrap();
+    let mut subscriber = Subscriber::<InPlace>::builder()
+        .subscribe(&publisher.as_binder())
+        .unwrap();
     // Shorter than the buffer the first copy leaves, then longer.
     let values = [pattern(1, 3000), pattern(2, 1000), pattern(3, 4000)];
     for value in &values {
@@ -195,7 +193,7 @@ fn loaned_values_copied_into_a_kept_buffer_hold_their_own_bytes_alone() {
 /// AC-15.3.1: a lent value lies in its slot, a ring value in the subscriber; both read alike.
 #[test]
 fn a_lent_sample_lies_in_the_pool_and_a_ring_sample_in_the_subscriber() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     let pool = subscriber.pool().unwrap().addresses();
     lend(&publisher, &pattern(5, 3000));
@@ -220,7 +218,7 @@ fn a_lent_sample_lies_in_the_pool_and_a_ring_sample_in_the_subscriber() {
 #[test]
 fn a_trusted_subscriber_reads_a_lent_value_in_place_and_copies_the_same_bytes() {
     // 2 pins, one to write, a depth of 4 and 1 loan: the three values stay readable.
-    let publisher = Publisher::<Bytes>::new(&pooled(2, 4, 1)).unwrap();
+    let publisher = pooled(2, 4, 1).build().unwrap();
     let mut untrusted = subscribe(&publisher);
     let mut first = subscribe(&publisher);
     publisher.publish(&Bytes(vec![1])).unwrap();
@@ -253,7 +251,7 @@ fn a_trusted_subscriber_reads_a_lent_value_in_place_and_copies_the_same_bytes() 
 #[test]
 fn a_held_sample_is_not_written_however_many_values_follow() {
     // 1 pin, one to write, a depth of 1 and 1 loan: 4 slots.
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     lend(&publisher, &pattern(42, SLOT));
     let mut sample = subscriber.try_recv_sample().unwrap();
@@ -284,7 +282,7 @@ fn a_held_sample_is_not_written_however_many_values_follow() {
 /// Depth 1: a value taken back as `try_latest` reads it gives way to the newer one, with no loss.
 #[test]
 fn the_newest_value_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
-    let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+    let publisher = Rc::new(pooled(1, 1, 1).build().unwrap());
     let mut subscriber = subscribe(&publisher);
     lend(&publisher, &pattern(1, 64));
     let mut next = Some(publisher.clone());
@@ -303,7 +301,7 @@ fn the_newest_value_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
 /// With a depth of 1, the value before a loan's is readable until that loan's record is.
 #[test]
 fn a_loan_takes_the_value_before_it_back_only_after_its_record_is_committed() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let subscriber = Rc::new(RefCell::new(subscribe(&publisher)));
     lend(&publisher, &pattern(1, 64));
     let (reading, seen) = (subscriber.clone(), Rc::new(RefCell::new(Vec::new())));
@@ -322,7 +320,7 @@ fn a_loan_takes_the_value_before_it_back_only_after_its_record_is_committed() {
 /// A publish at every judgment: past [`LATEST_RETRIES`] values taken back, one loss is reported.
 #[test]
 fn a_publisher_that_keeps_taking_the_newest_value_back_holds_no_try_latest() {
-    let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+    let publisher = Rc::new(pooled(1, 1, 1).build().unwrap());
     let mut subscriber = subscribe(&publisher);
     lend(&publisher, &pattern(0, 64));
     let published = Rc::new(Cell::new(1u8));
@@ -346,11 +344,45 @@ fn a_publisher_that_keeps_taking_the_newest_value_back_holds_no_try_latest() {
     );
 }
 
+/// The same on a state topic: the receive gives up with no loss, and a wait would look again.
+#[test]
+fn a_state_publisher_that_keeps_taking_the_newest_value_back_reports_no_loss() {
+    let first = |publisher: &Publisher<Bytes>| {
+        lend(publisher, &pattern(0, 64));
+        Ok(())
+    };
+    let publisher = Publisher::<Bytes>::state()
+        .max_subscribers(1)
+        .lend(SLOT)
+        .build_with(first)
+        .unwrap();
+    let publisher = Rc::new(publisher);
+    let mut subscriber = subscribe(&publisher);
+    let published = Rc::new(Cell::new(1u8));
+    let (lending, count) = (publisher.clone(), published.clone());
+    BEFORE_JUDGING.set(Some(Box::new(move || {
+        let n = count.get();
+        if n < 64 {
+            lend(&lending, &pattern(n, 64));
+            count.set(n + 1);
+        }
+    })));
+    let got = subscriber.try_recv();
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Err(RecvError::Empty));
+    assert!(subscriber.gave_up());
+    assert_eq!(subscriber.stats().lost, 0);
+    let published = published.get();
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(pattern(published - 1, 64))));
+    assert!(!subscriber.gave_up());
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
 /// The newest value, lent, is received copied or where it lies; the values skipped are not lost.
 #[test]
 fn the_newest_lent_value_is_received_past_the_values_before_it_with_no_loss() {
     // A depth of 3: no value is taken back before it is skipped.
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 3, 1)).unwrap();
+    let publisher = pooled(1, 3, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     let pool = subscriber.pool().unwrap().addresses();
     lend(&publisher, &pattern(1, 64));
@@ -382,7 +414,7 @@ fn the_newest_lent_value_is_received_past_the_values_before_it_with_no_loss() {
 /// Depth 1, a lend while the newest is judged: the sample is the newer value, with no loss.
 #[test]
 fn the_newest_sample_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
-    let publisher = Rc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+    let publisher = Rc::new(pooled(1, 1, 1).build().unwrap());
     let mut subscriber = subscribe(&publisher);
     lend(&publisher, &pattern(1, 64));
     let mut next = Some(publisher.clone());
@@ -402,7 +434,7 @@ fn the_newest_sample_taken_back_as_it_is_read_gives_way_to_the_newer_one() {
 
 #[test]
 fn a_dropped_sample_lets_go_of_its_slot() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 2, 1)).unwrap();
+    let publisher = pooled(1, 2, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     let slot = lend(&publisher, &[3; 8]);
     lend(&publisher, &[4; 8]);
@@ -419,7 +451,7 @@ fn a_dropped_sample_lets_go_of_its_slot() {
 
 #[test]
 fn a_sample_is_waited_for_until_a_value_a_bound_or_the_end() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     let bound = std::time::Duration::from_millis(20);
     assert_eq!(
@@ -467,7 +499,7 @@ fn pinning(publisher: &Publisher<Bytes>) -> (ControlPage, LoadedPool) {
 /// AC-15.3.3, AC-15.3.2: with every subscriber holding a pin, no pinned slot is lent or written.
 #[test]
 fn pinned_slots_are_not_lent_however_many_values_follow() {
-    let publisher = Publisher::<Bytes>::new(&pooled(2, 1, 1)).unwrap();
+    let publisher = pooled(2, 1, 1).build().unwrap();
     let (page, pool) = pinning(&publisher);
     let (other_page, _) = pinning(&publisher);
     let pinned = lend(&publisher, &pattern(42, SLOT));
@@ -513,7 +545,7 @@ fn a_loan_is_unwind_safe_and_not_sync() {
 /// A loan taken on one thread is published on another, and its value arrives.
 #[test]
 fn a_loan_published_on_another_thread_reaches_the_subscriber() {
-    let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+    let publisher = pooled(1, 1, 1).build().unwrap();
     let mut subscriber = subscribe(&publisher);
     let mut loan = publisher.loan_slice(64).unwrap();
     loan.copy_from_slice(&pattern(5, 64));
@@ -545,11 +577,10 @@ mod async_samples {
     }
 
     fn woken_by(publisher: &Publisher<Bytes>, wake: Wake) -> Subscriber<Bytes> {
-        let policy = SubscriberPolicy {
-            wake,
-            ..SubscriberPolicy::default()
-        };
-        Subscriber::request(&publisher.as_binder(), &policy).unwrap()
+        Subscriber::<Bytes>::builder()
+            .wake(wake)
+            .subscribe(&publisher.as_binder())
+            .unwrap()
     }
 
     /// Poll `future` once inside `runtime`, with a waker that does nothing.
@@ -565,7 +596,7 @@ mod async_samples {
     fn an_async_sample_receive_sleeps_until_a_value_is_lent() {
         let runtime = runtime();
         for wake in [Wake::Futex, Wake::Fd] {
-            let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+            let publisher = pooled(1, 1, 1).build().unwrap();
             let mut subscriber = woken_by(&publisher, wake);
             let local = subscriber.local().clone();
             let got = std::thread::scope(|scope| {
@@ -595,7 +626,7 @@ mod async_samples {
         let runtime = runtime();
         for wake in [Wake::Futex, Wake::Fd] {
             // 1 pin, one to write, a depth of 1 and 1 loan: 4 slots.
-            let publisher = Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap();
+            let publisher = pooled(1, 1, 1).build().unwrap();
             let mut subscriber = woken_by(&publisher, wake);
             {
                 let mut future = pin!(subscriber.recv_sample_async());
@@ -622,7 +653,7 @@ mod async_samples {
     fn an_async_sample_receive_and_its_sample_move_between_threads() {
         fn moved<T: Send>(_: &T) {}
         fn movable<T: Send>() {}
-        let publisher = Publisher::<Bytes>::new(&pooled(2, 1, 1)).unwrap();
+        let publisher = pooled(2, 1, 1).build().unwrap();
         let mut subscriber = subscribe(&publisher);
         moved(&subscriber.recv_sample_async());
         // SAFETY: the publisher is this crate's, in this process.
@@ -636,7 +667,7 @@ mod async_samples {
     #[test]
     fn a_spawned_future_holds_a_loan_across_an_await() {
         let runtime = runtime();
-        let publisher = std::sync::Arc::new(Publisher::<Bytes>::new(&pooled(1, 1, 1)).unwrap());
+        let publisher = std::sync::Arc::new(pooled(1, 1, 1).build().unwrap());
         let mut subscriber = subscribe(&publisher);
         let spawned = {
             let publisher = publisher.clone();

@@ -15,8 +15,8 @@ interface IBench {
     // The producer's topic (rsbinder-topic), made on the first call with a
     // ring of `ringBytes`; start() publishes to it as well. With
     // `backpressureMs` of 0 or more a publish waits that long for its
-    // subscribers (PublisherPolicy::backpressure); below 0 it never waits.
-    // A `window` above 0 is Backpressure::window; 0 sets none.
+    // subscribers (PublisherBuilder::lossless); below 0 it never waits.
+    // A `window` above 0 is that of PublisherBuilder::lossless_window; 0 sets none.
     IBinder topic(int ringBytes, int backpressureMs, int window);
 
     // The same topic with a pool of `slotBytes` slots, for `subscribers`

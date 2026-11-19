@@ -9,7 +9,7 @@
 //! ```text
 //! topic_uds_probe OP...
 //!   publish:PATH:VALUE       a Publisher at a socket at PATH, mode 0666, publishing VALUE
-//!   subscribe:PATH[:UID]     uds::subscribe_with, with `expect_uid` when UID is given
+//!   subscribe:PATH[:UID]     SubscriberBuilder::connect_with, with `expect_uid` when UID is given
 //!   recv                     a value of the last subscriber
 //!   advertise:HUB:NAME:VALUE a Publisher of NAME on the hub at socket HUB, publishing VALUE
 //!   readvertise:NAME:VALUE   the same on the session of the last `advertise`
@@ -38,9 +38,7 @@ mod probe {
     use rsbinder_topic::aidl::ITopicUdsRegistry::{ITopicUdsRegistry, ERROR_TAKEN};
     use rsbinder_topic::registry::uds::{ResolverOptions, UdsResolver};
     use rsbinder_topic::uds::{self, Endpoint, Options};
-    use rsbinder_topic::{
-        Bytes, NamedSubscriber, Publisher, PublisherPolicy, Start, Subscriber, SubscriberPolicy,
-    };
+    use rsbinder_topic::{Bytes, NamedSubscriber, Publisher, Start, Subscriber, SubscriberBuilder};
 
     fn outcome<T>(result: &Result<T, Status>) -> String {
         match result {
@@ -75,17 +73,24 @@ mod probe {
         address: Option<OwnedFd>,
     }
 
-    fn policy() -> SubscriberPolicy {
-        SubscriberPolicy {
-            start: Start::Last,
-            ..SubscriberPolicy::default()
-        }
+    fn builder() -> SubscriberBuilder<Bytes> {
+        Subscriber::<Bytes>::builder().start_at(Start::Newest)
+    }
+
+    fn new_publisher() -> Result<Publisher<Bytes>, Status> {
+        Publisher::<Bytes>::events().ring_bytes(64 << 10).build()
+    }
+
+    fn advertised(name: &str, resolver: &UdsResolver) -> Result<Publisher<Bytes>, Status> {
+        let publisher = new_publisher()?;
+        publisher.advertise_on(name, resolver)?;
+        Ok(publisher)
     }
 
     fn publish(held: &Mutex<Held>, path: &str, value: &str) {
         let server = RpcServer::setup_unix_server(path).expect("a socket");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666)).expect("a mode");
-        let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).expect("a publisher");
+        let publisher = new_publisher().expect("a publisher");
         let handle = uds::serve(&server, publisher.as_binder()).expect("a server");
         publisher
             .publish(&Bytes(value.as_bytes().to_vec()))
@@ -101,7 +106,7 @@ mod probe {
             ..Options::default()
         };
         let endpoint = Endpoint::Path(path.into());
-        let subscriber = uds::subscribe_with::<Bytes>(endpoint, &policy(), &options);
+        let subscriber = builder().connect_with(endpoint, &options);
         result("subscribe", path, &outcome(&subscriber));
         if let Ok(subscriber) = subscriber {
             held.lock().unwrap().subscribers.push(subscriber);
@@ -127,8 +132,7 @@ mod probe {
 
     fn advertise(held: &Mutex<Held>, hub: &str, name: &str, value: &str) {
         let made = resolver(hub, None).and_then(|resolver| {
-            let publisher =
-                Publisher::<Bytes>::advertise_with(name, &PublisherPolicy::default(), &resolver)?;
+            let publisher = advertised(name, &resolver)?;
             Ok((resolver, publisher))
         });
         result("advertise", name, &outcome(&made));
@@ -145,7 +149,7 @@ mod probe {
     fn readvertise(held: &Mutex<Held>, name: &str, value: &str) {
         let mut held = held.lock().unwrap();
         let resolver = held.resolvers.last().expect("a resolver").clone();
-        let made = Publisher::<Bytes>::advertise_with(name, &PublisherPolicy::default(), &resolver);
+        let made = advertised(name, &resolver);
         result("advertise", name, &outcome(&made));
         if let Ok(publisher) = made {
             publisher
@@ -175,7 +179,7 @@ mod probe {
 
     fn named(held: &Mutex<Held>, hub: &str, name: &str, expect: Option<&str>) {
         let made = resolver(hub, expect).and_then(|resolver| {
-            let subscriber = NamedSubscriber::<Bytes>::subscribe_with(name, &policy(), &resolver)?;
+            let subscriber = builder().subscribe_named_on(name, &resolver)?;
             Ok((resolver, subscriber))
         });
         result("named", name, &outcome(&made));

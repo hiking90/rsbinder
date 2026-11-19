@@ -12,8 +12,8 @@ use rsbinder::stream::{
 };
 use rsbinder::*;
 use rsbinder_topic::{
-    Backpressure, Bytes, Closed, PoolPolicy, Publisher, PublisherPolicy, RecvError, Sample, Subscriber,
-    SubscriberPolicy, Trust, Wake,
+    Bytes, Closed, EventTopic, Publisher, PublisherBuilder, RecvError, Sample, Subscriber, Trust,
+    Wake,
 };
 
 use crate::common::*;
@@ -74,15 +74,24 @@ pub fn ring_for(size: usize) -> usize {
 /// The topic's ring: `depth` records of `size`, iceoryx2's subscriber buffer for that size.
 pub fn topic_ring_for(size: usize) -> usize {
     let depth = crate::ix::buffer_for(size);
-    PublisherPolicy::for_payload(size.max(STAMP_BYTES), depth).ring_bytes
+    let record = size.max(STAMP_BYTES).div_ceil(8) * 8 + 8;
+    ((depth.max(1) + 1) * record).max(4096)
 }
 
-/// A wait of `ms` for the topic's subscribers, `window` records ahead at most (none at 0); none
-/// below 0.
-fn backpressure(ms: i32, window: i32) -> Option<Backpressure> {
-    let ms = u64::try_from(ms).ok()?;
-    let window = NonZeroUsize::new(window.max(0) as usize);
-    Some(Backpressure { publish_timeout: Duration::from_millis(ms), window })
+/// `events` waiting `ms` (none below 0) for subscribers, at most `window` records ahead (0: none).
+fn backpressure(
+    events: PublisherBuilder<Bytes, EventTopic>,
+    ms: i32,
+    window: i32,
+) -> PublisherBuilder<Bytes, EventTopic> {
+    let Ok(ms) = u64::try_from(ms) else {
+        return events;
+    };
+    let timeout = Duration::from_millis(ms);
+    match NonZeroUsize::new(window.max(0) as usize) {
+        Some(window) => events.lossless_window(timeout, window),
+        None => events.lossless(timeout),
+    }
 }
 
 /// `--backpressure MS` as the producer takes it: -1 without the flag.
@@ -119,16 +128,20 @@ struct Producer {
 }
 
 impl Producer {
-    /// The topic, made with `policy` on the first call.
-    fn topic_with(&self, policy: &PublisherPolicy) -> BinderResult<SIBinder> {
+    /// The topic, made with `events` on the first call; `loans` when `events` has a pool.
+    fn topic_with(
+        &self,
+        events: PublisherBuilder<Bytes, EventTopic>,
+        loans: bool,
+    ) -> BinderResult<SIBinder> {
         let mut topic = self.topic.lock().expect("lock");
         if topic.is_none() {
-            let publisher = Publisher::<Bytes>::new(policy).map_err(|e| {
+            let publisher = events.build().map_err(|e| {
                 eprintln!("rsb-producer: topic: {e}");
                 Status::from(StatusCode::NoMemory)
             })?;
             *topic = Some(publisher);
-            self.loans.store(policy.pool.is_some(), Ordering::SeqCst);
+            self.loans.store(loans, Ordering::SeqCst);
         }
         Ok(topic.as_ref().expect("made above").as_binder())
     }
@@ -155,11 +168,8 @@ impl IBench for Producer {
         backpressure_ms: i32,
         window: i32,
     ) -> BinderResult<SIBinder> {
-        self.topic_with(&PublisherPolicy {
-            ring_bytes: ring_bytes.max(0) as usize,
-            backpressure: backpressure(backpressure_ms, window),
-            ..PublisherPolicy::default()
-        })
+        let events = Publisher::<Bytes>::events().ring_bytes(ring_bytes.max(0) as usize);
+        self.topic_with(backpressure(events, backpressure_ms, window), false)
     }
 
     fn r#loanTopic(
@@ -172,18 +182,13 @@ impl IBench for Producer {
         window: i32,
     ) -> BinderResult<SIBinder> {
         let subscribers = subscribers.max(1) as usize;
-        self.topic_with(&PublisherPolicy {
-            ring_bytes: ring_bytes.max(0) as usize,
-            max_subscribers: subscribers,
-            max_per_uid: subscribers,
-            pool: Some(PoolPolicy {
-                slot_bytes: slot_bytes.max(0) as usize,
-                depth: depth.max(0) as usize,
-                ..PoolPolicy::default()
-            }),
-            backpressure: backpressure(backpressure_ms, window),
-            ..PublisherPolicy::default()
-        })
+        let events = Publisher::<Bytes>::events()
+            .ring_bytes(ring_bytes.max(0) as usize)
+            .max_subscribers(subscribers)
+            .max_per_uid(subscribers)
+            .lend(slot_bytes.max(0) as usize)
+            .lend_keep(depth.max(0) as usize);
+        self.topic_with(backpressure(events, backpressure_ms, window), true)
     }
 
     fn r#start(&self, count: i32, size: i32, rate_hz: i32) -> BinderResult<()> {
@@ -322,12 +327,10 @@ pub fn topic_consumer(a: &Args) -> Result<()> {
     let bench = connect(&a.str("name", ""))?;
     let topic =
         bench.r#topic(a.num("ring", 64 * 1024) as i32, backpressure_arg(a), window_arg(a))?;
-    let policy = SubscriberPolicy {
-        max_ring_bytes: 1 << 30,
-        wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
-        ..SubscriberPolicy::default()
-    };
-    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy)?;
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .max_ring_bytes(1 << 30)
+        .wake(if wait == "fd" { Wake::Fd } else { Wake::Futex })
+        .subscribe(&topic)?;
     ready("SUBSCRIBED");
     let mut record = Record::new(a.num("warmup", 0));
     let mut lost = 0u64;
@@ -381,13 +384,11 @@ pub fn topic_loan_consumer(a: &Args) -> Result<()> {
         backpressure_arg(a),
         window_arg(a),
     )?;
-    let policy = SubscriberPolicy {
-        max_ring_bytes: 1 << 30,
-        max_pool_bytes: usize::MAX,
-        wake: if wait == "fd" { Wake::Fd } else { Wake::Futex },
-        ..SubscriberPolicy::default()
-    };
-    let subscriber = Subscriber::<Bytes>::request(&topic, &policy)?;
+    let subscriber = Subscriber::<Bytes>::builder()
+        .max_ring_bytes(1 << 30)
+        .max_pool_bytes(usize::MAX)
+        .wake(if wait == "fd" { Wake::Fd } else { Wake::Futex })
+        .subscribe(&topic)?;
     ready("SUBSCRIBED");
     let record = if a.str("trust", "no") == "yes" {
         // SAFETY: the producer is this harness's own rsbinder-topic `Publisher`.

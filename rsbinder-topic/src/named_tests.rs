@@ -26,9 +26,9 @@ use crate::ring::{Kind, Stores, Writer, BEFORE_JUDGING};
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::{
-    wait_any, Acceptor, Advertisement, Authorize, Backpressure, Bytes, Closed, Disconnected,
-    NamedState, NamedSubscriber, PoolPolicy, Publisher, PublisherPolicy, RecvError, Resolver,
-    Start, Subscriber, SubscriberPolicy, Trusted, Wait, Wake, Watch,
+    wait_any, Acceptor, Advertisement, Bytes, Closed, Disconnected, EventTopic, NamedState,
+    NamedSubscriber, Publisher, PublisherBuilder, RecvError, Resolver, Start, Subscriber,
+    SubscriberBuilder, Trusted, Wait, Wake, Watch,
 };
 
 /// The bound of every wait a test makes, so that a broken subscriber fails rather than hangs.
@@ -155,23 +155,24 @@ impl Drop for Unwatch {
     }
 }
 
-fn policy() -> PublisherPolicy {
-    PublisherPolicy {
-        ring_bytes: MIN_RING,
-        ..PublisherPolicy::default()
-    }
+fn policy() -> PublisherBuilder<Bytes, EventTopic> {
+    Publisher::events()
 }
 
 fn bytes(byte: u8) -> Bytes {
     Bytes(vec![byte; 3])
 }
 
-fn advertise(names: &Names, policy: &PublisherPolicy) -> Publisher<Bytes> {
-    Publisher::advertise_with(NAME, policy, names).unwrap()
+fn advertise(names: &Names, policy: PublisherBuilder<Bytes, EventTopic>) -> Publisher<Bytes> {
+    let publisher = policy.build().unwrap();
+    publisher.advertise_on(NAME, names).unwrap();
+    publisher
 }
 
 fn subscribe(names: &Names) -> NamedSubscriber<Bytes> {
-    NamedSubscriber::subscribe_with(NAME, &SubscriberPolicy::default(), names).unwrap()
+    Subscriber::builder()
+        .subscribe_named_on(NAME, names)
+        .unwrap()
 }
 
 /// A receive with the test's bound.
@@ -189,7 +190,7 @@ fn a_subscriber_of_a_name_connects_when_a_publisher_takes_it_later() {
     let mut subscriber = subscribe(&names);
     assert!(!subscriber.wait_connected(Duration::from_millis(50)));
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     connected(&subscriber);
     publisher.publish(&bytes(1)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
@@ -203,8 +204,8 @@ fn a_receive_waits_for_the_connection_and_then_for_the_record() {
     let late = names.clone();
     let publishing = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
-        let publisher = advertise(&late, &policy());
-        // After the subscription: the first connection starts at the policy's `Latest`.
+        let publisher = advertise(&late, policy());
+        // After the subscription: the first connection starts at the policy's `Next`.
         let deadline = Instant::now() + WAIT;
         while publisher.subscriber_count() == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
@@ -219,7 +220,7 @@ fn a_receive_waits_for_the_connection_and_then_for_the_record() {
 #[test]
 fn an_ended_topic_is_one_disconnect_and_the_next_publisher_is_read_from_its_first_record() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
@@ -233,7 +234,7 @@ fn an_ended_topic_is_one_disconnect_and_the_next_publisher_is_read_from_its_firs
     );
     assert_eq!(subscriber.remembered(), 0, "an ended topic's publisher");
     // Published before the name is given: a reconnection starts at the oldest record.
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = policy().build().unwrap();
     second.publish(&bytes(7)).unwrap();
     second.publish(&bytes(8)).unwrap();
     names.give(NAME, second.as_binder());
@@ -247,7 +248,7 @@ fn an_ended_topic_is_one_disconnect_and_the_next_publisher_is_read_from_its_firs
 #[test]
 fn a_topic_ended_with_an_error_status_forgets_its_publisher() {
     let names = Names::default();
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     publisher.close_with(&Status::from(ExceptionCode::IllegalState));
@@ -260,7 +261,7 @@ fn a_topic_ended_with_an_error_status_forgets_its_publisher() {
     assert_eq!(subscriber.remembered(), 0, "an ended topic's publisher");
 }
 
-/// It lives on and may take the name again, so a connection to it would start at `Latest`.
+/// It lives on and may take the name again, so a connection to it would start at `Next`.
 #[test]
 fn a_publisher_whose_memory_failed_a_check_stays_remembered() {
     let names = Names::default();
@@ -288,7 +289,7 @@ fn a_publisher_whose_memory_failed_a_check_stays_remembered() {
 #[test]
 fn a_dead_resolver_closes_the_subscriber_once_its_connection_ends() {
     let names = Names::default();
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     subscriber.resolver_dies();
@@ -317,17 +318,17 @@ fn a_dead_resolver_closes_a_subscriber_without_a_connection_at_once() {
     let closed = Err(RecvError::Closed(Closed::ResolverDied));
     assert_eq!(recv(&mut subscriber), closed);
     // A publisher that comes later is not connected to.
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     publisher.publish(&bytes(2)).unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(300)));
     assert_eq!(recv(&mut subscriber), closed);
 }
 
-/// It lives on, so it stays remembered: given the name again, it is read from `Latest`.
+/// It lives on, so it stays remembered: given the name again, it is read from `Next`.
 #[test]
 fn a_publisher_that_shut_its_wake_socket_down_is_connected_to_again_at_latest() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
@@ -353,7 +354,7 @@ fn a_publisher_that_shut_its_wake_socket_down_is_connected_to_again_at_latest() 
 #[test]
 fn the_same_binder_registered_again_keeps_the_connection() {
     let names = Names::default();
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     publisher.publish(&bytes(1)).unwrap();
@@ -368,13 +369,13 @@ fn the_same_binder_registered_again_keeps_the_connection() {
 #[test]
 fn another_binder_for_the_name_is_read_after_the_records_of_the_old_one() {
     let names = Names::default();
-    let old = advertise(&names, &policy());
+    let old = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     old.publish(&bytes(1)).unwrap();
     old.publish(&bytes(2)).unwrap();
     // The old publisher lives on, as one whose death notice is still on its way.
-    let new = Publisher::<Bytes>::new(&policy()).unwrap();
+    let new = policy().build().unwrap();
     new.publish(&bytes(9)).unwrap();
     names.give(NAME, new.as_binder());
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
@@ -393,18 +394,13 @@ fn another_binder_for_the_name_is_read_after_the_records_of_the_old_one() {
 }
 
 /// One subscriber, a ring of 4 KiB and a pool of 4 KiB slots that keeps `depth` values.
-fn pooled(depth: usize) -> PublisherPolicy {
-    PublisherPolicy {
-        max_subscribers: 1,
-        max_per_uid: 1,
-        pool: Some(PoolPolicy {
-            slot_bytes: 4096,
-            depth,
-            max_loans: 1,
-            huge_pages: false,
-        }),
-        ..policy()
-    }
+fn pooled(depth: usize) -> PublisherBuilder<Bytes, EventTopic> {
+    policy()
+        .max_subscribers(1)
+        .max_per_uid(1)
+        .lend(4096)
+        .lend_keep(depth)
+        .max_loans(1)
 }
 
 /// Lend a slot, write `value` into it and publish it; the slot's number.
@@ -420,13 +416,13 @@ fn lend(publisher: &Publisher<Bytes>, value: &[u8]) -> u32 {
 #[test]
 fn samples_drain_a_replaced_publisher_and_go_on_to_the_next() {
     let names = Names::default();
-    let old = advertise(&names, &pooled(4));
+    let old = advertise(&names, pooled(4));
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     let first = lend(&old, &[1; 64]);
     old.publish(&bytes(2)).unwrap();
     lend(&old, &[3; 64]);
-    let new = Publisher::<Bytes>::new(&pooled(4)).unwrap();
+    let new = pooled(4).build().unwrap();
     lend(&new, &[9; 64]);
     names.give(NAME, new.as_binder());
     let sample = subscriber.recv_sample_timeout(WAIT).unwrap();
@@ -457,12 +453,12 @@ fn samples_drain_a_replaced_publisher_and_go_on_to_the_next() {
 #[test]
 fn a_latest_sample_of_a_drain_skips_to_the_newest_record_before_the_replacement() {
     let names = Names::default();
-    let old = advertise(&names, &pooled(4));
+    let old = advertise(&names, pooled(4));
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     lend(&old, &[1; 64]);
     let newest = lend(&old, &[2; 64]);
-    let new = Publisher::<Bytes>::new(&pooled(4)).unwrap();
+    let new = pooled(4).build().unwrap();
     names.give(NAME, new.as_binder());
     let sample = subscriber.try_latest_sample().unwrap();
     assert_eq!(sample.to_owned(), vec![2; 64]);
@@ -476,7 +472,7 @@ fn a_latest_sample_of_a_drain_skips_to_the_newest_record_before_the_replacement(
 #[test]
 fn a_sample_a_name_subscriber_holds_keeps_its_slot_pinned() {
     let names = Names::default();
-    let publisher = advertise(&names, &pooled(1));
+    let publisher = advertise(&names, pooled(1));
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     let slot = lend(&publisher, &[1; 64]);
@@ -494,7 +490,7 @@ fn a_sample_a_name_subscriber_holds_keeps_its_slot_pinned() {
 #[test]
 fn a_trusted_name_subscriber_reads_every_connection_in_place() {
     let names = Names::default();
-    let first = advertise(&names, &pooled(2));
+    let first = advertise(&names, pooled(2));
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     // Taken: the connection is the subscriber's when it vouches.
@@ -510,7 +506,7 @@ fn a_trusted_name_subscriber_reads_every_connection_in_place() {
     let ended = RecvError::Disconnected(Disconnected::Ended(Closed::End));
     assert_eq!(subscriber.recv_sample_timeout(WAIT).err(), Some(ended));
     // Made after the subscriber vouched.
-    let second = advertise(&names, &pooled(2));
+    let second = advertise(&names, pooled(2));
     assert!(subscriber.wait_connected(WAIT));
     lend(&second, &[6; 64]);
     let sample = subscriber.recv_sample_timeout(WAIT).unwrap();
@@ -526,13 +522,13 @@ fn a_trusted_name_subscriber_reads_every_connection_in_place() {
 #[test]
 fn a_name_given_back_to_the_connected_publisher_keeps_the_connection() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     // Taken by a receive: a replacement interrupts the connection's wait.
     first.publish(&bytes(1)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
-    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    let other = policy().build().unwrap();
     names.give(NAME, other.as_binder());
     first.publish(&bytes(2)).unwrap();
     // Seen as a replacement: read up to what is committed now.
@@ -561,24 +557,138 @@ fn a_name_given_back_to_the_connected_publisher_keeps_the_connection() {
 /// The name back to a publisher after its drain ended: read on from the reconnection.
 #[test]
 fn a_publisher_connected_to_again_returns_no_record_the_first_connection_returned() {
-    connected_to_again(Start::Latest);
+    connected_to_again(Start::Next);
 }
 
-/// As above, from a start that would return the records the first connection returned.
+/// `Newest` steps over the value returned last, still the newest; `Oldest` starts at `Next`.
 #[test]
-fn a_publisher_connected_to_again_starts_at_latest_whatever_the_policy_start() {
-    connected_to_again(Start::Last);
+fn a_publisher_connected_to_again_returns_no_record_whatever_the_policy_start() {
+    connected_to_again(Start::Newest);
     connected_to_again(Start::Oldest);
+}
+
+/// The name back to a publisher that published while another held it: with `Newest`, that value.
+#[test]
+fn a_newest_start_connected_to_again_returns_the_value_published_meanwhile() {
+    let names = Names::default();
+    let first = advertise(&names, policy());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Newest);
+    connected(&subscriber);
+    first.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = policy().build().unwrap();
+    other.publish(&bytes(5)).unwrap();
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    first.publish(&bytes(3)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    // At once, without a publish after the reconnection, and once.
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    // Published twice meanwhile: the newer, and the older is not counted as lost.
+    names.give(NAME, other.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    // Connected to the other publisher, whose value was returned before: nothing.
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(4)).unwrap();
+    first.publish(&bytes(6)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.stats().lost, 0);
+    assert_eq!(subscriber.stats().received, 4);
+}
+
+/// A connection that returned nothing keeps the record to skip for the connection after it.
+#[test]
+fn a_newest_start_connection_that_returned_nothing_keeps_the_record_to_skip() {
+    let names = Names::default();
+    let first = advertise(&names, policy());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Newest);
+    connected(&subscriber);
+    first.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = policy().build().unwrap();
+    other.publish(&bytes(5)).unwrap();
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    names.give(NAME, other.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    for _ in 0..2 {
+        // Back and forth with nothing published: each connection returns nothing.
+        names.give(NAME, first.as_binder());
+        assert_eq!(recv(&mut subscriber), replaced);
+        connected(&subscriber);
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+        names.give(NAME, other.as_binder());
+        assert_eq!(recv(&mut subscriber), replaced);
+        connected(&subscriber);
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    }
+    first.publish(&bytes(2)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+    assert_eq!(subscriber.stats().received, 3);
+}
+
+/// `Newest` connected again to a lending publisher: the value returned before is not pinned.
+#[test]
+fn a_newest_start_connected_to_again_returns_the_value_lent_meanwhile() {
+    let names = Names::default();
+    let first = advertise(&names, pooled(1));
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Newest);
+    connected(&subscriber);
+    lend(&first, &[1; 64]);
+    let sample = subscriber.recv_sample_timeout(WAIT).map(|s| s.to_owned());
+    assert_eq!(sample, Ok(vec![1; 64]));
+    let other = pooled(1).build().unwrap();
+    lend(&other, &[5; 64]);
+    let replaced = RecvError::Disconnected(Disconnected::Replaced);
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        subscriber.recv_sample_timeout(WAIT).err(),
+        Some(replaced.clone())
+    );
+    let sample = subscriber.recv_sample_timeout(WAIT).map(|s| s.to_owned());
+    assert_eq!(sample, Ok(vec![5; 64]));
+    // Back with nothing lent meanwhile: the value returned before is not returned again.
+    names.give(NAME, first.as_binder());
+    assert_eq!(
+        subscriber.recv_sample_timeout(WAIT).err(),
+        Some(replaced.clone())
+    );
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv_sample().err(), Some(RecvError::Empty));
+    assert_eq!(first.stats().subscribers[0].pinned, None);
+    // Away again, and back after a lend: that value.
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        subscriber.recv_sample_timeout(WAIT).err(),
+        Some(replaced.clone())
+    );
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv_sample().err(), Some(RecvError::Empty));
+    lend(&first, &[3; 64]);
+    names.give(NAME, first.as_binder());
+    assert_eq!(subscriber.recv_sample_timeout(WAIT).err(), Some(replaced));
+    let sample = subscriber.recv_sample_timeout(WAIT).map(|s| s.to_owned());
+    assert_eq!(sample, Ok(vec![3; 64]));
 }
 
 fn connected_to_again(start: Start) {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe_at(&names, Wake::Futex, start);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
-    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    let other = policy().build().unwrap();
     other.publish(&bytes(5)).unwrap();
     names.give(NAME, other.as_binder());
     assert_eq!(
@@ -615,6 +725,7 @@ impl ITopic for ByHand {
             start: 0,
             startIndex: 0,
             pool: None,
+            topicKind: crate::TopicKind::Event.wire(),
         })
     }
 }
@@ -711,7 +822,7 @@ fn draining(names: &Names, records: u64) -> Draining {
     names.give(NAME, old.clone());
     let mut subscriber = subscribe(names);
     connected(&subscriber);
-    let new = Publisher::<Bytes>::new(&policy()).unwrap();
+    let new = policy().build().unwrap();
     new.publish(&bytes(9)).unwrap();
     names.give(NAME, new.as_binder());
     assert_eq!(subscriber.try_recv(), Ok(Bytes(Vec::new())));
@@ -968,11 +1079,11 @@ fn back_as_the_drain_ends(names: &Names, binder: SIBinder) {
 #[test]
 fn a_name_that_comes_back_as_its_drain_ends_keeps_the_connection() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
-    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    let other = policy().build().unwrap();
     other.publish(&bytes(9)).unwrap();
     names.give(NAME, other.as_binder());
     assert_eq!(subscriber.try_recv(), Ok(bytes(1)));
@@ -1032,13 +1143,57 @@ fn a_latest_drain_lapped_at_every_look_ends_without_a_loss() {
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     assert_eq!(subscriber.try_latest(), Err(RecvError::Empty));
-    let new = Publisher::<Bytes>::new(&policy()).unwrap();
+    let new = policy().build().unwrap();
     new.publish(&bytes(9)).unwrap();
     names.give(NAME, new.as_binder());
     assert_eq!(
         subscriber.try_latest(),
         Err(RecvError::Disconnected(Disconnected::Replaced))
     );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
+/// [`ByHand`] that says its topic is a state topic.
+struct StateByHand(ByHand);
+
+impl Interface for StateByHand {}
+
+impl ITopic for StateByHand {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        let endpoint = self.0.r#subscribe(request)?;
+        Ok(TopicEndpoint {
+            topicKind: crate::TopicKind::State.wire(),
+            ..endpoint
+        })
+    }
+}
+
+/// A state topic's drain lapped at every judgment counts what it left unread as past values.
+#[test]
+fn a_state_drain_that_gives_up_short_of_its_end_reports_no_loss() {
+    let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
+    let stored = Rc::new(stored);
+    let writer: Old = Rc::new(RefCell::new(Writer::new(Shared(stored))));
+    publish_items(&writer, 4);
+    let names = Names::default();
+    let old = StateByHand(ByHand(memory));
+    names.give(NAME, BnTopic::new_binder(old).as_binder());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Ok(Bytes(Vec::new())));
+    assert_eq!(subscriber.topic_kind(), Some(crate::TopicKind::State));
+    publish_items(&writer, 4);
+    let new = state(&bytes(9));
+    names.give(NAME, new.as_binder());
+    let chasing = writer.clone();
+    judging(move || {
+        let written = chasing.borrow().position();
+        lap(&chasing, written);
+    });
+    let got = subscriber.try_recv();
+    BEFORE_JUDGING.set(None);
+    assert_eq!(got, Err(RecvError::Disconnected(Disconnected::Replaced)));
     assert_eq!(recv(&mut subscriber), Ok(bytes(9)));
     assert_eq!(subscriber.stats().lost, 0);
 }
@@ -1213,12 +1368,12 @@ fn a_drain_whose_old_publisher_hung_up_keeps_it_remembered() {
 #[test]
 fn a_drain_that_reads_the_end_of_the_old_topic_forgets_its_publisher() {
     let names = Names::default();
-    let old = advertise(&names, &policy());
+    let old = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     old.publish(&bytes(1)).unwrap();
     drop(old);
-    let new = Publisher::<Bytes>::new(&policy()).unwrap();
+    let new = policy().build().unwrap();
     new.publish(&bytes(9)).unwrap();
     names.give(NAME, new.as_binder());
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
@@ -1360,7 +1515,7 @@ fn a_drain_that_steps_to_its_end_reads_no_record_after_it() {
     names.give(NAME, BnTopic::new_binder(ByHand(memory)).as_binder());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let new = Publisher::<Bytes>::new(&policy()).unwrap();
+    let new = policy().build().unwrap();
     new.publish(&bytes(9)).unwrap();
     names.give(NAME, new.as_binder());
     assert_eq!(subscriber.try_recv(), Ok(Bytes(Vec::new())));
@@ -1436,7 +1591,7 @@ fn a_latest_drain_that_gave_up_past_its_end_looks_no_more() {
     names.give(NAME, BnTopic::new_binder(ByHand(memory)).as_binder());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let new = Publisher::<Bytes>::new(&policy()).unwrap();
+    let new = policy().build().unwrap();
     new.publish(&bytes(9)).unwrap();
     names.give(NAME, new.as_binder());
     assert_eq!(subscriber.try_latest(), Ok(Bytes(Vec::new())));
@@ -1464,13 +1619,13 @@ fn a_drain_lapped_between_receives_returns_or_counts_each_record_before_its_end_
     let ring = MIN_RING as u64 / 16;
     for burst in [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 128, 129, 200] {
         let names = Names::default();
-        let old = advertise(&names, &policy());
+        let old = advertise(&names, policy());
         let mut subscriber = subscribe(&names);
         connected(&subscriber);
         for at in 0..ring {
             old.publish(&value(at)).unwrap();
         }
-        let new = Publisher::<Bytes>::new(&policy()).unwrap();
+        let new = policy().build().unwrap();
         new.publish(&value(u64::MAX)).unwrap();
         names.give(NAME, new.as_binder());
         // The receive that takes the end, at `ring` records.
@@ -1514,12 +1669,12 @@ fn a_drain_lapped_between_receives_returns_or_counts_each_record_before_its_end_
 #[test]
 fn a_replacement_whose_wake_lands_after_the_name_came_back_ends_no_receive() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
-    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    let other = policy().build().unwrap();
     let (paused, held) = (mpsc::channel(), mpsc::channel::<()>());
     let replacing = {
         let (names, binder) = (names.clone(), other.as_binder());
@@ -1554,7 +1709,7 @@ fn a_replacement_whose_wake_lands_after_the_name_came_back_ends_no_receive() {
 #[test]
 fn a_replacements_wake_after_the_name_came_back_is_not_the_callers_interrupt() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
@@ -1576,13 +1731,13 @@ fn a_replacements_wake_after_the_name_came_back_is_not_the_callers_interrupt() {
 #[test]
 fn a_replacement_seen_while_waiting_ends_the_wait() {
     let names = Names::default();
-    let old = advertise(&names, &policy());
+    let old = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     let late = names.clone();
     let replacing = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
-        let new = advertise(&late, &policy());
+        let new = advertise(&late, policy());
         new.publish(&bytes(4)).unwrap();
         new
     });
@@ -1600,12 +1755,9 @@ fn a_replacement_seen_while_waiting_ends_the_wait() {
 #[test]
 fn a_full_publisher_is_told_once_and_asked_again_until_a_place_is_free() {
     let names = Names::default();
-    let full = PublisherPolicy {
-        max_subscribers: 1,
-        ..policy()
-    };
-    let publisher = advertise(&names, &full);
-    let place = Subscriber::<Bytes>::request(&publisher.as_binder(), &SubscriberPolicy::default());
+    let full = policy().max_subscribers(1);
+    let publisher = advertise(&names, full);
+    let place = Subscriber::<Bytes>::builder().subscribe(&publisher.as_binder());
     let place = place.unwrap();
     let mut subscriber = subscribe(&names);
     match recv(&mut subscriber) {
@@ -1628,18 +1780,15 @@ fn a_full_publisher_is_told_once_and_asked_again_until_a_place_is_free() {
 #[test]
 fn a_retry_moves_at_once_to_another_publisher_of_the_name() {
     let names = Names::default();
-    let full = PublisherPolicy {
-        max_subscribers: 0,
-        ..policy()
-    };
-    let _refusing = advertise(&names, &full);
+    let full = policy().max_subscribers(0);
+    let _refusing = advertise(&names, full);
     let mut subscriber = subscribe(&names);
     assert!(matches!(
         recv(&mut subscriber),
         Err(RecvError::Disconnected(Disconnected::Rejected(_)))
     ));
     // The first retry is 1 s away; the new binder is asked now.
-    let admitting = advertise(&names, &policy());
+    let admitting = advertise(&names, policy());
     assert!(subscriber.wait_connected(Duration::from_millis(500)));
     admitting.publish(&bytes(4)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
@@ -1650,14 +1799,11 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
     let names = Names::default();
     let asked = Arc::new(AtomicUsize::new(0));
     let count = asked.clone();
-    let refusing = PublisherPolicy {
-        authorize: Some(Authorize::new(move |_| {
-            count.fetch_add(1, Ordering::SeqCst);
-            false
-        })),
-        ..policy()
-    };
-    let publisher = advertise(&names, &refusing);
+    let refusing = policy().authorize(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        false
+    });
+    let publisher = advertise(&names, refusing);
     let mut subscriber = subscribe(&names);
     match recv(&mut subscriber) {
         Err(RecvError::Disconnected(Disconnected::Rejected(status))) => {
@@ -1679,7 +1825,7 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
     // Told once by the receive, at every ask by the state.
     assert!(refused(subscriber.state()), "{:?}", subscriber.state());
     // Another publisher of the name is asked.
-    let admitting = advertise(&names, &policy());
+    let admitting = advertise(&names, policy());
     connected(&subscriber);
     assert_eq!(subscriber.state(), NamedState::Connected);
     admitting.publish(&bytes(6)).unwrap();
@@ -1689,7 +1835,7 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
 #[test]
 fn a_closed_publisher_is_waited_past_without_a_notice() {
     let names = Names::default();
-    let closed = advertise(&names, &policy());
+    let closed = advertise(&names, policy());
     closed.close();
     let mut subscriber = subscribe(&names);
     assert_eq!(
@@ -1698,7 +1844,7 @@ fn a_closed_publisher_is_waited_past_without_a_notice() {
     );
     // An ended publisher is not a refusal of this subscriber: its successor will register.
     assert_eq!(subscriber.state(), NamedState::Waiting);
-    let next = advertise(&names, &policy());
+    let next = advertise(&names, policy());
     connected(&subscriber);
     next.publish(&bytes(7)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(7)));
@@ -1707,14 +1853,11 @@ fn a_closed_publisher_is_waited_past_without_a_notice() {
 #[test]
 fn a_topic_advertised_after_it_published_is_read_from_its_oldest_record() {
     let names = Names::default();
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = policy().build().unwrap();
     publisher.publish(&bytes(1)).unwrap();
     publisher.publish(&bytes(2)).unwrap();
-    let oldest = SubscriberPolicy {
-        start: Start::Oldest,
-        ..SubscriberPolicy::default()
-    };
-    let mut subscriber = NamedSubscriber::subscribe_with(NAME, &oldest, &names).unwrap();
+    let oldest = Subscriber::builder().start_at(Start::Oldest);
+    let mut subscriber = oldest.subscribe_named_on(NAME, &names).unwrap();
     publisher.advertise_on(NAME, &names).unwrap();
     connected(&subscriber);
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
@@ -1724,11 +1867,10 @@ fn a_topic_advertised_after_it_published_is_read_from_its_oldest_record() {
 #[test]
 fn a_bounded_latest_receive_times_out_and_then_returns_the_newest_record() {
     let names = Names::default();
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     let mut named = subscribe(&names);
     connected(&named);
-    let request =
-        Subscriber::<Bytes>::request(&publisher.as_binder(), &SubscriberPolicy::default());
+    let request = Subscriber::<Bytes>::builder().subscribe(&publisher.as_binder());
     let mut plain = request.unwrap();
     let short = Duration::from_millis(50);
     assert_eq!(named.recv_latest_timeout(short), Err(RecvError::Timeout));
@@ -1743,7 +1885,7 @@ fn a_bounded_latest_receive_times_out_and_then_returns_the_newest_record() {
 #[test]
 fn a_closed_publisher_gives_no_name() {
     let names = Names::default();
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = policy().build().unwrap();
     publisher.close();
     let refused = publisher.advertise_on(NAME, &names).unwrap_err();
     assert_eq!(refused.service_specific_error(), ERROR_CLOSED);
@@ -1829,9 +1971,9 @@ impl Resolver for Hosted {
 fn the_host_link_unlinks_once_as_the_subscriber_drops() {
     let unlinked = Arc::new(AtomicUsize::new(0));
     let resolver = Hosted(crate::link::PanickingUnlink::binder(&unlinked));
-    let subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with(NAME, &SubscriberPolicy::default(), &resolver)
-            .unwrap();
+    let subscriber = Subscriber::<Bytes>::builder()
+        .subscribe_named_on(NAME, &resolver)
+        .unwrap();
     let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(subscriber)));
     assert!(dropped.is_ok());
     assert_eq!(unlinked.load(Ordering::SeqCst), 1);
@@ -1839,13 +1981,13 @@ fn the_host_link_unlinks_once_as_the_subscriber_drops() {
 
 #[test]
 fn two_threads_giving_one_name_on_one_host_ask_once_and_leave_its_entry() {
-    let host = Publisher::<Bytes>::new(&policy()).unwrap();
+    let host = policy().build().unwrap();
     let registry = OneEntry {
         entries: Entries::default(),
         inside: AtomicUsize::new(0),
         host: host.as_binder(),
     };
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = policy().build().unwrap();
     std::thread::scope(|scope| {
         for _ in 0..2 {
             scope.spawn(|| publisher.advertise_on(NAME, &registry).unwrap());
@@ -1859,7 +2001,7 @@ fn two_threads_giving_one_name_on_one_host_ask_once_and_leave_its_entry() {
 #[test]
 fn a_binder_of_the_applications_own_is_advertised_in_the_publishers_place() {
     let names = Names::default();
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = policy().build().unwrap();
     let asked = Arc::new(AtomicUsize::new(0));
     let counted = Counted {
         acceptor: publisher.acceptor(),
@@ -1897,7 +2039,7 @@ thread_local! {
 
 /// A closed publisher's binder, which refuses with `ERROR_CLOSED`, and its subscription calls.
 fn closed_counted() -> (Publisher<Bytes>, SIBinder, Arc<AtomicUsize>) {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = policy().build().unwrap();
     publisher.close();
     let asked = Arc::new(AtomicUsize::new(0));
     let counted = Counted {
@@ -1935,7 +2077,7 @@ fn a_refusal_as_ended_asks_the_lookup_and_connects_to_the_binder_the_name_has() 
     let names = Names::looking();
     let (_closed, binder, asked) = closed_counted();
     names.give(NAME, binder);
-    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    let next = policy().build().unwrap();
     // Not given before the watch's first call: that call is the ended publisher.
     let (lost, given) = (names.clone(), next.as_binder());
     names.before_lookup(move || lost.withhold(NAME, given.clone()));
@@ -1953,7 +2095,7 @@ fn a_refusal_as_ended_before_the_watch_is_returned_asks_the_lookup_once_it_is() 
     let names = Names::looking();
     let (_closed, binder, asked) = closed_counted();
     names.give(NAME, binder);
-    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    let next = policy().build().unwrap();
     let (lost, given) = (names.clone(), next.as_binder());
     // The refusal comes within the watch: by the margin of `settled`, before it returns.
     names.after_first_call(move || {
@@ -1968,7 +2110,7 @@ fn a_refusal_as_ended_before_the_watch_is_returned_asks_the_lookup_once_it_is() 
     next.publish(&bytes(4)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
     assert_eq!(names.lookups(), 1);
-    // Asked by the thread `subscribe_with` starts, not the one refused: the path under test.
+    // Asked by the thread `subscribe_named_on` starts, not the one refused: the path under test.
     assert_eq!(*refused_here.lock().unwrap(), Some(false));
 }
 
@@ -1978,8 +2120,8 @@ fn a_notice_of_a_refused_binder_during_the_lookup_asks_once_more() {
     let names = Names::looking();
     let (_closed, refused, _) = closed_counted();
     names.give(NAME, refused.clone());
-    let first = Publisher::<Bytes>::new(&policy()).unwrap();
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let first = policy().build().unwrap();
+    let second = policy().build().unwrap();
     second.publish(&bytes(9)).unwrap();
     let (hook, calls) = (names.clone(), AtomicUsize::new(0));
     let (to_first, to_second) = (first.as_binder(), second.as_binder());
@@ -2012,7 +2154,7 @@ fn a_notice_that_gives_the_name_back_to_the_refused_binder_during_the_lookup_ask
     let names = Names::looking();
     let (_closed, refused, _) = closed_counted();
     names.give(NAME, refused.clone());
-    let former = Publisher::<Bytes>::new(&policy()).unwrap();
+    let former = policy().build().unwrap();
     let (hook, calls) = (names.clone(), AtomicUsize::new(0));
     let answer = former.as_binder();
     names.before_lookup(move || match calls.fetch_add(1, Ordering::SeqCst) {
@@ -2028,7 +2170,7 @@ fn a_notice_that_gives_the_name_back_to_the_refused_binder_during_the_lookup_ask
     looked(&names, 2);
     assert!(!subscriber.wait_connected(Duration::ZERO));
     assert_eq!(former.subscriber_count(), 0);
-    let next = advertise(&names, &policy());
+    let next = advertise(&names, policy());
     connected(&subscriber);
     next.publish(&bytes(6)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
@@ -2045,7 +2187,7 @@ fn a_lookup_that_answers_the_refused_binder_leaves_the_subscriber_waiting() {
     looked(&names, 1);
     assert!(!subscriber.wait_connected(Duration::ZERO));
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
-    let next = advertise(&names, &policy());
+    let next = advertise(&names, policy());
     connected(&subscriber);
     next.publish(&bytes(6)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
@@ -2075,10 +2217,10 @@ fn a_lookup_answer_refused_as_ended_is_not_looked_past() {
 #[test]
 fn an_ended_publisher_with_no_binder_after_it_asks_the_lookup() {
     let names = Names::looking();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = policy().build().unwrap();
     second.publish(&bytes(9)).unwrap();
     names.withhold(NAME, second.as_binder());
     first.publish(&bytes(1)).unwrap();
@@ -2097,10 +2239,10 @@ fn an_ended_publisher_with_no_binder_after_it_asks_the_lookup() {
 #[test]
 fn a_notice_during_a_lookup_that_panics_connects() {
     let names = Names::looking();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    let next = policy().build().unwrap();
     next.publish(&bytes(5)).unwrap();
     let (panicked, seen) = mpsc::channel();
     let (given, binder) = (names.clone(), next.as_binder());
@@ -2126,11 +2268,11 @@ fn a_notice_during_a_lookup_that_panics_connects() {
 #[test]
 fn a_dead_publisher_with_no_binder_after_it_asks_the_lookup() {
     let names = Names::looking();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = policy().build().unwrap();
     second.publish(&bytes(9)).unwrap();
     names.withhold(NAME, second.as_binder());
     let death = subscriber.connection_death().expect("a connection");
@@ -2147,7 +2289,7 @@ fn a_dead_publisher_with_no_binder_after_it_asks_the_lookup() {
 #[test]
 fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
     let names = Names::looking();
-    let first = Publisher::<Bytes>::new(&policy()).unwrap();
+    let first = policy().build().unwrap();
     let asked = Arc::new(AtomicUsize::new(0));
     let counted = Counted {
         acceptor: first.acceptor(),
@@ -2168,7 +2310,7 @@ fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
     looked(&names, 1);
     // The answer is not asked: it is the publisher whose end the connection read.
     assert_eq!(asked.load(Ordering::SeqCst), 1);
-    let next = advertise(&names, &policy());
+    let next = advertise(&names, policy());
     next.publish(&bytes(3)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
 }
@@ -2177,10 +2319,10 @@ fn a_lookup_that_answers_the_ended_publisher_leaves_the_subscriber_waiting() {
 #[test]
 fn without_a_lookup_an_ended_publisher_waits_for_the_next_notice() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = policy().build().unwrap();
     second.publish(&bytes(9)).unwrap();
     names.withhold(NAME, second.as_binder());
     drop(first);
@@ -2201,10 +2343,10 @@ fn without_a_lookup_an_ended_publisher_waits_for_the_next_notice() {
 #[test]
 fn a_notice_before_the_lookup_is_asked_is_taken_without_it() {
     let names = Names::looking();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = policy().build().unwrap();
     second.publish(&bytes(9)).unwrap();
     let (stale, ended) = (names.clone(), first.as_binder());
     names.before_lookup(move || stale.withhold(NAME, ended.clone()));
@@ -2224,11 +2366,11 @@ fn a_notice_before_the_lookup_is_asked_is_taken_without_it() {
 #[test]
 fn a_notice_during_the_lookup_is_taken_over_its_answer() {
     let names = Names::looking();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
-    let answer = Publisher::<Bytes>::new(&policy()).unwrap();
-    let notice = Publisher::<Bytes>::new(&policy()).unwrap();
+    let answer = policy().build().unwrap();
+    let notice = policy().build().unwrap();
     answer.publish(&bytes(8)).unwrap();
     notice.publish(&bytes(5)).unwrap();
     names.withhold(NAME, answer.as_binder());
@@ -2267,7 +2409,7 @@ impl Drop for Looked {
 
 impl Resolver for Ending {
     fn advertise(&self, _: &str, topic: SIBinder) -> BinderResult<Advertisement> {
-        let subscriber = Subscriber::<Bytes>::request(&topic, &SubscriberPolicy::default())?;
+        let subscriber = Subscriber::<Bytes>::builder().subscribe(&topic)?;
         Ok(Advertisement::new(Looked {
             subscriber: Mutex::new(subscriber),
             seen: self.clone(),
@@ -2283,7 +2425,8 @@ impl Resolver for Ending {
 #[test]
 fn a_publisher_drops_its_advertisement_before_its_end_record() {
     let ending = Ending::default();
-    let closed = Publisher::<Bytes>::advertise_with(NAME, &policy(), &ending).unwrap();
+    let closed = policy().build().unwrap();
+    closed.advertise_on(NAME, &ending).unwrap();
     assert!(closed.stats().advertised);
     closed.close();
     assert!(!closed.stats().advertised);
@@ -2292,7 +2435,8 @@ fn a_publisher_drops_its_advertisement_before_its_end_record() {
     closed.close();
     drop(closed);
     assert_eq!(ending.0.lock().unwrap().len(), 1);
-    let dropped = Publisher::<Bytes>::advertise_with(NAME, &policy(), &ending).unwrap();
+    let dropped = policy().build().unwrap();
+    dropped.advertise_on(NAME, &ending).unwrap();
     drop(dropped);
     assert_eq!(
         *ending.0.lock().unwrap(),
@@ -2307,7 +2451,7 @@ fn wait_connected_returns_when_connected_and_times_out_without_a_publisher() {
     let started = Instant::now();
     assert!(!subscriber.wait_connected(Duration::from_millis(200)));
     assert!(started.elapsed() >= Duration::from_millis(200));
-    let _publisher = advertise(&names, &policy());
+    let _publisher = advertise(&names, policy());
     connected(&subscriber);
 }
 
@@ -2323,7 +2467,7 @@ fn an_interrupt_ends_the_wait_for_a_connection_and_the_wait_on_one() {
     });
     assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
     interrupting.join().unwrap();
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     connected(&subscriber);
     // An interrupt before the wait ends the next one.
     interrupter.interrupt();
@@ -2343,7 +2487,7 @@ fn an_interrupt_ends_the_wait_for_a_connection_and_the_wait_on_one() {
 fn an_interrupt_before_the_connection_is_taken_ends_the_wait_on_it() {
     let names = Names::default();
     let mut subscriber = subscribe(&names);
-    let _publisher = advertise(&names, &policy());
+    let _publisher = advertise(&names, policy());
     connected(&subscriber);
     subscriber.interrupter().interrupt();
     assert_eq!(recv(&mut subscriber), Err(RecvError::Cancelled));
@@ -2376,7 +2520,7 @@ impl ITopic for Hanging {
 #[test]
 fn a_subscriber_dropped_during_a_call_that_hangs_returns_and_the_late_reply_is_closed() {
     let names = Names::default();
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = policy().build().unwrap();
     let (asked, was_asked) = mpsc::sync_channel(1);
     let (go, gone_on) = mpsc::sync_channel(1);
     let answered = Arc::new(AtomicUsize::new(0));
@@ -2414,7 +2558,7 @@ fn a_name_subscribers_stats_count_every_connection() {
     let names = Names::default();
     let mut subscriber = subscribe(&names);
     assert_eq!(subscriber.stats(), crate::SubscriberStats::default());
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
     first.publish(&bytes(2)).unwrap();
@@ -2423,7 +2567,7 @@ fn a_name_subscribers_stats_count_every_connection() {
     assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
     let ended = Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)));
     assert_eq!(recv(&mut subscriber), ended);
-    let second = advertise(&names, &policy());
+    let second = advertise(&names, policy());
     connected(&subscriber);
     second.publish(&bytes(3)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
@@ -2432,20 +2576,13 @@ fn a_name_subscribers_stats_count_every_connection() {
 }
 
 fn subscribe_on(names: &Names, name: &str, wake: Wake) -> NamedSubscriber<Bytes> {
-    let policy = SubscriberPolicy {
-        wake,
-        ..SubscriberPolicy::default()
-    };
-    NamedSubscriber::subscribe_with(name, &policy, names).unwrap()
+    let policy = Subscriber::builder().wake(wake);
+    policy.subscribe_named_on(name, names).unwrap()
 }
 
 fn subscribe_at(names: &Names, wake: Wake, start: Start) -> NamedSubscriber<Bytes> {
-    let policy = SubscriberPolicy {
-        wake,
-        start,
-        ..SubscriberPolicy::default()
-    };
-    NamedSubscriber::subscribe_with(NAME, &policy, names).unwrap()
+    let policy = Subscriber::builder().wake(wake).start_at(start);
+    policy.subscribe_named_on(NAME, names).unwrap()
 }
 
 fn raw_fds(subscriber: &NamedSubscriber<Bytes>) -> i32 {
@@ -2486,7 +2623,11 @@ fn name_subscribers_on_one_poll_loop_keep_their_fds_through_a_new_publisher() {
     let topics = ["test.a", "test.b", "test.c"];
     let publishers: Vec<_> = topics
         .iter()
-        .map(|name| Publisher::<Bytes>::advertise_with(name, &policy(), &names).unwrap())
+        .map(|name| {
+            let publisher = policy().build().unwrap();
+            publisher.advertise_on(name, &names).unwrap();
+            publisher
+        })
         .collect();
     let mut subscribers: Vec<_> = topics
         .iter()
@@ -2508,7 +2649,7 @@ fn name_subscribers_on_one_poll_loop_keep_their_fds_through_a_new_publisher() {
     drop(b);
     poll_until(&mut subscribers, &mut got, |got| got[1].len() == 2);
     // Published before the name is given: the reconnection reads it.
-    let next = Publisher::<Bytes>::new(&policy()).unwrap();
+    let next = policy().build().unwrap();
     next.publish(&bytes(7)).unwrap();
     names.give("test.b", next.as_binder());
     poll_until(&mut subscribers, &mut got, |got| got[1].len() == 3);
@@ -2532,7 +2673,7 @@ fn a_poll_that_sleeps_ends_at_a_commit_through_a_reconnection() {
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     for round in 0..2u8 {
-        let publisher = Arc::new(advertise(&names, &policy()));
+        let publisher = Arc::new(advertise(&names, policy()));
         // Took the connection: the next receive finds nothing, the poll then sleeps.
         connected(&subscriber);
         assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
@@ -2606,7 +2747,7 @@ fn announced(subscriber: &NamedSubscriber<Bytes>) {
 fn an_interrupt_whose_wakes_a_finish_wait_drains_ends_the_next_poll(connection: bool) {
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
-    let _publisher = connection.then(|| advertise(&names, &policy()));
+    let _publisher = connection.then(|| advertise(&names, policy()));
     if connection {
         announced(&subscriber);
         // Takes the connection.
@@ -2639,7 +2780,7 @@ fn an_interrupt_whose_wakes_a_finish_wait_drains_ends_the_next_poll_of_a_connect
 fn an_interrupt_before_the_connection_is_taken_kicks_one_poll() {
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
-    let _publisher = advertise(&names, &policy());
+    let _publisher = advertise(&names, policy());
     // The connection's eventfd wake lands now, not after a poll counted below drained the fd.
     announced(&subscriber);
     subscriber.interrupter().interrupt();
@@ -2662,7 +2803,7 @@ fn an_interrupt_before_the_connection_is_taken_kicks_one_poll() {
 fn a_name_subscribers_receive_cancelled_by_an_interrupt_leaves_no_poll_to_end_for_it() {
     let names = Names::default();
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
-    let _publisher = advertise(&names, &policy());
+    let _publisher = advertise(&names, policy());
     announced(&subscriber);
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
     subscriber.interrupter().interrupt();
@@ -2678,12 +2819,12 @@ fn a_name_subscribers_receive_cancelled_by_an_interrupt_leaves_no_poll_to_end_fo
 #[test]
 fn an_interrupt_whose_connections_wake_lands_late_ends_one_receive() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     first.publish(&bytes(1)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
-    let other = Publisher::<Bytes>::new(&policy()).unwrap();
+    let other = policy().build().unwrap();
     let (paused, held) = (mpsc::channel(), mpsc::channel::<()>());
     let interrupting = {
         let interrupter = subscriber.interrupter();
@@ -2730,11 +2871,11 @@ fn refused_to_join(subscriber: &mut NamedSubscriber<Bytes>) {
 #[test]
 fn a_connection_that_fails_to_join_leaves_no_replacement_behind() {
     let names = Names::default();
-    let first = advertise(&names, &policy());
+    let first = advertise(&names, policy());
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);
     // Made and not yet taken: the next publisher of the name is a replacement of it.
     connected(&subscriber);
-    let second = Publisher::<Bytes>::new(&policy()).unwrap();
+    let second = policy().build().unwrap();
     let (asked, was_asked) = mpsc::sync_channel(1);
     let (go, gone_on) = mpsc::sync_channel(1);
     let hanging = Hanging {
@@ -2744,7 +2885,7 @@ fn a_connection_that_fails_to_join_leaves_no_replacement_behind() {
         answered: Arc::new(AtomicUsize::new(0)),
     };
     names.give(NAME, BnTopic::new_binder(hanging).as_binder());
-    // No connection joined before: the replacement is read from the policy's `Latest`.
+    // No connection joined before: the replacement is read from the policy's `Next`.
     second.publish(&bytes(8)).unwrap();
     refused_to_join(&mut subscriber);
     // The first retry is 1 s away; the replacement is asked now, and held there.
@@ -2769,7 +2910,7 @@ fn a_connection_that_fails_to_join_leaves_no_replacement_behind() {
 #[test]
 fn a_connection_that_fails_to_join_is_asked_for_again_after_a_retry_interval() {
     let names = Names::default();
-    let publisher = advertise(&names, &policy());
+    let publisher = advertise(&names, policy());
     // Before the subscription: a retry that no join preceded starts at the policy's `Oldest`.
     publisher.publish(&bytes(9)).unwrap();
     let mut subscriber = subscribe_at(&names, Wake::Fd, Start::Oldest);
@@ -2821,7 +2962,7 @@ mod reactor {
             .build()
             .unwrap();
         let names = Names::default();
-        let first = advertise(&names, &policy());
+        let first = advertise(&names, policy());
         let mut subscriber = subscribe_on(&names, NAME, wake);
         connected(&subscriber);
         let (told, received) = mpsc::channel();
@@ -2839,7 +2980,7 @@ mod reactor {
         drop(first);
         // The end returned: the receive waits with no connection, then the next publisher's.
         while received.recv_timeout(WAIT).unwrap() < 2 {}
-        let second = advertise(&names, &policy());
+        let second = advertise(&names, policy());
         second.publish(&bytes(2)).unwrap();
         second.publish(&bytes(3)).unwrap();
         let got = runtime.block_on(receiving).unwrap();
@@ -2870,7 +3011,7 @@ mod reactor {
             let mut subscriber = subscribe_on(&names, NAME, wake);
             let late = names.clone();
             let publishing = std::thread::spawn(move || {
-                let publisher = advertise(&late, &pooled(1));
+                let publisher = advertise(&late, pooled(1));
                 let deadline = Instant::now() + WAIT;
                 while publisher.subscriber_count() == 0 && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(1));
@@ -2910,14 +3051,8 @@ mod reactor {
 }
 
 /// A policy that waits up to 100 ms for its subscribers.
-fn waiting() -> PublisherPolicy {
-    PublisherPolicy {
-        backpressure: Some(Backpressure {
-            publish_timeout: Duration::from_millis(100),
-            ..Backpressure::default()
-        }),
-        ..policy()
-    }
+fn waiting() -> PublisherBuilder<Bytes, EventTopic> {
+    policy().lossless(Duration::from_millis(100))
 }
 
 /// Two rings' worth of values, which a subscriber that reads none holds up past the timeout.
@@ -2932,12 +3067,9 @@ fn overrun(publisher: &Publisher<Bytes>) {
 fn a_subscriber_of_a_name_taken_out_connects_to_no_publisher_again() {
     for wake in [Wake::Futex, Wake::Fd] {
         let names = Names::default();
-        let first = advertise(&names, &waiting());
-        let woken = SubscriberPolicy {
-            wake,
-            ..SubscriberPolicy::default()
-        };
-        let mut subscriber = NamedSubscriber::subscribe_with(NAME, &woken, &names).unwrap();
+        let first = advertise(&names, waiting());
+        let woken = Subscriber::builder().wake(wake);
+        let mut subscriber = woken.subscribe_named_on(NAME, &names).unwrap();
         connected(&subscriber);
         overrun(&first);
         assert_eq!(first.stats().evicted, 1, "{wake:?}");
@@ -2947,7 +3079,7 @@ fn a_subscriber_of_a_name_taken_out_connects_to_no_publisher_again() {
             assert!(!subscriber.prepare_wait(), "a receive returns at once");
         }
         drop(first);
-        let second = advertise(&names, &policy());
+        let second = advertise(&names, policy());
         assert!(!subscriber.wait_connected(Duration::from_millis(200)));
         assert!(second.stats().subscribers.is_empty(), "{wake:?}");
         assert_eq!(subscriber.try_recv(), evicted, "{wake:?}");
@@ -2958,7 +3090,7 @@ fn a_subscriber_of_a_name_taken_out_connects_to_no_publisher_again() {
 #[test]
 fn a_subscriber_of_a_name_taken_out_while_it_drains_stays_out() {
     let names = Names::default();
-    let first = advertise(&names, &waiting());
+    let first = advertise(&names, waiting());
     let mut subscriber = subscribe(&names);
     connected(&subscriber);
     first.publish(&bytes(0)).unwrap();
@@ -2966,7 +3098,7 @@ fn a_subscriber_of_a_name_taken_out_while_it_drains_stays_out() {
     assert_eq!(recv(&mut subscriber), Ok(bytes(0)));
     overrun(&first);
     assert_eq!(first.stats().evicted, 1);
-    let second = advertise(&names, &policy());
+    let second = advertise(&names, policy());
     let evicted = Err(RecvError::Closed(Closed::Evicted));
     assert_eq!(recv(&mut subscriber), evicted);
     std::thread::sleep(Duration::from_millis(200));
@@ -2981,5 +3113,251 @@ fn a_name_subscriber_and_its_interrupter_move_between_threads() {
     moved::<NamedSubscriber<Bytes>>();
     moved::<NamedSubscriber<Bytes, Trusted>>();
     shared::<crate::Interrupter>();
-    shared::<Authorize>();
+    shared::<PublisherBuilder<Bytes, EventTopic>>();
+    shared::<SubscriberBuilder<Bytes>>();
+}
+
+fn state(first: &Bytes) -> Publisher<Bytes> {
+    Publisher::state().build(first).unwrap()
+}
+
+/// A value of a sequence long enough to lap a 4 KiB ring.
+fn count(n: u32) -> Bytes {
+    Bytes(n.to_le_bytes().to_vec())
+}
+
+#[test]
+fn a_state_topic_given_a_name_returns_its_value_to_a_subscriber_at_once() {
+    let names = Names::default();
+    let target = state(&bytes(1));
+    target.advertise_on(NAME, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    assert_eq!(subscriber.topic_kind(), None);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Ok(bytes(1)));
+    assert_eq!(subscriber.topic_kind(), Some(crate::TopicKind::State));
+}
+
+/// `Start::Auto` is taken from the kind of each publisher, on every connection to it.
+#[test]
+fn an_auto_start_follows_the_kind_of_each_publisher_the_name_moves_to() {
+    use crate::TopicKind::{Event, State};
+    let names = Names::default();
+    let events = advertise(&names, policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.topic_kind(), Some(Event));
+    events.publish(&bytes(1)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+
+    let target = state(&bytes(10));
+    target.publish(&bytes(11)).unwrap();
+    target.publish(&bytes(12)).unwrap();
+    names.give(NAME, target.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(12)));
+    assert_eq!(subscriber.topic_kind(), Some(State));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    // Back to the event topic: what it published meanwhile is not returned.
+    events.publish(&bytes(2)).unwrap();
+    names.give(NAME, events.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.topic_kind(), Some(Event));
+    events.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+
+    // Back to the state topic: its value of meanwhile at once, and once.
+    target.publish(&bytes(13)).unwrap();
+    names.give(NAME, target.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(13)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    // Away and back with no publish: the value returned last is not returned again.
+    names.give(NAME, events.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    names.give(NAME, target.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    assert_eq!(subscriber.stats().lost, 0);
+}
+
+/// `Oldest` reads a state topic as `Newest` does: back on it, the value published meanwhile.
+#[test]
+fn an_oldest_start_connected_to_a_state_topic_again_returns_the_value_published_meanwhile() {
+    let names = Names::default();
+    let first = state(&bytes(1));
+    names.give(NAME, first.as_binder());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Oldest);
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = state(&bytes(5));
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    first.publish(&bytes(3)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// The death notice of a kernel binder ends the ring's process, whatever the topic's kind.
+#[test]
+fn a_state_publisher_whose_death_notice_ran_is_forgotten() {
+    let names = Names::default();
+    let target = state(&bytes(1));
+    target.advertise_on(NAME, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    assert_eq!(subscriber.remembered(), 1);
+    let death = subscriber.connection_death().expect("a connection");
+    death.binder_died(&SIBinder::downgrade(&target.as_binder()));
+    assert!(matches!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Ended(_)))
+    ));
+    assert_eq!(subscriber.remembered(), 0, "a dead publisher");
+}
+
+/// `Next` on a state topic comes before its kind on every connection to a publisher it read.
+#[test]
+fn a_state_subscriber_at_next_connected_again_waits_for_the_next_value() {
+    let names = Names::default();
+    let first = state(&bytes(1));
+    names.give(NAME, first.as_binder());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Next);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(2)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(2)));
+    let other = state(&bytes(5));
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+
+    // Published while away: the connection starts past it.
+    first.publish(&bytes(3)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    // Away and back with no publish: nothing either.
+    names.give(NAME, other.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(4)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(4)));
+}
+
+/// A publisher new to a later connection is news to it, as far as its kind reads: its value.
+#[test]
+fn a_state_subscriber_at_next_returns_the_value_of_a_publisher_new_to_it() {
+    let names = Names::default();
+    let first = state(&bytes(1));
+    names.give(NAME, first.as_binder());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Next);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let other = state(&bytes(5));
+    other.publish(&bytes(6)).unwrap();
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// `Oldest` is the first connection's: back on a publisher it read, it starts at `Next`.
+#[test]
+fn an_event_subscriber_at_oldest_connected_again_returns_nothing_published_meanwhile() {
+    let names = Names::default();
+    let first = advertise(&names, policy());
+    first.publish(&bytes(1)).unwrap();
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Oldest);
+    connected(&subscriber);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(1)));
+    let other = policy().build().unwrap();
+    other.publish(&bytes(5)).unwrap();
+    names.give(NAME, other.as_binder());
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(bytes(5)));
+    first.publish(&bytes(2)).unwrap();
+    names.give(NAME, first.as_binder());
+    assert_eq!(recv(&mut subscriber), replaced);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    first.publish(&bytes(3)).unwrap();
+    assert_eq!(recv(&mut subscriber), Ok(bytes(3)));
+}
+
+/// Two records in the new ring tell its newest from its oldest.
+#[test]
+fn an_event_subscriber_at_newest_reads_the_newest_of_a_publisher_new_to_it() {
+    let names = Names::default();
+    let _first = advertise(&names, policy());
+    let mut subscriber = subscribe_at(&names, Wake::Futex, Start::Newest);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    let other = policy().build().unwrap();
+    other.publish(&bytes(5)).unwrap();
+    other.publish(&bytes(6)).unwrap();
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+}
+
+/// A state topic's drain returns its newest value and ends with no `Lagged`.
+#[test]
+fn a_state_publisher_replaced_after_a_lap_ends_its_drain_with_no_loss() {
+    let names = Names::default();
+    let first = state(&count(0));
+    first.advertise_on(NAME, &names).unwrap();
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Ok(count(0)));
+    for n in 1..=1000 {
+        first.publish(&count(n)).unwrap();
+    }
+    let second = state(&count(5000));
+    names.give(NAME, second.as_binder());
+    assert_eq!(recv(&mut subscriber), Ok(count(1000)));
+    let replaced = Err(RecvError::Disconnected(Disconnected::Replaced));
+    assert_eq!(recv(&mut subscriber), replaced);
+    assert_eq!(recv(&mut subscriber), Ok(count(5000)));
+    assert_eq!(subscriber.stats().lost, 0);
+
+    let events = advertise(&names, policy());
+    let mut subscriber = subscribe(&names);
+    connected(&subscriber);
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    for n in 1..=1000 {
+        events.publish(&count(n)).unwrap();
+    }
+    names.give(NAME, second.as_binder());
+    assert!(matches!(recv(&mut subscriber), Err(RecvError::Lagged(_))));
 }

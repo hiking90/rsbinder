@@ -16,11 +16,9 @@ pub struct PublisherStats {
     /// The subscriptions the topic holds, after taking out those that ended.
     pub subscribers: Vec<SubscriberInfo>,
     /// Subscriptions a wait for room took out
-    /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), each logged too.
+    /// ([`lossless`](crate::PublisherBuilder::lossless)), each logged too.
     pub evicted: u64,
     /// Whether the publisher holds a name now: one that
-    /// [`advertise`](crate::Publisher::advertise),
-    /// [`advertise_with`](crate::Publisher::advertise_with) or
     /// [`advertise_on`](crate::Publisher::advertise_on) gave, which
     /// [`close`](crate::Publisher::close) takes back.
     ///
@@ -73,7 +71,9 @@ pub struct SubscriberInfo {
 pub struct SubscriberStats {
     /// Values returned.
     pub received: u64,
-    /// Records reported lost, as [`RecvError::Lagged`](crate::RecvError::Lagged) counts them.
+    /// Records reported lost, as [`RecvError::Lagged`](crate::RecvError::Lagged) counts them. Stays
+    /// 0 on a [`TopicKind::State`](crate::TopicKind::State) topic, whose receives skip past values
+    /// without reporting them.
     pub lost: u64,
     /// Records that failed to decode, each one a [`RecvError::Decode`](crate::RecvError::Decode).
     pub decode_errors: u64,

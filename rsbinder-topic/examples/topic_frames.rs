@@ -16,9 +16,7 @@
 use std::time::Duration;
 
 use rsbinder::{hub, ProcessState, SIBinder};
-use rsbinder_topic::{
-    Bytes, Closed, PoolPolicy, Publisher, PublisherPolicy, RecvError, Subscriber, SubscriberPolicy,
-};
+use rsbinder_topic::{Bytes, Closed, Publisher, RecvError, Subscriber};
 
 const NAME: &str = "example.topic.frames";
 const FRAME: usize = 640 * 480;
@@ -40,15 +38,10 @@ fn topic() -> Result<SIBinder, Box<dyn std::error::Error>> {
 
 // ANCHOR: lend
 fn publish() -> Result<(), Box<dyn std::error::Error>> {
-    let policy = PublisherPolicy {
-        max_subscribers: 4,
-        pool: Some(PoolPolicy {
-            slot_bytes: FRAME,
-            ..PoolPolicy::default()
-        }),
-        ..PublisherPolicy::default()
-    };
-    let publisher = Publisher::<Bytes>::new(&policy)?;
+    let publisher = Publisher::<Bytes>::events()
+        .max_subscribers(4)
+        .lend(FRAME)
+        .build()?;
     hub::add_service(NAME, publisher.as_binder())?;
     for n in 0..300u32 {
         let mut frame = publisher.loan_slice(FRAME)?;
@@ -62,7 +55,7 @@ fn publish() -> Result<(), Box<dyn std::error::Error>> {
 
 // ANCHOR: sample
 fn subscribe(topic: &SIBinder) -> Result<(), Box<dyn std::error::Error>> {
-    let mut subscriber = Subscriber::<Bytes>::request(topic, &SubscriberPolicy::default())?;
+    let mut subscriber = Subscriber::<Bytes>::builder().subscribe(topic)?;
     let mut frame = vec![0; FRAME];
     loop {
         match subscriber.recv_sample() {
@@ -82,7 +75,7 @@ fn subscribe(topic: &SIBinder) -> Result<(), Box<dyn std::error::Error>> {
 
 // ANCHOR: trusted
 fn subscribe_trusted(topic: &SIBinder) -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = Subscriber::<Bytes>::request(topic, &SubscriberPolicy::default())?;
+    let subscriber = Subscriber::<Bytes>::builder().subscribe(topic)?;
     // SAFETY: this system's own rsbinder-topic `Publisher`, which writes no pinned slot.
     let mut subscriber = unsafe { subscriber.trust_publisher() };
     loop {

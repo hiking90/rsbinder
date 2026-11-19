@@ -24,6 +24,11 @@
 //! decides it, at a lap only, and a new drain ([`stop_at`](Cursor::stop_at)) starts at `tail`
 //! again. A publisher that has stopped writing overtakes nothing at or after the `tail` it left,
 //! so it never turns a drain to `half`.
+//!
+//! A reader attached at the newest record with a record to skip (`Start::Last`'s `skip`) moves
+//! over that record, once its header alone is judged whole, as over one it returned: the
+//! [`count_at`](Cursor::count_at) of an [`Owed::Unanchored`] reader counts nothing, and the
+//! [`step`](Cursor::step) leaves `Here { next: skip + 1 }`, from which the losses after it count.
 
 use super::rules::Header;
 use super::Judged;

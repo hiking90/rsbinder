@@ -332,7 +332,7 @@ fn close_ends_the_topic_with_its_status_after_the_last_value() {
     };
     assert_eq!(read, status);
     assert_eq!(read.message(), Some("gone"));
-    let mut late = subscriber::<Bytes>(&heap, Start::Last);
+    let mut late = subscriber::<Bytes>(&heap, Start::Last { skip: None });
     assert_eq!(
         late.try_latest(),
         Err(RecvError::Closed(Closed::Status(status)))
@@ -358,16 +358,24 @@ mod mapped {
 
     use super::*;
     use crate::layout::{map_topic, MAX_RING};
-    use crate::PublisherPolicy;
+    use crate::publish::{ring_for, Spec};
+    use crate::Publisher;
 
     fn subscriber<T: Payload>(fd: std::os::fd::BorrowedFd<'_>) -> TypedReader<T, impl Loads> {
         let memory = map_topic(fd, MAX_RING).unwrap();
         TypedReader::new(Reader::attach(memory, Start::Oldest).unwrap(), None)
     }
 
+    fn spec() -> Spec {
+        Spec {
+            ring_bytes: 64 << 10,
+            ..Spec::default()
+        }
+    }
+
     #[test]
     fn parcelables_and_bytes_reach_a_second_mapping_unchanged() {
-        let (fd, _, topic) = TypedWriter::create(&PublisherPolicy::default()).unwrap();
+        let (fd, _, topic) = TypedWriter::create(&spec()).unwrap();
         let mut sub = subscriber::<Sample>(fd.as_fd());
         let samples: Vec<_> = (0..100).map(sample).collect();
         topic.publish(&samples[0]).unwrap();
@@ -377,7 +385,7 @@ mod mapped {
         }
         assert_eq!(sub.try_recv(), Err(RecvError::Empty));
 
-        let (fd, _, topic) = TypedWriter::create(&PublisherPolicy::default()).unwrap();
+        let (fd, _, topic) = TypedWriter::create(&spec()).unwrap();
         let mut sub = subscriber::<Bytes>(fd.as_fd());
         let values: Vec<_> = (0..100u8)
             .map(|byte| Bytes(vec![byte; byte.into()]))
@@ -390,15 +398,20 @@ mod mapped {
 
     #[test]
     fn a_ring_under_4_kib_is_refused_and_one_sized_for_a_payload_is_made() {
-        let small = PublisherPolicy {
+        let small = Spec {
             ring_bytes: 4095,
-            ..PublisherPolicy::default()
+            ..Spec::default()
         };
         let made = TypedWriter::<Bytes, _>::create(&small);
         assert!(matches!(made.err(), Some(Error::BadValue(_))));
-        let policy = PublisherPolicy::for_payload(1, 1);
-        assert_eq!(policy.ring_bytes, 4096);
-        let (fd, _, topic) = TypedWriter::<Bytes, _>::create(&policy).unwrap();
+        assert_eq!(ring_for(1, 1), 4096);
+        let spec = Publisher::<Bytes>::events()
+            .max_value_bytes(1)
+            .keep(1)
+            .event_spec()
+            .unwrap();
+        assert_eq!(spec.ring_bytes, 4096);
+        let (fd, _, topic) = TypedWriter::<Bytes, _>::create(&spec).unwrap();
         topic.publish(&Bytes(vec![7; 2040])).unwrap();
         assert_eq!(subscriber(fd.as_fd()).try_recv(), Ok(Bytes(vec![7; 2040])));
     }

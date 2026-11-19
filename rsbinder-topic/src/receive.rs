@@ -44,7 +44,9 @@ pub enum RecvError {
     /// [`Payload::decode`] failed with this for one record, which is skipped. The next receive
     /// returns the record after it.
     Decode(StatusCode),
-    /// The topic has ended: every record before the end has been returned.
+    /// The topic has ended. On an event topic every record before the end has been returned. On a
+    /// [`TopicKind::State`](crate::TopicKind::State) topic only the newest value not yet returned
+    /// comes before the end; earlier ones are skipped and not counted.
     Closed(Closed),
     /// A [`NamedSubscriber`](crate::NamedSubscriber)'s connection to one publisher is over, or
     /// could not be made, and the subscriber waits for the next publisher of the name. Returned
@@ -58,14 +60,16 @@ pub enum RecvError {
 #[non_exhaustive]
 pub enum Disconnected {
     /// The topic of the connection ended, as [`Closed`] says. Every record before the end was
-    /// returned, but for [`Closed::Corrupted`], which ends the connection at the check that
-    /// failed.
+    /// returned, or on a [`TopicKind::State`](crate::TopicKind::State) topic the newest value not
+    /// yet returned, with earlier ones skipped and not counted, but for [`Closed::Corrupted`],
+    /// which ends the connection at the check that failed.
     ///
     /// After [`Closed::End`], [`Closed::Status`] or [`Closed::PublisherDied`] the subscriber
-    /// forgets that publisher, looks the name up once, and connects to the next binder the name
-    /// is given to. After `Corrupted` it keeps the publisher and does not connect again until the
-    /// name is registered anew, to the same binder or another: while that publisher holds the
-    /// name, a receive waits with nothing more to report.
+    /// looks the name up once and connects to the next binder the name is given to. It forgets
+    /// that publisher, except where [`NamedSubscriber`](crate::NamedSubscriber) says it remembers
+    /// one whose session over a socket ended. After `Corrupted` it keeps the publisher and does
+    /// not connect again until the name is registered anew, to the same binder or another: while
+    /// that publisher holds the name, a receive waits with nothing more to report.
     Ended(Closed),
     /// The publisher, or the resolver's check of it, refused the subscription with this status;
     /// a connection the subscriber has to an earlier publisher goes on. Refusals that a retry
@@ -120,9 +124,10 @@ pub enum Disconnected {
     ///
     /// [`try_latest`](crate::NamedSubscriber::try_latest) and
     /// [`recv_latest`](crate::NamedSubscriber::recv_latest) skip records without counting them,
-    /// as a [`Subscriber`](crate::Subscriber)'s do, and return the newest record each time: a
-    /// drain of them may return one record the previous publisher committed after this was seen,
-    /// always before `Replaced`.
+    /// as a [`Subscriber`](crate::Subscriber)'s do, and return the newest record each time, as
+    /// does every receive of a [`TopicKind::State`](crate::TopicKind::State) topic: a drain of
+    /// them may return one record the previous publisher committed after this was seen, always
+    /// before `Replaced`.
     Replaced,
 }
 
@@ -134,13 +139,15 @@ pub enum Closed {
     End,
     /// The publisher ended it with this status.
     Status(Status),
-    /// The publisher's process died. Every record it committed was returned before this.
+    /// The publisher's process died. On an event topic every record it committed was returned
+    /// before this. On a [`TopicKind::State`](crate::TopicKind::State) topic only the newest value
+    /// not yet returned was; earlier ones are skipped and not counted.
     PublisherDied,
     /// The publisher's memory failed a check: a length or a counter no publisher that follows the
     /// protocol writes. Nothing more is read from it.
     Corrupted,
     /// The publisher took the subscription out: its topic waits for subscribers
-    /// ([`PublisherPolicy::backpressure`](crate::PublisherPolicy::backpressure)), and waited for
+    /// ([`lossless`](crate::PublisherBuilder::lossless)), and waited for
     /// this one past its timeout. The records it had not read are not returned, as the publisher
     /// no longer keeps them; those before the notice arrived were.
     Evicted,
@@ -204,6 +211,10 @@ pub(crate) struct TypedReader<T, L> {
     loaned: Vec<u8>,
     /// Loans whose slot was taken back before this reader pinned it.
     lost_loans: u64,
+    /// A state topic's: a loan taken back is a past value, not a loss to report.
+    skips_lost: bool,
+    /// The last call gave up on loans taken back, with `skips_lost`.
+    gave_up_loans: bool,
     /// A loan named what no pool of the publisher's has: nothing more is read.
     corrupted: bool,
     _payload: PhantomData<fn() -> T>,
@@ -216,9 +227,19 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
             pool,
             loaned: Vec::new(),
             lost_loans: 0,
+            skips_lost: false,
+            gave_up_loans: false,
             corrupted: false,
             _payload: PhantomData,
         }
+    }
+
+    /// This reader for a state topic: a call that finds only loans taken back gives up with
+    /// [`RecvError::Empty`], as one the publisher keeps lapping does, instead of reporting one
+    /// lost; a newer value is committed by then, which the next call reads.
+    pub(crate) fn skipping_lost(mut self) -> Self {
+        self.skips_lost = true;
+        self
     }
 
     /// The next value, without waiting.
@@ -257,6 +278,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
+        self.gave_up_loans = false;
         let mut retries = 0;
         loop {
             let taken = if latest {
@@ -269,7 +291,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
                     return T::decode(&mut record).map_err(RecvError::Decode)
                 }
                 Ok(Taken::Loan { loan, .. }) => loan,
-                // The loan lost last was the newest: it is reported.
+                // The loan lost last was the newest: `lost_loan` decides what the caller gets.
                 Ok(Taken::Empty) if retries > 0 => return Err(self.lost_loan()),
                 other => return Err(not_a_value(other)),
             };
@@ -291,6 +313,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         if self.corrupted {
             return Err(RecvError::Closed(Closed::Corrupted));
         }
+        self.gave_up_loans = false;
         let mut retries = 0;
         loop {
             let taken = if latest {
@@ -304,7 +327,7 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
                     return Ok(Held::Ring { len });
                 }
                 Ok(Taken::Loan { loan, at, .. }) => (loan, at),
-                // The loan lost last was the newest: it is reported.
+                // The loan lost last was the newest: `lost_loan` decides what the caller gets.
                 Ok(Taken::Empty) if retries > 0 => return Err(self.lost_loan()),
                 other => return Err(not_a_value(other)),
             };
@@ -351,8 +374,12 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         }
     }
 
-    /// A loan whose slot was taken back before this reader pinned it, counted.
+    /// A loan taken back before this reader pinned it: counted, or with `skips_lost` a give-up.
     fn lost_loan(&mut self) -> RecvError {
+        if self.skips_lost {
+            self.gave_up_loans = true;
+            return RecvError::Empty;
+        }
         self.lost_loans += 1;
         RecvError::Lagged(1)
     }
@@ -360,6 +387,11 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
     /// Where the next record to return starts.
     pub(crate) fn position(&self) -> u64 {
         self.reader.position()
+    }
+
+    /// [`Reader::last_index`].
+    pub(crate) fn last_index(&self) -> Option<u32> {
+        self.reader.last_index()
     }
 
     /// Records and loans reported as lost so far.
@@ -378,9 +410,10 @@ impl<T: Payload, L: Loads> TypedReader<T, L> {
         self.reader.pending()
     }
 
-    /// Whether the ring reader's last call gave up short of `write` ([`Reader::gave_up`]).
+    /// Whether the last call gave up short of `write`: the ring reader's ([`Reader::gave_up`]),
+    /// or on loans taken back ([`skipping_lost`](Self::skipping_lost)).
     pub(crate) fn gave_up(&self) -> bool {
-        self.reader.gave_up()
+        self.reader.gave_up() || self.gave_up_loans
     }
 
     /// [`Reader::count_lost_before`]; none when the reader has failed a check, after which nothing

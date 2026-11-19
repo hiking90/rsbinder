@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::layout::MIN_RING;
 use crate::{
-    Backpressure, Bytes, Closed, PoolPolicy, Publisher, PublisherPolicy, RecvError, Subscriber,
-    SubscriberPolicy, Trusted, Wake,
+    Bytes, Closed, EventTopic, Publisher, PublisherBuilder, RecvError, Subscriber, Trusted, Wake,
 };
 
 const SPAN: Duration = Duration::from_secs(10);
@@ -23,23 +22,28 @@ fn waiting(timeout: Duration) -> Publisher<Bytes> {
 
 /// [`waiting`], for a subscriber more than `window` records behind as well.
 fn within(timeout: Duration, window: Option<NonZeroUsize>) -> Publisher<Bytes> {
-    Publisher::new(&PublisherPolicy {
-        ring_bytes: MIN_RING,
-        backpressure: Some(Backpressure {
-            publish_timeout: timeout,
-            window,
-        }),
-        ..PublisherPolicy::default()
-    })
-    .unwrap()
+    lossless(Publisher::events(), timeout, window)
+        .build()
+        .unwrap()
+}
+
+/// `builder` waiting up to `timeout`, and for `window` if one is given.
+fn lossless(
+    builder: PublisherBuilder<Bytes, EventTopic>,
+    timeout: Duration,
+    window: Option<NonZeroUsize>,
+) -> PublisherBuilder<Bytes, EventTopic> {
+    match window {
+        Some(window) => builder.lossless_window(timeout, window),
+        None => builder.lossless(timeout),
+    }
 }
 
 fn subscribe(publisher: &Publisher<Bytes>, wake: Wake) -> Subscriber<Bytes> {
-    let policy = SubscriberPolicy {
-        wake,
-        ..SubscriberPolicy::default()
-    };
-    Subscriber::request(&publisher.as_binder(), &policy).unwrap()
+    Subscriber::<Bytes>::builder()
+        .wake(wake)
+        .subscribe(&publisher.as_binder())
+        .unwrap()
 }
 
 /// 64 bytes that carry `n`.
@@ -287,23 +291,13 @@ fn pooled_within(
     timeout: Duration,
     window: Option<NonZeroUsize>,
 ) -> Publisher<Bytes> {
-    Publisher::new(&PublisherPolicy {
-        ring_bytes: MIN_RING,
-        max_subscribers,
-        max_per_uid: max_subscribers,
-        pool: Some(PoolPolicy {
-            slot_bytes: SLOT,
-            depth: 1,
-            max_loans: 1,
-            huge_pages: false,
-        }),
-        backpressure: Some(Backpressure {
-            publish_timeout: timeout,
-            window,
-        }),
-        ..PublisherPolicy::default()
-    })
-    .unwrap()
+    let builder = Publisher::events()
+        .max_subscribers(max_subscribers)
+        .max_per_uid(max_subscribers)
+        .lend(SLOT)
+        .lend_keep(1)
+        .max_loans(1);
+    lossless(builder, timeout, window).build().unwrap()
 }
 
 /// Lend a slot, write `value(n)` into it and publish it; the slot's number.

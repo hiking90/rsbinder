@@ -7,7 +7,7 @@
 //! --pub       topic=NAME [payload=bytes|record] [hz=10] [size=32] [ring=BYTES] [subs=N]
 //!             [pool] [bp=MS] [window=N] [via=sm|REGISTRY] [prepub=K]
 //! --sub       topic=NAME [payload=bytes|record] [api=plain|named] [recv=recv|latest|sample|async]
-//!             [wake=futex|fd] [start=latest|last|oldest] [trust] [group=G] [via=sm|REGISTRY]
+//!             [wake=futex|fd] [start=next|newest|oldest] [trust] [group=G] [via=sm|REGISTRY]
 //! --fuse      out=NAME frames=NAME readings=NAME [via=sm]
 //! --relay     topic=NAME service=NAME
 //! --report    service=NAME [hz=2]
@@ -244,8 +244,8 @@ impl Role {
                 start: items.choice(
                     "start",
                     &[
-                        ("latest", Start::Latest),
-                        ("last", Start::Last),
+                        ("next", Start::Next),
+                        ("newest", Start::Newest),
                         ("oldest", Start::Oldest),
                     ],
                 )?,
@@ -337,7 +337,7 @@ mod tests {
                 api: Api::Plain,
                 recv: Recv::Recv,
                 wake: Wake::Futex,
-                start: Start::Latest,
+                start: Start::Next,
                 trust: false,
                 group: None,
                 via: Via::ServiceManager,
@@ -376,7 +376,7 @@ mod tests {
             ),
             (
                 "--sub",
-                "topic=t,payload=record,recv=async,wake=fd,start=last",
+                "topic=t,payload=record,recv=async,wake=fd,start=newest",
             ),
             ("--pub", "topic=t,payload=record,hz=1000,prepub=50"),
             ("--fuse", "out=a,frames=b,readings=c"),

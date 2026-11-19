@@ -43,8 +43,7 @@ use rsbinder_topic::aidl::TopicInfo::TopicInfo;
 use rsbinder_topic::aidl::TopicRef::TopicRef;
 use rsbinder_topic::registry::{AllowAll, Registry, RegistryResolver, TopicListing};
 use rsbinder_topic::{
-    Bytes, Closed, Disconnected, NamedState, NamedSubscriber, Publisher, PublisherPolicy,
-    RecvError, Resolver, Start, SubscriberPolicy,
+    Bytes, Closed, Disconnected, NamedState, Publisher, RecvError, Resolver, Start, Subscriber,
 };
 
 /// Where a child finds the registry.
@@ -118,6 +117,13 @@ fn listed(resolver: &RegistryResolver, name: &str) -> Option<TopicListing> {
     infos.pop()
 }
 
+/// A topic advertised as `name` through `resolver`.
+fn advertised(name: &str, resolver: &dyn Resolver) -> BinderResult<Publisher<Bytes>> {
+    let publisher = Publisher::<Bytes>::events().build()?;
+    publisher.advertise_on(name, resolver)?;
+    Ok(publisher)
+}
+
 /// A child that advertises `name` through `registry` and publishes as told.
 fn publisher(name: &str, registry: &str) -> Peer {
     let peer = Peer::spawn_with("advertise", name, &[(REGISTRY, registry)]);
@@ -137,9 +143,9 @@ fn a_subscriber_started_first_meets_the_publisher_and_the_one_started_after_it()
     let registry = registry_name("first");
     let (_host, resolver) = host(&registry);
     let name = name("first");
-    let policy = SubscriberPolicy::default();
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &resolver).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .subscribe_named_on(&name, &resolver)
+        .unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(100)));
     let mut peer = publisher(&name, &registry);
     assert!(subscriber.wait_connected(WAIT));
@@ -167,14 +173,13 @@ fn a_closed_or_dropped_publishers_name_is_gone_from_the_next_call() {
     let registry = registry_name("close");
     let (_host, resolver) = host(&registry);
     let name = name("close");
-    let policy = PublisherPolicy::default();
-    let publisher = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
+    let publisher = advertised(&name, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
     assert!(publisher.stats().advertised);
     publisher.close();
     assert!(!publisher.stats().advertised);
     assert!(listed(&resolver, &name).is_none());
-    let publisher = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
+    let publisher = advertised(&name, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
     drop(publisher);
     assert!(listed(&resolver, &name).is_none());
@@ -187,8 +192,7 @@ fn a_name_given_again_on_the_same_host_stays_and_a_new_name_takes_its_place() {
     let registry = registry_name("again");
     let (_host, resolver) = host(&registry);
     let (first, second) = (name("again.first"), name("again.second"));
-    let policy = PublisherPolicy::default();
-    let publisher = Publisher::<Bytes>::advertise_with(&first, &policy, &resolver).unwrap();
+    let publisher = advertised(&first, &resolver).unwrap();
     publisher
         .advertise_on(&first, &self::resolver(&registry))
         .unwrap();
@@ -257,10 +261,9 @@ fn a_watch_drops_older_notices_and_ends_what_it_began() {
     assert_eq!(fake.says(), "ready");
     let resolver = resolver(&registry);
     let name = name("fake");
-    let policy = PublisherPolicy::default();
-    let first = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
+    let first = advertised(&name, &resolver).unwrap();
     assert_eq!(fake.says(), "advertised 0");
-    let second = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap();
+    let second = advertised(&name, &resolver).unwrap();
     assert_eq!(fake.says(), "advertised 1");
 
     let (record, heard) = recorded();
@@ -306,8 +309,7 @@ fn a_failed_advertise_withdraws_its_name() {
     let name = name("refused");
     fake.tell("refuse-advertise");
     assert_eq!(fake.says(), "ok");
-    let policy = PublisherPolicy::default();
-    let refused = Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap_err();
+    let refused = advertised(&name, &resolver).unwrap_err();
     assert_eq!(refused.exception_code(), ExceptionCode::Security);
     assert_eq!(fake.says(), "advertised 0");
     assert_eq!(fake.says(), "withdrawn 0");
@@ -320,9 +322,11 @@ fn a_new_host_knows_only_the_publishers_made_again() {
     let registry = registry_name("restart");
     let (mut first_host, resolver) = host(&registry);
     let name = name("restart");
-    let policy = SubscriberPolicy::default();
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &resolver).unwrap();
+    let builder = Subscriber::<Bytes>::builder();
+    let mut subscriber = builder
+        .clone()
+        .subscribe_named_on(&name, &resolver)
+        .unwrap();
     let mut peer = publisher(&name, &registry);
     assert!(subscriber.wait_connected(WAIT));
     first_host.kill();
@@ -344,7 +348,7 @@ fn a_new_host_knows_only_the_publishers_made_again() {
     assert_eq!(second_host.says(), "ready");
     let resolver = self::resolver(&registry);
     assert!(listed(&resolver, &name).is_none());
-    let mut again = NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &resolver).unwrap();
+    let mut again = builder.subscribe_named_on(&name, &resolver).unwrap();
     assert!(!again.wait_connected(Duration::from_millis(100)));
     let mut made_again = publisher(&name, &registry);
     assert!(again.wait_connected(WAIT));
@@ -373,8 +377,8 @@ fn a_binder_of_another_interface_is_taken_and_refused_to_subscribers() {
     assert!(listed(&resolver, &name).is_some());
 
     // Our own binder: the resolver's `watch` reply fails to read it as `ITopic`.
-    let policy = SubscriberPolicy::default();
-    let refused = NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &resolver)
+    let refused = Subscriber::<Bytes>::builder()
+        .subscribe_named_on(&name, &resolver)
         .map(|_| ())
         .unwrap_err();
     assert_eq!(refused.transaction_error(), StatusCode::BadType);
@@ -400,9 +404,8 @@ fn a_stopped_publisher_holds_up_no_call_of_the_registry() {
     assert!(found.as_binder() == again.as_binder());
     let names = timed("a list", &stopped, || resolver.list("").unwrap());
     assert!(names.iter().any(|info| info.name == stopped_name));
-    let policy = PublisherPolicy::default();
     let _other = timed("an advertise of another name", &stopped, || {
-        Publisher::<Bytes>::advertise_with(&other, &policy, &resolver).unwrap()
+        advertised(&other, &resolver).unwrap()
     });
     let looking = Peer::spawn_with("lookup", &other, &[(REGISTRY, &registry)]);
     let said = looking.says();
@@ -421,7 +424,7 @@ fn stopped_watchers_hold_up_no_call_and_each_meets_the_last_publisher_once_resum
     let name = name("watchers");
     let env = [(REGISTRY, registry.as_str())];
     let watchers: Vec<Peer> = (0..WATCHERS)
-        .map(|_| Peer::spawn_with("last", &name, &env))
+        .map(|_| Peer::spawn_with("newest", &name, &env))
         .collect();
     for watcher in &watchers {
         assert_eq!(watcher.says(), "watching");
@@ -442,9 +445,8 @@ fn stopped_watchers_hold_up_no_call_and_each_meets_the_last_publisher_once_resum
             topic
         })
         .collect();
-    let policy = PublisherPolicy::default();
     let last = timed("the last advertise", &stopped, || {
-        Publisher::<Bytes>::advertise_with(&name, &policy, &resolver).unwrap()
+        advertised(&name, &resolver).unwrap()
     });
     let (failed, owed) = stats(&mut host);
     assert!(failed >= 1, "no notice failed");
@@ -545,9 +547,7 @@ fn child() {
         }
         "advertise" => {
             init();
-            let policy = PublisherPolicy::default();
-            let publisher =
-                Publisher::<Bytes>::advertise_with(&name, &policy, &registry()).unwrap();
+            let publisher = advertised(&name, &registry()).unwrap();
             say("ready");
             // `publish N` publishes the bytes 0 to N - 1, until EOF.
             for line in std::io::stdin().lines().map_while(Result::ok) {
@@ -565,20 +565,18 @@ fn child() {
         }
         "subscribe" => {
             init();
-            let policy = SubscriberPolicy::default();
-            let _subscriber =
-                NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &registry()).unwrap();
+            let _subscriber = Subscriber::<Bytes>::builder()
+                .subscribe_named_on(&name, &registry())
+                .unwrap();
             say("watching");
             wait_for_eof();
         }
-        "last" => {
+        "newest" => {
             init();
-            let policy = SubscriberPolicy {
-                start: Start::Last,
-                ..SubscriberPolicy::default()
-            };
-            let mut subscriber =
-                NamedSubscriber::<Bytes>::subscribe_with(&name, &policy, &registry()).unwrap();
+            let mut subscriber = Subscriber::<Bytes>::builder()
+                .start_at(Start::Newest)
+                .subscribe_named_on(&name, &registry())
+                .unwrap();
             say("watching");
             let got = loop {
                 match subscriber.recv_timeout(6 * WAIT) {

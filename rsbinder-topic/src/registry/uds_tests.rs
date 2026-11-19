@@ -33,11 +33,12 @@ use crate::aidl::ITopicAddressWatcher::{BnTopicAddressWatcher, ITopicAddressWatc
 use crate::aidl::ITopicUdsRegistry::ITopicUdsRegistry;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
+use crate::named::BEFORE_LOOKING;
 use crate::resolve::{Advertisement, OnResolved, Resolved, Watch};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
 use crate::{
-    Bytes, Closed, Disconnected, NamedState, NamedSubscriber, Publisher, PublisherPolicy,
-    RecvError, Resolver, SubscriberPolicy,
+    Bytes, Closed, Disconnected, EventTopic, NamedState, NamedSubscriber, Payload, Publisher,
+    PublisherBuilder, RecvError, Resolver, Start, Subscriber, SubscriberBuilder,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -130,18 +131,30 @@ struct Raw {
     session: SessionGuard,
 }
 
+fn events() -> PublisherBuilder<Bytes, EventTopic> {
+    Publisher::<Bytes>::events()
+}
+
+fn advertised(name: &str, resolver: &dyn Resolver) -> BinderResult<Publisher<Bytes>> {
+    let publisher = events().build()?;
+    publisher.advertise_on(name, resolver)?;
+    Ok(publisher)
+}
+
 fn topic() -> (Publisher<Bytes>, Strong<dyn ITopic>) {
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = events().build().unwrap();
     let topic = publisher.as_binder().into_interface().unwrap();
     (publisher, topic)
 }
 
-fn policy() -> SubscriberPolicy {
-    SubscriberPolicy::default()
+fn policy<T: Payload>() -> SubscriberBuilder<T> {
+    Subscriber::<T>::builder()
 }
 
 fn named(fixture: &Fixture, name: &str) -> NamedSubscriber<Bytes> {
-    NamedSubscriber::subscribe_with(name, &policy(), &fixture.resolver()).unwrap()
+    policy()
+        .subscribe_named_on(name, &fixture.resolver())
+        .unwrap()
 }
 
 fn code(status: rsbinder::Status) -> ExceptionCode {
@@ -613,9 +626,7 @@ fn the_registry_keeps_no_copy_of_a_socket() {
 fn a_name_subscriber_reaches_a_publisher_through_the_registry() {
     let fixture = Fixture::new("named", AllowAll);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let mut subscriber = named(&fixture, "a.name");
     assert!(subscriber.wait_connected(WAIT));
     publisher.publish(&Bytes(vec![1])).unwrap();
@@ -630,9 +641,7 @@ fn a_name_subscriber_that_comes_first_hears_of_the_publisher() {
     let mut subscriber = named(&fixture, "a.name");
     assert!(!subscriber.wait_connected(Duration::from_millis(50)));
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     assert!(subscriber.wait_connected(WAIT));
     publisher.publish(&Bytes(vec![2])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
@@ -643,18 +652,14 @@ fn a_name_subscriber_that_comes_first_hears_of_the_publisher() {
 fn a_name_given_to_another_publisher_replaces_once() {
     let fixture = Fixture::new("replace", AllowAll);
     let resolver = fixture.resolver();
-    let first =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let first = advertised("a.name", &resolver).unwrap();
     let mut subscriber = named(&fixture, "a.name");
     assert!(subscriber.wait_connected(WAIT));
     first.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
 
     first.publish(&Bytes(vec![2])).unwrap();
-    let second =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let second = advertised("a.name", &resolver).unwrap();
     second.publish(&Bytes(vec![3])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
     assert_eq!(
@@ -672,9 +677,7 @@ fn a_name_given_to_another_publisher_replaces_once() {
 fn a_closed_publisher_ends_its_subscribers_and_takes_its_name_back() {
     let fixture = Fixture::new("close", AllowAll);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let mut subscriber = named(&fixture, "a.name");
     assert!(subscriber.wait_connected(WAIT));
     publisher.publish(&Bytes(vec![1])).unwrap();
@@ -691,9 +694,7 @@ fn a_closed_publisher_ends_its_subscribers_and_takes_its_name_back() {
 fn a_registry_that_ends_is_the_resolvers_death_and_connections_go_on() {
     let mut fixture = Fixture::new("host", AllowAll);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let mut subscriber = named(&fixture, "a.name");
     assert!(subscriber.wait_connected(WAIT));
     fixture.stop();
@@ -715,19 +716,17 @@ fn a_registry_that_ends_is_the_resolvers_death_and_connections_go_on() {
 fn dropping_one_advertisement_leaves_the_resolvers_other_name_and_watch() {
     let fixture = Fixture::new("two", AllowAll);
     let resolver = fixture.resolver();
-    let keep =
-        Publisher::<Bytes>::advertise_with("keep", &PublisherPolicy::default(), &resolver).unwrap();
-    let gone =
-        Publisher::<Bytes>::advertise_with("gone", &PublisherPolicy::default(), &resolver).unwrap();
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("keep", &policy(), &resolver).unwrap();
+    let keep = advertised("keep", &resolver).unwrap();
+    let gone = advertised("gone", &resolver).unwrap();
+    let mut subscriber = policy::<Bytes>()
+        .subscribe_named_on("keep", &resolver)
+        .unwrap();
     assert!(subscriber.wait_connected(WAIT));
     drop(gone);
     eventually("the name to go", || fixture.registry.stats().topics == 1);
     keep.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
-    let again =
-        Publisher::<Bytes>::advertise_with("gone", &PublisherPolicy::default(), &resolver).unwrap();
+    let again = advertised("gone", &resolver).unwrap();
     assert_eq!(fixture.registry.stats().topics, 2);
     drop(again);
 }
@@ -737,7 +736,7 @@ fn dropping_one_advertisement_leaves_the_resolvers_other_name_and_watch() {
 fn a_publisher_moved_between_names_and_back_keeps_the_last() {
     let fixture = Fixture::new("aba", AllowAll);
     let resolver = fixture.resolver();
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = events().build().unwrap();
     publisher.advertise_on("a", &resolver).unwrap();
     publisher.advertise_on("b", &resolver).unwrap();
     publisher.advertise_on("a", &resolver).unwrap();
@@ -753,7 +752,7 @@ fn a_publisher_moved_between_names_and_back_keeps_the_last() {
 fn a_name_of_a_publisher_advertised_to_one_host_twice_is_asked_once() {
     let fixture = Fixture::new("same_host", AllowAll);
     let resolver = fixture.resolver();
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = events().build().unwrap();
     publisher.advertise_on("a", &resolver).unwrap();
     let generation = fixture.raw().registry.r#lookup("a").unwrap().generation;
     publisher.advertise_on("a", &resolver).unwrap();
@@ -788,16 +787,14 @@ fn a_remote_binder_is_not_advertised() {
 #[test]
 fn a_publisher_given_a_new_socket_is_the_publisher_a_subscriber_read() {
     let fixture = Fixture::new("resocket", AllowAll);
-    let policy = SubscriberPolicy {
-        start: crate::Start::Oldest,
-        ..SubscriberPolicy::default()
-    };
+    let policy = policy::<Bytes>().start_at(crate::Start::Oldest);
     let first = fixture.resolver();
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = events().build().unwrap();
     publisher.advertise_on("a.name", &first).unwrap();
     publisher.publish(&Bytes(vec![1])).unwrap();
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy, &fixture.resolver()).unwrap();
+    let mut subscriber = policy
+        .subscribe_named_on("a.name", &fixture.resolver())
+        .unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
     let second = fixture.resolver();
     publisher.advertise_on("a.name", &second).unwrap();
@@ -809,7 +806,7 @@ fn a_publisher_given_a_new_socket_is_the_publisher_a_subscriber_read() {
     publisher.publish(&Bytes(vec![2])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
     // Another publisher starts where the policy says: its first record is not missed.
-    let other = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let other = events().build().unwrap();
     other.publish(&Bytes(vec![3])).unwrap();
     other.advertise_on("a.name", &first).unwrap();
     assert_eq!(
@@ -823,17 +820,15 @@ fn a_publisher_given_a_new_socket_is_the_publisher_a_subscriber_read() {
 fn a_resolver_subscribes_to_the_topic_a_name_has_now() {
     let fixture = Fixture::new("plain", AllowAll);
     let resolver = fixture.resolver();
-    let refused = resolver.subscribe::<Bytes>("a.name", &policy());
+    let refused = resolver.subscribe("a.name", policy::<Bytes>());
     assert_eq!(
         refused.err().map(|status| status.transaction_error()),
         Some(StatusCode::NameNotFound)
     );
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let mut subscriber = fixture
         .resolver()
-        .subscribe::<Bytes>("a.name", &policy())
+        .subscribe("a.name", policy::<Bytes>())
         .unwrap();
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
@@ -854,7 +849,7 @@ fn a_commit_a_policy_refuses_leaves_the_publisher_its_name() {
     let access = Arc::new(RefusesCommitOf("b.name", AtomicU32::new(0)));
     let fixture = Fixture::new("keep_name", access.clone());
     let resolver = fixture.resolver();
-    let publisher = Publisher::<Bytes>::new(&PublisherPolicy::default()).unwrap();
+    let publisher = events().build().unwrap();
     publisher.advertise_on("a.name", &resolver).unwrap();
     let raw = fixture.raw();
     let held = raw.registry.r#lookup("a.name").unwrap();
@@ -885,9 +880,7 @@ fn the_state_of_a_name_with_no_publisher_says_so() {
 fn a_publisher_of_an_unexpected_uid_is_not_subscribed_to() {
     let fixture = Fixture::new("uid", AllowAll);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let own = rustix::process::geteuid().as_raw();
     let options = ResolverOptions {
         expect_publisher_uid: Some(own + 1),
@@ -895,8 +888,9 @@ fn a_publisher_of_an_unexpected_uid_is_not_subscribed_to() {
     };
     let endpoint = Endpoint::Path(fixture.path.clone());
     let picky = UdsResolver::connect(endpoint, &options).unwrap();
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &picky).unwrap();
+    let mut subscriber = policy::<Bytes>()
+        .subscribe_named_on("a.name", &picky)
+        .unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(200)));
     publisher.publish(&Bytes(vec![1])).unwrap();
     match subscriber.recv_timeout(WAIT) {
@@ -940,8 +934,9 @@ fn a_publisher_given_up_on_is_a_refusal_until_a_binder_comes() {
     }
 
     let resolver = GivesUp(Mutex::default());
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    let mut subscriber = policy::<Bytes>()
+        .subscribe_named_on("a.name", &resolver)
+        .unwrap();
     let tell = resolver.0.lock().unwrap().take().unwrap();
     let refusal = || Err(Status::from((ExceptionCode::Security, "not that uid")));
     tell(refusal());
@@ -983,16 +978,15 @@ fn a_session_that_ended_is_made_again_for_the_same_generation() {
 fn a_subscriber_whose_session_ended_connects_again_with_no_new_generation() {
     let fixture = Fixture::new("reconnect", AllowAll);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let spy = SessionsSeen {
         resolver: fixture.resolver(),
         seen: seen.clone(),
     };
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &spy).unwrap();
+    let mut subscriber = policy::<Bytes>()
+        .subscribe_named_on("a.name", &spy)
+        .unwrap();
     assert!(subscriber.wait_connected(WAIT));
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
@@ -1009,6 +1003,338 @@ fn a_subscriber_whose_session_ended_connects_again_with_no_new_generation() {
     // A session's end reads as the publisher's death, which forgets it: from the oldest again.
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+}
+
+/// The publisher outlives the session: the value already returned is not returned again.
+#[test]
+fn a_state_subscriber_whose_session_ended_does_not_return_its_value_again() {
+    let fixture = Fixture::new("reconnect_state", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = Publisher::<Bytes>::state().build(&Bytes(vec![1])).unwrap();
+    publisher.advertise_on("a.name", &resolver).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let spy = SessionsSeen {
+        resolver: fixture.resolver(),
+        seen: seen.clone(),
+    };
+    let mut subscriber = policy::<Bytes>()
+        .subscribe_named_on("a.name", &spy)
+        .unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    let session = seen.lock().unwrap()[0].upgrade().unwrap();
+    let guard = session.downcast::<SessionGuard>().unwrap();
+    guard.0.close_session();
+    drop(guard);
+    assert!(matches!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Ended(_)))
+    ));
+    assert!(subscriber.wait_connected(WAIT));
+    let quiet = Duration::from_millis(200);
+    assert_eq!(subscriber.recv_timeout(quiet), Err(RecvError::Timeout));
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+}
+
+/// `Start::Newest` on an event topic: the record already returned is not returned again.
+#[test]
+fn an_event_subscriber_at_newest_whose_session_ended_does_not_return_its_record_again() {
+    let fixture = Fixture::new("reconnect_newest", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = advertised("a.name", &resolver).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let spy = SessionsSeen {
+        resolver: fixture.resolver(),
+        seen: seen.clone(),
+    };
+    let mut subscriber = policy::<Bytes>()
+        .start_at(crate::Start::Newest)
+        .subscribe_named_on("a.name", &spy)
+        .unwrap();
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&Bytes(vec![1])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
+    let session = seen.lock().unwrap()[0].upgrade().unwrap();
+    let guard = session.downcast::<SessionGuard>().unwrap();
+    guard.0.close_session();
+    drop(guard);
+    assert!(matches!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Ended(_)))
+    ));
+    assert!(subscriber.wait_connected(WAIT));
+    let quiet = Duration::from_millis(200);
+    assert_eq!(subscriber.recv_timeout(quiet), Err(RecvError::Timeout));
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+}
+
+/// How long a test watches for a record that must not come.
+const QUIET: Duration = Duration::from_millis(200);
+
+fn value(byte: u8) -> Bytes {
+    Bytes(vec![byte])
+}
+
+fn state_of(byte: u8) -> Publisher<Bytes> {
+    Publisher::<Bytes>::state().build(&value(byte)).unwrap()
+}
+
+fn named_at(fixture: &Fixture, start: Start) -> NamedSubscriber<Bytes> {
+    policy()
+        .start_at(start)
+        .subscribe_named_on("a.name", &fixture.resolver())
+        .unwrap()
+}
+
+/// End the session of the connection a receive took, and see the next receive report it.
+fn end_session(subscriber: &mut NamedSubscriber<Bytes>) {
+    let guard = subscriber.connection_session::<SessionGuard>();
+    guard.expect("a connection taken").0.close_session();
+    let ended = subscriber.recv_timeout(WAIT);
+    assert!(
+        matches!(ended, Err(RecvError::Disconnected(Disconnected::Ended(_)))),
+        "{ended:?}"
+    );
+}
+
+/// Run `then` once a connection has ended, before the thread of the next one starts.
+fn meanwhile(then: impl FnOnce() + 'static) {
+    let mut then = Some(then);
+    BEFORE_LOOKING.set(Some(Box::new(move || {
+        if let Some(then) = then.take() {
+            then();
+        }
+    })));
+}
+
+fn replaced(subscriber: &mut NamedSubscriber<Bytes>) {
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    assert!(subscriber.wait_connected(WAIT));
+}
+
+/// The value returned before the session ended is not returned by the connection after it.
+#[test]
+fn a_state_subscriber_at_next_whose_session_ended_does_not_return_its_value_again() {
+    let fixture = Fixture::new("next_again", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = state_of(1);
+    publisher.advertise_on("a.name", &resolver).unwrap();
+    let mut subscriber = named_at(&fixture, Start::Next);
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&value(2)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+    end_session(&mut subscriber);
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+    publisher.publish(&value(3)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(3)));
+}
+
+/// `Next` starts past what was published while the session was down, as after a move of the name.
+#[test]
+fn a_state_subscriber_at_next_whose_session_ended_waits_for_the_next_value() {
+    let fixture = Fixture::new("next_meanwhile", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = Arc::new(state_of(1));
+    publisher.advertise_on("a.name", &resolver).unwrap();
+    let mut subscriber = named_at(&fixture, Start::Next);
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&value(2)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+    let away = publisher.clone();
+    meanwhile(move || away.publish(&value(3)).unwrap());
+    end_session(&mut subscriber);
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+    publisher.publish(&value(4)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(4)));
+}
+
+/// A connection that returned nothing still leaves the ring remembered through a session's end.
+#[test]
+fn a_state_subscriber_at_next_that_returned_nothing_waits_after_its_session_ended() {
+    let fixture = Fixture::new("next_nothing", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = state_of(1);
+    publisher.advertise_on("a.name", &resolver).unwrap();
+    let mut subscriber = named_at(&fixture, Start::Next);
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    end_session(&mut subscriber);
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+    publisher.publish(&value(2)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+}
+
+/// The value published while the session was down differs from the one returned: it comes at once.
+#[test]
+fn a_state_subscriber_whose_session_ended_returns_the_value_published_meanwhile() {
+    let fixture = Fixture::new("auto_meanwhile", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = Arc::new(state_of(1));
+    publisher.advertise_on("a.name", &resolver).unwrap();
+    let mut subscriber = named_at(&fixture, Start::Auto);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+    let away = publisher.clone();
+    meanwhile(move || away.publish(&value(2)).unwrap());
+    end_session(&mut subscriber);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+}
+
+/// `Start::Newest` on an event topic reads as a state topic's connection does.
+#[test]
+fn an_event_subscriber_at_newest_whose_session_ended_returns_the_record_published_meanwhile() {
+    let fixture = Fixture::new("newest_meanwhile", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = Arc::new(advertised("a.name", &resolver).unwrap());
+    let mut subscriber = named_at(&fixture, Start::Newest);
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&value(1)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+    let away = publisher.clone();
+    meanwhile(move || away.publish(&value(2)).unwrap());
+    end_session(&mut subscriber);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+}
+
+/// Each ring keeps its own record: the end of one session does not take the other's.
+#[test]
+fn two_publishers_whose_sessions_ended_each_keep_the_record_returned_last() {
+    let fixture = Fixture::new("two_ended", AllowAll);
+    let resolvers: [UdsResolver; 4] = std::array::from_fn(|_| fixture.resolver());
+    let (one, two) = (state_of(1), state_of(2));
+    one.advertise_on("a.name", &resolvers[0]).unwrap();
+    let mut subscriber = named_at(&fixture, Start::Auto);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+    end_session(&mut subscriber);
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+    two.advertise_on("a.name", &resolvers[1]).unwrap();
+    replaced(&mut subscriber);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+    end_session(&mut subscriber);
+    assert!(subscriber.wait_connected(WAIT));
+    assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+
+    one.advertise_on("a.name", &resolvers[2]).unwrap();
+    replaced(&mut subscriber);
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+    one.publish(&value(3)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(3)));
+    two.advertise_on("a.name", &resolvers[3]).unwrap();
+    replaced(&mut subscriber);
+    assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+    two.publish(&value(4)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(4)));
+}
+
+/// Plan 15 field D23: an event topic read from `Next` is read anew, so nothing published is lost.
+#[test]
+fn an_event_subscriber_whose_session_ended_returns_what_was_published_meanwhile() {
+    let fixture = Fixture::new("event_meanwhile", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = Arc::new(advertised("a.name", &resolver).unwrap());
+    let mut subscriber = named_at(&fixture, Start::Auto);
+    assert!(subscriber.wait_connected(WAIT));
+    publisher.publish(&value(1)).unwrap();
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+    let away = publisher.clone();
+    meanwhile(move || away.publish(&value(2)).unwrap());
+    end_session(&mut subscriber);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+}
+
+/// With and without a publish while the session was down: the ring again, from its oldest record.
+#[test]
+fn an_event_subscriber_at_oldest_whose_session_ended_reads_the_ring_from_its_oldest() {
+    for published in [false, true] {
+        let fixture = Fixture::new("oldest_ended", AllowAll);
+        let resolver = fixture.resolver();
+        let publisher = Arc::new(advertised("a.name", &resolver).unwrap());
+        publisher.publish(&value(1)).unwrap();
+        let mut subscriber = named_at(&fixture, Start::Oldest);
+        assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+        if published {
+            let away = publisher.clone();
+            meanwhile(move || away.publish(&value(2)).unwrap());
+        }
+        end_session(&mut subscriber);
+        assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+        if published {
+            assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+        }
+        assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+    }
+}
+
+/// A connection that returned nothing forgets the ring as one that returned records does.
+#[test]
+fn an_event_subscriber_that_returned_nothing_reads_the_ring_from_its_oldest_past_a_session_end() {
+    for start in [Start::Next, Start::Oldest] {
+        let fixture = Fixture::new("event_nothing", AllowAll);
+        let resolver = fixture.resolver();
+        let publisher = Arc::new(advertised("a.name", &resolver).unwrap());
+        let mut subscriber = named_at(&fixture, start);
+        assert!(subscriber.wait_connected(WAIT));
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+        let away = publisher.clone();
+        meanwhile(move || away.publish(&value(1)).unwrap());
+        end_session(&mut subscriber);
+        assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)), "{start:?}");
+    }
+}
+
+/// The second connection returned nothing: the third still steps over what the first returned.
+#[test]
+fn a_subscriber_at_newest_that_returned_nothing_keeps_the_record_to_skip_past_a_session_end() {
+    for state in [false, true] {
+        let fixture = Fixture::new("skip_kept", AllowAll);
+        let resolver = fixture.resolver();
+        let publisher = if state {
+            state_of(1)
+        } else {
+            let publisher = events().build().unwrap();
+            publisher.publish(&value(1)).unwrap();
+            publisher
+        };
+        publisher.advertise_on("a.name", &resolver).unwrap();
+        let mut subscriber = named_at(&fixture, Start::Newest);
+        assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+        end_session(&mut subscriber);
+        assert!(subscriber.wait_connected(WAIT));
+        assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
+        end_session(&mut subscriber);
+        assert!(subscriber.wait_connected(WAIT));
+        assert_eq!(subscriber.recv_timeout(QUIET), Err(RecvError::Timeout));
+        publisher.publish(&value(2)).unwrap();
+        assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(2)));
+    }
+}
+
+/// The end record over a socket forgets a state topic's publisher: it refuses every later call.
+#[test]
+fn a_state_publisher_that_ended_over_a_socket_is_forgotten() {
+    let fixture = Fixture::new("state_end", AllowAll);
+    let resolver = fixture.resolver();
+    let publisher = state_of(1);
+    publisher.advertise_on("a.name", &resolver).unwrap();
+    let mut subscriber = named_at(&fixture, Start::Auto);
+    assert_eq!(subscriber.recv_timeout(WAIT), Ok(value(1)));
+    assert_eq!(subscriber.remembered(), 1);
+    drop(publisher);
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Err(RecvError::Disconnected(Disconnected::Ended(Closed::End)))
+    );
+    assert_eq!(subscriber.remembered(), 0, "an ended topic's publisher");
 }
 
 /// A notice could reach neither: no incoming connection to call on, or no descriptor to take.
@@ -1075,9 +1401,7 @@ fn a_host_of_an_unexpected_uid_is_refused() {
 fn a_lookup_and_a_notice_of_one_generation_share_a_binder() {
     let fixture = Fixture::new("same_gen", AllowAll);
     let resolver = fixture.resolver();
-    let _publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let _publisher = advertised("a.name", &resolver).unwrap();
     let told = Arc::new(Mutex::new(Vec::new()));
     let keep = told.clone();
     let watch = resolver
@@ -1130,8 +1454,9 @@ fn a_publisher_that_answers_only_later_is_reached_with_no_newer_generation() {
     let resolver = (0..100)
         .find_map(|_| UdsResolver::connect(Endpoint::Path(fixture.path.clone()), &options).ok())
         .expect("a connect to the host within 100 tries");
-    let mut subscriber =
-        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    let mut subscriber = policy::<Bytes>()
+        .subscribe_named_on("a.name", &resolver)
+        .unwrap();
     assert!(!subscriber.wait_connected(Duration::from_millis(300)));
 
     let server = RpcServer::setup_unix_server_from_bound_fd(socket).unwrap();
@@ -1169,12 +1494,11 @@ fn a_refused_subscriber_leaves_the_publishers_connection_to_another() {
     };
     let endpoint = Endpoint::Path(fixture.path.clone());
     let advertising = UdsResolver::connect(endpoint, &options).unwrap();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &advertising)
-            .unwrap();
+    let publisher = advertised("a.name", &advertising).unwrap();
     let resolver = fixture.resolver();
-    let mut refused =
-        NamedSubscriber::<Word>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    let mut refused = policy::<Word>()
+        .subscribe_named_on("a.name", &resolver)
+        .unwrap();
     let told = refused.recv_timeout(WAIT);
     match told {
         Err(RecvError::Disconnected(Disconnected::Rejected(status))) => {
@@ -1184,8 +1508,9 @@ fn a_refused_subscriber_leaves_the_publishers_connection_to_another() {
     }
     assert!(matches!(refused.state(), NamedState::Refused(_)));
 
-    let mut other =
-        NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver).unwrap();
+    let mut other = policy::<Bytes>()
+        .subscribe_named_on("a.name", &resolver)
+        .unwrap();
     assert!(other.wait_connected(WAIT), "the refused one holds the room");
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(other.recv_timeout(WAIT), Ok(Bytes(vec![1])));
@@ -1286,8 +1611,9 @@ fn a_process_with_no_descriptor_free_keeps_its_session_and_connects_later() {
         let host = PathBuf::from(host);
         let endpoint = Endpoint::Path(host.clone());
         let resolver = UdsResolver::connect(endpoint, &ResolverOptions::default()).unwrap();
-        let subscriber =
-            NamedSubscriber::<Bytes>::subscribe_with("a.full", &policy(), &resolver).unwrap();
+        let subscriber = policy::<Bytes>()
+            .subscribe_named_on("a.full", &resolver)
+            .unwrap();
         let mut full = std::fs::File::create(host.with_file_name("full")).unwrap();
         let limit = rustix::process::Rlimit {
             current: Some(512),
@@ -1353,7 +1679,7 @@ fn a_process_with_no_descriptor_free_keeps_its_session_and_connects_later() {
 fn the_watches_of_a_name_share_a_host_watch_that_ends_with_the_last() {
     let fixture = Fixture::new("shared_watch", AllowAll);
     let resolver = fixture.resolver();
-    let watch = |name| NamedSubscriber::<Bytes>::subscribe_with(name, &policy(), &resolver);
+    let watch = |name| policy::<Bytes>().subscribe_named_on(name, &resolver);
     let first = watch("a.name").unwrap();
     let mut second = watch("a.name").unwrap();
     let other = watch("a.other").unwrap();
@@ -1382,7 +1708,7 @@ fn the_watches_of_a_name_share_a_host_watch_that_ends_with_the_last() {
 fn a_name_watched_again_right_after_its_last_watch_hears_of_a_change() {
     let fixture = Fixture::new("watched_again", AllowAll);
     let resolver = fixture.resolver();
-    let watch = || NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &resolver);
+    let watch = || policy::<Bytes>().subscribe_named_on("a.name", &resolver);
     let mut subscriber = watch().unwrap();
     for _ in 0..50 {
         drop(subscriber);
@@ -1401,7 +1727,11 @@ fn a_resolver_watches_many_names_on_one_address_and_no_session_ends() {
     let names: Vec<String> = (0..20).map(|n| format!("a.name{n}")).collect();
     let mut subscribers: Vec<NamedSubscriber<Bytes>> = names
         .iter()
-        .map(|name| NamedSubscriber::subscribe_with(name, &policy(), &resolver).unwrap())
+        .map(|name| {
+            policy::<Bytes>()
+                .subscribe_named_on(name, &resolver)
+                .unwrap()
+        })
         .collect();
     let raw = fixture.raw();
     let mut publishers = Vec::new();
@@ -1615,9 +1945,7 @@ fn a_publisher_stopped_in_the_subscription_call_holds_no_watch_from_the_next_one
     let mut subscriber = named(&fixture, "a.name");
     running.recv_timeout(WAIT).unwrap();
 
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     assert!(subscriber.wait_connected(WAIT));
     publisher.publish(&Bytes(vec![1])).unwrap();
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
@@ -1678,7 +2006,9 @@ fn a_dropped_subscriber_closes_the_session_of_a_publisher_stopped_in_the_call() 
         resolver: fixture.resolver(),
         seen: seen.clone(),
     };
-    let subscriber = NamedSubscriber::<Bytes>::subscribe_with("a.name", &policy(), &spy).unwrap();
+    let subscriber = policy::<Bytes>()
+        .subscribe_named_on("a.name", &spy)
+        .unwrap();
     running.recv_timeout(WAIT).unwrap();
     assert!(!seen.lock().unwrap().is_empty());
     drop(subscriber);
@@ -2231,11 +2561,10 @@ fn a_host_that_holds_a_call_holds_no_publisher_drop_and_no_watch_drop() {
     });
     let fixture = Fixture::new("held_host", access);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
-    let watching =
-        NamedSubscriber::<Bytes>::subscribe_with("b.name", &policy(), &resolver).unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
+    let watching = policy::<Bytes>()
+        .subscribe_named_on("b.name", &resolver)
+        .unwrap();
     let mut subscriber = named(&fixture, "a.name");
     assert!(subscriber.wait_connected(WAIT));
 
@@ -2267,9 +2596,7 @@ fn a_host_that_holds_a_call_holds_no_publisher_drop_and_no_watch_drop() {
 fn a_dropped_publisher_refuses_a_connect_while_its_sessions_last() {
     let fixture = Fixture::new("refuses", AllowAll);
     let resolver = fixture.resolver();
-    let publisher =
-        Publisher::<Bytes>::advertise_with("a.name", &PublisherPolicy::default(), &resolver)
-            .unwrap();
+    let publisher = advertised("a.name", &resolver).unwrap();
     let raw = fixture.raw();
     let address = OwnedFd::from(raw.registry.r#lookup("a.name").unwrap().socket.unwrap());
     let subscriber = named(&fixture, "a.name");

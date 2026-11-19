@@ -31,9 +31,10 @@ use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::Token;
 use crate::layout::{self, ControlView, CLOSED, HEADER_OFFSET, MIN_RING, NO_FUTURE_WRITE, VERSION};
 use crate::pool::GenerationLoads;
+use crate::publish::PoolSpec;
 use crate::{
-    Acceptor, Bytes, Closed, Payload, PoolPolicy, PublishError, Publisher, PublisherPolicy,
-    RecvError, Start, Subscriber, SubscriberPolicy, Wake,
+    Acceptor, Bytes, Closed, EventTopic, Payload, PublishError, Publisher, PublisherBuilder,
+    RecvError, Start, Subscriber, Wake,
 };
 
 const ALONE: &str = "RSBINDER_TOPIC_ALONE";
@@ -67,19 +68,12 @@ pub(crate) fn memfds() -> (usize, usize) {
     )
 }
 
-fn policy() -> PublisherPolicy {
-    PublisherPolicy {
-        ring_bytes: MIN_RING,
-        ..PublisherPolicy::default()
-    }
+fn events<T: Payload + 'static>() -> PublisherBuilder<T, EventTopic> {
+    Publisher::<T>::events()
 }
 
 fn subscribe<T: Payload>(topic: &SIBinder, start: Start) -> BinderResult<Subscriber<T>> {
-    let policy = SubscriberPolicy {
-        start,
-        ..SubscriberPolicy::default()
-    };
-    Subscriber::request(topic, &policy)
+    Subscriber::<T>::builder().start_at(start).subscribe(topic)
 }
 
 fn bytes(byte: u8) -> Bytes {
@@ -112,7 +106,7 @@ fn control(magic: &[u8; 4], version: u32, pins: u32, size: u64) -> OwnedFd {
     )
 }
 
-/// A request as `Subscriber::request` makes it, with `control` and `token` given.
+/// A request as `SubscriberBuilder::subscribe` makes it, with `control` and `token` given.
 fn request(control: OwnedFd, token: SIBinder) -> SubscribeRequest {
     SubscribeRequest {
         version: VERSION as i32,
@@ -148,9 +142,9 @@ fn code(result: BinderResult<impl Sized>) -> StatusCode {
 
 #[test]
 fn a_subscriber_in_the_publishers_process_receives_and_each_end_sees_the_other_go() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let topic = publisher.as_binder();
-    let mut subscriber = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
+    let mut subscriber = subscribe::<Bytes>(&topic, Start::Next).unwrap();
     assert_eq!(publisher.subscriber_count(), 1);
     assert_eq!(subscriber.try_recv(), Err(RecvError::Empty));
     publisher.publish(&bytes(1)).unwrap();
@@ -162,49 +156,49 @@ fn a_subscriber_in_the_publishers_process_receives_and_each_end_sees_the_other_g
     drop(subscriber);
     assert_eq!(publisher.subscriber_count(), 0);
 
-    let mut subscriber = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
+    let mut subscriber = subscribe::<Bytes>(&topic, Start::Next).unwrap();
     publisher.publish(&bytes(4)).unwrap();
     // The binder outlives the publisher, as one the service manager holds does.
     drop(publisher);
     assert_eq!(subscriber.try_recv(), Ok(bytes(4)));
     assert_eq!(subscriber.try_recv(), Err(RecvError::Closed(Closed::End)));
-    let late = subscribe::<Bytes>(&topic, Start::Latest);
+    let late = subscribe::<Bytes>(&topic, Start::Next);
     assert_eq!(service_specific(late), ERROR_CLOSED);
 }
 
 #[test]
 fn each_start_takes_the_record_it_names_first() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let topic = publisher.as_binder();
-    let mut last = subscribe::<Bytes>(&topic, Start::Last).unwrap();
+    let mut newest = subscribe::<Bytes>(&topic, Start::Newest).unwrap();
     publisher
         .publish_all(&[bytes(0), bytes(1), bytes(2)])
         .unwrap();
-    // `Last` on a topic with no record yet starts where `Latest` would.
-    assert_eq!(last.try_recv(), Ok(bytes(0)));
+    // `Newest` on a topic with no record yet starts where `Next` would.
+    assert_eq!(newest.try_recv(), Ok(bytes(0)));
 
-    let mut latest = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
-    let mut last = subscribe::<Bytes>(&topic, Start::Last).unwrap();
+    let mut next = subscribe::<Bytes>(&topic, Start::Next).unwrap();
+    let mut newest = subscribe::<Bytes>(&topic, Start::Newest).unwrap();
     let mut oldest = subscribe::<Bytes>(&topic, Start::Oldest).unwrap();
-    assert_eq!(latest.try_recv(), Err(RecvError::Empty));
-    assert_eq!(last.try_recv(), Ok(bytes(2)));
+    assert_eq!(next.try_recv(), Err(RecvError::Empty));
+    assert_eq!(newest.try_recv(), Ok(bytes(2)));
     assert_eq!(oldest.try_recv(), Ok(bytes(0)));
     publisher.publish(&bytes(3)).unwrap();
-    assert_eq!(latest.try_recv(), Ok(bytes(3)));
-    assert_eq!(last.try_recv(), Ok(bytes(3)));
+    assert_eq!(next.try_recv(), Ok(bytes(3)));
+    assert_eq!(newest.try_recv(), Ok(bytes(3)));
     assert_eq!(oldest.try_recv(), Ok(bytes(1)));
 }
 
 #[test]
 fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let acceptor = publisher.acceptor();
     let page = || control(b"RSTC", VERSION, 0, 0x80);
 
     let mut other = request(page(), token());
     other.version = VERSION as i32 + 1;
     assert_eq!(service_specific(acceptor.accept(&other)), ERROR_VERSION);
-    let other = subscribe::<crate::typed_tests::Sample>(&publisher.as_binder(), Start::Latest);
+    let other = subscribe::<crate::typed_tests::Sample>(&publisher.as_binder(), Start::Next);
     assert_eq!(code(other), StatusCode::BadType);
     // Asked from this thread, two pins on a page of two: the count alone is wrong.
     for (pins, page) in [(2, control(b"RSTC", VERSION, 2, 0x88)), (-1, page())] {
@@ -242,7 +236,7 @@ fn a_request_the_publisher_cannot_take_is_refused_for_what_is_wrong_with_it() {
 
 #[test]
 fn a_control_page_that_is_not_what_the_request_says_is_refused() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let acceptor = publisher.acceptor();
     let seals = Seals::GROW | Seals::SHRINK | Seals::FUTURE_WRITE;
     let null = OwnedFd::from(File::open("/dev/null").unwrap());
@@ -256,7 +250,7 @@ fn a_control_page_that_is_not_what_the_request_says_is_refused() {
         (control(b"RSTC", VERSION, 1, 0x80), "another pin count"),
         (control(b"RSTC", VERSION, 0, 0x88), "another size"),
     ] {
-        // The request is made as `Subscriber::request` makes it, from this thread.
+        // The request is made as `SubscriberBuilder::subscribe` makes it, from this thread.
         let asked = request(fd, token());
         let _asking = crate::connect::Asking::new(&asked);
         let refused = acceptor.accept(&asked);
@@ -279,7 +273,7 @@ fn a_control_page_that_is_not_what_the_request_says_is_refused() {
 /// A request with this thread's token but not its address, as a nested call brings, is refused.
 #[test]
 fn a_copy_of_the_request_this_thread_makes_is_refused() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let acceptor = publisher.acceptor();
     let token = token();
     let asked = request(control(b"RSTC", VERSION, 0, 0x80), token.clone());
@@ -293,37 +287,30 @@ fn a_copy_of_the_request_this_thread_makes_is_refused() {
 
 #[test]
 fn a_full_publisher_refuses_until_a_subscriber_goes() {
-    let policy = PublisherPolicy {
-        max_subscribers: 2,
-        ..policy()
-    };
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let builder = events::<Bytes>().max_subscribers(2);
+    let publisher = builder.clone().build().unwrap();
     let topic = publisher.as_binder();
-    let first = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
-    let _second = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
-    let third = subscribe::<Bytes>(&topic, Start::Latest);
+    let first = subscribe::<Bytes>(&topic, Start::Next).unwrap();
+    let _second = subscribe::<Bytes>(&topic, Start::Next).unwrap();
+    let third = subscribe::<Bytes>(&topic, Start::Next);
     assert_eq!(service_specific(third), ERROR_FULL);
     drop(first);
     // The refused one left nothing; the dropped one is taken out before the count is checked.
-    assert!(subscribe::<Bytes>(&topic, Start::Latest).is_ok());
+    assert!(subscribe::<Bytes>(&topic, Start::Next).is_ok());
 
     // Every subscription here is this process's uid.
-    let policy = PublisherPolicy {
-        max_per_uid: 1,
-        ..policy
-    };
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
-    let _first = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest).unwrap();
-    let second = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest);
+    let publisher = builder.max_per_uid(1).build().unwrap();
+    let _first = subscribe::<Bytes>(&publisher.as_binder(), Start::Next).unwrap();
+    let second = subscribe::<Bytes>(&publisher.as_binder(), Start::Next);
     assert_eq!(service_specific(second), ERROR_FULL);
 }
 
 #[test]
 fn a_closed_publisher_takes_no_subscription() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
-    let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
+    let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Next).unwrap();
     publisher.close_with(&Status::new_service_specific_error(9, None));
-    let late = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest);
+    let late = subscribe::<Bytes>(&publisher.as_binder(), Start::Next);
     assert_eq!(service_specific(late), ERROR_CLOSED);
     assert!(matches!(
         subscriber.try_recv(),
@@ -351,25 +338,25 @@ impl ITopic for Guarded {
 
 #[test]
 fn an_itopic_of_the_application_refuses_or_admits_through_its_acceptor() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     // Outside a transaction, this process's own.
     let uid = CallingContext::current().uid;
     let guard = |uid| {
         let acceptor = publisher.acceptor();
         BnTopic::new_binder(Guarded { uid, acceptor }).as_binder()
     };
-    let refused = subscribe::<Bytes>(&guard(uid.wrapping_add(1)), Start::Latest);
+    let refused = subscribe::<Bytes>(&guard(uid.wrapping_add(1)), Start::Next);
     assert_eq!(
         refused.err().map(|status| status.exception_code()),
         Some(ExceptionCode::Security)
     );
-    let mut admitted = subscribe::<Bytes>(&guard(uid), Start::Latest).unwrap();
+    let mut admitted = subscribe::<Bytes>(&guard(uid), Start::Next).unwrap();
     publisher.publish(&bytes(5)).unwrap();
     assert_eq!(admitted.try_recv(), Ok(bytes(5)));
     let topic = guard(uid);
     drop(publisher);
     assert_eq!(
-        service_specific(subscribe::<Bytes>(&topic, Start::Latest)),
+        service_specific(subscribe::<Bytes>(&topic, Start::Next)),
         ERROR_CLOSED
     );
 }
@@ -400,6 +387,7 @@ fn endpoint(fd: OwnedFd, capacity: u64) -> TopicEndpoint {
         start: 0,
         startIndex: 0,
         pool: None,
+        topicKind: crate::TopicKind::Event.wire(),
     }
 }
 
@@ -417,21 +405,22 @@ fn with_pool(endpoint: TopicEndpoint, fd: OwnedFd, slots: i32, slot_bytes: i32) 
 
 #[test]
 fn a_publisher_with_a_pool_hands_it_to_each_subscriber() {
-    let pooled = PoolPolicy {
+    let pooled = PoolSpec {
         slot_bytes: 100,
         depth: 1,
         max_loans: 2,
         huge_pages: false,
     };
-    let policy = PublisherPolicy {
-        max_subscribers: 2,
-        pool: Some(pooled.clone()),
-        ..policy()
-    };
+    let builder = events::<Bytes>()
+        .max_subscribers(2)
+        .lend(100)
+        .lend_keep(1)
+        .max_loans(2);
+    assert_eq!(builder.event_spec().unwrap().pool, Some(pooled.clone()));
     // A slot for each subscriber's pin, one to write, the depth and the loans; 64-byte slots.
     assert_eq!(pooled.shape(2), Some((2 + 1 + 1 + 2, 128)));
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
-    let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest).unwrap();
+    let publisher = builder.build().unwrap();
+    let mut subscriber = subscribe::<Bytes>(&publisher.as_binder(), Start::Next).unwrap();
     let pool = subscriber.pool().expect("the publisher's pool");
     assert_eq!(pool.slots(), 6);
     assert_eq!((0..6).map(|slot| pool.load_generation(slot)).max(), Some(0));
@@ -439,27 +428,28 @@ fn a_publisher_with_a_pool_hands_it_to_each_subscriber() {
     publisher.publish(&bytes(9)).unwrap();
     assert_eq!(subscriber.try_recv(), Ok(bytes(9)));
 
-    let plain = Publisher::<Bytes>::new(&self::policy()).unwrap();
-    let subscriber = subscribe::<Bytes>(&plain.as_binder(), Start::Latest).unwrap();
+    let plain = events::<Bytes>().build().unwrap();
+    let subscriber = subscribe::<Bytes>(&plain.as_binder(), Start::Next).unwrap();
     assert!(subscriber.pool().is_none());
 }
 
 /// A `depth` or `max_loans` of 0 counts as 1 in the slot count, as the pool keeps and lends.
 #[test]
 fn a_zero_depth_or_loan_count_is_counted_as_the_pool_uses_it() {
-    let zero = PoolPolicy {
+    let zero = PoolSpec {
         slot_bytes: 64,
         depth: 0,
         max_loans: 0,
         huge_pages: false,
     };
     assert_eq!(zero.shape(2), Some((2 + 1 + 1 + 1, 64)));
-    let policy = PublisherPolicy {
-        max_subscribers: 2,
-        pool: Some(zero),
-        ..policy()
-    };
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let builder = events::<Bytes>()
+        .max_subscribers(2)
+        .lend(64)
+        .lend_keep(0)
+        .max_loans(0);
+    assert_eq!(builder.event_spec().unwrap().pool, Some(zero));
+    let publisher = builder.build().unwrap();
     let loan = publisher.loan_slice(8).expect("a loan with max_loans 0");
     assert_eq!(
         publisher.loan_slice(8).err(),
@@ -470,27 +460,26 @@ fn a_zero_depth_or_loan_count_is_counted_as_the_pool_uses_it() {
 
 #[test]
 fn a_pool_past_4_gib_is_refused_before_anything_is_made() {
-    let pool = |slot_bytes| PoolPolicy {
+    let pool = |slot_bytes| PoolSpec {
         slot_bytes,
-        ..PoolPolicy::default()
+        depth: 2,
+        max_loans: 1,
+        huge_pages: false,
     };
     // 68 slots of 64 MiB is past 4 GiB; of 32 MiB, under it.
     assert_eq!(pool(64 << 20).shape(64), None);
     assert_eq!(pool(32 << 20).shape(64), Some((68, 32 << 20)));
     assert_eq!(pool(usize::MAX).shape(1), None);
     assert_eq!(pool(1).shape(usize::MAX), None);
-    let policy = PublisherPolicy {
-        pool: Some(pool(64 << 20)),
-        ..policy()
-    };
-    let refused = Publisher::<Bytes>::new(&policy).unwrap_err();
+    let builder = events::<Bytes>().lend(64 << 20);
+    assert_eq!(builder.event_spec().unwrap().pool, Some(pool(64 << 20)));
+    let refused = builder.build().unwrap_err();
     assert_eq!(refused.exception_code(), ExceptionCode::IllegalArgument);
     assert_eq!(refused.message(), Some("rejected: pool larger than 4 GiB"));
-    let small = PublisherPolicy {
-        ring_bytes: 4095,
-        ..PublisherPolicy::default()
-    };
-    let refused = Publisher::<Bytes>::new(&small).unwrap_err();
+    let refused = Publisher::<Bytes>::events()
+        .ring_bytes(4095)
+        .build()
+        .unwrap_err();
     assert_eq!(refused.exception_code(), ExceptionCode::IllegalArgument);
     assert_eq!(
         refused.message(),
@@ -518,6 +507,17 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
             }),
             Some(ERROR_VERSION),
             "another version",
+        ),
+        (
+            Box::new({
+                let good = good.clone();
+                move || TopicEndpoint {
+                    topicKind: 2,
+                    ..endpoint(dup(&good), capacity)
+                }
+            }),
+            None,
+            "a topic of no kind",
         ),
         (
             Box::new({
@@ -609,11 +609,9 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
             "topic memory as the pool",
         ),
     ];
-    let policy = SubscriberPolicy {
-        max_ring_bytes: MIN_RING,
-        max_pool_bytes: 1 << 20,
-        ..SubscriberPolicy::default()
-    };
+    let builder = Subscriber::<Bytes>::builder()
+        .max_ring_bytes(MIN_RING)
+        .max_pool_bytes(1 << 20);
     for (make, refused, why) in cases {
         let control = Arc::new(Mutex::new(None));
         let forged = Forged {
@@ -621,7 +619,7 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
             control: control.clone(),
         };
         let topic = BnTopic::new_binder(forged).as_binder();
-        let refusal = Subscriber::<Bytes>::request(&topic, &policy).map(drop);
+        let refusal = builder.clone().subscribe(&topic).map(drop);
         match refused {
             Some(error) => assert_eq!(service_specific(refusal), error, "{why}"),
             None => assert_eq!(code(refusal), StatusCode::BadValue, "{why}"),
@@ -634,13 +632,13 @@ fn a_reply_the_subscriber_cannot_use_is_refused_and_its_control_page_closed() {
         control: Arc::new(Mutex::new(None)),
     };
     let topic = BnTopic::new_binder(forged).as_binder();
-    assert!(Subscriber::<Bytes>::request(&topic, &policy).is_ok());
+    assert!(builder.subscribe(&topic).is_ok());
 }
 
 /// AC-15.2.25 for the wake: a request whose `wakeFd` is not what its `wake` asks for.
 #[test]
 fn a_request_with_a_wake_fd_the_publisher_cannot_use_is_refused() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let acceptor = publisher.acceptor();
     type Wakes = fn() -> Option<OwnedFd>;
     let socket: Wakes = || Some(crate::wake::pair().unwrap().0);
@@ -700,12 +698,11 @@ fn a_request_with_a_wake_fd_the_publisher_cannot_use_is_refused() {
 /// A byte this process sends on the subscriber's own wake socket is readable until drained.
 #[test]
 fn a_wake_of_this_process_makes_the_wake_socket_readable_until_drained() {
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
-    let policy = SubscriberPolicy {
-        wake: Wake::Fd,
-        ..SubscriberPolicy::default()
-    };
-    let subscriber = Subscriber::<Bytes>::request(&publisher.as_binder(), &policy).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
+    let subscriber = Subscriber::<Bytes>::builder()
+        .wake(Wake::Fd)
+        .subscribe(&publisher.as_binder())
+        .unwrap();
     let words = subscriber.local().words();
     let fd = words.fd.as_ref().unwrap();
     let readable = || {
@@ -745,11 +742,10 @@ fn a_wake_socket_shut_down_without_an_end_ends_the_wait_as_the_publishers_death(
         theirs: theirs.clone(),
     };
     let topic = BnTopic::new_binder(shutting).as_binder();
-    let policy = SubscriberPolicy {
-        wake: Wake::Fd,
-        ..SubscriberPolicy::default()
-    };
-    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .wake(Wake::Fd)
+        .subscribe(&topic)
+        .unwrap();
     let local = subscriber.local().clone();
     let wait = std::time::Duration::from_secs(10);
     let receiving = std::thread::spawn(move || subscriber.recv_timeout(wait).map(drop));
@@ -808,7 +804,7 @@ fn a_reader_lapped_at_every_look_ends_at_its_deadline() {
     };
     let short = Duration::from_millis(100);
     let (sent, got) = mpsc::channel();
-    let mut subscriber = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
+    let mut subscriber = subscribe::<Bytes>(&topic, Start::Next).unwrap();
     moving(&mut subscriber);
     #[cfg_attr(
         not(feature = "tokio"),
@@ -828,11 +824,10 @@ fn a_reader_lapped_at_every_look_ends_at_its_deadline() {
     // Each `recv_async`: on the blocking pool's path, and on the reactor's.
     #[cfg(feature = "tokio")]
     for wake in [Wake::Futex, Wake::Fd] {
-        let policy = SubscriberPolicy {
-            wake,
-            ..SubscriberPolicy::default()
-        };
-        let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+        let mut subscriber = Subscriber::<Bytes>::builder()
+            .wake(wake)
+            .subscribe(&topic)
+            .unwrap();
         moving(&mut subscriber);
         locals.push(subscriber.local().clone());
         let (to, lapping) = (sent.clone(), writer.clone());
@@ -866,11 +861,10 @@ fn a_reader_lapped_at_every_look_sleeps_when_no_deadline_ends_it() {
     use std::time::{Duration, Instant};
     let (topic, writer) = lapped_topic();
     let subscribe = |wake| {
-        let policy = SubscriberPolicy {
-            wake,
-            ..SubscriberPolicy::default()
-        };
-        Subscriber::<Bytes>::request(&topic, &policy).unwrap()
+        Subscriber::<Bytes>::builder()
+            .wake(wake)
+            .subscribe(&topic)
+            .unwrap()
     };
     let cases = [
         (Wake::Futex, false),
@@ -954,11 +948,10 @@ fn a_reactor_wait_whose_seq_moves_at_every_arm_ends_at_its_timeout() {
         theirs: Mutex::new(None),
     };
     let topic = BnTopic::new_binder(keeping).as_binder();
-    let policy = SubscriberPolicy {
-        wake: Wake::Fd,
-        ..SubscriberPolicy::default()
-    };
-    let mut subscriber = Subscriber::<Bytes>::request(&topic, &policy).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .wake(Wake::Fd)
+        .subscribe(&topic)
+        .unwrap();
     // Between the wait's `seen` and its look after arming, so that look never finds `seen`.
     let stored = Mutex::new((stored, 0u32));
     subscriber.about_to_park = Some(Box::new(move || {
@@ -1000,7 +993,7 @@ impl Payload for Explosive {
 
 #[test]
 fn a_panic_in_encode_leaves_the_publisher_working() {
-    let publisher = Arc::new(Publisher::<Explosive>::new(&policy()).unwrap());
+    let publisher = Arc::new(events::<Explosive>().build().unwrap());
     let topic = publisher.as_binder();
     let panicked = std::thread::spawn({
         let publisher = publisher.clone();
@@ -1011,7 +1004,7 @@ fn a_panic_in_encode_leaves_the_publisher_working() {
     let caught = std::panic::catch_unwind(AssertUnwindSafe(|| publisher.publish_all([&Explosive])));
     assert!(caught.is_err());
     // The lock was never taken with the encoding running, so nothing is poisoned.
-    let _subscriber = subscribe::<Explosive>(&topic, Start::Latest).unwrap();
+    let _subscriber = subscribe::<Explosive>(&topic, Start::Next).unwrap();
     assert_eq!(publisher.publish_all([]), Ok(0));
     assert_eq!(publisher.subscriber_count(), 1);
 }
@@ -1021,14 +1014,14 @@ fn without_the_future_write_seal_nothing_is_made_and_nothing_is_left() {
     if !alone("connect_tests::without_the_future_write_seal_nothing_is_made_and_nothing_is_left") {
         return;
     }
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let before = memfds();
     NO_FUTURE_WRITE.set(true);
     assert_eq!(
-        Publisher::<Bytes>::new(&policy()).err(),
+        events::<Bytes>().build().err(),
         Some(Status::from(ExceptionCode::UnsupportedOperation))
     );
-    let refused = subscribe::<Bytes>(&publisher.as_binder(), Start::Latest);
+    let refused = subscribe::<Bytes>(&publisher.as_binder(), Start::Next);
     assert_eq!(
         refused.err().map(|status| status.exception_code()),
         Some(ExceptionCode::UnsupportedOperation)
@@ -1043,20 +1036,16 @@ fn a_refused_or_ended_subscription_leaves_no_memfd_behind() {
     if !alone("connect_tests::a_refused_or_ended_subscription_leaves_no_memfd_behind") {
         return;
     }
-    let policy = PublisherPolicy {
-        max_subscribers: 1,
-        ..policy()
-    };
-    let publisher = Publisher::<Bytes>::new(&policy).unwrap();
+    let publisher = events::<Bytes>().max_subscribers(1).build().unwrap();
     let topic = publisher.as_binder();
     let before = memfds();
-    let held = subscribe::<Bytes>(&topic, Start::Latest).unwrap();
+    let held = subscribe::<Bytes>(&topic, Start::Next).unwrap();
     // Each side maps the other's object; the subscriber also maps its own control page.
     let (fds, maps) = before;
     assert_eq!(memfds(), (fds, maps + 3));
-    let full = subscribe::<Bytes>(&topic, Start::Latest);
+    let full = subscribe::<Bytes>(&topic, Start::Next);
     assert_eq!(service_specific(full), ERROR_FULL);
-    let wrong = subscribe::<crate::typed_tests::Sample>(&topic, Start::Latest);
+    let wrong = subscribe::<crate::typed_tests::Sample>(&topic, Start::Next);
     assert_eq!(code(wrong), StatusCode::BadType);
     assert_eq!(memfds(), (fds, maps + 3));
     drop(held);
@@ -1068,7 +1057,7 @@ fn a_refused_or_ended_subscription_leaves_no_memfd_behind() {
 fn an_rpc_binder_of_a_session_with_no_incoming_connection_is_refused() {
     use rsbinder::rpc::{RpcServer, RpcSession};
 
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let name = format!("rsbinder-topic-rpc-{}", std::process::id());
     let server = RpcServer::setup_unix_server_abstract(name.as_bytes()).unwrap();
     server.set_root(publisher.as_binder()).unwrap();
@@ -1076,7 +1065,7 @@ fn an_rpc_binder_of_a_session_with_no_incoming_connection_is_refused() {
     let session = RpcSession::setup_unix_client_abstract(name.as_bytes()).unwrap();
     let topic = session.get_root().unwrap();
     assert!(topic.is_remote() && topic.as_proxy().is_none());
-    let refused = subscribe::<Bytes>(&topic, Start::Latest);
+    let refused = subscribe::<Bytes>(&topic, Start::Next);
     assert_eq!(code(refused), StatusCode::InvalidOperation);
     assert_eq!(publisher.subscriber_count(), 0);
 }
@@ -1136,18 +1125,18 @@ fn instances_of_a_generic_parcelable_share_a_type_name_unless_wrapped() {
         <Pair<i32> as Payload>::type_name(),
         <Pair<i64> as Payload>::type_name()
     );
-    let publisher = Publisher::<Pair<i32>>::new(&policy()).unwrap();
+    let publisher = events::<Pair<i32>>().build().unwrap();
     let topic = publisher.as_binder();
     // Taken, and the records are not what the subscriber's type reads.
-    let mut other = subscribe::<Pair<i64>>(&topic, Start::Latest).unwrap();
+    let mut other = subscribe::<Pair<i64>>(&topic, Start::Next).unwrap();
     publisher.publish(&Pair(7)).unwrap();
     assert!(matches!(other.try_recv(), Err(RecvError::Decode(_))));
     assert_eq!(
-        code(subscribe::<Longs>(&topic, Start::Latest)),
+        code(subscribe::<Longs>(&topic, Start::Next)),
         StatusCode::BadType
     );
-    let longs = Publisher::<Longs>::new(&policy()).unwrap();
-    let mut wrapped = subscribe::<Longs>(&longs.as_binder(), Start::Latest).unwrap();
+    let longs = events::<Longs>().build().unwrap();
+    let mut wrapped = subscribe::<Longs>(&longs.as_binder(), Start::Next).unwrap();
     longs.publish(&Longs(Pair(-3))).unwrap();
     assert_eq!(wrapped.try_recv(), Ok(Longs(Pair(-3))));
 }
@@ -1157,7 +1146,7 @@ fn instances_of_a_generic_parcelable_share_a_type_name_unless_wrapped() {
 fn an_unsynchronized_reader_of_bytes_reads_the_records_of_a_reply() {
     use rsbinder::fmq::{AttachPolicy, Descriptor, UnsyncRead, UnsyncReader, UnsyncStart};
 
-    let publisher = Publisher::<Bytes>::new(&policy()).unwrap();
+    let publisher = events::<Bytes>().build().unwrap();
     let asking = token();
     let asked = request(control(b"RSTC", VERSION, 0, 0x80), asking.clone());
     let endpoint = {

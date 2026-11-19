@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 
 use rsbinder::Status;
 
-use crate::{
-    Bytes, Closed, Publisher, PublisherPolicy, RecvError, Start, Subscriber, SubscriberPolicy, Wake,
-};
+use crate::{Bytes, Closed, Publisher, RecvError, Start, Subscriber, Wake};
 
 fn num(n: u32) -> Bytes {
     Bytes(n.to_le_bytes().to_vec())
@@ -29,19 +27,14 @@ fn value(bytes: &Bytes) -> u32 {
 }
 
 fn topic(ring_bytes: usize) -> Publisher<Bytes> {
-    Publisher::new(&PublisherPolicy {
-        ring_bytes,
-        ..PublisherPolicy::default()
-    })
-    .unwrap()
+    Publisher::events().ring_bytes(ring_bytes).build().unwrap()
 }
 
 fn subscriber(publisher: &Publisher<Bytes>) -> Subscriber<Bytes> {
-    let policy = SubscriberPolicy {
-        start: Start::Latest,
-        ..SubscriberPolicy::default()
-    };
-    Subscriber::request(&publisher.as_binder(), &policy).unwrap()
+    Subscriber::<Bytes>::builder()
+        .start_at(Start::Next)
+        .subscribe(&publisher.as_binder())
+        .unwrap()
 }
 
 /// Poll `holds` until it does, failing after 10 s.
@@ -438,11 +431,10 @@ fn a_wait_that_saw_a_commit_on_the_fd_wake_is_woken_by_the_next() {
 fn a_commit_after_a_wait_that_saw_the_last(wake: Wake) {
     use std::sync::mpsc;
     let publisher = Arc::new(topic(64 << 10));
-    let policy = SubscriberPolicy {
-        wake,
-        ..SubscriberPolicy::default()
-    };
-    let mut subscriber = Subscriber::request(&publisher.as_binder(), &policy).unwrap();
+    let mut subscriber = Subscriber::<Bytes>::builder()
+        .wake(wake)
+        .subscribe(&publisher.as_binder())
+        .unwrap();
     // Once each: the first commit stops after its bump, the wait after `WAITING`.
     let (bumped, at_bump) = mpsc::sync_channel::<()>(0);
     let (resume, resumed) = mpsc::sync_channel::<()>(0);
@@ -574,8 +566,9 @@ impl crate::Payload for NotFour {
 #[test]
 fn a_slow_subscribers_lost_is_the_sum_of_its_lagged_on_both_ends() {
     let publisher = topic(4096);
-    let policy = SubscriberPolicy::default();
-    let mut slow = Subscriber::<NotFour>::request(&publisher.as_binder(), &policy).unwrap();
+    let mut slow = Subscriber::<NotFour>::builder()
+        .subscribe(&publisher.as_binder())
+        .unwrap();
     for n in 0..1000 {
         publisher.publish(&num(n)).unwrap();
     }

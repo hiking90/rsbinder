@@ -11,18 +11,17 @@ use std::sync::Arc;
 use rsbinder::hub;
 use rsbinder::{BinderResult, SIBinder};
 
-/// Turns topic names into topic binders, for [`Publisher::advertise_with`] and
-/// [`NamedSubscriber::subscribe_with`].
+/// Turns topic names into topic binders, for [`Publisher::advertise_on`] and
+/// [`SubscriberBuilder::subscribe_named_on`].
 ///
-/// [`ServiceManager`] is the implementation [`Publisher::advertise`] and
-/// [`NamedSubscriber::subscribe`] use; [`RegistryResolver`] is a registry of topic names, apart
+/// [`ServiceManager`] is the implementation [`SubscriberBuilder::subscribe_named`] uses;
+/// [`RegistryResolver`] is a registry of topic names, apart
 /// from service names; `registry::uds::UdsResolver` (feature `uds`) is one on a Unix socket.
 ///
 /// [`RegistryResolver`]: crate::registry::RegistryResolver
-/// [`Publisher::advertise`]: crate::Publisher::advertise
-/// [`Publisher::advertise_with`]: crate::Publisher::advertise_with
-/// [`NamedSubscriber::subscribe`]: crate::NamedSubscriber::subscribe
-/// [`NamedSubscriber::subscribe_with`]: crate::NamedSubscriber::subscribe_with
+/// [`Publisher::advertise_on`]: crate::Publisher::advertise_on
+/// [`SubscriberBuilder::subscribe_named`]: crate::SubscriberBuilder::subscribe_named
+/// [`SubscriberBuilder::subscribe_named_on`]: crate::SubscriberBuilder::subscribe_named_on
 pub trait Resolver: Send + Sync {
     /// Give `name` to `topic`, an `ITopic` binder, until the returned [`Advertisement`] is
     /// dropped.
