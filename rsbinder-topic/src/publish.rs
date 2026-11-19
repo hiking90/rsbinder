@@ -401,8 +401,7 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
             evicted: state.evicted,
             advertised: false,
         };
-        drop(state);
-        drop(gone);
+        self.unlock(state, gone);
         stats
     }
 
@@ -412,7 +411,10 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     }
 
     /// Unlock, then tell evictions and drop `gone`: a call under the lock may run a death notice.
-    fn unlock(&self, mut state: MutexGuard<'_, State<S>>, gone: Vec<Arc<Link>>) {
+    ///
+    /// Every lock that may change the list of subscriptions ends here, so what follows a change
+    /// runs for each one.
+    pub(crate) fn unlock(&self, mut state: MutexGuard<'_, State<S>>, gone: Vec<Arc<Link>>) {
         let evictions = std::mem::take(&mut state.evictions);
         let waited = state.backpressure.unwrap_or_default();
         drop(state);

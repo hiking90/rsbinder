@@ -281,8 +281,7 @@ impl<T: Payload + 'static> Publisher<T> {
         let mut state = self.shared.writer.lock();
         let gone = state.links.prune();
         let count = state.links.len();
-        drop(state);
-        drop(gone);
+        self.shared.writer.unlock(state, gone);
         count
     }
 
@@ -658,9 +657,8 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             state.links.push(link.clone(), start);
             Ok((start, state.writer.next_index()))
         };
-        drop(state);
-        // Unmapped and unlinked here, after the lock: `link` too, when it was refused.
-        drop(gone);
+        // Unmapped and unlinked after the lock: `link` too, when it was refused.
+        self.writer.unlock(state, gone);
         drop(link);
         let (start, index) = taken?;
         Ok(TopicEndpoint {
@@ -680,8 +678,7 @@ impl<T: Payload> Forget for Shared<T> {
     fn forget(&self, dead: &Arc<Dead>) {
         let mut state = self.writer.lock();
         let gone = state.links.remove(dead);
-        drop(state);
-        drop(gone);
+        self.writer.unlock(state, gone.into_iter().collect());
     }
 }
 
