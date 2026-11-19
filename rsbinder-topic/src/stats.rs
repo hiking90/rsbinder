@@ -28,6 +28,25 @@ pub struct PublisherStats {
     pub advertised: bool,
 }
 
+/// A publisher's list of subscriptions at one moment: [`Publisher::subscribers`] and
+/// [`Publisher::wait_subscribers`].
+///
+/// [`Publisher::subscribers`]: crate::Publisher::subscribers
+/// [`Publisher::wait_subscribers`]: crate::Publisher::wait_subscribers
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Subscribers {
+    /// Grows by one with every subscription the list takes in or lets go of, and with nothing
+    /// else. Two values that differ mean the list changed in between; how much it grew says
+    /// nothing more, since a check that finds several subscriptions ended counts once.
+    pub generation: u64,
+    /// The subscriptions held, as [`Publisher::subscriber_count`] counts them: those a wait for
+    /// room took out are counted until their subscribers drop them.
+    ///
+    /// [`Publisher::subscriber_count`]: crate::Publisher::subscriber_count
+    pub count: usize,
+}
+
 /// One subscription as its publisher sees it.
 ///
 /// `lag_bytes`, `lost` and `waiting` come from the subscriber's control page, which the

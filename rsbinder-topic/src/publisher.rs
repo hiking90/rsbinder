@@ -14,6 +14,7 @@
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use rsbinder::{
     BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
@@ -35,7 +36,7 @@ use crate::pool::MAX_PINS;
 use crate::publish::{Authorize, Spec};
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Advertisement, Resolver};
-use crate::{wake, Bytes, Payload, PublishError, PublisherStats, TopicKind};
+use crate::{wake, Bytes, Payload, PublishError, PublisherStats, Subscribers, TopicKind};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -249,6 +250,13 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.lock().after_bump = Some(pause);
     }
 
+    /// Sleeps a thread's wait for the list began; one counted holds the lock until it sleeps.
+    #[cfg(test)]
+    pub(crate) fn list_sleeps(&self) -> usize {
+        let sleeps = &self.shared.writer.list_sleeps;
+        sleeps.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Take a wait in `state` as woken already in every subscription.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn take_as_woken(&self, state: u32) {
@@ -283,6 +291,62 @@ impl<T: Payload + 'static> Publisher<T> {
         let count = state.links.len();
         self.shared.writer.unlock(state, gone);
         count
+    }
+
+    /// The subscriptions the topic holds now, after taking out those that ended, and the
+    /// generation of the list: the `seen` of a first [`wait_subscribers`](Self::wait_subscribers).
+    pub fn subscribers(&self) -> Subscribers {
+        self.shared.writer.subscribers()
+    }
+
+    /// Wait until the list of subscriptions is no longer at generation `seen`, or `timeout`
+    /// passes, then the list as it is: for a publisher that starts work when the first
+    /// subscriber comes and stops it when the last goes, without asking over and over.
+    ///
+    /// It returns at once when the list has changed since `seen` was read. Changes that land
+    /// between two calls are not lost: the next call sees the list as they left it. With
+    /// `timeout` passed it returns the list unchanged, its generation still `seen`.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use rsbinder_topic::{Bytes, Publisher};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let publisher = Publisher::<Bytes>::events().build()?;
+    /// let mut now = publisher.subscribers();
+    /// loop {
+    ///     if now.count > 0 {
+    ///         // Turn the sensor on, publish while someone listens.
+    ///     } else {
+    ///         // Turn it off.
+    ///     }
+    ///     now = publisher.wait_subscribers(now.generation, Some(Duration::from_secs(1)));
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// A subscriber of this crate tells the publisher when it drops its subscription, which
+    /// wakes this wait. One that does not (an `rsbinder-topic` 0.1 subscriber, or a process that
+    /// leaves its subscription without dropping it) is seen when the topic next checks: at the
+    /// next publish, or when this wait starts or times out. A wait without a timeout learns of
+    /// such a drop at the next publish only. A subscriber process that dies is seen at once.
+    ///
+    /// The wait takes the topic's lock to look, which a publish on a
+    /// [`lossless`](crate::PublisherBuilder::lossless) topic holds while it waits for room.
+    pub fn wait_subscribers(&self, seen: u64, timeout: Option<Duration>) -> Subscribers {
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        self.shared.writer.wait_subscribers(seen, deadline)
+    }
+
+    /// [`wait_subscribers`](Self::wait_subscribers) for a future, without a timeout: wrap it in
+    /// `tokio::time::timeout` for one. Dropping the future ends the wait and leaves nothing
+    /// behind.
+    ///
+    /// Each look takes the topic's lock on the thread that polls the future; a publish on a
+    /// [`lossless`](crate::PublisherBuilder::lossless) topic holds it while it waits for room.
+    #[cfg(feature = "tokio")]
+    pub async fn wait_subscribers_async(&self, seen: u64) -> Subscribers {
+        self.shared.writer.wait_subscribers_async(seen).await
     }
 
     /// End the topic without an error: subscribers receive the records before it, then

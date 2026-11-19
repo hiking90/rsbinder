@@ -145,7 +145,7 @@ pub use publisher::{Acceptor, LoanMut, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
 pub use resolve::{Advertisement, OnResolved, Resolved, Resolver, ServiceManager, Watch};
 pub use sample::Sample;
-pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
+pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats, Subscribers};
 pub use subscriber::{Interrupter, Start, Subscriber, Wake};
 pub use trust::{Trust, Trusted, Untrusted};
 
@@ -191,6 +191,19 @@ mod connect_tests;
     )
 ))]
 mod rpc_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod subscribers_tests;
 
 #[cfg(all(
     test,

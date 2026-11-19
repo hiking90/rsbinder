@@ -15,7 +15,7 @@ use crate::backpressure::Readers;
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::pool::{self, Pins};
 use crate::wake::{send_wake, Sent};
-use crate::SubscriberInfo;
+use crate::{SubscriberInfo, Subscribers};
 
 /// Link `recipient` to `binder`'s death, removed when the link drops; `None` for a binder of
 /// this process, which has none.
@@ -273,6 +273,9 @@ impl Eviction {
 #[derive(Default)]
 pub(crate) struct Links {
     links: Vec<Arc<Link>>,
+    /// Bumped by every change of `links`; `changed` is raised with it until the unlock takes it.
+    generation: u64,
+    changed: bool,
     /// Wake bytes sent.
     #[cfg(test)]
     sends: u64,
@@ -296,6 +299,25 @@ impl Links {
     pub(crate) fn push(&mut self, link: Arc<Link>, start: u64) {
         link.start.store(start, Ordering::Relaxed);
         self.links.push(link);
+        self.bump();
+    }
+
+    /// The list as it is now: its generation and its length.
+    pub(crate) fn subscribers(&self) -> Subscribers {
+        Subscribers {
+            generation: self.generation,
+            count: self.links.len(),
+        }
+    }
+
+    /// Whether the list changed since the last call, which lowers the flag.
+    pub(crate) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    fn bump(&mut self) {
+        self.generation += 1;
+        self.changed = true;
     }
 
     /// The lowest read position among the subscriptions that have not ended, each as its control
@@ -363,7 +385,11 @@ impl Links {
 
     /// Take out the subscriptions that ended.
     pub(crate) fn prune(&mut self) -> Vec<Arc<Link>> {
-        pool::take_ended(&mut self.links, |link| link.ended())
+        let gone = pool::take_ended(&mut self.links, |link| link.ended());
+        if !gone.is_empty() {
+            self.bump();
+        }
+        gone
     }
 
     /// Take out the subscription flagged by `dead`.
@@ -374,6 +400,7 @@ impl Links {
             .links
             .iter()
             .position(|link| Arc::ptr_eq(&link.dead, dead))?;
+        self.bump();
         Some(self.links.swap_remove(at))
     }
 }

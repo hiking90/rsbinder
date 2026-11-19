@@ -11,6 +11,7 @@ use std::sync::atomic::{fence, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use rsbinder::__sync::Signal;
 use rsbinder::{CallingContext, Status, StatusCode};
 
 use crate::backpressure::Lossless;
@@ -21,7 +22,7 @@ use crate::payload::{relabel, Piece};
 use crate::pool::LentSlot;
 use crate::pool::{LendError, Loan, Slots, MAX_PINS};
 use crate::ring::{Kind, Refused, Stores, Writer};
-use crate::{end, Encoding, Payload, PublisherStats, TopicKind};
+use crate::{end, Encoding, Payload, PublisherStats, Subscribers, TopicKind};
 
 /// What a topic is made with: the settings of a [`PublisherBuilder`](crate::PublisherBuilder),
 /// worked out.
@@ -326,6 +327,11 @@ thread_local! {
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
 pub(crate) struct TypedWriter<T, S> {
     state: Mutex<State<S>>,
+    /// Woken by [`unlock`](Self::unlock) after a change of the list of subscriptions.
+    subscribers: Signal,
+    /// Sleeps a thread's wait for the list began, each counted under the lock before it.
+    #[cfg(test)]
+    pub(crate) list_sleeps: std::sync::atomic::AtomicUsize,
     /// Buffers to encode into, one per thread that publishes at a time.
     scratch: Mutex<Vec<Scratch>>,
     max_payload: usize,
@@ -385,9 +391,63 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 #[cfg(all(test, not(loom)))]
                 after_bump: None,
             }),
+            subscribers: Signal::default(),
+            #[cfg(test)]
+            list_sleeps: std::sync::atomic::AtomicUsize::new(0),
             scratch: Mutex::new(Vec::new()),
             _payload: PhantomData,
         }
+    }
+
+    /// The list of subscriptions now, after taking out those that ended.
+    pub(crate) fn subscribers(&self) -> Subscribers {
+        let mut state = self.lock();
+        let gone = state.links.prune();
+        let now = state.links.subscribers();
+        self.unlock(state, gone);
+        now
+    }
+
+    /// The list once its generation is not `seen`, or as it is at `deadline`.
+    pub(crate) fn wait_subscribers(&self, seen: u64, deadline: Option<Instant>) -> Subscribers {
+        let mut state = self.lock();
+        let mut timed_out = false;
+        loop {
+            let gone = state.links.prune();
+            let now = state.links.subscribers();
+            // A prune that took one out changed the generation, and `gone` is dropped unlocked.
+            if timed_out || now.generation != seen || !gone.is_empty() {
+                self.unlock(state, gone);
+                return now;
+            }
+            #[cfg(test)]
+            self.list_sleeps.fetch_add(1, Ordering::SeqCst);
+            (state, timed_out) = match self
+                .subscribers
+                .wait_until(state, deadline)
+                .expect("lock poisoned")
+            {
+                Ok(state) => (state, false),
+                Err(state) => (state, true),
+            };
+        }
+    }
+
+    /// [`wait_subscribers`](Self::wait_subscribers) for a future, without a deadline.
+    #[cfg(feature = "tokio")]
+    pub(crate) async fn wait_subscribers_async(&self, seen: u64) -> Subscribers {
+        let mut now = Subscribers::default();
+        self.subscribers
+            .wait_async(|| {
+                let mut state = self.lock();
+                let gone = state.links.prune();
+                now = state.links.subscribers();
+                let done = now.generation != seen || !gone.is_empty();
+                self.unlock(state, gone);
+                done
+            })
+            .await;
+        now
     }
 
     /// What has been published, and the subscriptions held after taking out those that ended.
@@ -417,7 +477,11 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     pub(crate) fn unlock(&self, mut state: MutexGuard<'_, State<S>>, gone: Vec<Arc<Link>>) {
         let evictions = std::mem::take(&mut state.evictions);
         let waited = state.backpressure.unwrap_or_default();
+        let changed = state.links.take_changed();
         drop(state);
+        if changed {
+            self.subscribers.wake_all();
+        }
         for eviction in evictions {
             eviction.tell(T::type_name(), waited);
         }
