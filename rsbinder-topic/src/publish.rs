@@ -832,3 +832,6 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
         Ok(records.len())
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests;
