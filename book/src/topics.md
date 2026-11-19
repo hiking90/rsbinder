@@ -612,8 +612,16 @@ or with `--topic-socket` a hub's registry on a Unix socket:
 | `topic record NAME FILE` | each record with its receive time, into a file |
 
 `hz`, `echo` and `record` subscribe as an `AnyType` subscriber that is
-`unwaited`, so they hold up none of the topic's subscribers and say what they
-lose. `stat` gives a publisher that does not answer `--timeout` (2 s) and exits 2.
+`unwaited`, so they hold up none of the topic's subscribers and, on an event
+topic, say what they lose; a state topic skips past values without counting
+them. `stat` gives a publisher that does not answer `--timeout` (2 s) and exits 2.
+
+The file `record` writes is little-endian: the magic `RSTR`, a `u32` format
+version (1), the `u32` topic kind (`ITopic.TOPIC_EVENT` or `TOPIC_STATE`), the
+`u32` length of the type name and its bytes. Then one entry per record: a `u64`
+receive time (`CLOCK_MONOTONIC` nanoseconds), a `u32` length and the payload;
+or, where records were lost, the receive time, then `0xFFFF_FFFF` in place of
+the length and a `u64` count of them.
 
 The `tracing` feature of `rsbinder-topic` emits an event, under the target
 `rsbinder_topic`, for each subscription taken, refused, taken out or ended, the

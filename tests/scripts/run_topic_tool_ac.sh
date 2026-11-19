@@ -168,7 +168,7 @@ if start_hub --config "$CFG"; then
     tool "$WORK/none" topic stat tool.none
     [ "$RC" -eq 1 ] && ok "a name with no topic: exit 1" || bad "no topic exit $RC"
     tool "$WORK/list" topic list tool.
-    [ "$RC" -eq 0 ] && awk 'NR == 2 { exit $1 != "tool.a" }' "$WORK/list" \
+    [ "$RC" -eq 0 ] && awk 'NR == 2 { found = ($1 == "tool.a") } END { exit !found }' "$WORK/list" \
         && ok "topic list is topics" || bad "list: $(cat "$WORK/list")"
 
     kill -STOP "$PUB"

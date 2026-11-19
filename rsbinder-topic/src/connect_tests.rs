@@ -373,7 +373,7 @@ fn a_publisher_that_does_not_take_the_flag_has_the_unwaited_subscription_ended()
     let topic = BnTopic::new_binder(Unflagged(publisher.acceptor())).as_binder();
     let refused = Subscriber::<Bytes>::builder().unwaited().subscribe(&topic);
     assert_eq!(code(refused), StatusCode::InvalidOperation);
-    // Taken as a waited one, then told of its end by the subscriber that refused the reply.
+    // Taken as a waited one; its page closed, so the list no longer has it.
     assert_eq!(publisher.subscribers().count, 0);
     // A subscription that asks for nothing is the same to both.
     assert!(subscribe::<Bytes>(&topic, Start::Next).is_ok());

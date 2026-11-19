@@ -16,7 +16,6 @@ use crate::aidl::ITopic::{BnTopic, ITopic, WAKE_FUTEX};
 use crate::aidl::ITopicRegistry::ITopicRegistry;
 use crate::aidl::ITopicWatcher::BnTopicWatcher;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
-use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::Token;
 use crate::layout::{ControlPage, VERSION};
 use crate::link::{link_death, Dead};
@@ -199,29 +198,44 @@ fn a_subscriber_over_rpc_that_drops_tells_the_publisher_at_once() {
     server.terminate();
 }
 
-/// A publisher that predates `unsubscribed`: it answers the call `UNKNOWN_TRANSACTION`.
+/// A 0.1 publisher: its `on_transact` fails every code past `subscribe`, `UNKNOWN_TRANSACTION`.
 struct Predating(crate::Acceptor);
 
 impl Interface for Predating {}
 
-impl ITopic for Predating {
-    fn r#subscribe(&self, request: &SubscribeRequest) -> rsbinder::BinderResult<TopicEndpoint> {
-        self.0.accept(request)
+impl rsbinder::Remotable for Predating {
+    fn descriptor() -> &'static str {
+        <BnTopic as rsbinder::Remotable>::descriptor()
     }
 
-    fn r#unsubscribed(&self) -> rsbinder::BinderResult<()> {
-        Err(StatusCode::UnknownTransaction.into())
+    fn on_transact(
+        &self,
+        code: rsbinder::TransactionCode,
+        reader: &mut rsbinder::Parcel,
+        reply: &mut rsbinder::Parcel,
+    ) -> rsbinder::Result<()> {
+        if code != rsbinder::FIRST_CALL_TRANSACTION {
+            return Err(StatusCode::UnknownTransaction);
+        }
+        let request: SubscribeRequest = reader.read()?;
+        match self.0.accept(&request) {
+            Ok(endpoint) => {
+                reply.write(&rsbinder::Status::from(StatusCode::Ok))?;
+                reply.write(&endpoint)
+            }
+            Err(status) => reply.write(&status),
+        }
     }
 
-    fn r#status(&self) -> rsbinder::BinderResult<crate::aidl::TopicStatus::TopicStatus> {
-        Err(StatusCode::UnknownTransaction.into())
+    fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> rsbinder::Result<()> {
+        Ok(())
     }
 }
 
 #[test]
 fn a_publisher_that_predates_the_notice_keeps_the_session_it_comes_over() {
     let publisher = publisher();
-    let predating = BnTopic::new_binder(Predating(publisher.acceptor())).as_binder();
+    let predating = Interface::as_binder(&rsbinder::Binder::new(Predating(publisher.acceptor())));
     let (name, server) = serve(predating);
     let session = connect(&name, 1);
     let topic = session.get_root().unwrap();

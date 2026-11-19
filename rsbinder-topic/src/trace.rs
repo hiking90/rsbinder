@@ -8,8 +8,7 @@
 //! which its resolver's notices also take, so a tracing subscriber that calls back into the
 //! topic from them can hold those notices up.
 
-/// A `tracing` event of `level` under this crate's target; nothing without the feature, whose
-/// arguments are then not compiled either.
+/// A `tracing` event of `level` under this crate's target; without the feature, nothing compiled.
 macro_rules! event {
     ($level:ident, $($arg:tt)+) => {{
         #[cfg(feature = "tracing")]

@@ -6,22 +6,23 @@
 //!
 //! Each command finds the topic by its name once, through one of three sources: `rsb_hub`'s topic
 //! registry (the default), the service manager (`--service`), or the registry a hub serves on a
-//! Unix socket (`--topic-socket`). It never guesses: a name the chosen source has no topic for
-//! is exit 1.
+//! Unix socket (`--topic-socket`). It never guesses: a name the chosen source has nothing for is
+//! exit 1; a binder under the name that is not a topic refuses the call, which is exit 2.
 //!
 //! `hz`, `echo` and `record` subscribe once as a subscriber of any type
 //! (`rsbinder_topic::AnyType`) that the publisher does not wait for
 //! (`SubscriberBuilder::unwaited`): a slow terminal holds up no subscriber the topic serves, and
-//! loses records of its own instead, which each command reports. The subscription counts against
-//! the topic's bounds, so a full topic refuses it.
+//! on an event topic loses records of its own instead, which each command reports. A state topic
+//! skips past values without counting them, so nothing is reported lost there. The subscription
+//! counts against the topic's bounds, so a full topic refuses it.
 //!
 //! # The file `record` writes
 //!
 //! Little-endian. A header: the magic `RSTR`, a `u32` format version (1), the `u32` topic kind
 //! (`ITopic.TOPIC_EVENT` or `TOPIC_STATE`), the `u32` length of the type name and its bytes.
 //! Then one entry per record: a `u64` receive time (`CLOCK_MONOTONIC` nanoseconds), a `u32`
-//! length and the payload; or, where records were lost, the length `0xFFFF_FFFF` and a `u64`
-//! count of them. Each entry is flushed as it is written.
+//! length and the payload; or, where records were lost, the receive time, then `0xFFFF_FFFF` in
+//! place of the length and a `u64` count of them. Each entry is flushed as it is written.
 
 use std::fmt::Write as _;
 use std::fs::File;

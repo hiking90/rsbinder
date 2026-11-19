@@ -347,8 +347,7 @@ fn the_last_value_lent_on_a_state_topic_comes_before_its_end() {
 
 #[test]
 fn an_endpoint_without_a_kind_is_of_an_event_topic() {
-    // The parcelable ends before `topicKind`, which then reads as its default, as do the
-    // fields after it.
+    // Cut before `topicKind`: it and every field after read as defaults.
     let sent = TopicEndpoint {
         topicKind: TopicKind::State.wire(),
         id: 7,

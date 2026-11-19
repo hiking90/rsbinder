@@ -92,8 +92,7 @@ fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     assert_eq!(memfds(), before);
 }
 
-/// Wait for the list to change from another thread, started a while before `change`; the list
-/// and how long the wait took.
+/// The list a wait started on another thread before `change` returns, and how long it took.
 fn wait_through(
     publisher: &Publisher<Bytes>,
     change: impl FnOnce(),
@@ -116,9 +115,16 @@ fn wait_through(
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_publishers_wait_hears_of_a_subscriber_of_another_process_that_comes_drops_or_dies() {
     let (name, publisher) = publish("wait");
-    let mut peer = Peer::spawn("subscribe", &name);
-    let (now, took) = wait_through(&publisher, || assert_eq!(peer.says(), "subscribed"));
-    assert_eq!(now.count, 1, "after {took:?}");
+    // Spawned inside the change, so the subscription cannot come before the wait's `seen`.
+    let mut spawned = None;
+    let (now, took) = wait_through(&publisher, || {
+        let peer = Peer::spawn("subscribe", &name);
+        assert_eq!(peer.says(), "subscribed");
+        spawned = Some(peer);
+    });
+    let mut peer = spawned.unwrap();
+    assert!(took < WAIT / 2, "the subscription was not heard: {took:?}");
+    assert_eq!(now.count, 1);
     // The drop's one-way notice, with no publish to look at the page.
     let (now, took) = wait_through(&publisher, || {
         peer.tell("drop");
@@ -751,10 +757,10 @@ fn child() {
                 .r#status()
                 .unwrap();
             say(&format!("status {}", status.subscribers.len()));
-            let (read_end, write_end) = std::io::pipe().unwrap();
+            let (read_end, write_end) = rustix::pipe::pipe().unwrap();
             topic.as_proxy().unwrap().dump(write_end, &[]).unwrap();
             let mut text = String::new();
-            std::fs::File::from(OwnedFd::from(read_end))
+            std::fs::File::from(read_end)
                 .read_to_string(&mut text)
                 .unwrap();
             say(&format!("dump {}", text.lines().count()));

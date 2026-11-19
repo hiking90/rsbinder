@@ -20,7 +20,7 @@ Each item below breaks a build against rsbinder 0.13.0 or `rsbinder-topic`
 observes. `rsbinder-topic` goes to 0.2.0 with this release, as its API breaks.
 The book's
 [Migrating from 0.13 to 0.14](https://hiking90.github.io/rsbinder/migrating-0.14.html)
-says what to change for each. The item marked **wire** changes bytes between
+says what to change for each. The items marked **wire** change bytes between
 peers; peers of either release still subscribe to each other.
 
 - `try_get_interface_async`, `check_interface_async`,
@@ -149,9 +149,9 @@ peers; peers of either release still subscribe to each other.
   at the next one, and every receive of a state topic returns the newest value
   with no `RecvError::Lagged`.
 - `rsbinder-topic`: `Publisher::subscribers`, `wait_subscribers` and
-  `wait_subscribers_async`: the list of subscriptions as a generation and a
-  count, and a wait for it to change, for a publisher that works only while
-  someone subscribes.
+  `wait_subscribers_async`, returning `Subscribers` (a generation and a
+  count): the list of subscriptions, and a wait for it to change, for a
+  publisher that works only while someone subscribes.
 - `rsbinder-topic`: `SubscriberBuilder::unwaited`, a subscription no publish
   waits for and no wait for room takes out (`ITopic.FLAG_UNWAITED`); it loses
   what it does not read in time, and counts against the subscription bounds.
@@ -162,13 +162,16 @@ peers; peers of either release still subscribe to each other.
 - `rsbinder-topic`: `ITopic.status` and the binder dump of a publisher
   (`dumpsys` on Android), which name each subscription's uid, pid, lag and
   losses, for callers `PublisherBuilder::inspect` admits: by default the
-  publisher's uid, root, and on Android `shell`. `RegistryResolver::lookup`,
-  `uds::status` and `UdsResolver::status` ask for it from outside.
+  publisher's uid, root, and on Android `shell`. `RegistryResolver::lookup`
+  gives the `ITopic` binder of a registry name; `uds::status` and
+  `UdsResolver::status` ask for the status over a socket; `TopicStatus`
+  implements `Display`, the text of the dump.
 - `rsbinder-topic`: the `tracing` feature, events of each subscription's life
   under the target `rsbinder_topic`, none per record.
 - `rsbinder-tools`: `rsb_service topic list|stat|hz|echo|record` (feature
   `topic`), a topic's status, rate and records from outside its publisher;
-  `topics` stays as `topic list`.
+  `topics` stays as `topic list`; the module `rsbinder_tools::topic_cmd`
+  (feature `topic`) with the `record` file constants.
 
 ### Changed
 

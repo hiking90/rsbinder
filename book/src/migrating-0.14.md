@@ -181,12 +181,13 @@ refused with `EX_ILLEGAL_ARGUMENT`.
   is refused with `BadValue`.
 - **wire**: `SubscribeRequest` has a new last field, `flags`, and
   `TopicEndpoint` the last fields `id`, `flags` and `typeName`, in that order.
-  `ITopic` has two more methods, `unsubscribed` (one way, code 1) and `status`
-  (code 2). The layout version is unchanged, so peers of either release still
-  subscribe to each other. Against a publisher built on 0.1.0: `unsubscribed`
-  and `status` are `UNKNOWN_TRANSACTION`, the first never seen by its one-way
-  caller; `Subscriber::id` is `None` and `topic_type` the subscriber's own type
-  name; an `AnyType` subscriber is refused with `BadType`; and an `unwaited`
+  `ITopic` has two more methods, `unsubscribed` (one way) and `status`, at AIDL
+  index 1 and 2 (`FIRST_CALL_TRANSACTION + 1`, `+ 2`). The layout version is
+  unchanged, so peers of either release still subscribe to each other. Against
+  a publisher built on 0.1.0: `unsubscribed` and `status` are
+  `UNKNOWN_TRANSACTION`, the first never seen by its one-way caller;
+  `Subscriber::id` is `None` and `topic_type` the subscriber's own type name;
+  an `AnyType` subscriber is refused with `BadType`; and an `unwaited`
   subscriber is refused with `InvalidOperation` by its own side, which then
   tells the publisher to take the subscription out. A subscriber built on 0.1.0
   sends none of the fields, and its drop is seen at the publisher's next

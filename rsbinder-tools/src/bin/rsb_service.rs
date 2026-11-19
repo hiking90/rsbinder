@@ -402,7 +402,9 @@ fn cli() -> clap::Command {
                 ))
                 .subcommand(counted(
                     named_topic("record")
-                        .about("Write each record to FILE (see `rsbinder_tools::topic_cmd`)")
+                        .about(
+                            "Write each record to FILE (format: the book's \"Inspecting a topic\")",
+                        )
                         .arg(
                             clap::Arg::new("file")
                                 .value_name("FILE")
@@ -576,7 +578,7 @@ fn main() -> ExitCode {
     let device = matches
         .get_one::<String>("device")
         .expect("device has a default value");
-    // 0 threads: every call is a sync round trip and nothing inbound ever arrives.
+    // 0 threads: none the kernel asks for; a topic subscription starts the pool thread it needs.
     if let Err(e) = ProcessState::init(&format!("{DEFAULT_BINDERFS_PATH}/{device}"), 0) {
         eprintln!(
             "rsb_service: cannot open the binder device {DEFAULT_BINDERFS_PATH}/{device}: {e:?}"

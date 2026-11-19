@@ -266,11 +266,7 @@ pub(crate) struct Trace {
 /// was reached, through whichever binder or socket.
 pub(crate) type RingId = (u64, u64);
 
-/// The control page, marked `CLOSED` when dropped, and the publisher told so through `topic`.
-/// A wait left on the pool shares the page.
-///
-/// A field of the subscriber ahead of its death link and session, so the call goes out while
-/// both are held.
+/// Marks the page `CLOSED` and tells `topic` on drop, while the later death link and session live.
 struct Closing {
     page: Arc<ControlPage>,
     /// `None` once told.
@@ -281,8 +277,7 @@ impl Drop for Closing {
     fn drop(&mut self) {
         self.page.state().fetch_or(CLOSED, Ordering::Release);
         if let Some(topic) = self.topic.take() {
-            // As `DeathLink`'s drop: a thread whose locals are gone panics on a binder call.
-            // One way, and a publisher gone or one that predates the call needs no telling.
+            // A call panics on a thread whose locals are gone (`DeathLink`); a failed one is left.
             let _ = catch_unwind(AssertUnwindSafe(move || {
                 let _ = topic.r#unsubscribed();
                 drop(topic);
@@ -407,9 +402,14 @@ impl<T: Payload> Subscriber<T> {
             log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
             StatusCode::BadValue
         })?;
+        // A publisher that names none took only this side's own name.
+        let type_name = match endpoint.typeName.as_str() {
+            "" => T::type_name().to_owned(),
+            named => named.to_owned(),
+        };
         event!(
             debug,
-            payload = T::type_name(),
+            payload = type_name.as_str(),
             id = endpoint.id as u64,
             kind = ?kind,
             "subscribed"
@@ -442,11 +442,7 @@ impl<T: Payload> Subscriber<T> {
             kind,
             // The bits of a `u64`, as the publisher wrote them.
             id: Some(endpoint.id as u64).filter(|&id| id != 0),
-            // A publisher that names none took only this side's own name.
-            type_name: match endpoint.typeName.as_str() {
-                "" => T::type_name().to_owned(),
-                named => named.to_owned(),
-            },
+            type_name,
             #[cfg(feature = "tracing")]
             told_closed: false,
             #[cfg(test)]
@@ -939,13 +935,12 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         self.closing(result)
     }
 
-    /// `result`, with an event for the first [`RecvError::Closed`] a receive returns: every
-    /// receive after it returns it again.
+    /// `result`, with an event for the first [`RecvError::Closed`] only: later receives repeat it.
     fn closing<V>(&mut self, result: Result<V, RecvError>) -> Result<V, RecvError> {
         #[cfg(feature = "tracing")]
         if let Err(RecvError::Closed(why)) = &result {
             if !std::mem::replace(&mut self.told_closed, true) {
-                event!(debug, payload = T::type_name(), why = ?why, "subscription closed");
+                event!(debug, payload = self.type_name.as_str(), why = ?why, "subscription closed");
             }
         }
         result
