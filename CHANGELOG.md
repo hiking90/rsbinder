@@ -222,6 +222,10 @@ peers; peers of either release still subscribe to each other.
 
 ### Fixed
 
+- A stream or topic `*_async` wait made as soon as the last one ended takes the
+  thread that ran that wait. The thread was not counted as free until it had
+  told its caller, so waits made one after another could hold two or three
+  threads where one serves them.
 - Dropping a stream `Sink` no longer blocks until a blocking-pool thread is
   free when a dropped `send_async` left a record or batch queued behind a
   full pool: the ring path gives the record up at once, the RPC path sends
