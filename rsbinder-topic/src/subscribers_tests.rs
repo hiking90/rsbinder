@@ -50,6 +50,7 @@ impl Quiet {
             pins: MAX_PINS as i32,
             wake: WAKE_FUTEX,
             wakeFd: None,
+            flags: 0,
         };
         let _asking = Asking::new(&request);
         publisher.acceptor().accept(&request).unwrap();

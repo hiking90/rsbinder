@@ -652,6 +652,29 @@ impl<T: Payload> SubscriberBuilder<T> {
         self
     }
 
+    /// Ask the publisher not to wait for this subscriber: for a tool that watches a topic
+    /// without holding up the subscribers it serves.
+    ///
+    /// On a [`lossless`](crate::PublisherBuilder::lossless) topic a publish does not wait for
+    /// this subscriber's reads and no wait for room takes it out: records it has not read when
+    /// the ring comes round are lost, and a receive reports them as
+    /// [`RecvError::Lagged`](crate::RecvError::Lagged). On a topic that lends slots
+    /// ([`PublisherBuilder::lend`]) a slot this subscriber has not read past is lent again unless
+    /// it pins it, and the value is lost. On any other topic nothing changes: nothing waits for a
+    /// subscriber there.
+    ///
+    /// The subscription counts against
+    /// [`max_subscribers`](crate::PublisherBuilder::max_subscribers) and
+    /// [`max_per_uid`](crate::PublisherBuilder::max_per_uid) as any other, so it can be refused
+    /// with [`ITopic::ERROR_FULL`](crate::aidl::ITopic::ERROR_FULL), and it takes a place another
+    /// subscriber could have had. A publisher of `rsbinder-topic` 0.1 does not know the request;
+    /// the subscription is then refused with `InvalidOperation` and the publisher told to take
+    /// it out.
+    pub fn unwaited(mut self) -> Self {
+        self.settings.unwaited = true;
+        self
+    }
+
     /// The largest ring this subscriber maps, in bytes. Default 256 MiB on a 64-bit target and
     /// 16 MiB on a 32-bit one, whose address space is smaller.
     ///

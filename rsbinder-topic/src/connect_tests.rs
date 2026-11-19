@@ -23,7 +23,7 @@ use rsbinder::{
 };
 
 use crate::aidl::ITopic::{
-    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
+    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, FLAG_UNWAITED, WAKE_FD, WAKE_FUTEX,
 };
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
@@ -116,6 +116,7 @@ fn request(control: OwnedFd, token: SIBinder) -> SubscribeRequest {
         pins: 0,
         wake: WAKE_FUTEX,
         wakeFd: None,
+        flags: 0,
     }
 }
 
@@ -330,6 +331,64 @@ fn predating_topic() -> SIBinder {
 fn a_publisher_that_gives_no_number_leaves_the_subscription_without_one() {
     let subscriber = subscribe::<Bytes>(&predating_topic(), Start::Next).unwrap();
     assert_eq!(subscriber.id(), None);
+}
+
+/// A publisher that takes every subscription as one it waits for and says nothing of flags, as
+/// one of `rsbinder-topic` 0.1 does.
+pub(crate) struct Unflagged(pub(crate) Acceptor);
+
+impl Interface for Unflagged {}
+
+impl ITopic for Unflagged {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        let dup = |fd: &Option<ParcelFileDescriptor>| {
+            let fd = fd.as_ref()?.as_fd().try_clone_to_owned().unwrap();
+            Some(ParcelFileDescriptor::new(fd))
+        };
+        let asked = SubscribeRequest {
+            flags: 0,
+            token: request.token.clone(),
+            control: dup(&request.control),
+            wakeFd: dup(&request.wakeFd),
+            r#type: request.r#type.clone(),
+            ..*request
+        };
+        let _asking = crate::connect::Asking::new(&asked);
+        self.0.accept(&asked)
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.0.unsubscribed();
+        Ok(())
+    }
+}
+
+#[test]
+fn a_publisher_that_does_not_take_the_flag_has_the_unwaited_subscription_ended() {
+    let publisher = events::<Bytes>().build().unwrap();
+    let topic = BnTopic::new_binder(Unflagged(publisher.acceptor())).as_binder();
+    let refused = Subscriber::<Bytes>::builder().unwaited().subscribe(&topic);
+    assert_eq!(code(refused), StatusCode::InvalidOperation);
+    // Taken as a waited one, then told of its end by the subscriber that refused the reply.
+    assert_eq!(publisher.subscribers().count, 0);
+    // A subscription that asks for nothing is the same to both.
+    assert!(subscribe::<Bytes>(&topic, Start::Next).is_ok());
+}
+
+#[test]
+fn a_publisher_returns_the_flags_it_knows_and_leaves_out_the_rest() {
+    let publisher = events::<Bytes>().build().unwrap();
+    let (fd, _page) = crate::layout::ControlPage::create(0).unwrap();
+    let asked = SubscribeRequest {
+        flags: FLAG_UNWAITED | i32::MIN,
+        ..request(fd, token())
+    };
+    let _asking = crate::connect::Asking::new(&asked);
+    let endpoint = publisher.acceptor().accept(&asked).unwrap();
+    assert_eq!(endpoint.flags, FLAG_UNWAITED);
+    let listed = &publisher.stats().subscribers[0];
+    assert!(listed.unwaited);
+    assert_eq!(listed.id, endpoint.id as u64);
 }
 
 #[test]

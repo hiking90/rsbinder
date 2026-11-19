@@ -23,7 +23,7 @@ use rsbinder::{
 
 use crate::aidl::ISubscription::ISubscription;
 use crate::aidl::ITopic::{
-    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
+    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, FLAG_UNWAITED, WAKE_FD, WAKE_FUTEX,
 };
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
@@ -724,12 +724,15 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         let caller = CallingContext::current();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
+        // The bits this publisher knows, and only those go back: the subscriber checks for its own.
+        let flags = request.flags & FLAG_UNWAITED;
         let link = Link::new(
             control,
             (uid, caller.pid),
             socket,
             (token, subscription),
             list,
+            flags & FLAG_UNWAITED != 0,
         )?;
         let link = Arc::new(link);
 
@@ -765,6 +768,7 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             pool,
             topicKind: self.kind.wire(),
             id: id as i64,
+            flags,
         })
     }
 }

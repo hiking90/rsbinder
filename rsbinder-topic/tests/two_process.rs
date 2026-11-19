@@ -871,6 +871,7 @@ fn raw_request(token: SIBinder) -> SubscribeRequest {
         pins: 0,
         wake: 0,
         wakeFd: None,
+        flags: 0,
     }
 }
 

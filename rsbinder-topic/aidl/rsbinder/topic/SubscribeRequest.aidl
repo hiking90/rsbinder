@@ -78,4 +78,12 @@ parcelable SubscribeRequest {
      * same socket.
      */
     @nullable ParcelFileDescriptor wakeFd;
+
+    /**
+     * ITopic.FLAG_* bits the subscriber asks for. The publisher takes the
+     * bits it knows, returns them in TopicEndpoint.flags and leaves out the
+     * rest; a subscriber that finds a bit it asked for left out ends the
+     * subscription. A subscriber that sends no such field asks for none.
+     */
+    int flags;
 }

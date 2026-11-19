@@ -75,6 +75,10 @@ pub struct SubscriberInfo {
     /// Whether a wait for room took it out. It holds its place until the subscriber drops it,
     /// and the slot it pins stays pinned.
     pub evicted: bool,
+    /// Whether the subscriber asked not to be waited for
+    /// ([`SubscriberBuilder::unwaited`](crate::SubscriberBuilder::unwaited)): no publish waits for
+    /// it and no wait for room takes it out.
+    pub unwaited: bool,
     /// The slot of the topic's pool the subscription pins now, while it holds a
     /// [`Sample`](crate::Sample) of a lent value: the publisher lends no pinned slot. `None`
     /// when it pins none, and on a topic without a pool.

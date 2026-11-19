@@ -67,6 +67,7 @@ fn request(token: SIBinder) -> (SubscribeRequest, ControlPage) {
         pins: MAX_PINS as i32,
         wake: WAKE_FUTEX,
         wakeFd: None,
+        flags: 0,
     };
     (request, page)
 }

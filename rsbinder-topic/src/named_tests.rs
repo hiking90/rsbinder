@@ -13,11 +13,14 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rsbinder::{BinderResult, DeathRecipient, ExceptionCode, Interface, SIBinder, Status};
+use rsbinder::{
+    BinderResult, DeathRecipient, ExceptionCode, Interface, SIBinder, Status, StatusCode,
+};
 
 use crate::aidl::ITopic::{BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL};
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
+use crate::connect_tests::Unflagged;
 use crate::layout::{self, Stored, HEADER_OFFSET, MIN_RING, VERSION};
 use crate::named::{
     BEFORE_DRAIN_ENDS, BEFORE_INTERRUPT, BEFORE_LOOKING, BEFORE_REPLACE, BETWEEN_LOOKS,
@@ -1839,6 +1842,49 @@ fn a_caller_the_policy_refuses_is_told_once_and_not_asked_again() {
     assert_eq!(subscriber.state(), NamedState::Connected);
     admitting.publish(&bytes(6)).unwrap();
     assert_eq!(recv(&mut subscriber), Ok(bytes(6)));
+}
+
+#[test]
+fn an_unwaited_name_subscriber_asks_so_of_every_publisher_it_connects_to() {
+    let names = Names::default();
+    let first = advertise(&names, policy());
+    let policy_of = Subscriber::<Bytes>::builder().unwaited();
+    let mut subscriber = policy_of.subscribe_named_on(NAME, &names).unwrap();
+    connected(&subscriber);
+    assert!(first.stats().subscribers[0].unwaited);
+    let other = policy().build().unwrap();
+    names.give(NAME, other.as_binder());
+    assert_eq!(
+        recv(&mut subscriber),
+        Err(RecvError::Disconnected(Disconnected::Replaced))
+    );
+    connected(&subscriber);
+    assert!(other.stats().subscribers[0].unwaited);
+}
+
+#[test]
+fn a_publisher_that_does_not_take_unwaited_is_told_once_and_not_asked_again() {
+    let names = Names::default();
+    let publisher = policy().build().unwrap();
+    let topic = BnTopic::new_binder(Unflagged(publisher.acceptor())).as_binder();
+    names.give(NAME, topic.clone());
+    let policy_of = Subscriber::<Bytes>::builder().unwaited();
+    let mut subscriber = policy_of.subscribe_named_on(NAME, &names).unwrap();
+    match recv(&mut subscriber) {
+        Err(RecvError::Disconnected(Disconnected::Rejected(status))) => {
+            assert_eq!(status.transaction_error(), StatusCode::InvalidOperation)
+        }
+        other => panic!("{other:?}"),
+    }
+    // Taken in and taken out once: a second ask would move the generation again.
+    let asked_once = publisher.subscribers();
+    assert_eq!(asked_once.count, 0);
+    names.give(NAME, topic);
+    assert_eq!(
+        subscriber.recv_timeout(Duration::from_millis(500)),
+        Err(RecvError::Timeout)
+    );
+    assert_eq!(publisher.subscribers(), asked_once);
 }
 
 #[test]

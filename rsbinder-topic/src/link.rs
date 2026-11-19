@@ -124,6 +124,10 @@ pub(crate) struct Link {
     subscription: Strong<dyn ISubscription>,
     /// Taken out by a wait for room (plan 15 §6.5): no longer waited for, its pin still kept.
     evicted: AtomicBool,
+    /// Asked not to be waited for ([`FLAG_UNWAITED`]): from the start, as an evicted one is.
+    ///
+    /// [`FLAG_UNWAITED`]: crate::aidl::ITopic::FLAG_UNWAITED
+    unwaited: bool,
     _death: Option<DeathLink>,
 }
 
@@ -138,13 +142,14 @@ enum Wanted {
 
 impl Link {
     /// A subscription through `control` from `uid` and `pid`, woken by `socket` if any, gone with
-    /// `token`, which is `subscription`.
+    /// `token`, which is `subscription`; one no publish waits for if `unwaited`.
     pub(crate) fn new(
         control: ControlView,
         (uid, pid): (u32, i32),
         socket: Option<OwnedFd>,
         (token, subscription): (&SIBinder, Strong<dyn ISubscription>),
         list: Weak<dyn Forget>,
+        unwaited: bool,
     ) -> rsbinder::Result<Self> {
         let dead = Arc::new(Dead::default());
         let watch = Watch {
@@ -165,6 +170,7 @@ impl Link {
             id: AtomicU64::new(0),
             subscription,
             evicted: AtomicBool::new(false),
+            unwaited,
         })
     }
 
@@ -239,6 +245,7 @@ impl Link {
             lost: self.control.lost(),
             waiting: self.control.state().load() & WAITING != 0,
             evicted: self.evicted(),
+            unwaited: self.unwaited,
             pinned: self.pinned(),
         }
     }
@@ -329,7 +336,7 @@ impl Links {
         self.changed = true;
     }
 
-    /// The lowest read position among the subscriptions that have not ended, each as its control
+    /// The lowest read position among the subscriptions waited for, each as its control
     /// page reports it and no lower than where it started; `u64::MAX` with none. A slot whose
     /// record ends at or below it is one no subscriber still has to read (`pool.rs`), and a record
     /// that overwrites nothing above it is one a publish need not wait for (`backpressure.rs`).
@@ -338,11 +345,12 @@ impl Links {
         reads.min().unwrap_or(u64::MAX)
     }
 
-    /// The subscriptions a publish reads past or waits for: not ended, not taken out.
+    /// The subscriptions a publish reads past or waits for: not ended, not taken out, not asked
+    /// to go unwaited.
     fn waited_for(&self) -> impl Iterator<Item = &Arc<Link>> {
         self.links
             .iter()
-            .filter(|link| !link.ended() && !link.evicted())
+            .filter(|link| !link.ended() && !link.evicted() && !link.unwaited)
     }
 
     /// Take out every subscription waited for that has not read up to `need`: what to tell them.

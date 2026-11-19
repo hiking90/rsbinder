@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use rsbinder::{ExceptionCode, Parcel, SIBinder, StatusCode};
 
+use crate::aidl::ITopic::FLAG_UNWAITED;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::MIN_RING;
 use crate::subscriber::Settings;
@@ -351,11 +352,12 @@ fn an_endpoint_without_a_kind_is_of_an_event_topic() {
     let sent = TopicEndpoint {
         topicKind: TopicKind::State.wire(),
         id: 7,
+        flags: FLAG_UNWAITED,
         ..Default::default()
     };
     let read = cut_from_kind(&sent);
     assert_eq!(TopicKind::from_wire(read.topicKind), Some(TopicKind::Event));
-    assert_eq!(read.id, 0);
+    assert_eq!((read.id, read.flags), (0, 0));
 }
 
 /// `sent` as a subscriber reads it from a publisher that writes no field from `topicKind` on.
@@ -364,6 +366,7 @@ fn cut_from_kind(sent: &TopicEndpoint) -> TopicEndpoint {
     let mut tail = Parcel::new();
     tail.write(&sent.topicKind).unwrap();
     tail.write(&sent.id).unwrap();
+    tail.write(&sent.flags).unwrap();
     let tail = tail.data_size() as i32;
     let mut parcel = Parcel::new();
     parcel.write(&sent).unwrap();

@@ -144,6 +144,23 @@ fn a_dropped_subscriber_leaves_nothing_at_either_end() {
     });
 }
 
+#[test]
+fn an_unwaited_subscription_over_a_socket_is_one_the_publisher_does_not_wait_for() {
+    let publisher = policy().lossless(WAIT).build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "unwaited");
+    let mut subscriber = subscriber_policy()
+        .unwaited()
+        .connect(Endpoint::Path(path))
+        .unwrap();
+    let started = Instant::now();
+    for byte in 0..=255 {
+        publisher.publish(&Bytes(vec![byte; 64])).unwrap();
+    }
+    assert!(started.elapsed() < WAIT / 2, "waited {:?}", started.elapsed());
+    assert!(publisher.stats().subscribers[0].unwaited);
+    assert!(matches!(subscriber.try_recv(), Err(RecvError::Lagged(_))));
+}
+
 /// The drop's notice and the session's end both reach the publisher; one subscription goes once.
 #[test]
 fn a_dropped_subscriber_changes_the_list_once() {
@@ -294,6 +311,7 @@ fn the_sessions_deadline_ends_with_the_setup() {
         pins: MAX_PINS as i32,
         wake: WAKE_FUTEX,
         wakeFd: None,
+        flags: 0,
     };
     topic.r#subscribe(&request).unwrap();
     assert!(!session.0.is_ended());

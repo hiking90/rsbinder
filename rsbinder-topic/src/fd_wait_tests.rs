@@ -714,6 +714,7 @@ fn a_subscriber_that_closes_its_socket_is_taken_out_and_raises_no_sigpipe() {
         pins: 0,
         wake: crate::aidl::ITopic::WAKE_FD,
         wakeFd: Some(rsbinder::ParcelFileDescriptor::new(theirs)),
+        flags: 0,
     };
     {
         let _asking = crate::connect::Asking::new(&request);

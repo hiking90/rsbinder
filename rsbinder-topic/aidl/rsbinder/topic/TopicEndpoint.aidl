@@ -66,4 +66,10 @@ parcelable TopicEndpoint {
      * no such field is read as 0: no number.
      */
     long id;
+
+    /**
+     * The bits of SubscribeRequest.flags the publisher took: those it
+     * knows. A publisher that sends no such field took none.
+     */
+    int flags;
 }

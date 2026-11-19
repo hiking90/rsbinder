@@ -35,7 +35,7 @@ use rsbinder::{
 use tokio::io::{unix::AsyncFd, Interest};
 
 use crate::aidl::ISubscription::BnSubscription;
-use crate::aidl::ITopic::{ITopic, ERROR_VERSION, WAKE_FD, WAKE_FUTEX};
+use crate::aidl::ITopic::{ITopic, ERROR_VERSION, FLAG_UNWAITED, WAKE_FD, WAKE_FUTEX};
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
@@ -136,6 +136,7 @@ pub(crate) struct Settings {
     pub(crate) max_ring_bytes: usize,
     pub(crate) max_pool_bytes: usize,
     pub(crate) wake: Wake,
+    pub(crate) unwaited: bool,
 }
 
 impl Default for Settings {
@@ -145,6 +146,18 @@ impl Default for Settings {
             max_ring_bytes: DEFAULT_MAX_RING,
             max_pool_bytes: DEFAULT_MAX_POOL,
             wake: Wake::Futex,
+            unwaited: false,
+        }
+    }
+}
+
+impl Settings {
+    /// The `SubscribeRequest.flags` these ask for.
+    fn flags(&self) -> i32 {
+        if self.unwaited {
+            FLAG_UNWAITED
+        } else {
+            0
         }
     }
 }
@@ -335,6 +348,7 @@ impl<T: Payload> Subscriber<T> {
                 Wake::Fd => WAKE_FD,
             },
             wakeFd: sent,
+            flags: policy.flags(),
         };
         let endpoint = {
             let _asking = Asking::new(&request);
@@ -342,6 +356,15 @@ impl<T: Payload> Subscriber<T> {
         };
         // The publisher holds its own fds now; this side keeps the mapping and a duplicate.
         drop(request);
+        // A bit asked for and left out is one the publisher did not take; `control` tells it.
+        if endpoint.flags != policy.flags() {
+            log::error!(
+                "topic: cannot subscribe, the publisher took flags {:#x} of {:#x}",
+                endpoint.flags,
+                policy.flags()
+            );
+            return Err(StatusCode::InvalidOperation.into());
+        }
         let kind = TopicKind::from_wire(endpoint.topicKind).ok_or_else(|| {
             log::error!(
                 "topic: cannot subscribe, a topic of kind {}",
