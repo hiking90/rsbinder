@@ -264,16 +264,22 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.lock().after_bump = Some(pause);
     }
 
-    /// Run `f` with the topic's lock held, as a publish that waits for room holds it.
+    /// Run `f` with the topic's lock held, as a publish that waits for room holds it; the guard's
+    /// plain drop lets it go, as `give_back` and an early return do.
     #[cfg(test)]
     pub(crate) fn with_lock<R>(&self, f: impl FnOnce() -> R) -> R {
-        let state = self.shared.writer.lock();
-        let done = f();
-        self.shared.writer.unlock(state, Vec::new());
-        done
+        let _state = self.shared.writer.lock();
+        f()
     }
 
-    /// Sleeps a thread's wait for the list began; one counted holds the lock until it sleeps.
+    /// Run `pause` under the lock in a thread's wait for the list, after a look found no change.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn pause_after_list_look(&self, pause: Box<dyn FnMut() + Send>) {
+        self.shared.writer.lock().after_list_look = Some(pause);
+    }
+
+    /// Sleeps a thread's wait for the list began; one counted holds the lock a change's count
+    /// takes until it sleeps.
     #[cfg(test)]
     pub(crate) fn list_sleeps(&self) -> usize {
         let sleeps = &self.shared.writer.list_sleeps;

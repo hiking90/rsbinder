@@ -31,8 +31,7 @@ fn subscribe(publisher: &Publisher<Bytes>) -> Subscriber<Bytes> {
         .unwrap()
 }
 
-/// A subscription that ends as a subscriber that does not tell the publisher does: its control
-/// page marked `CLOSED`, and nothing else.
+/// A subscription that ends untold, as a 0.1 subscriber's: its control page `CLOSED`, nothing else.
 struct Quiet {
     page: Arc<ControlPage>,
     _token: SIBinder,
@@ -58,12 +57,6 @@ impl Quiet {
             page: Arc::new(page),
             _token: token,
         }
-    }
-
-    fn close(&self) {
-        self.page
-            .state()
-            .fetch_or(CLOSED, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -121,7 +114,7 @@ pub(crate) fn woken_by(
             let now = publisher.wait_subscribers(seen, Some(LONG));
             woke.send((now, started.elapsed())).unwrap();
         });
-        // Counted under the lock, which the change takes: it lands once the wait sleeps.
+        // Counted under the lock a change's count takes, so the change's wake finds it asleep.
         while publisher.list_sleeps() == 0 {
             std::thread::yield_now();
         }
@@ -172,6 +165,37 @@ fn a_drop_while_the_lock_is_held_waits_for_nothing_and_is_seen_as_the_lock_goes(
 }
 
 #[test]
+fn a_drop_while_the_wait_holds_the_lock_before_its_sleep_wakes_it() {
+    let publisher = publisher();
+    let seen = publisher.subscribers().generation;
+    let mut subscriber = Some(subscribe(&publisher));
+    let (told, dropped_in_time) = mpsc::channel();
+    publisher.pause_after_list_look(Box::new(move || {
+        let Some(subscriber) = subscriber.take() else {
+            return;
+        };
+        // Its `try_lock` finds this wait holding the lock, so only the wait's release settles it.
+        let (dropped, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(subscriber);
+            dropped.send(()).unwrap();
+        });
+        told.send(done.recv_timeout(LONG / 4).is_ok()).unwrap();
+    }));
+    let started = Instant::now();
+    let now = publisher.wait_subscribers(seen + 1, Some(LONG));
+    let took = started.elapsed();
+    // The pause runs inside the wait on this thread, so its answer is in by now or never comes.
+    assert_eq!(
+        dropped_in_time.try_recv(),
+        Ok(true),
+        "the drop waited for the lock"
+    );
+    assert!(took < LONG / 2, "not woken: {took:?}");
+    assert_eq!((now.generation, now.count), (seen + 2, 0));
+}
+
+#[test]
 fn a_refused_subscriber_leaves_the_list_as_it_was() {
     let publisher = Publisher::<Bytes>::events()
         .max_subscribers(1)
@@ -215,8 +239,17 @@ fn a_subscription_that_ends_unannounced_is_seen_when_the_wait_times_out() {
     let quiet = Quiet::subscribe(&publisher);
     let seen = publisher.subscribers();
     assert_eq!(seen.count, 1);
-    quiet.close();
-    let now = publisher.wait_subscribers(seen.generation, Some(Duration::from_millis(30)));
+    let timeout = Duration::from_millis(100);
+    let page = quiet.page.clone();
+    // Closed under the lock after the first look: only the look after the timeout sees it.
+    publisher.pause_after_list_look(Box::new(move || {
+        page.state()
+            .fetch_or(CLOSED, std::sync::atomic::Ordering::Release);
+    }));
+    let started = Instant::now();
+    let now = publisher.wait_subscribers(seen.generation, Some(timeout));
+    let took = started.elapsed();
+    assert!(took >= timeout, "returned before the timeout: {took:?}");
     assert_eq!((now.generation, now.count), (seen.generation + 1, 0));
 }
 

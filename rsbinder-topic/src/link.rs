@@ -125,9 +125,7 @@ pub(crate) struct Link {
     subscription: Strong<dyn ISubscription>,
     /// Taken out by a wait for room (plan 15 §6.5): no longer waited for, its pin still kept.
     evicted: AtomicBool,
-    /// Asked not to be waited for ([`FLAG_UNWAITED`]): from the start, as an evicted one is.
-    ///
-    /// [`FLAG_UNWAITED`]: crate::aidl::ITopic::FLAG_UNWAITED
+    /// Asked not to be waited for (`FLAG_UNWAITED`): from the start, as an evicted one is.
     unwaited: bool,
     _death: Option<DeathLink>,
 }
@@ -376,8 +374,7 @@ impl Links {
         reads.min().unwrap_or(u64::MAX)
     }
 
-    /// The subscriptions a publish reads past or waits for: not ended, not taken out, not asked
-    /// to go unwaited.
+    /// The subscriptions a publish reads past or waits for: none ended, taken out or unwaited.
     fn waited_for(&self) -> impl Iterator<Item = &Arc<Link>> {
         self.links
             .iter()

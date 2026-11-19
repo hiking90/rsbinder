@@ -225,7 +225,7 @@ pub(crate) struct State<S> {
     /// [`Lossless`]: the wait for room; `window`, how far ahead a record goes.
     backpressure: Option<Duration>,
     window: Option<NonZeroUsize>,
-    /// Subscriptions a wait took out, told after [`TypedWriter::unlock`] lets go; `evicted` counts.
+    /// Subscriptions a wait took out, told as [`Held`] lets go; `evicted` counts.
     evictions: Vec<Eviction>,
     evicted: u64,
     /// Records published, and their payload bytes, for [`PublisherStats`].
@@ -234,6 +234,9 @@ pub(crate) struct State<S> {
     /// A test's pause after a commit bumps `seq`, before it loads the subscribers' `state`.
     #[cfg(all(test, not(loom)))]
     pub(crate) after_bump: Option<Box<dyn FnMut() + Send>>,
+    /// A test's pause in a thread's wait for the list, after a look that found no change.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) after_list_look: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl<S: Stores> State<S> {
@@ -339,14 +342,82 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The topic's lock, held: [`TypedWriter::lock`] makes it, and every release of the lock is its
+/// drop, which does what follows each unlock (see [`TypedWriter::unlock`]). No release goes
+/// around it: a thread's wait for the list lets this go first and sleeps on another lock.
+pub(crate) struct Held<'a, T: Payload, S: Stores> {
+    topic: &'a TypedWriter<T, S>,
+    /// `None` only inside the drop.
+    state: Option<MutexGuard<'a, State<S>>>,
+    /// Subscriptions taken out under the lock, dropped after it.
+    gone: Vec<Arc<Link>>,
+}
+
+impl<T: Payload, S: Stores> std::ops::Deref for Held<'_, T, S> {
+    type Target = State<S>;
+
+    fn deref(&self) -> &State<S> {
+        self.state.as_ref().expect("held until dropped")
+    }
+}
+
+impl<T: Payload, S: Stores> std::ops::DerefMut for Held<'_, T, S> {
+    fn deref_mut(&mut self) -> &mut State<S> {
+        self.state.as_mut().expect("held until dropped")
+    }
+}
+
+impl<T: Payload, S: Stores> Drop for Held<'_, T, S> {
+    fn drop(&mut self) {
+        let Some(mut state) = self.state.take() else {
+            return;
+        };
+        let topic = self.topic;
+        let evictions = std::mem::take(&mut state.evictions);
+        let waited = state.backpressure.unwrap_or_default();
+        let changed = state.links.take_changed();
+        drop(state);
+        // A panic under this hold poisoned the lock: every later lock panics, a settle here too.
+        if topic.state.is_poisoned() {
+            return;
+        }
+        if changed {
+            topic.list_changed();
+        }
+        for eviction in evictions {
+            eviction.tell(T::type_name(), waited);
+        }
+        let gone = std::mem::take(&mut self.gone);
+        #[cfg(feature = "tracing")]
+        for link in &gone {
+            let (id, reason) = (link.id(), link.end_reason());
+            event!(
+                debug,
+                payload = T::type_name(),
+                id,
+                reason,
+                "subscription ended"
+            );
+        }
+        drop(gone);
+        // With the one in `unsubscribed`: a drop whose `try_lock` found this lock held is seen.
+        fence(Ordering::SeqCst);
+        if topic.prune_owed.load(Ordering::Relaxed) {
+            topic.settle_owed();
+        }
+    }
+}
+
 /// A topic's writer behind a lock, fed with values of `T`. Any thread may publish.
 pub(crate) struct TypedWriter<T, S> {
     state: Mutex<State<S>>,
-    /// Woken by [`unlock`](Self::unlock) after a change of the list of subscriptions.
+    /// Woken after a change of the list of subscriptions, once `changes` counts it.
     subscribers: Signal,
+    /// Changes of the list; a thread's wait for it sleeps on this lock, never on `state`.
+    changes: Mutex<u64>,
     /// A subscriber dropped a subscription while the lock was held: the next unlock prunes.
     prune_owed: AtomicBool,
-    /// Sleeps a thread's wait for the list began, each counted under the lock before it.
+    /// Sleeps a thread's wait for the list began, each counted under `changes` before it.
     #[cfg(test)]
     pub(crate) list_sleeps: std::sync::atomic::AtomicUsize,
     /// Buffers to encode into, one per thread that publishes at a time.
@@ -407,8 +478,11 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
                 bytes: 0,
                 #[cfg(all(test, not(loom)))]
                 after_bump: None,
+                #[cfg(all(test, not(loom)))]
+                after_list_look: None,
             }),
             subscribers: Signal::default(),
+            changes: Mutex::new(0),
             prune_owed: AtomicBool::new(false),
             #[cfg(test)]
             list_sleeps: std::sync::atomic::AtomicUsize::new(0),
@@ -422,27 +496,36 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     /// subscriber of this process that drops one subscription and reads another on the same
     /// thread would be taken out of the other.
     pub(crate) fn unsubscribed(&self) {
-        // After the subscriber's `CLOSED`, which the prune that takes the flag then sees.
-        self.prune_owed.store(true, Ordering::Release);
-        // With the one in `unlock`: a holder this `try_lock` finds sees the flag after it lets go.
+        // An RMW, so every owed drop's `CLOSED` stays in the release sequence the settle reads.
+        self.prune_owed.swap(true, Ordering::Release);
+        // With the one in `Held`'s drop: a holder this `try_lock` finds sees the flag on release.
         fence(Ordering::SeqCst);
         self.settle_owed();
     }
 
     /// Prune for an owed [`unsubscribed`](Self::unsubscribed) if the lock is free.
     fn settle_owed(&self) {
-        let mut state = match self.state.try_lock() {
+        let state = match self.state.try_lock() {
             Ok(state) => state,
-            // The holder's `unlock` looks at the flag after it lets go.
+            // The holder's `Held` drop looks at the flag after it lets go.
             Err(TryLockError::WouldBlock) => return,
             Err(TryLockError::Poisoned(_)) => panic!("lock poisoned"),
         };
+        let mut state = self.held(state);
         let gone = if self.prune_owed.swap(false, Ordering::AcqRel) {
             state.links.prune()
         } else {
             Vec::new()
         };
         self.unlock(state, gone);
+    }
+
+    /// Count a change of the list under `changes`, then wake its waits.
+    fn list_changed(&self) {
+        let mut changes = self.changes.lock().expect("lock poisoned");
+        *changes = changes.wrapping_add(1);
+        drop(changes);
+        self.subscribers.wake_all();
     }
 
     /// The list of subscriptions now, after taking out those that ended.
@@ -455,27 +538,38 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     }
 
     /// The list once its generation is not `seen`, or as it is at `deadline`.
+    ///
+    /// The lock is let go through [`Held`] before the sleep, which is on `changes`: a drop whose
+    /// `try_lock` found the lock held is settled by that release, and the change it makes counts
+    /// in `changes`, read before the look.
     pub(crate) fn wait_subscribers(&self, seen: u64, deadline: Option<Instant>) -> Subscribers {
-        let mut state = self.lock();
         let mut timed_out = false;
         loop {
+            let counted = *self.changes.lock().expect("lock poisoned");
+            let mut state = self.lock();
             let gone = state.links.prune();
             let now = state.links.subscribers();
-            // A prune that took one out changed the generation, and `gone` is dropped unlocked.
-            if timed_out || now.generation != seen || !gone.is_empty() {
-                self.unlock(state, gone);
+            // A prune that took one out changed the generation.
+            let done = timed_out || now.generation != seen || !gone.is_empty();
+            #[cfg(all(test, not(loom)))]
+            if let Some(pause) = state.after_list_look.as_mut().filter(|_| !done) {
+                pause();
+            }
+            self.unlock(state, gone);
+            if done {
                 return now;
+            }
+            let changes = self.changes.lock().expect("lock poisoned");
+            if *changes != counted {
+                continue;
             }
             #[cfg(test)]
             self.list_sleeps.fetch_add(1, Ordering::SeqCst);
-            (state, timed_out) = match self
+            timed_out = self
                 .subscribers
-                .wait_until(state, deadline)
+                .wait_until(changes, deadline)
                 .expect("lock poisoned")
-            {
-                Ok(state) => (state, false),
-                Err(state) => (state, true),
-            };
+                .is_err();
         }
     }
 
@@ -512,42 +606,26 @@ impl<T: Payload, S: Stores> TypedWriter<T, S> {
     }
 
     /// The lock every change to the ring and to the list of subscriptions takes.
-    pub(crate) fn lock(&self) -> MutexGuard<'_, State<S>> {
-        self.state.lock().expect("lock poisoned")
+    pub(crate) fn lock(&self) -> Held<'_, T, S> {
+        self.held(self.state.lock().expect("lock poisoned"))
+    }
+
+    fn held<'a>(&'a self, state: MutexGuard<'a, State<S>>) -> Held<'a, T, S> {
+        Held {
+            topic: self,
+            state: Some(state),
+            gone: Vec::new(),
+        }
     }
 
     /// Unlock, then tell evictions and drop `gone`: a call under the lock may run a death notice.
     ///
-    /// Every lock that may change the list of subscriptions ends here, so what follows a change
-    /// runs for each one.
-    pub(crate) fn unlock(&self, mut state: MutexGuard<'_, State<S>>, gone: Vec<Arc<Link>>) {
-        let evictions = std::mem::take(&mut state.evictions);
-        let waited = state.backpressure.unwrap_or_default();
-        let changed = state.links.take_changed();
+    /// Every release of the lock is [`Held`]'s drop: it wakes the waits for the list after a
+    /// change, tells evictions, and settles a drop whose `try_lock` found the lock held. This
+    /// call adds `gone`, dropped after the lock.
+    pub(crate) fn unlock(&self, mut state: Held<'_, T, S>, gone: Vec<Arc<Link>>) {
+        state.gone.extend(gone);
         drop(state);
-        if changed {
-            self.subscribers.wake_all();
-        }
-        for eviction in evictions {
-            eviction.tell(T::type_name(), waited);
-        }
-        #[cfg(feature = "tracing")]
-        for link in &gone {
-            let (id, reason) = (link.id(), link.end_reason());
-            event!(
-                debug,
-                payload = T::type_name(),
-                id,
-                reason,
-                "subscription ended"
-            );
-        }
-        drop(gone);
-        // With the one in `unsubscribed`: a drop whose `try_lock` found this lock held is seen.
-        fence(Ordering::SeqCst);
-        if self.prune_owed.load(Ordering::Relaxed) {
-            self.settle_owed();
-        }
     }
 
     /// The futex wakes this topic has sent.
