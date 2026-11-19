@@ -34,6 +34,8 @@ pub(crate) struct Spec {
     pub(crate) max_subscribers: usize,
     pub(crate) max_per_uid: usize,
     pub(crate) authorize: Option<Authorize>,
+    /// Who may ask for the topic's status or a dump; `None` for [`may_inspect`]'s callers.
+    pub(crate) inspect: Option<Authorize>,
     pub(crate) pool: Option<PoolSpec>,
     pub(crate) backpressure: Option<Lossless>,
 }
@@ -46,6 +48,7 @@ impl Default for Spec {
             max_subscribers: 64,
             max_per_uid: 64,
             authorize: None,
+            inspect: None,
             pool: None,
             backpressure: None,
         }
@@ -103,6 +106,17 @@ impl Authorize {
     pub(crate) fn admits(&self, caller: &CallingContext) -> bool {
         (self.0)(caller)
     }
+}
+
+/// The uid of Android's `shell`, which `adb shell dumpsys` runs as (AOSP
+/// `system/core/libcutils/include/private/android_filesystem_config.h`, `AID_SHELL`).
+pub(crate) const SHELL_UID: u32 = 2000;
+
+/// Whether `caller` may look at a topic of a publisher of `own` uid when its builder did not say
+/// ([`PublisherBuilder::inspect`](crate::PublisherBuilder::inspect)): `own`, root, and on
+/// Android `shell`.
+pub(crate) fn may_inspect(caller: u32, own: u32, android: bool) -> bool {
+    caller == own || caller == 0 || (android && caller == SHELL_UID)
 }
 
 impl fmt::Debug for Authorize {

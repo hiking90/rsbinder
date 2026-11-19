@@ -27,13 +27,15 @@ use crate::aidl::ITopic::{
 };
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
+use crate::aidl::SubscriberStatus::SubscriberStatus;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
+use crate::aidl::TopicStatus::TopicStatus;
 use crate::connect::{asked_here, policy_status, refuse, status_of};
 use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::pool::LentSlot;
 use crate::pool::MAX_PINS;
-use crate::publish::{Authorize, Spec};
+use crate::publish::{may_inspect, Authorize, Spec};
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Advertisement, Resolver};
 use crate::{wake, Bytes, Payload, PublishError, PublisherStats, Subscribers, TopicKind};
@@ -93,6 +95,8 @@ struct Shared<T> {
     max_subscribers: usize,
     max_per_uid: usize,
     authorize: Option<Authorize>,
+    inspect: Option<Authorize>,
+    lossless: bool,
 }
 
 impl<T: Payload + 'static> Publisher<T> {
@@ -115,6 +119,8 @@ impl<T: Payload + 'static> Publisher<T> {
             max_subscribers: spec.max_subscribers,
             max_per_uid: spec.max_per_uid,
             authorize: spec.authorize.clone(),
+            inspect: spec.inspect.clone(),
+            lossless: spec.backpressure.is_some(),
         });
         let acceptor = Acceptor {
             topic: Arc::downgrade(&shared) as Weak<dyn Accept>,
@@ -554,13 +560,18 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 /// use rsbinder_topic::aidl::ITopic::{BnTopic, ITopic};
 /// use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 /// use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
+/// use rsbinder_topic::aidl::TopicStatus::TopicStatus;
 /// use rsbinder_topic::{Acceptor, Bytes, Publisher};
 ///
 /// struct Guarded {
 ///     acceptor: Acceptor,
 /// }
 ///
-/// impl rsbinder::Interface for Guarded {}
+/// impl rsbinder::Interface for Guarded {
+///     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+///         self.acceptor.dump(writer, args)
+///     }
+/// }
 ///
 /// impl ITopic for Guarded {
 ///     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
@@ -573,6 +584,10 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 ///     fn r#unsubscribed(&self) -> BinderResult<()> {
 ///         self.acceptor.unsubscribed();
 ///         Ok(())
+///     }
+///
+///     fn r#status(&self) -> BinderResult<TopicStatus> {
+///         self.acceptor.status()
 ///     }
 /// }
 ///
@@ -646,6 +661,46 @@ impl Acceptor {
             topic.unsubscribed();
         }
     }
+
+    /// Answer [`ITopic::status`]: the topic and each subscription it holds after taking out
+    /// those that ended, as [`Publisher::stats`] reads them, for a caller the topic's
+    /// [`inspect`](crate::PublisherBuilder::inspect) admits; `EX_SECURITY` for another.
+    /// [`ITopic::ERROR_CLOSED`] once the publisher is dropped. A closed publisher still answers.
+    ///
+    /// Call it from the handler of the call, on the thread the call arrived on: the caller it
+    /// checks is that call's.
+    ///
+    /// [`ITopic::status`]: crate::aidl::ITopic::ITopic::r#status
+    /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
+    pub fn status(&self) -> BinderResult<TopicStatus> {
+        let topic = self.topic.upgrade();
+        let topic = topic.ok_or_else(|| refuse(ERROR_CLOSED, "the publisher has been dropped"))?;
+        topic.inspected()?;
+        Ok(topic.status())
+    }
+
+    /// Answer a binder dump (`dumpsys` on Android): [`status`](Self::status)'s reply as text,
+    /// one line for the topic and one per subscription. A caller the topic's
+    /// [`inspect`](crate::PublisherBuilder::inspect) refuses is told so in the text, and a
+    /// publisher dropped writes that it is. `args` are not read.
+    ///
+    /// An `ITopic` of the application's own calls it from its `rsbinder::Interface::dump`.
+    /// The text is made with the topic's lock let go, then written in one call; the writer is the
+    /// caller's fd, which a caller that does not read can hold up.
+    pub fn dump(&self, writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> {
+        let text = match self.status() {
+            Ok(status) => format!("{status}"),
+            Err(refused) if refused.exception_code() == ExceptionCode::Security => {
+                let caller = CallingContext::current();
+                format!(
+                    "rsbinder-topic: uid {} pid {} may not look at this topic\n",
+                    caller.uid, caller.pid
+                )
+            }
+            Err(_) => "rsbinder-topic: the publisher has been dropped\n".to_owned(),
+        };
+        writer.write_all(text.as_bytes()).map_err(StatusCode::from)
+    }
 }
 
 impl fmt::Debug for Acceptor {
@@ -660,6 +715,12 @@ trait Accept: Send + Sync {
 
     /// Take out the subscriptions that ended.
     fn unsubscribed(&self);
+
+    /// `EX_SECURITY` unless the caller may look at the topic.
+    fn inspected(&self) -> BinderResult<()>;
+
+    /// The topic and its subscriptions now.
+    fn status(&self) -> TopicStatus;
 }
 
 impl<T: Payload + 'static> Accept for Shared<T> {
@@ -667,6 +728,50 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         let mut state = self.writer.lock();
         let gone = state.links.prune();
         self.writer.unlock(state, gone);
+    }
+
+    fn inspected(&self) -> BinderResult<()> {
+        let caller = CallingContext::current();
+        let admitted = match &self.inspect {
+            Some(inspect) => inspect.admits(&caller),
+            None => {
+                let own = rustix::process::getuid().as_raw();
+                may_inspect(caller.uid, own, cfg!(target_os = "android"))
+            }
+        };
+        if !admitted {
+            return Err(Status::from((
+                ExceptionCode::Security,
+                "the publisher's `inspect` does not admit the caller",
+            )));
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> TopicStatus {
+        let stats = self.writer.stats();
+        let subscribers = stats.subscribers.iter().map(|info| SubscriberStatus {
+            // The bits of the `u64`s and the `u32` uid, as the reply's other fields carry them.
+            id: info.id as i64,
+            uid: info.uid as i32,
+            pid: info.pid,
+            lagBytes: info.lag_bytes as i64,
+            lost: info.lost as i64,
+            waiting: info.waiting,
+            evicted: info.evicted,
+            unwaited: info.unwaited,
+            pinned: info.pinned.map_or(-1, |slot| slot as i32),
+        });
+        TopicStatus {
+            typeName: T::type_name().to_owned(),
+            topicKind: self.kind.wire(),
+            ringBytes: self.capacity as i64,
+            lossless: self.lossless,
+            published: stats.published as i64,
+            bytes: stats.bytes as i64,
+            evicted: stats.evicted as i64,
+            subscribers: subscribers.collect(),
+        }
     }
 
     fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
@@ -795,9 +900,17 @@ struct Service {
     acceptor: Acceptor,
 }
 
-impl Interface for Service {}
+impl Interface for Service {
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+        self.acceptor.dump(writer, args)
+    }
+}
 
 impl ITopic for Service {
+    fn r#status(&self) -> BinderResult<TopicStatus> {
+        self.acceptor.status()
+    }
+
     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         self.acceptor.accept(request)
     }

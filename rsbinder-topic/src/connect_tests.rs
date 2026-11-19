@@ -361,6 +361,10 @@ impl ITopic for Unflagged {
         self.0.unsubscribed();
         Ok(())
     }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        self.0.status()
+    }
 }
 
 #[test]
@@ -425,6 +429,10 @@ impl ITopic for Guarded {
         self.acceptor.unsubscribed();
         Ok(())
     }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        self.acceptor.status()
+    }
 }
 
 #[test]
@@ -470,6 +478,10 @@ impl ITopic for Forged {
 
     fn r#unsubscribed(&self) -> BinderResult<()> {
         Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        Err(StatusCode::UnknownTransaction.into())
     }
 }
 
@@ -837,6 +849,10 @@ fn a_wake_socket_shut_down_without_an_end_ends_the_wait_as_the_publishers_death(
         fn r#unsubscribed(&self) -> BinderResult<()> {
             Ok(())
         }
+
+        fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+            Err(StatusCode::UnknownTransaction.into())
+        }
     }
     let shutting = Shutting {
         memory,
@@ -874,6 +890,10 @@ fn lapped_topic() -> (SIBinder, Lapper) {
 
         fn r#unsubscribed(&self) -> BinderResult<()> {
             Ok(())
+        }
+
+        fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+            Err(StatusCode::UnknownTransaction.into())
         }
     }
     let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
@@ -1049,6 +1069,10 @@ fn a_reactor_wait_whose_seq_moves_at_every_arm_ends_at_its_timeout() {
 
         fn r#unsubscribed(&self) -> BinderResult<()> {
             Ok(())
+        }
+
+        fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+            Err(StatusCode::UnknownTransaction.into())
         }
     }
     let (memory, stored) = layout::create_topic(MIN_RING).unwrap();

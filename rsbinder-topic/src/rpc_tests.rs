@@ -212,6 +212,10 @@ impl ITopic for Predating {
     fn r#unsubscribed(&self) -> rsbinder::BinderResult<()> {
         Err(StatusCode::UnknownTransaction.into())
     }
+
+    fn r#status(&self) -> rsbinder::BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        Err(StatusCode::UnknownTransaction.into())
+    }
 }
 
 #[test]

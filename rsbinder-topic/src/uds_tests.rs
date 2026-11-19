@@ -162,6 +162,31 @@ fn an_unwaited_subscription_over_a_socket_is_one_the_publisher_does_not_wait_for
 }
 
 #[test]
+fn the_status_over_a_socket_is_the_publishers_and_its_inspect_sees_the_peers_uid() {
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "status");
+    let _subscriber = subscriber_policy()
+        .connect(Endpoint::Path(path.clone()))
+        .unwrap();
+    let status = uds::status(Endpoint::Path(path), &Options::default()).unwrap();
+    let here = publisher.acceptor().status().unwrap();
+    assert_eq!(status.to_string(), here.to_string());
+    assert_eq!(status.subscribers.len(), 1);
+
+    let own = rustix::process::getuid().as_raw();
+    let other = policy()
+        .inspect(move |caller| caller.uid != own)
+        .build()
+        .unwrap();
+    let (path, _server, _handle) = serve(&other, "refused");
+    let refused = uds::status(Endpoint::Path(path), &Options::default());
+    assert_eq!(
+        refused.err().map(|status| status.exception_code()),
+        Some(ExceptionCode::Security)
+    );
+}
+
+#[test]
 fn a_subscriber_of_any_type_reads_over_a_socket() {
     let publisher = policy().build().unwrap();
     let (path, _server, _handle) = serve(&publisher, "any");

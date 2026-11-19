@@ -736,6 +736,10 @@ impl ITopic for ByHand {
     fn r#unsubscribed(&self) -> BinderResult<()> {
         Ok(())
     }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        Err(StatusCode::UnknownTransaction.into())
+    }
 }
 
 /// The header of an item with no payload: a record of 8 bytes.
@@ -1178,6 +1182,10 @@ impl ITopic for StateByHand {
 
     fn r#unsubscribed(&self) -> BinderResult<()> {
         self.0.r#unsubscribed()
+    }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        self.0.r#status()
     }
 }
 
@@ -2090,6 +2098,10 @@ impl ITopic for Counted {
         self.acceptor.unsubscribed();
         Ok(())
     }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        self.acceptor.status()
+    }
 }
 
 thread_local! {
@@ -2579,6 +2591,10 @@ impl ITopic for Hanging {
     fn r#unsubscribed(&self) -> BinderResult<()> {
         self.acceptor.unsubscribed();
         Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        self.acceptor.status()
     }
 }
 

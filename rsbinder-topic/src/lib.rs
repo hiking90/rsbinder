@@ -220,6 +220,19 @@ mod any_type_tests;
 
 #[cfg(all(
     test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod status_tests;
+
+#[cfg(all(
+    test,
     feature = "uds",
     not(loom),
     not(miri),

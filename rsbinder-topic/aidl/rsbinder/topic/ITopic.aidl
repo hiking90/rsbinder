@@ -7,6 +7,7 @@ package rsbinder.topic;
 
 import rsbinder.topic.SubscribeRequest;
 import rsbinder.topic.TopicEndpoint;
+import rsbinder.topic.TopicStatus;
 
 /**
  * A topic: one publisher, any number of subscribers. A subscription is this
@@ -68,4 +69,12 @@ interface ITopic {
      * `UNKNOWN_TRANSACTION`, which a one-way caller never sees.
      */
     oneway void unsubscribed();
+
+    /**
+     * The topic and its subscriptions now. It names other processes'
+     * uids and pids, so a publisher answers only the callers its policy
+     * lets look, and refuses the rest with `EX_SECURITY`. A publisher that
+     * predates it answers `UNKNOWN_TRANSACTION`.
+     */
+    TopicStatus status();
 }

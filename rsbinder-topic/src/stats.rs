@@ -109,6 +109,51 @@ pub struct SubscriberStats {
     pub connections: u64,
 }
 
+/// The text of a topic's binder dump: one line for the topic, then one per subscription, each
+/// ending in a newline. `rsb_service topic stat` prints the same.
+impl std::fmt::Display for crate::aidl::TopicStatus::TopicStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match crate::TopicKind::from_wire(self.topicKind) {
+            Some(crate::TopicKind::State) => "state",
+            Some(_) => "event",
+            None => "unknown",
+        };
+        let waits = if self.lossless { "lossless" } else { "lossy" };
+        // The `long`s carry `u64` bits, the uids `u32` ones.
+        writeln!(
+            f,
+            "{} {kind} topic: ring {} bytes, {waits}, published {} ({} bytes), evicted {}, {} \
+             subscribers",
+            self.typeName,
+            self.ringBytes as u64,
+            self.published as u64,
+            self.bytes as u64,
+            self.evicted as u64,
+            self.subscribers.len()
+        )?;
+        for one in &self.subscribers {
+            write!(
+                f,
+                "  #{} uid {} pid {}: lag {} bytes, lost {}",
+                one.id as u64, one.uid as u32, one.pid, one.lagBytes as u64, one.lost as u64
+            )?;
+            let marks = [
+                (one.waiting, ", waiting"),
+                (one.evicted, ", evicted"),
+                (one.unwaited, ", unwaited"),
+            ];
+            for (_, mark) in marks.iter().filter(|(set, _)| *set) {
+                f.write_str(mark)?;
+            }
+            if one.pinned >= 0 {
+                write!(f, ", pins slot {}", one.pinned)?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
+
 impl std::ops::AddAssign for SubscriberStats {
     fn add_assign(&mut self, other: Self) {
         self.received += other.received;

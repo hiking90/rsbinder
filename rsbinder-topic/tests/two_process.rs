@@ -136,6 +136,19 @@ fn a_publishers_wait_hears_of_a_subscriber_of_another_process_that_comes_drops_o
 
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
+fn another_process_of_the_publishers_uid_reads_its_status_and_its_dump() {
+    let (name, publisher) = publish("inspect");
+    let subscriber = Peer::spawn("subscribe", &name);
+    assert_eq!(subscriber.says(), "subscribed");
+    let inspector = Peer::spawn("inspect", &name);
+    assert_eq!(inspector.says(), "status 1");
+    // The topic's line and the subscriber's.
+    assert_eq!(inspector.says(), "dump 2");
+    assert_eq!(publisher.subscriber_count(), 1);
+}
+
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
 fn a_subscriber_of_another_process_reads_a_state_topics_value_at_once() {
     init();
     let first = Bytes(b"first".to_vec());
@@ -726,6 +739,25 @@ fn child() {
             assert_eq!(line.trim(), "drop");
             drop(subscriber);
             say("dropped");
+            wait_for_eof();
+        }
+        "inspect" => {
+            use std::io::Read;
+            let topic = hub::check_service(&name).unwrap();
+            let status = topic
+                .clone()
+                .into_interface::<dyn ITopic>()
+                .unwrap()
+                .r#status()
+                .unwrap();
+            say(&format!("status {}", status.subscribers.len()));
+            let (read_end, write_end) = std::io::pipe().unwrap();
+            topic.as_proxy().unwrap().dump(write_end, &[]).unwrap();
+            let mut text = String::new();
+            std::fs::File::from(OwnedFd::from(read_end))
+                .read_to_string(&mut text)
+                .unwrap();
+            say(&format!("dump {}", text.lines().count()));
             wait_for_eof();
         }
         "state" => {

@@ -73,6 +73,10 @@ impl ITopic for Ended {
     fn r#unsubscribed(&self) -> BinderResult<()> {
         Ok(())
     }
+
+    fn r#status(&self) -> BinderResult<rsbinder_topic::aidl::TopicStatus::TopicStatus> {
+        Err(rsbinder::StatusCode::UnknownTransaction.into())
+    }
 }
 
 /// The first token a [`Capture`] topic was handed.
@@ -95,6 +99,10 @@ impl ITopic for Capture {
 
     fn r#unsubscribed(&self) -> BinderResult<()> {
         Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<rsbinder_topic::aidl::TopicStatus::TopicStatus> {
+        Err(rsbinder::StatusCode::UnknownTransaction.into())
     }
 }
 
