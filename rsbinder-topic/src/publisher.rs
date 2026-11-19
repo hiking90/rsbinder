@@ -378,10 +378,10 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.wait_subscribers_async(seen).await
     }
 
-    /// End the topic without an error: subscribers receive the records before it, then
-    /// [`Closed::End`](crate::Closed::End). Later publishes are [`PublishError::Closed`] and
-    /// later subscriptions are refused with [`ITopic::ERROR_CLOSED`]. Closing again does
-    /// nothing; dropping the publisher closes it so.
+    /// End the topic without an error: subscribers receive the records before it, or on a state
+    /// topic the newest value not yet returned, then [`Closed::End`](crate::Closed::End). Later
+    /// publishes are [`PublishError::Closed`] and later subscriptions are refused with
+    /// [`ITopic::ERROR_CLOSED`]. Closing again does nothing; dropping the publisher closes it so.
     ///
     /// A name the publisher holds ([`advertise_on`](Self::advertise_on)) is taken back first, as
     /// its resolver does it: the service manager does not.
@@ -394,7 +394,7 @@ impl<T: Payload + 'static> Publisher<T> {
         self.close_with(&Status::ok());
     }
 
-    /// [`close`](Self::close) with `status`: subscribers receive the records before it, then
+    /// [`close`](Self::close) with `status`: subscribers receive what `close` leaves them, then
     /// [`Closed::Status`](crate::Closed::Status) with this status, or
     /// [`Closed::End`](crate::Closed::End) for an ok one, as `close` gives.
     ///
