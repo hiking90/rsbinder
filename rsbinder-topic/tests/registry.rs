@@ -608,6 +608,10 @@ impl ITopic for Ended {
     fn r#subscribe(&self, _request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         Err(Status::new_service_specific_error(ERROR_CLOSED, None))
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
 }
 
 /// A watcher told of nothing, sent where a topic belongs.

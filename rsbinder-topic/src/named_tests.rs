@@ -728,6 +728,10 @@ impl ITopic for ByHand {
             topicKind: crate::TopicKind::Event.wire(),
         })
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
 }
 
 /// The header of an item with no payload: a record of 8 bytes.
@@ -1166,6 +1170,10 @@ impl ITopic for StateByHand {
             topicKind: crate::TopicKind::State.wire(),
             ..endpoint
         })
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.0.r#unsubscribed()
     }
 }
 
@@ -2030,6 +2038,11 @@ impl ITopic for Counted {
         ASKED_HERE.set(true);
         self.acceptor.accept(request)
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.acceptor.unsubscribed();
+        Ok(())
+    }
 }
 
 thread_local! {
@@ -2514,6 +2527,11 @@ impl ITopic for Hanging {
         let reply = self.acceptor.accept(request);
         self.answered.fetch_add(1, Ordering::SeqCst);
         reply
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.acceptor.unsubscribed();
+        Ok(())
     }
 }
 

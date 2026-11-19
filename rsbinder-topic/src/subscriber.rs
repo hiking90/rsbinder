@@ -5,9 +5,10 @@
 //!
 //! [`Subscriber::request_starting`] takes the steps SUB1–SUB8 of the plan: it checks the binder,
 //! makes the control page and the token, links to the publisher's death, makes the call, checks
-//! the reply, maps the topic memory and sets the read position. From the call on, every way out
-//! that is not a subscriber drops the control page with `CLOSED` set in it, so a publisher that
-//! added the subscription before its reply was lost takes it out at its next publish.
+//! the reply, maps the topic memory and sets the read position. From the control page on, every
+//! way out that is not a subscriber drops the page with `CLOSED` set in it and calls
+//! `ITopic.unsubscribed`, so a publisher that added the subscription before its reply was lost
+//! takes it out then, or, if it predates the call, at its next publish.
 //!
 //! A receive that waits looks at the ring, spins a little (`rsbinder::fmq::shm::spin`), and
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
@@ -16,6 +17,7 @@ use std::any::Any;
 use std::fmt;
 use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(feature = "tokio")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
@@ -152,8 +154,9 @@ impl Default for Settings {
 /// publisher's socket (feature `uds`).
 ///
 /// It maps the topic's memory read-only and reads records at its own pace; nothing it does
-/// reaches the publisher or another subscriber. Dropping it ends the subscription: the publisher
-/// takes it out at its next publish or subscription.
+/// reaches the publisher or another subscriber. Dropping it ends the subscription and tells the
+/// publisher with a one-way call, which takes it out then. A publisher of `rsbinder-topic` 0.1
+/// does not know the call and takes it out at its next publish or subscription.
 ///
 /// # Receiving
 ///
@@ -240,12 +243,28 @@ pub(crate) struct Trace {
 /// was reached, through whichever binder or socket.
 pub(crate) type RingId = (u64, u64);
 
-/// The control page, marked `CLOSED` when dropped. A wait left on the pool shares it.
-struct Closing(Arc<ControlPage>);
+/// The control page, marked `CLOSED` when dropped, and the publisher told so through `topic`.
+/// A wait left on the pool shares the page.
+///
+/// A field of the subscriber ahead of its death link and session, so the call goes out while
+/// both are held.
+struct Closing {
+    page: Arc<ControlPage>,
+    /// `None` once told.
+    topic: Option<Strong<dyn ITopic>>,
+}
 
 impl Drop for Closing {
     fn drop(&mut self) {
-        self.0.state().fetch_or(CLOSED, Ordering::Release);
+        self.page.state().fetch_or(CLOSED, Ordering::Release);
+        if let Some(topic) = self.topic.take() {
+            // As `DeathLink`'s drop: a thread whose locals are gone panics on a binder call.
+            // One way, and a publisher gone or one that predates the call needs no telling.
+            let _ = catch_unwind(AssertUnwindSafe(move || {
+                let _ = topic.r#unsubscribed();
+                drop(topic);
+            }));
+        }
     }
 }
 
@@ -274,8 +293,13 @@ impl<T: Payload> Subscriber<T> {
         use rsbinder::TransportCaps as Caps;
         Caps::__require_of_binder(topic, Caps::CALLBACKS, "a topic subscription")?;
         let death_ends_ring = Caps::__of_binder(topic).contains(Caps::KERNEL_KNOBS);
+        let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
-        let control = Closing(Arc::new(page));
+        // From here on every way out tells the publisher, which may have taken the subscription.
+        let control = Closing {
+            page: Arc::new(page),
+            topic: Some(service.clone()),
+        };
         let local = Arc::new(Local::new());
         let token = Token {
             local: Arc::downgrade(&local),
@@ -287,7 +311,6 @@ impl<T: Payload> Subscriber<T> {
             dead: dead.clone(),
         };
         let death = link_death(topic, died)?;
-        let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         // `Wake::Fd`: a pair of this side's own; the publisher and this process send, it polls.
         let (fd_wake, sent) = match policy.wake {
             Wake::Futex => (None, None),
@@ -328,13 +351,13 @@ impl<T: Payload> Subscriber<T> {
         let pool = match &endpoint.pool {
             Some(pool) => {
                 let pool = map_pool(pool, policy.max_pool_bytes)?;
-                Some(PoolReader::new(pool, control.0.clone()))
+                Some(PoolReader::new(pool, control.page.clone()))
             }
             None => None,
         };
         local.set_words(Parts {
             seq: memory.seq(),
-            control: control.0.clone(),
+            control: control.page.clone(),
             fd: fd_wake,
         });
         let (chosen, skip) = start(ring, kind);
@@ -831,7 +854,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         read: u64,
         before: Option<u32>,
     ) -> Result<V, RecvError> {
-        let page = &self.control.0;
+        let page = &self.control.page;
         // After the copy: a publisher that waits for this `read` writes over the record only then.
         page.read().store(read, Ordering::Release);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
@@ -1062,7 +1085,7 @@ impl<M: Trust> Subscriber<Bytes, M> {
 
     /// The sample of what the last [`look_held`](Self::look_held) returned.
     pub(crate) fn sample(&self, held: Held) -> Sample<'_, M> {
-        self.reader.sample(held, self.control.0.read())
+        self.reader.sample(held, self.control.page.read())
     }
 
     /// The next value, the newest with `latest`, in the reader's buffer or a slot it pins now.

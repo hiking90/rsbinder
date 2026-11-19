@@ -69,6 +69,10 @@ impl ITopic for Ended {
     fn r#subscribe(&self, _request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         Err(Status::new_service_specific_error(ERROR_CLOSED, None))
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
 }
 
 /// The first token a [`Capture`] topic was handed.
@@ -87,6 +91,10 @@ impl ITopic for Capture {
             println!("SAY captured");
         }
         Err(Status::new_service_specific_error(ERROR_CLOSED, None))
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
     }
 }
 

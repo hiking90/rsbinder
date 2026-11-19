@@ -534,10 +534,14 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 
 /// Takes subscriptions to one [`Publisher`] on behalf of an `ITopic` the application implements.
 ///
-/// An application that decides who may subscribe implements
-/// [`ITopic`](crate::aidl::ITopic::ITopic) itself: its `subscribe` checks the caller with
-/// `rsbinder::CallingContext` (uid, pid, SELinux context), returns an `EX_SECURITY` status to
-/// refuse, and calls [`accept`](Self::accept) to admit.
+/// A check of the caller alone needs none of this:
+/// [`PublisherBuilder::authorize`](crate::PublisherBuilder::authorize) runs it in the publisher's
+/// own binder. Implement [`ITopic`](crate::aidl::ITopic::ITopic) only for work of the
+/// application's own around a subscription. Its `subscribe` may check the caller with
+/// `rsbinder::CallingContext` (uid, pid, SELinux context), return an `EX_SECURITY` status to
+/// refuse, and call [`accept`](Self::accept) to admit; every other method hands over to the
+/// acceptor's method of the same name. `ITopic` gains methods as the crate does, and each one has
+/// its counterpart here.
 ///
 /// ```no_run
 /// use rsbinder::{BinderResult, CallingContext, ExceptionCode, Status};
@@ -558,6 +562,11 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 ///             return Err(Status::from(ExceptionCode::Security));
 ///         }
 ///         self.acceptor.accept(request)
+///     }
+///
+///     fn r#unsubscribed(&self) -> BinderResult<()> {
+///         self.acceptor.unsubscribed();
+///         Ok(())
 ///     }
 /// }
 ///
@@ -618,6 +627,18 @@ impl Acceptor {
             None => Err(refuse(ERROR_CLOSED, "the publisher has been dropped")),
         }
     }
+
+    /// Answer [`ITopic::unsubscribed`]: take out the subscriptions whose subscriber dropped
+    /// them, so that [`Publisher::wait_subscribers`] sees it now. An `ITopic` of the
+    /// application's own calls it from its `unsubscribed`, for any caller: it takes out only
+    /// subscriptions that ended already. Nothing once the publisher is dropped.
+    ///
+    /// [`ITopic::unsubscribed`]: crate::aidl::ITopic::ITopic::r#unsubscribed
+    pub fn unsubscribed(&self) {
+        if let Some(topic) = self.topic.upgrade() {
+            topic.unsubscribed();
+        }
+    }
 }
 
 impl fmt::Debug for Acceptor {
@@ -629,9 +650,18 @@ impl fmt::Debug for Acceptor {
 /// [`Shared`] without its payload type, which the acceptor does not have.
 trait Accept: Send + Sync {
     fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint>;
+
+    /// Take out the subscriptions that ended.
+    fn unsubscribed(&self);
 }
 
 impl<T: Payload + 'static> Accept for Shared<T> {
+    fn unsubscribed(&self) {
+        let mut state = self.writer.lock();
+        let gone = state.links.prune();
+        self.writer.unlock(state, gone);
+    }
+
     fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         if let Some(authorize) = &self.authorize {
             if !authorize.admits(&CallingContext::current()) {
@@ -756,5 +786,10 @@ impl Interface for Service {}
 impl ITopic for Service {
     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         self.acceptor.accept(request)
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.acceptor.unsubscribed();
+        Ok(())
     }
 }

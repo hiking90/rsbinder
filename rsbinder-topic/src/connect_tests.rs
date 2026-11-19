@@ -334,6 +334,11 @@ impl ITopic for Guarded {
         }
         self.acceptor.accept(request)
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.acceptor.unsubscribed();
+        Ok(())
+    }
 }
 
 #[test]
@@ -375,6 +380,10 @@ impl ITopic for Forged {
         let pins = request.pins as u32;
         *self.control.lock().unwrap() = Some(ControlView::map(fd, pins).unwrap());
         Ok((self.endpoint)())
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
     }
 }
 
@@ -736,6 +745,10 @@ fn a_wake_socket_shut_down_without_an_end_ends_the_wait_as_the_publishers_death(
             *self.theirs.lock().unwrap() = Some(socket.try_clone_to_owned().unwrap());
             Ok(endpoint(self.memory.try_clone().unwrap(), MIN_RING as u64))
         }
+
+        fn r#unsubscribed(&self) -> BinderResult<()> {
+            Ok(())
+        }
     }
     let shutting = Shutting {
         memory,
@@ -769,6 +782,10 @@ fn lapped_topic() -> (SIBinder, Lapper) {
     impl ITopic for Lapping {
         fn r#subscribe(&self, _: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
             Ok(endpoint(self.0.try_clone().unwrap(), MIN_RING as u64))
+        }
+
+        fn r#unsubscribed(&self) -> BinderResult<()> {
+            Ok(())
         }
     }
     let (memory, stored) = layout::create_topic(MIN_RING).unwrap();
@@ -940,6 +957,10 @@ fn a_reactor_wait_whose_seq_moves_at_every_arm_ends_at_its_timeout() {
             let socket = request.wakeFd.as_ref().unwrap().as_fd();
             *self.theirs.lock().unwrap() = Some(socket.try_clone_to_owned().unwrap());
             Ok(endpoint(self.memory.try_clone().unwrap(), MIN_RING as u64))
+        }
+
+        fn r#unsubscribed(&self) -> BinderResult<()> {
+            Ok(())
         }
     }
     let (memory, stored) = layout::create_topic(MIN_RING).unwrap();

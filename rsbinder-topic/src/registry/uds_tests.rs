@@ -1928,6 +1928,10 @@ impl ITopic for StoppedTopic {
         let _ = self.released.lock().unwrap().recv();
         Err(StatusCode::DeadObject.into())
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
 }
 
 /// `ResolverOptions::timeout` leaves this call without a deadline: the next generation ends it.

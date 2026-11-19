@@ -20,6 +20,7 @@ use crate::connect::Token;
 use crate::connect_tests::{alone, memfds};
 use crate::layout::{ControlPage, VERSION};
 use crate::pool::MAX_PINS;
+use crate::subscribers_tests::{woken_by, LONG};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
 use crate::{
     Bytes, Closed, EventTopic, Payload, Publisher, PublisherBuilder, RecvError, Subscriber,
@@ -141,6 +142,20 @@ fn a_dropped_subscriber_leaves_nothing_at_either_end() {
     eventually("the session's threads and the mappings", || {
         (memfds(), tasks()) == before
     });
+}
+
+/// The drop's notice and the session's end both reach the publisher; one subscription goes once.
+#[test]
+fn a_dropped_subscriber_changes_the_list_once() {
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "once");
+    let mut subscriber = Some(subscriber_policy().connect(Endpoint::Path(path)).unwrap());
+    let (now, took) = woken_by(&publisher, || drop(subscriber.take()));
+    assert!(took < LONG / 2, "not told: {took:?}");
+    assert_eq!(now.count, 0);
+    // Whichever of the two came second took nothing out.
+    let later = publisher.wait_subscribers(now.generation, Some(Duration::from_millis(300)));
+    assert_eq!(later, now);
 }
 
 #[test]

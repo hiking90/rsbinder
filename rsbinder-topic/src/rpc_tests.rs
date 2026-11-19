@@ -12,15 +12,17 @@ use rsbinder::rpc::transport::TcpDebugTransport;
 use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
 use rsbinder::{ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode, Strong};
 
-use crate::aidl::ITopic::{ITopic, WAKE_FUTEX};
+use crate::aidl::ITopic::{BnTopic, ITopic, WAKE_FUTEX};
 use crate::aidl::ITopicRegistry::ITopicRegistry;
 use crate::aidl::ITopicWatcher::BnTopicWatcher;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
+use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::connect::Token;
 use crate::layout::{ControlPage, VERSION};
 use crate::link::{link_death, Dead};
 use crate::pool::MAX_PINS;
 use crate::registry::{AllowAll, Registry, RegistryResolver};
+use crate::subscribers_tests::{woken_by, LONG};
 use crate::{Bytes, Closed, Payload, Publisher, RecvError, Subscriber};
 
 const WIRE: u32 = 2;
@@ -180,6 +182,52 @@ fn a_session_that_passes_fds_and_has_an_incoming_connection_subscribes() {
         Err(RecvError::Closed(Closed::PublisherDied))
     );
     session.close_session();
+}
+
+#[test]
+fn a_subscriber_over_rpc_that_drops_tells_the_publisher_at_once() {
+    let publisher = publisher();
+    let (name, server) = serve(publisher.as_binder());
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    let mut subscriber = Some(Subscriber::<Bytes>::builder().subscribe(&topic).unwrap());
+    let (now, took) = woken_by(&publisher, || drop(subscriber.take()));
+    assert!(took < LONG / 2, "not told: {took:?}");
+    assert_eq!(now.count, 0);
+    session.close_session();
+    server.terminate();
+}
+
+/// A publisher that predates `unsubscribed`: it answers the call `UNKNOWN_TRANSACTION`.
+struct Predating(crate::Acceptor);
+
+impl Interface for Predating {}
+
+impl ITopic for Predating {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> rsbinder::BinderResult<TopicEndpoint> {
+        self.0.accept(request)
+    }
+
+    fn r#unsubscribed(&self) -> rsbinder::BinderResult<()> {
+        Err(StatusCode::UnknownTransaction.into())
+    }
+}
+
+#[test]
+fn a_publisher_that_predates_the_notice_keeps_the_session_it_comes_over() {
+    let publisher = publisher();
+    let predating = BnTopic::new_binder(Predating(publisher.acceptor())).as_binder();
+    let (name, server) = serve(predating);
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    drop(Subscriber::<Bytes>::builder().subscribe(&topic).unwrap());
+    // The session that carried the refused notice still carries a subscription.
+    let mut again = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
+    assert_eq!(publisher.subscriber_count(), 1);
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    assert_eq!(again.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+    session.close_session();
+    server.terminate();
 }
 
 #[test]

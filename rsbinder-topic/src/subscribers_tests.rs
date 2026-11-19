@@ -18,7 +18,7 @@ use crate::layout::{ControlPage, CLOSED, VERSION};
 use crate::pool::MAX_PINS;
 use crate::{Bytes, Payload, Publisher, Start, Subscriber, Subscribers};
 
-const LONG: Duration = Duration::from_secs(10);
+pub(crate) const LONG: Duration = Duration::from_secs(10);
 
 fn publisher() -> Publisher<Bytes> {
     Publisher::<Bytes>::events().build().unwrap()
@@ -103,7 +103,10 @@ fn a_wait_returns_at_once_when_the_list_changed_since_seen() {
 }
 
 /// Wait on `publisher` from another thread while `change` runs; the list it returned, and when.
-fn woken_by(publisher: &Publisher<Bytes>, change: impl FnOnce()) -> (Subscribers, Duration) {
+pub(crate) fn woken_by(
+    publisher: &Publisher<Bytes>,
+    change: impl FnOnce(),
+) -> (Subscribers, Duration) {
     let seen = publisher.subscribers().generation;
     let (woke, woken) = mpsc::channel();
     std::thread::scope(|scope| {
@@ -129,6 +132,29 @@ fn a_subscription_taken_wakes_a_wait() {
     let (now, took) = woken_by(&publisher, || subscriber = Some(subscribe(&publisher)));
     assert!(took < LONG / 2, "not woken: {took:?}");
     assert_eq!(now.count, 1);
+}
+
+#[test]
+fn a_dropped_subscriber_tells_the_publisher_and_wakes_a_wait_without_a_publish() {
+    let publisher = publisher();
+    let mut subscriber = Some(subscribe(&publisher));
+    let (now, took) = woken_by(&publisher, || drop(subscriber.take()));
+    assert!(took < LONG / 2, "not woken: {took:?}");
+    assert_eq!(now.count, 0);
+}
+
+#[test]
+fn a_refused_subscriber_leaves_the_list_as_it_was() {
+    let publisher = Publisher::<Bytes>::events()
+        .max_subscribers(1)
+        .build()
+        .unwrap();
+    let _held = subscribe(&publisher);
+    let before = publisher.subscribers();
+    // Its control page is closed and the publisher told, with nothing of it in the list.
+    let refused = Subscriber::<Bytes>::builder().subscribe(&publisher.as_binder());
+    assert!(refused.is_err());
+    assert_eq!(publisher.subscribers(), before);
 }
 
 #[test]

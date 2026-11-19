@@ -742,6 +742,10 @@ impl ITopic for Closed {
     fn r#subscribe(&self, _: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         Err(refuse(ERROR_CLOSED, "a test topic"))
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
 }
 
 fn topic() -> Strong<dyn ITopic> {

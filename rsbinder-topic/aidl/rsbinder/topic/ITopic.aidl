@@ -51,4 +51,13 @@ interface ITopic {
      * (SubscribeRequest names each).
      */
     TopicEndpoint subscribe(in SubscribeRequest request);
+
+    /**
+     * A subscriber of this process has dropped a subscription: the publisher
+     * takes out the subscriptions whose control page is marked closed now,
+     * not at its next publish. It carries nothing and changes nothing else,
+     * so any caller may make it. A publisher that predates it answers
+     * `UNKNOWN_TRANSACTION`, which a one-way caller never sees.
+     */
+    oneway void unsubscribed();
 }
