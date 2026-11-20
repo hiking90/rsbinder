@@ -237,7 +237,8 @@ fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
         eprintln!("rsb_service: {name}: not registered (or not visible to this caller)");
         return ExitCode::from(exit::NO);
     };
-    let Some(proxy) = binder.as_proxy() else {
+    // A kernel proxy, or the RPC proxy of a service the hub reaches through an accessor.
+    let Some(proxy) = binder.as_remote() else {
         // Only a binder local to this process lacks a proxy; `rsb_service` registers none.
         eprintln!("rsb_service: {name}: not a remote binder, nothing to dump");
         return ExitCode::from(exit::ERR);
@@ -265,6 +266,13 @@ fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
                 eprintln!(
                     "  The service is still writing an earlier dump. rsb_hub writes one at a \
                      time, and its log names the caller whose dump it is."
+                );
+            }
+            if code == rsbinder::StatusCode::FdsNotAllowed {
+                eprintln!(
+                    "  The service is reached over an RPC session that carries no file \
+                     descriptors (an accessor's session, as in AOSP), so it cannot be sent \
+                     the output to write to."
                 );
             }
             ExitCode::from(exit::ERR)

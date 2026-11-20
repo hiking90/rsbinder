@@ -4084,6 +4084,7 @@ pub fn rsbinder::ProxyHandle::try_descriptor(&self) -> rsbinder::Result<&str>
 pub fn rsbinder::ProxyHandle::unlink_to_death(&self, alloc::sync::Weak<dyn rsbinder::DeathRecipient>) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::was_parceled(&self) -> bool
 impl rsbinder::RemoteProxy for rsbinder::ProxyHandle
+pub fn rsbinder::ProxyHandle::dump(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
@@ -5026,10 +5027,12 @@ pub fn rsbinder::shared_memory::BnMemoryHeap<H>::on_dump_fd(&self, std::os::fd::
 pub fn rsbinder::shared_memory::BnMemoryHeap<H>::on_transact(&self, rsbinder::TransactionCode, &mut rsbinder::Parcel, &mut rsbinder::Parcel) -> rsbinder::Result<()>
 pub fn rsbinder::shared_memory::BnMemoryHeap<H>::transaction_name(rsbinder::TransactionCode) -> core::option::Option<&'static str> where Self: core::marker::Sized
 pub trait rsbinder::RemoteProxy
+pub fn rsbinder::RemoteProxy::dump(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::RemoteProxy::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::RemoteProxy::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::RemoteProxy::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>
 impl rsbinder::RemoteProxy for rsbinder::ProxyHandle
+pub fn rsbinder::ProxyHandle::dump(&self, std::os::fd::owned::OwnedFd, &[alloc::string::String]) -> rsbinder::Result<()>
 pub fn rsbinder::ProxyHandle::prepare_request(&self, &str) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::prepare_transact(&self, bool) -> rsbinder::Result<rsbinder::Parcel>
 pub fn rsbinder::ProxyHandle::submit_transact(&self, rsbinder::TransactionCode, &rsbinder::Parcel, rsbinder::TransactionFlags) -> rsbinder::Result<core::option::Option<rsbinder::Parcel>>

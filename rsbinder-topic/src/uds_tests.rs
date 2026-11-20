@@ -191,6 +191,26 @@ fn the_status_over_a_socket_is_the_publishers_and_its_inspect_sees_the_peers_uid
 }
 
 #[test]
+fn a_dump_over_a_socket_is_the_text_of_the_publishers_status() {
+    use std::io::Read;
+
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "dump");
+    let _subscriber = subscriber_policy()
+        .connect(Endpoint::Path(path.clone()))
+        .unwrap();
+    let session = uds::connect(Endpoint::Path(path), &Options::default()).unwrap();
+    let topic = session.0.get_root().unwrap();
+    let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+    topic.as_remote().unwrap().dump(write_end, &[]).unwrap();
+    let mut text = String::new();
+    std::fs::File::from(read_end)
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(text, publisher.acceptor().status().unwrap().to_string());
+}
+
+#[test]
 fn a_subscriber_of_any_type_reads_over_a_socket() {
     let publisher = policy().build().unwrap();
     let (path, _server, _handle) = serve(&publisher, "any");
