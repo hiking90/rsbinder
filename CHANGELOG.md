@@ -141,6 +141,15 @@ peers; peers of either release still subscribe to each other.
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds
   a blocking-pool thread that a `timeout` around the future cannot release,
   and `Runtime::drop` then waits for it.
+- `RemoteProxy::dump`, AOSP `BpBinder::dump` over the kernel and the RPC
+  stack alike: an RPC binder can now be sent `DUMP_TRANSACTION`, which until
+  now only a kernel proxy (`ProxyHandle::dump`) could send. Over RPC the fd
+  goes in the session's fd table, so the session must have negotiated
+  `FileDescriptorTransportMode::Unix`; any other is `FdsNotAllowed` before
+  anything is sent. `ProxyHandle::dump` keeps its signature and calls it.
+  `rsb_service dump` uses it, so a service the service manager hands out as
+  an RPC binder (an Android 16 accessor's) is sent the dump too; an
+  accessor's session carries no fds, as in AOSP, and the tool says so.
 - `rsbinder-topic`: state topics. `Publisher::state()` makes a topic whose
   newest record is its current value, with a first value given to `build` or
   written by `build_with`. A subscriber learns the kind as it subscribes

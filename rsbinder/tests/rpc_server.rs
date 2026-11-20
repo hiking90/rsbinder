@@ -5071,3 +5071,107 @@ fn resend_after_would_block_delivers_a_live_node() {
         "the node the resend delivered is released once by the peer's DEC_STRONG"
     );
 }
+
+/// Writes `dumped` and each argument, space-separated, into the fd of a dump.
+struct Dumper(Arc<AtomicUsize>);
+
+impl Interface for Dumper {}
+
+impl Remotable for Dumper {
+    fn descriptor() -> &'static str {
+        DESC
+    }
+    fn on_transact(&self, _: TransactionCode, _: &mut Parcel, _: &mut Parcel) -> Result<()> {
+        Err(StatusCode::UnknownTransaction)
+    }
+    fn on_dump(&self, w: &mut dyn std::io::Write, args: &[String]) -> Result<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let text = std::iter::once("dumped").chain(args.iter().map(String::as_str));
+        let text = text.collect::<Vec<_>>().join(" ");
+        w.write_all(text.as_bytes()).map_err(StatusCode::from)
+    }
+}
+
+/// A server of a [`Dumper`] on android-13+ wire `version` (`None`: R34), fds allowed when `fds`.
+fn dump_server(
+    tag: &str,
+    version: Option<u32>,
+    fds: bool,
+) -> (ServeCleanup, Arc<AtomicUsize>, std::path::PathBuf) {
+    use rsbinder::rpc::FileDescriptorTransportMode;
+
+    let path = tmp_sock(tag);
+    let dumps = Arc::new(AtomicUsize::new(0));
+    let server = RpcServer::setup_unix_server(&path).expect("bind");
+    if let Some(version) = version {
+        server.set_android13plus(version);
+    }
+    if fds {
+        server.set_supported_fd_modes(&[FileDescriptorTransportMode::Unix]);
+    }
+    let root = Interface::as_binder(&Binder::new(Dumper(Arc::clone(&dumps))));
+    server.set_root(root).expect("set_root");
+    let bg = server.run_background().expect("run_background");
+    let cleanup = ServeCleanup::new(Arc::clone(&server), bg, path.clone());
+    (cleanup, dumps, path)
+}
+
+/// What a pipe's read end holds once every write end is closed.
+fn drained(read_end: std::os::fd::OwnedFd) -> String {
+    use std::io::Read;
+
+    let mut text = String::new();
+    std::fs::File::from(read_end)
+        .read_to_string(&mut text)
+        .expect("read the dump");
+    text
+}
+
+/// `RemoteProxy::dump` over a session that carries fds reaches the remote's `on_dump`, with args.
+#[test]
+fn a_dump_over_rpc_writes_into_the_fd_it_sends() {
+    use rsbinder::rpc::FileDescriptorTransportMode;
+
+    // R34 carries an fd as a bare index, android-13+ v1+ as an object whose position is recorded;
+    // android-13+ v0 has no fd mode at all.
+    for (i, version) in [None, Some(1u32), Some(2)].into_iter().enumerate() {
+        let (_cleanup, dumps, path) = dump_server(&format!("dump_{i}"), version, true);
+        let client = match version {
+            None => {
+                let client = RpcSession::setup_unix_client(&path).expect("connect");
+                let mode = client.negotiate_fd_transport(FileDescriptorTransportMode::Unix);
+                assert_eq!(mode, Ok(FileDescriptorTransportMode::Unix));
+                client
+            }
+            Some(version) => {
+                let config = RpcClientConfig::unix(&path, version)
+                    .fd_mode(FileDescriptorTransportMode::Unix);
+                RpcSession::setup_client_android13plus_with_config(config).expect("connect")
+            }
+        };
+        let root = client.get_root().expect("get_root");
+        let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
+        let args = ["-a".to_owned(), "b c".to_owned()];
+        let remote = root.as_remote().expect("an RPC proxy");
+        remote.dump(write_end, &args).expect("dump");
+        assert_eq!(drained(read_end), "dumped -a b c", "wire {version:?}");
+        assert_eq!(dumps.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// A session without fds refuses the dump before sending it, and closes the fd it was given.
+#[test]
+fn a_dump_over_rpc_without_fds_is_refused_and_sends_nothing() {
+    let (_cleanup, dumps, path) = dump_server("dump_nofd", Some(2), false);
+    let config = RpcClientConfig::unix(&path, 2);
+    let client = RpcSession::setup_client_android13plus_with_config(config).expect("connect");
+    let root = client.get_root().expect("get_root");
+    let (read_end, write_end) = rustix::pipe::pipe().expect("pipe");
+    let remote = root.as_remote().expect("an RPC proxy");
+    assert_eq!(remote.dump(write_end, &[]), Err(StatusCode::FdsNotAllowed));
+    // The read end sees end of file: the write end the call took is closed.
+    assert_eq!(drained(read_end), "");
+    assert_eq!(dumps.load(Ordering::SeqCst), 0);
+    // The session is still usable: the refusal happened before anything went out.
+    assert!(root.ping_binder().is_ok());
+}

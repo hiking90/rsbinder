@@ -263,8 +263,8 @@ pub(crate) fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(errno_status)
 }
 
-/// Body of [`write_raw_fd`] for a [`dup_for_parcel`] fd; ownership moves only after the body.
-fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
+/// [`write_raw_fd`] of an owned fd (a dup, or a caller's); a refused fd mode drops it unwritten.
+pub(crate) fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
     #[cfg(feature = "rpc")]
     if let Some(profile) = rpc_fd_profile(parcel)? {
         // Push only after the body is written, so a failed write leaves no ghost table entry.

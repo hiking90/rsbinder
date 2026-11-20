@@ -173,19 +173,26 @@ pipe whose reader has exited fails with `EPIPE`, which `?` converts to
 marks the proxy dead and fails every later call on it. The same substitution
 applies to every method a service implements.
 
-On the client side, you can invoke `dump()` on a remote service through its proxy.
-The output is written to a file descriptor (typically a pipe):
+On the client side, you can invoke `dump()` on a remote service through its proxy,
+kernel or RPC alike (`RemoteProxy::dump`). The output is written to a file
+descriptor (typically a pipe), which the call takes and closes:
 
 ```rust
 let (read_end, write_end) = rsbinder::ParcelFileDescriptor::pipe()?;
 let args = vec!["dump".to_owned(), "MyService".to_owned()];
 
-service.as_binder().as_proxy().unwrap().dump(write_end, &args)?;
+let binder = service.as_binder();
+binder.as_remote().unwrap().dump(write_end.into(), &args)?;
 
 let mut buf = String::new();
 (&read_end).read_to_string(&mut buf)?;
 // buf now contains the dump output
 ```
+
+Over RPC the fd travels in the session's fd table, so the session must have
+been set up with `FileDescriptorTransportMode::Unix`; on any other session,
+TCP, vsock and TLS among them, the call fails with `FdsNotAllowed` and sends
+nothing.
 
 ## Testing Service Liveness with ping_binder()
 

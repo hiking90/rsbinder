@@ -404,44 +404,17 @@ impl ProxyHandle {
         Ok(())
     }
 
-    /// Send `DUMP_TRANSACTION` to the remote binder, which writes its
-    /// state into `fd` — the transport under Android's `dumpsys <service>`,
-    /// and under `rsb_service dump <name>` on Linux.
-    ///
-    /// `fd` is **consumed**: the parcel takes ownership of the descriptor
-    /// and closes it once the transaction is done, so pass a duplicate when
-    /// the caller needs to keep writing to the same file. (A deliberate
-    /// divergence from AOSP `BpBinder::dump`, which calls
-    /// `writeFileDescriptor(fd)` with `takeOwnership = false` and leaves
-    /// the caller's fd open — the `Into<OwnedFd>` bound here makes the
-    /// transfer explicit instead: a `File`, an `OwnedFd`, a `ChildStdin`
-    /// and the other owning std types pass their fd, which closes exactly
-    /// once whichever way the call ends.) The transaction is sent with
-    /// `FLAG_CLEAR_BUF` where AOSP passes `0`: the kernel then zeroes the
-    /// transaction buffer after the callee is done, harmless to the peer
-    /// and cheap insurance for a dump that may carry sensitive state. The remote's handler is
-    /// [`crate::Remotable::on_dump`], which the AIDL backend routes to
-    /// [`crate::Interface::dump`]; the default implementation writes
-    /// nothing and succeeds.
-    ///
-    /// `args` reach the handler verbatim; their meaning is the service's
-    /// own. The call is synchronous, so it returns only after the remote
-    /// has finished writing.
+    /// [`RemoteProxy::dump`] on a kernel proxy, taking the fd of any owning
+    /// type: a `File`, an `OwnedFd`, a `ChildStdin` and the other owning std
+    /// types pass their fd, which closes exactly once whichever way the call
+    /// ends. A proxy whose remote has died fails with
+    /// [`StatusCode::DeadObject`] before anything is sent.
     pub fn dump<F: Into<OwnedFd>>(&self, fd: F, args: &[String]) -> Result<()> {
         // A dead proxy drops `fd` here, which closes it.
         if self.death.is_dead() {
             return Err(StatusCode::DeadObject);
         }
-        let mut send = Parcel::new();
-        // The parcel owns the fd from here and closes it on drop; a refused write closes it now.
-        send.write_kernel_fd(fd.into())?;
-
-        send.write::<i32>(&(args.len() as i32))?;
-        for arg in args {
-            send.write(arg)?;
-        }
-        self.submit_transact(DUMP_TRANSACTION, &send, FLAG_CLEAR_BUF)?;
-        Ok(())
+        RemoteProxy::dump(self, fd.into(), args)
     }
 }
 

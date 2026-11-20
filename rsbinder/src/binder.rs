@@ -645,6 +645,46 @@ pub trait RemoteProxy {
         data: &Parcel,
         flags: TransactionFlags,
     ) -> Result<Option<Parcel>>;
+
+    /// Send `DUMP_TRANSACTION` to the remote binder, which writes its state
+    /// into `fd`: AOSP `BpBinder::dump`, over the kernel and the RPC stack
+    /// alike. It is the transport under Android's `dumpsys <service>` and
+    /// `rsb_service dump <name>`. The remote's handler is
+    /// [`Remotable::on_dump`](crate::Remotable::on_dump), which the AIDL
+    /// backend routes to [`Interface::dump`](crate::Interface::dump); the
+    /// default implementation writes nothing and succeeds.
+    ///
+    /// `fd` is **consumed**: the request takes ownership of the descriptor
+    /// and closes it once the call ends, whichever way, so pass a duplicate
+    /// when the caller needs to keep writing to the same file. AOSP's
+    /// `writeFileDescriptor(fd)` borrows the caller's fd instead
+    /// (`takeOwnership = false`).
+    ///
+    /// Over RPC the fd travels in the session's file descriptor table, so
+    /// the session must have negotiated `FileDescriptorTransportMode::Unix`.
+    /// On any other session, such as one over TCP, vsock or TLS, or an
+    /// android-13+ session at wire v0, which has no fd mode, the call fails with
+    /// [`StatusCode::FdsNotAllowed`](crate::StatusCode::FdsNotAllowed) before
+    /// anything is sent.
+    ///
+    /// The transaction carries `FLAG_CLEAR_BUF` where AOSP passes `0`: on
+    /// the kernel stack the driver zeroes the transaction buffer after the
+    /// callee is done, for a dump that may carry sensitive state; over RPC
+    /// the flag has no effect, as the receiver reads only `FLAG_ONEWAY`.
+    ///
+    /// `args` reach the handler verbatim; their meaning is the service's
+    /// own. The call is synchronous: it returns once the remote has finished
+    /// writing.
+    fn dump(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
+        let mut send = self.prepare_transact(false)?;
+        crate::file_descriptor::write_raw_owned_fd(&mut send, fd)?;
+        send.write::<i32>(&(args.len() as i32))?;
+        for arg in args {
+            send.write(arg)?;
+        }
+        self.submit_transact(DUMP_TRANSACTION, &send, FLAG_CLEAR_BUF)?;
+        Ok(())
+    }
 }
 
 /// Where a generated proxy sends a call: a remote binder through its
