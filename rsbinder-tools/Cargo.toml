@@ -19,7 +19,8 @@ env_logger.workspace = true
 anstyle.workspace = true
 clap.workspace = true
 libc.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
+# `time`: the receive time `rsb_service topic record` writes (`CLOCK_MONOTONIC`).
+rustix = { workspace = true, features = ["fs", "process", "time"] }
 thiserror.workspace = true
 serde.workspace = true
 toml.workspace = true

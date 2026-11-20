@@ -46,9 +46,12 @@
 //! A [`Publisher`] makes the topic and hands out an `ITopic` binder; a [`Subscriber`] takes a
 //! subscription through it with one twoway call. Both are made by a builder
 //! ([`Publisher::events`], [`Subscriber::builder`]). Each end learns of the other's end: a
-//! subscriber that is dropped marks its control page, one whose process dies is reported to the
-//! publisher through binder, and a publisher that is dropped or closed writes an end record,
-//! while one whose process dies is reported to its subscribers.
+//! subscriber that is dropped marks its control page and tells the publisher with a one-way
+//! call, one whose process dies is reported to the publisher through binder, and a publisher that
+//! is dropped or closed writes an end record, while one whose process dies is reported to its
+//! subscribers. A publisher waits for its list of subscriptions to change with
+//! [`Publisher::wait_subscribers`], and answers a status call and a binder dump for the callers
+//! its [`inspect`](PublisherBuilder::inspect) admits.
 //!
 //! ```no_run
 //! use rsbinder::{hub, ProcessState};
@@ -130,6 +133,7 @@ mod ring;
 mod sample;
 mod stats;
 mod subscriber;
+mod trace;
 mod trust;
 #[cfg(feature = "uds")]
 pub mod uds;
@@ -138,14 +142,14 @@ mod wake;
 
 pub use builder::{EventTopic, PublisherBuilder, StateTopic, SubscriberBuilder, TopicKind};
 pub use named::{NamedState, NamedSubscriber};
-pub use payload::{Bytes, Encoding, Payload, Record};
+pub use payload::{AnyType, Bytes, Encoding, Payload, Record};
 pub use poll::{wait_any, Wait};
 pub use publish::PublishError;
 pub use publisher::{Acceptor, LoanMut, Publisher};
 pub use receive::{Closed, Disconnected, RecvError};
 pub use resolve::{Advertisement, OnResolved, Resolved, Resolver, ServiceManager, Watch};
 pub use sample::Sample;
-pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats};
+pub use stats::{PublisherStats, SubscriberInfo, SubscriberStats, Subscribers};
 pub use subscriber::{Interrupter, Start, Subscriber, Wake};
 pub use trust::{Trust, Trusted, Untrusted};
 
@@ -191,6 +195,59 @@ mod connect_tests;
     )
 ))]
 mod rpc_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod subscribers_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod any_type_tests;
+
+#[cfg(all(
+    test,
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod status_tests;
+
+#[cfg(all(
+    test,
+    feature = "tracing",
+    not(loom),
+    not(miri),
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_pointer_width = "64",
+        all(target_arch = "x86", target_feature = "sse2"),
+        all(target_arch = "arm", target_has_atomic = "64")
+    )
+))]
+mod trace_tests;
 
 #[cfg(all(
     test,

@@ -14,6 +14,7 @@
 use std::fmt;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use rsbinder::{
     BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
@@ -22,20 +23,24 @@ use rsbinder::{
 
 use crate::aidl::ISubscription::ISubscription;
 use crate::aidl::ITopic::{
-    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, WAKE_FD, WAKE_FUTEX,
+    BnTopic, ITopic, ERROR_CLOSED, ERROR_FULL, ERROR_VERSION, FLAG_UNWAITED, WAKE_FD, WAKE_FUTEX,
 };
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
+use crate::aidl::SubscriberStatus::SubscriberStatus;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
+use crate::aidl::TopicStatus::TopicStatus;
 use crate::connect::{asked_here, policy_status, refuse, status_of};
 use crate::layout::{self, ControlView, Stored, HEADER_OFFSET, VERSION};
 use crate::link::{Dead, Forget, Link};
 use crate::pool::LentSlot;
 use crate::pool::MAX_PINS;
-use crate::publish::{Authorize, Spec};
+use crate::publish::{may_inspect, Authorize, Spec};
 use crate::publish::{PoolFd, TypedWriter};
 use crate::resolve::{Advertisement, Resolver};
-use crate::{wake, Bytes, Payload, PublishError, PublisherStats, TopicKind};
+#[cfg(feature = "tracing")]
+use crate::trace::event;
+use crate::{wake, Bytes, Payload, PublishError, PublisherStats, Subscribers, TopicKind};
 
 /// The sending end of a topic of `T`: it writes values into the topic's memory and takes
 /// subscriptions to it.
@@ -92,11 +97,19 @@ struct Shared<T> {
     max_subscribers: usize,
     max_per_uid: usize,
     authorize: Option<Authorize>,
+    inspect: Option<Authorize>,
+    lossless: bool,
 }
 
 impl<T: Payload + 'static> Publisher<T> {
     /// Make a topic with `spec`: the last call of a [`PublisherBuilder`](crate::PublisherBuilder).
     pub(crate) fn from_spec(spec: &Spec) -> BinderResult<Self> {
+        if T::type_name().is_empty() {
+            return Err(Status::from((
+                ExceptionCode::IllegalArgument,
+                "the empty type name is a subscriber's of any type, and no publisher's",
+            )));
+        }
         let (fd, pool, writer) = TypedWriter::create(spec).map_err(policy_status)?;
         let capacity = writer.lock().writer.capacity();
         let shared = Arc::new(Shared {
@@ -108,6 +121,8 @@ impl<T: Payload + 'static> Publisher<T> {
             max_subscribers: spec.max_subscribers,
             max_per_uid: spec.max_per_uid,
             authorize: spec.authorize.clone(),
+            inspect: spec.inspect.clone(),
+            lossless: spec.backpressure.is_some(),
         });
         let acceptor = Acceptor {
             topic: Arc::downgrade(&shared) as Weak<dyn Accept>,
@@ -249,6 +264,28 @@ impl<T: Payload + 'static> Publisher<T> {
         self.shared.writer.lock().after_bump = Some(pause);
     }
 
+    /// Run `f` with the topic's lock held, as a publish that waits for room holds it; the guard's
+    /// plain drop lets it go, as `give_back` and an early return do.
+    #[cfg(test)]
+    pub(crate) fn with_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _state = self.shared.writer.lock();
+        f()
+    }
+
+    /// Run `pause` under the lock in a thread's wait for the list, after a look found no change.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn pause_after_list_look(&self, pause: Box<dyn FnMut() + Send>) {
+        self.shared.writer.lock().after_list_look = Some(pause);
+    }
+
+    /// Sleeps a thread's wait for the list began; one counted holds the lock a change's count
+    /// takes until it sleeps.
+    #[cfg(test)]
+    pub(crate) fn list_sleeps(&self) -> usize {
+        let sleeps = &self.shared.writer.list_sleeps;
+        sleeps.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Take a wait in `state` as woken already in every subscription.
     #[cfg(all(test, not(loom), any(target_os = "linux", target_os = "android")))]
     pub(crate) fn take_as_woken(&self, state: u32) {
@@ -281,9 +318,64 @@ impl<T: Payload + 'static> Publisher<T> {
         let mut state = self.shared.writer.lock();
         let gone = state.links.prune();
         let count = state.links.len();
-        drop(state);
-        drop(gone);
+        self.shared.writer.unlock(state, gone);
         count
+    }
+
+    /// The subscriptions the topic holds now, after taking out those that ended, and the
+    /// generation of the list: the `seen` of a first [`wait_subscribers`](Self::wait_subscribers).
+    pub fn subscribers(&self) -> Subscribers {
+        self.shared.writer.subscribers()
+    }
+
+    /// Wait until the list of subscriptions is no longer at generation `seen`, or `timeout`
+    /// passes, then the list as it is: for a publisher that starts work when the first
+    /// subscriber comes and stops it when the last goes, without asking over and over.
+    ///
+    /// It returns at once when the list has changed since `seen` was read. Changes that land
+    /// between two calls are not lost: the next call sees the list as they left it. With
+    /// `timeout` passed it returns the list unchanged, its generation still `seen`.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use rsbinder_topic::{Bytes, Publisher};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let publisher = Publisher::<Bytes>::events().build()?;
+    /// let mut now = publisher.subscribers();
+    /// loop {
+    ///     if now.count > 0 {
+    ///         // Turn the sensor on, publish while someone listens.
+    ///     } else {
+    ///         // Turn it off.
+    ///     }
+    ///     now = publisher.wait_subscribers(now.generation, Some(Duration::from_secs(1)));
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// A subscriber of this crate tells the publisher when it drops its subscription, which
+    /// wakes this wait. One that does not (an `rsbinder-topic` 0.1 subscriber, or a process that
+    /// leaves its subscription without dropping it) is seen when the topic next checks: at the
+    /// next publish, or when this wait starts or times out. A wait without a timeout learns of
+    /// such a drop at the next publish only. A subscriber process that dies is seen at once.
+    ///
+    /// The wait takes the topic's lock to look, which a publish on a
+    /// [`lossless`](crate::PublisherBuilder::lossless) topic holds while it waits for room.
+    pub fn wait_subscribers(&self, seen: u64, timeout: Option<Duration>) -> Subscribers {
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        self.shared.writer.wait_subscribers(seen, deadline)
+    }
+
+    /// [`wait_subscribers`](Self::wait_subscribers) for a future, without a timeout: wrap it in
+    /// `tokio::time::timeout` for one. Dropping the future ends the wait and leaves nothing
+    /// behind.
+    ///
+    /// Each look takes the topic's lock on the thread that polls the future; a publish on a
+    /// [`lossless`](crate::PublisherBuilder::lossless) topic holds it while it waits for room.
+    #[cfg(feature = "tokio")]
+    pub async fn wait_subscribers_async(&self, seen: u64) -> Subscribers {
+        self.shared.writer.wait_subscribers_async(seen).await
     }
 
     /// End the topic without an error: subscribers receive the records before it, then
@@ -471,23 +563,32 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 
 /// Takes subscriptions to one [`Publisher`] on behalf of an `ITopic` the application implements.
 ///
-/// An application that decides who may subscribe implements
-/// [`ITopic`](crate::aidl::ITopic::ITopic) itself: its `subscribe` checks the caller with
-/// `rsbinder::CallingContext` (uid, pid, SELinux context), returns an `EX_SECURITY` status to
-/// refuse, and calls [`accept`](Self::accept) to admit.
+/// A check of the caller alone needs none of this:
+/// [`PublisherBuilder::authorize`](crate::PublisherBuilder::authorize) runs it in the publisher's
+/// own binder. Implement [`ITopic`](crate::aidl::ITopic::ITopic) only for work of the
+/// application's own around a subscription. Its `subscribe` may check the caller with
+/// `rsbinder::CallingContext` (uid, pid, SELinux context), return an `EX_SECURITY` status to
+/// refuse, and call [`accept`](Self::accept) to admit; every other method hands over to the
+/// acceptor's method of the same name. `ITopic` gains methods as the crate does, and each one has
+/// its counterpart here.
 ///
 /// ```no_run
 /// use rsbinder::{BinderResult, CallingContext, ExceptionCode, Status};
 /// use rsbinder_topic::aidl::ITopic::{BnTopic, ITopic};
 /// use rsbinder_topic::aidl::SubscribeRequest::SubscribeRequest;
 /// use rsbinder_topic::aidl::TopicEndpoint::TopicEndpoint;
+/// use rsbinder_topic::aidl::TopicStatus::TopicStatus;
 /// use rsbinder_topic::{Acceptor, Bytes, Publisher};
 ///
 /// struct Guarded {
 ///     acceptor: Acceptor,
 /// }
 ///
-/// impl rsbinder::Interface for Guarded {}
+/// impl rsbinder::Interface for Guarded {
+///     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+///         self.acceptor.dump(writer, args)
+///     }
+/// }
 ///
 /// impl ITopic for Guarded {
 ///     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
@@ -495,6 +596,15 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 ///             return Err(Status::from(ExceptionCode::Security));
 ///         }
 ///         self.acceptor.accept(request)
+///     }
+///
+///     fn r#unsubscribed(&self) -> BinderResult<()> {
+///         self.acceptor.unsubscribed();
+///         Ok(())
+///     }
+///
+///     fn r#status(&self) -> BinderResult<TopicStatus> {
+///         self.acceptor.status()
 ///     }
 /// }
 ///
@@ -520,7 +630,8 @@ impl Acceptor {
     /// Refusals: `EX_SECURITY` when the topic's
     /// [`authorize`](crate::PublisherBuilder::authorize) does not admit the caller,
     /// checked first; [`ITopic::ERROR_VERSION`] for another layout version; `BadType` when the
-    /// request names another payload type; `UnexpectedNull` for a null `token` or `control`;
+    /// request names another payload type (the empty name, [`AnyType`](crate::AnyType)'s, names
+    /// any); `UnexpectedNull` for a null `token` or `control`;
     /// `BadValue` for a token of this process that came through binder (its death would say
     /// nothing about the caller) or that is not an `ISubscription`, a pin count other than 0 or 1,
     /// a `wake` that is neither [`ITopic::WAKE_FUTEX`] nor [`ITopic::WAKE_FD`], a `wakeFd` that is
@@ -555,6 +666,61 @@ impl Acceptor {
             None => Err(refuse(ERROR_CLOSED, "the publisher has been dropped")),
         }
     }
+
+    /// Answer [`ITopic::unsubscribed`]: take out the subscriptions whose subscriber dropped
+    /// them, so that [`Publisher::wait_subscribers`] sees it now. An `ITopic` of the
+    /// application's own calls it from its `unsubscribed`, for any caller: it takes out only
+    /// subscriptions that ended already. Nothing once the publisher is dropped.
+    ///
+    /// [`ITopic::unsubscribed`]: crate::aidl::ITopic::ITopic::unsubscribed
+    pub fn unsubscribed(&self) {
+        if let Some(topic) = self.topic.upgrade() {
+            topic.unsubscribed();
+        }
+    }
+
+    /// Answer [`ITopic::status`]: the topic and each subscription it holds after taking out
+    /// those that ended, as [`Publisher::stats`] reads them, for a caller the topic's
+    /// [`inspect`](crate::PublisherBuilder::inspect) admits; `EX_SECURITY` for another.
+    /// [`ITopic::ERROR_CLOSED`] once the publisher is dropped. A closed publisher still answers.
+    ///
+    /// Call it from the handler of the call, on the thread the call arrived on: the caller it
+    /// checks is that call's. For an admitted caller it takes the topic's lock, which a publish on
+    /// a [`lossless`](crate::PublisherBuilder::lossless) topic holds while it waits for room, so
+    /// the answer can wait up to that timeout; a refused caller is answered without it.
+    ///
+    /// [`ITopic::status`]: crate::aidl::ITopic::ITopic::status
+    /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
+    pub fn status(&self) -> BinderResult<TopicStatus> {
+        let topic = self.topic.upgrade();
+        let topic = topic.ok_or_else(|| refuse(ERROR_CLOSED, "the publisher has been dropped"))?;
+        topic.inspected()?;
+        Ok(topic.status())
+    }
+
+    /// Answer a binder dump (`dumpsys` on Android): [`status`](Self::status)'s reply as text,
+    /// one line for the topic and one per subscription. A caller the topic's
+    /// [`inspect`](crate::PublisherBuilder::inspect) refuses is told so in the text, and a
+    /// publisher dropped writes that it is. `args` are not read.
+    ///
+    /// An `ITopic` of the application's own calls it from its `rsbinder::Interface::dump`.
+    /// The status is read under the topic's lock, as [`status`](Self::status) reads it, waiting
+    /// for it as that does; the text is made once the lock is let go and written in one call. The
+    /// writer is the caller's fd, which a caller that does not read can hold up.
+    pub fn dump(&self, writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> {
+        let text = match self.status() {
+            Ok(status) => format!("{status}"),
+            Err(refused) if refused.exception_code() == ExceptionCode::Security => {
+                let caller = CallingContext::current();
+                format!(
+                    "rsbinder-topic: uid {} pid {} may not look at this topic\n",
+                    caller.uid, caller.pid
+                )
+            }
+            Err(_) => "rsbinder-topic: the publisher has been dropped\n".to_owned(),
+        };
+        writer.write_all(text.as_bytes()).map_err(StatusCode::from)
+    }
 }
 
 impl fmt::Debug for Acceptor {
@@ -565,11 +731,88 @@ impl fmt::Debug for Acceptor {
 
 /// [`Shared`] without its payload type, which the acceptor does not have.
 trait Accept: Send + Sync {
-    fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint>;
+    /// [`take`](Self::take), and its event once the lock is let go.
+    fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        #[cfg(feature = "tracing")]
+        let payload = self.payload();
+        let taken = self.take(request);
+        #[cfg(feature = "tracing")]
+        trace_taken(payload, &taken);
+        taken
+    }
+
+    /// Refuse the subscription `request` asks for, or take it.
+    fn take(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint>;
+
+    /// The name of the payload type.
+    #[cfg(feature = "tracing")]
+    fn payload(&self) -> &'static str;
+
+    /// Take out the subscriptions that ended.
+    fn unsubscribed(&self);
+
+    /// `EX_SECURITY` unless the caller may look at the topic.
+    fn inspected(&self) -> BinderResult<()>;
+
+    /// The topic and its subscriptions now.
+    fn status(&self) -> TopicStatus;
 }
 
 impl<T: Payload + 'static> Accept for Shared<T> {
-    fn accept(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+    fn unsubscribed(&self) {
+        self.writer.unsubscribed();
+    }
+
+    fn inspected(&self) -> BinderResult<()> {
+        let caller = CallingContext::current();
+        let admitted = match &self.inspect {
+            Some(inspect) => inspect.admits(&caller),
+            None => {
+                let own = rustix::process::getuid().as_raw();
+                may_inspect(caller.uid, own, cfg!(target_os = "android"))
+            }
+        };
+        if !admitted {
+            return Err(Status::from((
+                ExceptionCode::Security,
+                "the publisher's `inspect` does not admit the caller",
+            )));
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> TopicStatus {
+        let stats = self.writer.stats();
+        let subscribers = stats.subscribers.iter().map(|info| SubscriberStatus {
+            // The bits of the `u64`s and the `u32` uid, as the reply's other fields carry them.
+            id: info.id as i64,
+            uid: info.uid as i32,
+            pid: info.pid,
+            lagBytes: info.lag_bytes as i64,
+            lost: info.lost as i64,
+            waiting: info.waiting,
+            evicted: info.evicted,
+            unwaited: info.unwaited,
+            pinned: info.pinned.map_or(-1, |slot| slot as i32),
+        });
+        TopicStatus {
+            typeName: T::type_name().to_owned(),
+            topicKind: self.kind.wire(),
+            ringBytes: self.capacity as i64,
+            lossless: self.lossless,
+            published: stats.published as i64,
+            bytes: stats.bytes as i64,
+            evicted: stats.evicted as i64,
+            subscribers: subscribers.collect(),
+        }
+    }
+
+    #[cfg(feature = "tracing")]
+    fn payload(&self) -> &'static str {
+        T::type_name()
+    }
+
+    fn take(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         if let Some(authorize) = &self.authorize {
             if !authorize.admits(&CallingContext::current()) {
                 return Err(Status::from((
@@ -584,7 +827,8 @@ impl<T: Payload + 'static> Accept for Shared<T> {
                 "subscriber of another layout version",
             ));
         }
-        if request.r#type != T::type_name() {
+        // The empty name is a subscriber's that takes any type (`AnyType`).
+        if !request.r#type.is_empty() && request.r#type != T::type_name() {
             return Err(StatusCode::BadType.into());
         }
         let pins = u32::try_from(request.pins)
@@ -631,12 +875,15 @@ impl<T: Payload + 'static> Accept for Shared<T> {
         let caller = CallingContext::current();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
+        // The bits this publisher knows, and only those go back: the subscriber checks for its own.
+        let flags = request.flags & FLAG_UNWAITED;
         let link = Link::new(
             control,
             (uid, caller.pid),
             socket,
             (token, subscription),
             list,
+            flags & FLAG_UNWAITED != 0,
         )?;
         let link = Arc::new(link);
 
@@ -655,14 +902,13 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             ))
         } else {
             let start = state.writer.position();
-            state.links.push(link.clone(), start);
-            Ok((start, state.writer.next_index()))
+            let id = state.links.push(link.clone(), start);
+            Ok((start, state.writer.next_index(), id))
         };
-        drop(state);
-        // Unmapped and unlinked here, after the lock: `link` too, when it was refused.
-        drop(gone);
+        // Unmapped and unlinked after the lock: `link` too, when it was refused.
+        self.writer.unlock(state, gone);
         drop(link);
-        let (start, index) = taken?;
+        let (start, index, id) = taken?;
         Ok(TopicEndpoint {
             version: VERSION as i32,
             ring,
@@ -672,6 +918,9 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             startIndex: index as i32,
             pool,
             topicKind: self.kind.wire(),
+            id: id as i64,
+            flags,
+            typeName: T::type_name().to_owned(),
         })
     }
 }
@@ -680,8 +929,22 @@ impl<T: Payload> Forget for Shared<T> {
     fn forget(&self, dead: &Arc<Dead>) {
         let mut state = self.writer.lock();
         let gone = state.links.remove(dead);
-        drop(state);
-        drop(gone);
+        self.writer.unlock(state, gone.into_iter().collect());
+    }
+}
+
+/// The event of a subscription call to a topic of `payload`, taken or refused.
+#[cfg(feature = "tracing")]
+fn trace_taken(payload: &str, taken: &BinderResult<TopicEndpoint>) {
+    let caller = CallingContext::current();
+    let (uid, pid) = (caller.uid, caller.pid);
+    match taken {
+        Ok(endpoint) => {
+            let id = endpoint.id as u64;
+            let unwaited = endpoint.flags & FLAG_UNWAITED != 0;
+            event!(debug, payload, id, uid, pid, unwaited, "subscription taken");
+        }
+        Err(status) => event!(debug, payload, uid, pid, reason = %status, "subscription refused"),
     }
 }
 
@@ -690,10 +953,23 @@ struct Service {
     acceptor: Acceptor,
 }
 
-impl Interface for Service {}
+impl Interface for Service {
+    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
+        self.acceptor.dump(writer, args)
+    }
+}
 
 impl ITopic for Service {
+    fn r#status(&self) -> BinderResult<TopicStatus> {
+        self.acceptor.status()
+    }
+
     fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         self.acceptor.accept(request)
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.acceptor.unsubscribed();
+        Ok(())
     }
 }

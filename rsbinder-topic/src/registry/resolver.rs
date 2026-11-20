@@ -79,6 +79,14 @@ impl RegistryResolver {
         let listed = self.registry.r#list(prefix)?;
         Ok(listed.into_iter().map(TopicListing::from).collect())
     }
+
+    /// The topic `name` is given to now, an `ITopic` binder: for a caller that subscribes or
+    /// asks its status once, with no watch. `None` for a name with no topic and for one the
+    /// host's policy does not let this process subscribe to, which the answer cannot tell apart.
+    /// `EX_ILLEGAL_ARGUMENT` for a name outside the service name rule.
+    pub fn lookup(&self, name: &str) -> BinderResult<Option<SIBinder>> {
+        Ok(parts(self.registry.r#lookup(name)?).0)
+    }
 }
 
 impl fmt::Debug for RegistryResolver {

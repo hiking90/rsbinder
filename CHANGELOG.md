@@ -20,7 +20,7 @@ Each item below breaks a build against rsbinder 0.13.0 or `rsbinder-topic`
 observes. `rsbinder-topic` goes to 0.2.0 with this release, as its API breaks.
 The book's
 [Migrating from 0.13 to 0.14](https://hiking90.github.io/rsbinder/migrating-0.14.html)
-says what to change for each. The item marked **wire** changes bytes between
+says what to change for each. The items marked **wire** change bytes between
 peers; peers of either release still subscribe to each other.
 
 - `try_get_interface_async`, `check_interface_async`,
@@ -112,6 +112,28 @@ peers; peers of either release still subscribe to each other.
   literal of `TopicEndpoint` names the field or ends in `..Default::default()`.
 - `rsbinder-topic`: a subscription whose `ITopic` reply has a `topicKind`
   other than 0 or 1 is refused with `BadValue`.
+- **`rsbinder-topic` (breaking): `ITopic` has two more methods**,
+  `oneway void unsubscribed()` and `TopicStatus status()`. An `ITopic` of the
+  application's own does not compile until it implements them; each hands
+  over to the `Acceptor` method of the same name, and its
+  `rsbinder::Interface::dump` to `Acceptor::dump`. A struct literal of
+  `SubscribeRequest` or `TopicEndpoint` names the new fields or ends in
+  `..Default::default()`, and `SubscriberInfo` has the fields `id` and
+  `unwaited`.
+- `rsbinder-topic`: a dropped `Subscriber` tells its publisher at once with
+  `ITopic.unsubscribed`, where the publisher saw the drop at its next
+  publish. A reply the subscriber refuses tells it too.
+- `rsbinder-topic`: `Payload::type_name` reserves the empty name, and
+  `build()` refuses a type that has it with `EX_ILLEGAL_ARGUMENT`.
+- **wire**: `rsbinder-topic`: `SubscribeRequest` has a new last field `flags`,
+  and `TopicEndpoint` the last fields `id`, `flags` and `typeName`; `ITopic`
+  has the methods above, with no change of the layout version. A 0.1.0
+  publisher sends none of the fields, answers `unsubscribed` and `status`
+  with `UNKNOWN_TRANSACTION`, refuses an `AnyType` subscriber with
+  `BadType`, and a subscription that asked not to be waited for is refused
+  by the subscriber with `InvalidOperation`. A 0.1.0 subscriber ignores the
+  new fields and never calls the new methods: its drop is seen at the next
+  publish, as before.
 
 ### Added
 
@@ -126,6 +148,30 @@ peers; peers of either release still subscribe to each other.
   `Start::Auto` starts a state topic at its newest record and an event topic
   at the next one, and every receive of a state topic returns the newest value
   with no `RecvError::Lagged`.
+- `rsbinder-topic`: `Publisher::subscribers`, `wait_subscribers` and
+  `wait_subscribers_async`, returning `Subscribers` (a generation and a
+  count): the list of subscriptions, and a wait for it to change, for a
+  publisher that works only while someone subscribes.
+- `rsbinder-topic`: `SubscriberBuilder::unwaited`, a subscription no publish
+  waits for and no wait for room takes out (`ITopic.FLAG_UNWAITED`); it loses
+  what it does not read in time, and counts against the subscription bounds.
+- `rsbinder-topic`: `AnyType`, a subscriber of any topic's bytes, and
+  `Subscriber::topic_type`, the type name its publisher compares.
+- `rsbinder-topic`: `Subscriber::id` and `SubscriberInfo::id`, the publisher's
+  number for each subscription.
+- `rsbinder-topic`: `ITopic.status` and the binder dump of a publisher
+  (`dumpsys` on Android), which name each subscription's uid, pid, lag and
+  losses, for callers `PublisherBuilder::inspect` admits: by default the
+  publisher's uid, root, and on Android `shell`. `RegistryResolver::lookup`
+  gives the `ITopic` binder of a registry name; `uds::status` and
+  `UdsResolver::status` ask for the status over a socket; `TopicStatus`
+  implements `Display`, the text of the dump.
+- `rsbinder-topic`: the `tracing` feature, events of each subscription's life
+  under the target `rsbinder_topic`, none per record.
+- `rsbinder-tools`: `rsb_service topic list|stat|hz|echo|record` (feature
+  `topic`), a topic's status, rate and records from outside its publisher;
+  `topics` stays as `topic list`; the module `rsbinder_tools::topic_cmd`
+  (feature `topic`) with the `record` file constants.
 
 ### Changed
 

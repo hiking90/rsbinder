@@ -21,7 +21,7 @@
 //! (`drivers/android/binder/transaction.rs`) drops the reply and sends `BR_FAILED_REPLY` only to
 //! the sender of a transaction, so the caller waits for ever, and the test returns before it.
 //! Either way the publisher added the subscription and holds the control page mapped; the
-//! subscriber, still alive, closed it, and the next commit takes the subscription out.
+//! subscriber, still alive, closed it and told the publisher, which takes the subscription out.
 
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
@@ -87,9 +87,70 @@ fn a_killed_or_dropped_subscriber_is_taken_out_and_its_page_unmapped() {
     assert_eq!(publisher.subscriber_count(), 1);
     peer.tell("drop");
     assert_eq!(peer.says(), "dropped");
-    // No death: the page says `CLOSED`, and the count takes it out.
+    // No death: the page says `CLOSED`, and the drop's notice or the count takes it out.
     assert_eq!(publisher.subscriber_count(), 0);
     assert_eq!(memfds(), before);
+}
+
+/// The list a wait started on another thread before `change` returns, and how long it took.
+fn wait_through(
+    publisher: &Publisher<Bytes>,
+    change: impl FnOnce(),
+) -> (rsbinder_topic::Subscribers, Duration) {
+    let seen = publisher.subscribers().generation;
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            let started = Instant::now();
+            let now = publisher.wait_subscribers(seen, Some(WAIT));
+            (now, started.elapsed())
+        });
+        // Long enough for the wait to sleep, so the change has to wake it.
+        std::thread::sleep(Duration::from_millis(200));
+        change();
+        waiting.join().unwrap()
+    })
+}
+
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_publishers_wait_hears_of_a_subscriber_of_another_process_that_comes_drops_or_dies() {
+    let (name, publisher) = publish("wait");
+    // Spawned inside the change, so the subscription cannot come before the wait's `seen`.
+    let mut spawned = None;
+    let (now, took) = wait_through(&publisher, || {
+        let peer = Peer::spawn("subscribe", &name);
+        assert_eq!(peer.says(), "subscribed");
+        spawned = Some(peer);
+    });
+    let mut peer = spawned.unwrap();
+    assert!(took < WAIT / 2, "the subscription was not heard: {took:?}");
+    assert_eq!(now.count, 1);
+    // The drop's one-way notice, with no publish to look at the page.
+    let (now, took) = wait_through(&publisher, || {
+        peer.tell("drop");
+        assert_eq!(peer.says(), "dropped");
+    });
+    assert!(took < WAIT / 2, "the drop was not told: {took:?}");
+    assert_eq!(now.count, 0);
+
+    let mut peer = Peer::spawn("subscribe", &name);
+    assert_eq!(peer.says(), "subscribed");
+    let (now, took) = wait_through(&publisher, || peer.kill());
+    assert!(took < WAIT / 2, "the death was not seen: {took:?}");
+    assert_eq!(now.count, 0);
+}
+
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn another_process_of_the_publishers_uid_reads_its_status_and_its_dump() {
+    let (name, publisher) = publish("inspect");
+    let subscriber = Peer::spawn("subscribe", &name);
+    assert_eq!(subscriber.says(), "subscribed");
+    let inspector = Peer::spawn("inspect", &name);
+    assert_eq!(inspector.says(), "status 1");
+    // The topic's line and the subscriber's.
+    assert_eq!(inspector.says(), "dump 2");
+    assert_eq!(publisher.subscriber_count(), 1);
 }
 
 #[test]
@@ -226,9 +287,7 @@ fn a_reply_the_subscriber_refuses_leaves_its_page_closed() {
     let peer = Peer::spawn("small-ring", &name);
     assert_eq!(peer.says(), "refused: BadValue");
     // As below, with the reply delivered and refused (a ring above the subscriber's bound).
-    assert_eq!(memfds(), (before.0, before.1 + 1));
-    publisher.publish(&Bytes(vec![1])).unwrap();
-    assert_eq!(memfds(), before);
+    eventually("the notice to unmap the page", || memfds() == before);
     assert_eq!(publisher.subscriber_count(), 0);
 }
 
@@ -251,10 +310,8 @@ fn a_reply_the_subscriber_cannot_take_leaves_its_page_closed() {
     let peer = Peer::spawn("nofile", &name);
     // The C driver's `BR_FAILED_REPLY`: no fd number for the topic memory, and no errno.
     assert_eq!(peer.says(), "failed: FailedTransaction");
-    // The publisher still maps the page the subscriber closed; the next commit drops it.
-    assert_eq!(memfds(), (before.0, before.1 + 1));
-    publisher.publish(&Bytes(vec![1])).unwrap();
-    assert_eq!(memfds(), before);
+    // The subscriber closed the page and told the publisher, which takes it out with no commit.
+    eventually("the notice to unmap the page", || memfds() == before);
     assert_eq!(publisher.subscriber_count(), 0);
 }
 
@@ -690,6 +747,25 @@ fn child() {
             say("dropped");
             wait_for_eof();
         }
+        "inspect" => {
+            use std::io::Read;
+            let topic = hub::check_service(&name).unwrap();
+            let status = topic
+                .clone()
+                .into_interface::<dyn ITopic>()
+                .unwrap()
+                .r#status()
+                .unwrap();
+            say(&format!("status {}", status.subscribers.len()));
+            let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+            topic.as_proxy().unwrap().dump(write_end, &[]).unwrap();
+            let mut text = String::new();
+            std::fs::File::from(read_end)
+                .read_to_string(&mut text)
+                .unwrap();
+            say(&format!("dump {}", text.lines().count()));
+            wait_for_eof();
+        }
         "state" => {
             let topic = hub::check_service(&name).unwrap();
             let mut subscriber = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
@@ -833,6 +909,7 @@ fn raw_request(token: SIBinder) -> SubscribeRequest {
         pins: 0,
         wake: 0,
         wakeFd: None,
+        flags: 0,
     }
 }
 

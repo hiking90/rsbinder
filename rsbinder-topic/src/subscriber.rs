@@ -5,9 +5,10 @@
 //!
 //! [`Subscriber::request_starting`] takes the steps SUB1–SUB8 of the plan: it checks the binder,
 //! makes the control page and the token, links to the publisher's death, makes the call, checks
-//! the reply, maps the topic memory and sets the read position. From the call on, every way out
-//! that is not a subscriber drops the control page with `CLOSED` set in it, so a publisher that
-//! added the subscription before its reply was lost takes it out at its next publish.
+//! the reply, maps the topic memory and sets the read position. From the control page on, every
+//! way out that is not a subscriber drops the page with `CLOSED` set in it and calls
+//! `ITopic.unsubscribed`, so a publisher that added the subscription before its reply was lost
+//! takes it out then, or, if it predates the call, at its next publish.
 //!
 //! A receive that waits looks at the ring, spins a little (`rsbinder::fmq::shm::spin`), and
 //! sleeps on the topic's `seq` by the protocol in `wait.rs`.
@@ -18,6 +19,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(feature = "tokio")]
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 #[cfg(feature = "tokio")]
@@ -33,7 +35,7 @@ use rsbinder::{
 use tokio::io::{unix::AsyncFd, Interest};
 
 use crate::aidl::ISubscription::BnSubscription;
-use crate::aidl::ITopic::{ITopic, ERROR_VERSION, WAKE_FD, WAKE_FUTEX};
+use crate::aidl::ITopic::{ITopic, ERROR_VERSION, FLAG_UNWAITED, WAKE_FD, WAKE_FUTEX};
 use crate::aidl::Pool::Pool;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
@@ -43,6 +45,7 @@ use crate::link::{link_death, Dead};
 use crate::pool::{PoolReader, MAX_PINS};
 use crate::receive::{Held, TypedReader};
 use crate::ring::{self, Loads, Reader};
+use crate::trace::event;
 use crate::wait::{
     decide, Died, Local, Looked, Next, Parts, Slept, Until, Words, ABANDON, ALL, INTERRUPTED,
     NOTICE,
@@ -134,6 +137,7 @@ pub(crate) struct Settings {
     pub(crate) max_ring_bytes: usize,
     pub(crate) max_pool_bytes: usize,
     pub(crate) wake: Wake,
+    pub(crate) unwaited: bool,
 }
 
 impl Default for Settings {
@@ -143,6 +147,18 @@ impl Default for Settings {
             max_ring_bytes: DEFAULT_MAX_RING,
             max_pool_bytes: DEFAULT_MAX_POOL,
             wake: Wake::Futex,
+            unwaited: false,
+        }
+    }
+}
+
+impl Settings {
+    /// The `SubscribeRequest.flags` these ask for.
+    fn flags(&self) -> i32 {
+        if self.unwaited {
+            FLAG_UNWAITED
+        } else {
+            0
         }
     }
 }
@@ -152,8 +168,11 @@ impl Default for Settings {
 /// publisher's socket (feature `uds`).
 ///
 /// It maps the topic's memory read-only and reads records at its own pace; nothing it does
-/// reaches the publisher or another subscriber. Dropping it ends the subscription: the publisher
-/// takes it out at its next publish or subscription.
+/// reaches the publisher or another subscriber. Dropping it ends the subscription and tells the
+/// publisher with a one-way call, which takes it out then. The drop does not wait for the
+/// publisher's lock: a publisher of this process that holds it, as a lossless publish waiting for
+/// room does, takes the subscription out as it lets go. A publisher of `rsbinder-topic` 0.1 does
+/// not know the call and takes it out at its next publish or subscription.
 ///
 /// # Receiving
 ///
@@ -211,6 +230,13 @@ pub struct Subscriber<T: Payload, M: Trust = Untrusted> {
     session: Option<Arc<dyn Any + Send + Sync>>,
     ring: RingId,
     kind: TopicKind,
+    /// The publisher's number for the subscription; `None` from a publisher that sends none.
+    id: Option<u64>,
+    /// The name of the topic's payload type, as the publisher compares it.
+    type_name: String,
+    /// A receive has returned a [`RecvError::Closed`], whose event is then emitted.
+    #[cfg(feature = "tracing")]
+    told_closed: bool,
     /// A test's pause before a wait loads the `seq` it decides on.
     #[cfg(test)]
     pub(crate) before_seen: Option<Box<dyn FnMut() + Send + Sync>>,
@@ -240,12 +266,23 @@ pub(crate) struct Trace {
 /// was reached, through whichever binder or socket.
 pub(crate) type RingId = (u64, u64);
 
-/// The control page, marked `CLOSED` when dropped. A wait left on the pool shares it.
-struct Closing(Arc<ControlPage>);
+/// Marks the page `CLOSED` and tells `topic` on drop, while the later death link and session live.
+struct Closing {
+    page: Arc<ControlPage>,
+    /// `None` once told.
+    topic: Option<Strong<dyn ITopic>>,
+}
 
 impl Drop for Closing {
     fn drop(&mut self) {
-        self.0.state().fetch_or(CLOSED, Ordering::Release);
+        self.page.state().fetch_or(CLOSED, Ordering::Release);
+        if let Some(topic) = self.topic.take() {
+            // A call panics on a thread whose locals are gone (`DeathLink`); a failed one is left.
+            let _ = catch_unwind(AssertUnwindSafe(move || {
+                let _ = topic.r#unsubscribed();
+                drop(topic);
+            }));
+        }
     }
 }
 
@@ -274,8 +311,13 @@ impl<T: Payload> Subscriber<T> {
         use rsbinder::TransportCaps as Caps;
         Caps::__require_of_binder(topic, Caps::CALLBACKS, "a topic subscription")?;
         let death_ends_ring = Caps::__of_binder(topic).contains(Caps::KERNEL_KNOBS);
+        let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         let (fd, page) = ControlPage::create(MAX_PINS).map_err(status_of)?;
-        let control = Closing(Arc::new(page));
+        // From here on every way out tells the publisher, which may have taken the subscription.
+        let control = Closing {
+            page: Arc::new(page),
+            topic: Some(service.clone()),
+        };
         let local = Arc::new(Local::new());
         let token = Token {
             local: Arc::downgrade(&local),
@@ -287,7 +329,6 @@ impl<T: Payload> Subscriber<T> {
             dead: dead.clone(),
         };
         let death = link_death(topic, died)?;
-        let service: Strong<dyn ITopic> = topic.clone().into_interface()?;
         // `Wake::Fd`: a pair of this side's own; the publisher and this process send, it polls.
         let (fd_wake, sent) = match policy.wake {
             Wake::Futex => (None, None),
@@ -310,6 +351,7 @@ impl<T: Payload> Subscriber<T> {
                 Wake::Fd => WAKE_FD,
             },
             wakeFd: sent,
+            flags: policy.flags(),
         };
         let endpoint = {
             let _asking = Asking::new(&request);
@@ -317,6 +359,15 @@ impl<T: Payload> Subscriber<T> {
         };
         // The publisher holds its own fds now; this side keeps the mapping and a duplicate.
         drop(request);
+        // A bit asked for and left out is one the publisher did not take; `control` tells it.
+        if endpoint.flags != policy.flags() {
+            log::error!(
+                "topic: cannot subscribe, the publisher took flags {:#x} of {:#x}",
+                endpoint.flags,
+                policy.flags()
+            );
+            return Err(StatusCode::InvalidOperation.into());
+        }
         let kind = TopicKind::from_wire(endpoint.topicKind).ok_or_else(|| {
             log::error!(
                 "topic: cannot subscribe, a topic of kind {}",
@@ -328,13 +379,13 @@ impl<T: Payload> Subscriber<T> {
         let pool = match &endpoint.pool {
             Some(pool) => {
                 let pool = map_pool(pool, policy.max_pool_bytes)?;
-                Some(PoolReader::new(pool, control.0.clone()))
+                Some(PoolReader::new(pool, control.page.clone()))
             }
             None => None,
         };
         local.set_words(Parts {
             seq: memory.seq(),
-            control: control.0.clone(),
+            control: control.page.clone(),
             fd: fd_wake,
         });
         let (chosen, skip) = start(ring, kind);
@@ -351,6 +402,18 @@ impl<T: Payload> Subscriber<T> {
             log::error!("topic: cannot subscribe, the topic's memory is corrupted: {what}");
             StatusCode::BadValue
         })?;
+        // A publisher that names none took only this side's own name.
+        let type_name = match endpoint.typeName.as_str() {
+            "" => T::type_name().to_owned(),
+            named => named.to_owned(),
+        };
+        event!(
+            debug,
+            payload = type_name.as_str(),
+            id = endpoint.id as u64,
+            kind = ?kind,
+            "subscribed"
+        );
         Ok(Self {
             _abandon: Abandon {
                 local: local.clone(),
@@ -377,6 +440,11 @@ impl<T: Payload> Subscriber<T> {
             session: None,
             ring,
             kind,
+            // The bits of a `u64`, as the publisher wrote them.
+            id: Some(endpoint.id as u64).filter(|&id| id != 0),
+            type_name,
+            #[cfg(feature = "tracing")]
+            told_closed: false,
             #[cfg(test)]
             before_seen: None,
             #[cfg(test)]
@@ -416,6 +484,20 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     /// The kind of the topic, as its publisher declared it.
     pub fn topic_kind(&self) -> TopicKind {
         self.kind
+    }
+
+    /// The publisher's number for this subscription, as its
+    /// [`SubscriberInfo::id`](crate::SubscriberInfo::id) names it. `None` from a publisher of
+    /// `rsbinder-topic` 0.1, which gives none.
+    pub fn id(&self) -> Option<u64> {
+        self.id
+    }
+
+    /// The name of the topic's payload type, as its publisher compares it: for a subscriber of
+    /// [`AnyType`](crate::AnyType), what its records are. A publisher of `rsbinder-topic` 0.1
+    /// names none and took only this subscriber's own name, which this is then.
+    pub fn topic_type(&self) -> &str {
+        &self.type_name
     }
 
     /// Whether a receive that asked for the newest value with `latest` returns the newest:
@@ -690,7 +772,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
     pub(crate) fn look(&mut self, latest: bool) -> Result<T, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
-            return Err(RecvError::Closed(Closed::Evicted));
+            return self.closing(Err(RecvError::Closed(Closed::Evicted)));
         }
         let before = self.before_look();
         let died = self.local.died();
@@ -831,7 +913,7 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
         read: u64,
         before: Option<u32>,
     ) -> Result<V, RecvError> {
-        let page = &self.control.0;
+        let page = &self.control.page;
         // After the copy: a publisher that waits for this `read` writes over the record only then.
         page.read().store(read, Ordering::Release);
         page.lost().store(self.reader.lost(), Ordering::Relaxed);
@@ -846,10 +928,22 @@ impl<T: Payload, M: Trust> Subscriber<T, M> {
             Err(RecvError::Closed(Closed::End | Closed::Status(_))) => self.read_end = true,
             Err(_) => {}
         }
-        match received {
+        let result = match received {
             Err(RecvError::Empty) if died => Err(RecvError::Closed(Closed::PublisherDied)),
             other => other,
+        };
+        self.closing(result)
+    }
+
+    /// `result`, with an event for the first [`RecvError::Closed`] only: later receives repeat it.
+    fn closing<V>(&mut self, result: Result<V, RecvError>) -> Result<V, RecvError> {
+        #[cfg(feature = "tracing")]
+        if let Err(RecvError::Closed(why)) = &result {
+            if !std::mem::replace(&mut self.told_closed, true) {
+                event!(debug, payload = self.type_name.as_str(), why = ?why, "subscription closed");
+            }
         }
+        result
     }
 
     /// The publisher's pool as this subscriber mapped it, for tests of the subscription.
@@ -951,6 +1045,10 @@ impl<T: Payload> Subscriber<T> {
             session,
             ring,
             kind,
+            id,
+            type_name,
+            #[cfg(feature = "tracing")]
+            told_closed,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -980,6 +1078,10 @@ impl<T: Payload> Subscriber<T> {
             session,
             ring,
             kind,
+            id,
+            type_name,
+            #[cfg(feature = "tracing")]
+            told_closed,
             #[cfg(test)]
             before_seen,
             #[cfg(test)]
@@ -1062,14 +1164,14 @@ impl<M: Trust> Subscriber<Bytes, M> {
 
     /// The sample of what the last [`look_held`](Self::look_held) returned.
     pub(crate) fn sample(&self, held: Held) -> Sample<'_, M> {
-        self.reader.sample(held, self.control.0.read())
+        self.reader.sample(held, self.control.page.read())
     }
 
     /// The next value, the newest with `latest`, in the reader's buffer or a slot it pins now.
     pub(crate) fn look_held(&mut self, latest: bool) -> Result<Held, RecvError> {
         if self.local.evicted() {
             self.looked = Looked::Exact;
-            return Err(RecvError::Closed(Closed::Evicted));
+            return self.closing(Err(RecvError::Closed(Closed::Evicted)));
         }
         let before = self.before_look();
         let died = self.local.died();

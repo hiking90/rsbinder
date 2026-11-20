@@ -1928,6 +1928,14 @@ impl ITopic for StoppedTopic {
         let _ = self.released.lock().unwrap().recv();
         Err(StatusCode::DeadObject.into())
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        Err(StatusCode::UnknownTransaction.into())
+    }
 }
 
 /// `ResolverOptions::timeout` leaves this call without a deadline: the next generation ends it.

@@ -7,6 +7,7 @@ package rsbinder.topic;
 
 import rsbinder.topic.SubscribeRequest;
 import rsbinder.topic.TopicEndpoint;
+import rsbinder.topic.TopicStatus;
 
 /**
  * A topic: one publisher, any number of subscribers. A subscription is this
@@ -44,6 +45,14 @@ interface ITopic {
     const int ERROR_CLOSED = 3;
 
     /**
+     * SubscribeRequest.flags, TopicEndpoint.flags: the publisher does not
+     * wait for this subscriber. A publish does not wait for its reads, a
+     * pool lends a slot it has not read past unless it pins it, and a wait
+     * for room never takes it out; it loses what it has not read in time.
+     */
+    const int FLAG_UNWAITED = 1;
+
+    /**
      * Take a subscription. A publisher that refuses the caller returns
      * `EX_SECURITY`; the other refusals are the constants above, `BAD_TYPE`
      * for a payload type of another name, `UNEXPECTED_NULL` for a null
@@ -51,4 +60,21 @@ interface ITopic {
      * (SubscribeRequest names each).
      */
     TopicEndpoint subscribe(in SubscribeRequest request);
+
+    /**
+     * A subscriber of this process has dropped a subscription: the publisher
+     * takes out the subscriptions whose control page is marked closed now,
+     * not at its next publish. It carries nothing and changes nothing else,
+     * so any caller may make it. A publisher that predates it answers
+     * `UNKNOWN_TRANSACTION`, which a one-way caller never sees.
+     */
+    oneway void unsubscribed();
+
+    /**
+     * The topic and its subscriptions now. It names other processes'
+     * uids and pids, so a publisher answers only the callers its policy
+     * lets look, and refuses the rest with `EX_SECURITY`. A publisher that
+     * predates it answers `UNKNOWN_TRANSACTION`.
+     */
+    TopicStatus status();
 }

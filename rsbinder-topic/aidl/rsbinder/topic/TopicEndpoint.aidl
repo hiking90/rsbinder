@@ -58,4 +58,26 @@ parcelable TopicEndpoint {
      * subscriber refuses any other value with `BAD_VALUE`.
      */
     int topicKind;
+
+    /**
+     * The publisher's number for this subscription, unique within the
+     * publisher and never 0, the bits of a `u64`. The publisher's own
+     * account of its subscriptions names each by it. A publisher that sends
+     * no such field is read as 0: no number.
+     */
+    long id;
+
+    /**
+     * The bits of SubscribeRequest.flags the publisher took: those it
+     * knows. A publisher that sends no such field took none.
+     */
+    int flags;
+
+    /**
+     * The name of the payload type, as the publisher compares it with
+     * SubscribeRequest.type: what a subscriber that asked for any type
+     * (an empty SubscribeRequest.type) reads to learn it. A publisher that
+     * sends no such field is read as "", and took only its own name.
+     */
+    String typeName;
 }

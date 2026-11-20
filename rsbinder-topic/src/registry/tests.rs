@@ -742,6 +742,14 @@ impl ITopic for Closed {
     fn r#subscribe(&self, _: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         Err(refuse(ERROR_CLOSED, "a test topic"))
     }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        Err(rsbinder::StatusCode::UnknownTransaction.into())
+    }
 }
 
 fn topic() -> Strong<dyn ITopic> {

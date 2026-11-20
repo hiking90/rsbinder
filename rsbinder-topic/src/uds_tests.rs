@@ -20,6 +20,7 @@ use crate::connect::Token;
 use crate::connect_tests::{alone, memfds};
 use crate::layout::{ControlPage, VERSION};
 use crate::pool::MAX_PINS;
+use crate::subscribers_tests::{woken_by, LONG};
 use crate::uds::{self, Endpoint, Options, SessionGuard};
 use crate::{
     Bytes, Closed, EventTopic, Payload, Publisher, PublisherBuilder, RecvError, Subscriber,
@@ -141,6 +142,81 @@ fn a_dropped_subscriber_leaves_nothing_at_either_end() {
     eventually("the session's threads and the mappings", || {
         (memfds(), tasks()) == before
     });
+}
+
+#[test]
+fn an_unwaited_subscription_over_a_socket_is_one_the_publisher_does_not_wait_for() {
+    let publisher = policy().lossless(WAIT).build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "unwaited");
+    let mut subscriber = subscriber_policy()
+        .unwaited()
+        .connect(Endpoint::Path(path))
+        .unwrap();
+    let started = Instant::now();
+    for byte in 0..=255 {
+        publisher.publish(&Bytes(vec![byte; 64])).unwrap();
+    }
+    assert!(
+        started.elapsed() < WAIT / 2,
+        "waited {:?}",
+        started.elapsed()
+    );
+    assert!(publisher.stats().subscribers[0].unwaited);
+    assert!(matches!(subscriber.try_recv(), Err(RecvError::Lagged(_))));
+}
+
+#[test]
+fn the_status_over_a_socket_is_the_publishers_and_its_inspect_sees_the_peers_uid() {
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "status");
+    let _subscriber = subscriber_policy()
+        .connect(Endpoint::Path(path.clone()))
+        .unwrap();
+    let status = uds::status(Endpoint::Path(path), &Options::default()).unwrap();
+    let here = publisher.acceptor().status().unwrap();
+    assert_eq!(status.to_string(), here.to_string());
+    assert_eq!(status.subscribers.len(), 1);
+
+    let own = rustix::process::getuid().as_raw();
+    let other = policy()
+        .inspect(move |caller| caller.uid != own)
+        .build()
+        .unwrap();
+    let (path, _server, _handle) = serve(&other, "refused");
+    let refused = uds::status(Endpoint::Path(path), &Options::default());
+    assert_eq!(
+        refused.err().map(|status| status.exception_code()),
+        Some(ExceptionCode::Security)
+    );
+}
+
+#[test]
+fn a_subscriber_of_any_type_reads_over_a_socket() {
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "any");
+    let mut subscriber = Subscriber::<crate::AnyType>::builder()
+        .connect(Endpoint::Path(path))
+        .unwrap();
+    assert_eq!(subscriber.topic_type(), "bytes");
+    publisher.publish(&bytes(9)).unwrap();
+    assert_eq!(
+        subscriber.recv_timeout(WAIT),
+        Ok(crate::AnyType(vec![9; 3]))
+    );
+}
+
+/// The drop's notice and the session's end both reach the publisher; one subscription goes once.
+#[test]
+fn a_dropped_subscriber_changes_the_list_once() {
+    let publisher = policy().build().unwrap();
+    let (path, _server, _handle) = serve(&publisher, "once");
+    let mut subscriber = Some(subscriber_policy().connect(Endpoint::Path(path)).unwrap());
+    let (now, took) = woken_by(&publisher, || drop(subscriber.take()));
+    assert!(took < LONG / 2, "not told: {took:?}");
+    assert_eq!(now.count, 0);
+    // Whichever of the two came second took nothing out.
+    let later = publisher.wait_subscribers(now.generation, Some(Duration::from_millis(300)));
+    assert_eq!(later, now);
 }
 
 #[test]
@@ -279,6 +355,7 @@ fn the_sessions_deadline_ends_with_the_setup() {
         pins: MAX_PINS as i32,
         wake: WAKE_FUTEX,
         wakeFd: None,
+        flags: 0,
     };
     topic.r#subscribe(&request).unwrap();
     assert!(!session.0.is_ended());

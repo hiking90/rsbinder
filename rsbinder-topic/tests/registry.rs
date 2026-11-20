@@ -175,10 +175,13 @@ fn a_closed_or_dropped_publishers_name_is_gone_from_the_next_call() {
     let name = name("close");
     let publisher = advertised(&name, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
+    // Back through the host, a binder of this process is the publisher's own.
+    assert_eq!(resolver.lookup(&name).unwrap(), Some(publisher.as_binder()));
     assert!(publisher.stats().advertised);
     publisher.close();
     assert!(!publisher.stats().advertised);
     assert!(listed(&resolver, &name).is_none());
+    assert_eq!(resolver.lookup(&name).unwrap(), None);
     let publisher = advertised(&name, &resolver).unwrap();
     assert!(listed(&resolver, &name).is_some());
     drop(publisher);
@@ -607,6 +610,14 @@ impl Interface for Ended {}
 impl ITopic for Ended {
     fn r#subscribe(&self, _request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
         Err(Status::new_service_specific_error(ERROR_CLOSED, None))
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<rsbinder_topic::aidl::TopicStatus::TopicStatus> {
+        Err(rsbinder::StatusCode::UnknownTransaction.into())
     }
 }
 

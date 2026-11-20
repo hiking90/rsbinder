@@ -23,10 +23,13 @@ default = ["tokio"]
 tokio = ["rsbinder/tokio", "dep:tokio"]
 # Topics without kernel binder: the subscription call over RPC on a Unix domain
 # socket (`uds`, plans/15-pubsub-uds).
-uds = ["rsbinder/rpc", "rustix/process"]
+uds = ["rsbinder/rpc"]
 # The entry point the `fuzz/` crate calls, as `rsbinder`'s feature of the
 # same name: absent from every other build.
 fuzzing = []
+# `tracing` events of each subscription's life (none per record), under the
+# target `rsbinder_topic`; apart from `rsbinder`'s feature of the same name.
+tracing = ["dep:tracing"]
 
 [dependencies]
 # Not `workspace = true`: a member cannot turn off the default features of an
@@ -41,13 +44,15 @@ rsbinder = { version = "=0.13.0", path = "../rsbinder", default-features = false
 # failures of a seal. `event` and `net`: the fd wake, a socket pair, an eventfd
 # and `poll` (both are features `rsbinder` turns on already). `mm`: `madvise`
 # for a pool on huge pages. `fs`: `fstat`, which tells a topic's memory from another's.
-rustix = { workspace = true, features = ["event", "net", "mm", "fs"] }
+# `process`: the publisher's own uid, which may look at its status by default.
+rustix = { workspace = true, features = ["event", "net", "mm", "fs", "process"] }
 # `net`: `AsyncFd`, which a `recv_async` of an fd-woken subscription waits on. The `Notify` a
 # `recv_async` joins a left wait with is `rsbinder`'s (`rsbinder/tokio`, which this feature enables).
 tokio = { workspace = true, optional = true, features = ["net"] }
 # The warning a topic with backpressure gives when it takes a subscription out (plan 15 §6.5),
 # and the check a subscriber's corrupted topic memory failed.
 log = { workspace = true }
+tracing = { workspace = true, optional = true }
 
 [build-dependencies]
 rsbinder-aidl = { workspace = true }

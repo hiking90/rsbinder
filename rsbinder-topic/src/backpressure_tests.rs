@@ -310,6 +310,87 @@ fn lend(publisher: &Publisher<Bytes>, n: u32) -> u32 {
     slot
 }
 
+fn unwaited(publisher: &Publisher<Bytes>) -> Subscriber<Bytes> {
+    Subscriber::<Bytes>::builder()
+        .unwaited()
+        .subscribe(&publisher.as_binder())
+        .unwrap()
+}
+
+#[test]
+fn an_unwaited_subscriber_holds_up_no_publish_and_loses_what_it_did_not_read() {
+    // A publish that waited for it would take `SPAN`.
+    let publisher = waiting(SPAN);
+    let mut subscriber = unwaited(&publisher);
+    let started = Instant::now();
+    for n in 0..1000 {
+        publisher.publish(&value(n)).unwrap();
+    }
+    assert!(
+        started.elapsed() < SPAN / 2,
+        "waited {:?}",
+        started.elapsed()
+    );
+    let stats = publisher.stats();
+    assert_eq!(stats.evicted, 0);
+    assert!(stats.subscribers[0].unwaited);
+    assert!(!stats.subscribers[0].evicted);
+    assert!(matches!(subscriber.try_recv(), Err(RecvError::Lagged(_))));
+    let mut last = None;
+    while let Ok(Bytes(bytes)) = subscriber.try_recv() {
+        last = Some(number(&bytes));
+    }
+    assert_eq!(last, Some(999));
+}
+
+#[test]
+fn a_waited_subscriber_beside_an_unwaited_one_still_holds_up_a_publish() {
+    let timeout = Duration::from_millis(200);
+    let publisher = waiting(timeout);
+    let _unwaited = unwaited(&publisher);
+    let _waited = subscribe(&publisher, Wake::Futex);
+    let started = Instant::now();
+    for n in 0..1000 {
+        publisher.publish(&value(n)).unwrap();
+    }
+    assert!(started.elapsed() >= timeout);
+    let stats = publisher.stats();
+    assert_eq!(stats.evicted, 1);
+    let evicted: Vec<_> = stats
+        .subscribers
+        .iter()
+        .map(|s| (s.unwaited, s.evicted))
+        .collect();
+    assert_eq!(evicted, [(true, false), (false, true)]);
+}
+
+#[test]
+fn an_unwaited_subscribers_sample_keeps_its_slot_and_what_it_did_not_read_is_lent_again() {
+    // Four slots: one pin, one to write, a depth of one and one loan.
+    let publisher = pooled(1, SPAN);
+    let mut subscriber = unwaited(&publisher);
+    let first = lend(&publisher, 0);
+    let sample = subscriber.try_recv_sample().unwrap();
+    let started = Instant::now();
+    let lent: Vec<u32> = (1..40).map(|n| lend(&publisher, n)).collect();
+    assert!(started.elapsed() < SPAN / 2, "a lend waited for it");
+    assert!(!lent.contains(&first), "the pinned slot was lent: {lent:?}");
+    assert_eq!(number(&sample.to_owned()), 0);
+    drop(sample);
+    let (mut lost, mut last) = (0, None);
+    loop {
+        match subscriber.try_recv() {
+            Ok(Bytes(bytes)) => last = Some(number(&bytes)),
+            Err(RecvError::Lagged(n)) => lost += n,
+            Err(RecvError::Empty) => break,
+            Err(other) => panic!("{other}"),
+        }
+    }
+    assert!(lost > 0, "nothing lost");
+    assert_eq!(last, Some(39));
+    assert_eq!(publisher.stats().evicted, 0);
+}
+
 /// AC-15.3.8 (loan): futex and fd subscribers, copying or in place, get every value of many laps.
 #[test]
 fn every_loaned_value_reaches_every_subscriber_however_often_the_pool_goes_round() {

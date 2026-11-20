@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder::__sync::Signal;
+
+use crate::trace::event;
 use rsbinder::{
     BinderResult, DeathLink, DeathRecipient, ExceptionCode, SIBinder, Status, StatusCode, WIBinder,
 };
@@ -343,6 +345,9 @@ impl Drain {
 
 /// What the subscriber, the resolver's callback and the connection thread share.
 struct Named<T: Payload> {
+    /// The name the subscriber watches, for its events.
+    #[cfg(feature = "tracing")]
+    name: String,
     policy: Settings,
     state: Mutex<State<T>>,
     /// Each change of `state` is signalled to every kind of wait: a thread's, a future's, a poll's.
@@ -520,6 +525,8 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             Wake::Fd => Some(NamedFds::new().map_err(StatusCode::from)?),
         };
         let named = Arc::new(Named {
+            #[cfg(feature = "tracing")]
+            name: name.to_owned(),
             policy,
             state: Mutex::new(State::new()),
             changed: Signal::default(),
@@ -955,6 +962,12 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
                 state.wake = Some(wake);
                 // SAFETY: `M` is `Trusted` only after `trust_publisher`, on its caller's word.
                 let subscriber = unsafe { subscriber.vouched::<M>() };
+                event!(
+                    debug,
+                    name = %self.named.name,
+                    connections = self.past.connections + 1,
+                    "connected"
+                );
                 self.current = Some(Connection {
                     subscriber,
                     binder,
@@ -1109,6 +1122,7 @@ impl<T: Payload + 'static, M: Trust> NamedSubscriber<T, M> {
         mut state: MutexGuard<'_, State<T>>,
         why: Disconnected,
     ) -> RecvError {
+        event!(debug, name = %self.named.name, why = ?why, "disconnected");
         let gone = self.current.take();
         if let Some(connection) = &gone {
             self.past += connection.subscriber.stats();

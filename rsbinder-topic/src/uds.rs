@@ -70,8 +70,10 @@ use rsbinder::rpc::{
 };
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use rsbinder::StatusCode;
-use rsbinder::{BinderResult, ExceptionCode, SIBinder, Status};
+use rsbinder::{BinderResult, ExceptionCode, SIBinder, Status, Strong};
 
+use crate::aidl::ITopic::ITopic;
+use crate::aidl::TopicStatus::TopicStatus;
 use crate::connect::status_of;
 use crate::subscriber::Settings;
 use crate::{layout, Payload, Subscriber};
@@ -221,6 +223,16 @@ pub(crate) fn connect_with<T: Payload>(
         Subscriber::request_starting(&session.0.get_root()?, policy, |_, _| (start, None))?;
     session.0.set_reply_timeout(None)?;
     Ok(subscriber.with_session(Arc::new(session)))
+}
+
+/// The status of the topic of the publisher at `endpoint`, over a session of its own that is
+/// closed before this returns: what [`ITopic::status`]
+/// answers. The publisher checks the caller by the session's peer credentials. The errors of
+/// connecting are those of [`SubscriberBuilder::connect`](crate::SubscriberBuilder::connect).
+pub fn status(endpoint: Endpoint, options: &Options) -> BinderResult<TopicStatus> {
+    let session = connect(endpoint, options)?;
+    let topic: Strong<dyn ITopic> = session.0.get_root()?.into_interface()?;
+    topic.r#status()
 }
 
 /// Serve `topic`, an `ITopic` binder of this process such as

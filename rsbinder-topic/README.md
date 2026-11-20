@@ -25,6 +25,10 @@ for them.
   of topic names `rsb_hub` serves with its `topic` feature, under a policy of
   its own. Without a binder device, at a socket path or through the same
   registry on a socket (`rsb_hub --topic-socket`).
+- A publisher can wait for its subscribers to come and go, and answers a status
+  call and a binder dump (`dumpsys`) for the callers it lets look;
+  `rsb_service topic` prints a topic's status, rate and records from outside,
+  as a subscriber the publisher does not wait for.
 
 ```toml
 [dependencies]

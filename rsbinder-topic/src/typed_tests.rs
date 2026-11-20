@@ -123,7 +123,7 @@ fn subscriber<T: Payload>(heap: &Heap, start: Start) -> TypedReader<T, impl Load
     TypedReader::new(Reader::attach(heap.loaded(), start).unwrap(), None)
 }
 
-fn sample(seq: i32) -> Sample {
+pub(crate) fn sample(seq: i32) -> Sample {
     Sample {
         seq,
         name: format!("sample {seq}"),

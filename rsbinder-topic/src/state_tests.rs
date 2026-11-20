@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use rsbinder::{ExceptionCode, Parcel, SIBinder, StatusCode};
 
+use crate::aidl::ITopic::FLAG_UNWAITED;
 use crate::aidl::TopicEndpoint::TopicEndpoint;
 use crate::layout::MIN_RING;
 use crate::subscriber::Settings;
@@ -346,11 +347,28 @@ fn the_last_value_lent_on_a_state_topic_comes_before_its_end() {
 
 #[test]
 fn an_endpoint_without_a_kind_is_of_an_event_topic() {
-    // The parcelable ends before `topicKind`, which then reads as its default.
+    // Cut before `topicKind`: it and every field after read as defaults.
     let sent = TopicEndpoint {
         topicKind: TopicKind::State.wire(),
+        id: 7,
+        flags: FLAG_UNWAITED,
+        typeName: "bytes".to_owned(),
         ..Default::default()
     };
+    let read = cut_from_kind(&sent);
+    assert_eq!(TopicKind::from_wire(read.topicKind), Some(TopicKind::Event));
+    assert_eq!((read.id, read.flags, read.typeName.as_str()), (0, 0, ""));
+}
+
+/// `sent` as a subscriber reads it from a publisher that writes no field from `topicKind` on.
+fn cut_from_kind(sent: &TopicEndpoint) -> TopicEndpoint {
+    // The fields as the parcelable writes them, each in turn.
+    let mut tail = Parcel::new();
+    tail.write(&sent.topicKind).unwrap();
+    tail.write(&sent.id).unwrap();
+    tail.write(&sent.flags).unwrap();
+    tail.write(&sent.typeName).unwrap();
+    let tail = tail.data_size() as i32;
     let mut parcel = Parcel::new();
     parcel.write(&sent).unwrap();
     let end = parcel.data_size();
@@ -365,8 +383,7 @@ fn an_endpoint_without_a_kind_is_of_an_event_topic() {
         "a parcelable sized from its size field"
     );
     parcel.set_data_position(start);
-    parcel.write(&(size - 4)).unwrap();
+    parcel.write(&(size - tail)).unwrap();
     parcel.set_data_position(0);
-    let read: TopicEndpoint = parcel.read().unwrap();
-    assert_eq!(TopicKind::from_wire(read.topicKind), Some(TopicKind::Event));
+    parcel.read().unwrap()
 }

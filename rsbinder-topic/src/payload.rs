@@ -44,6 +44,9 @@ use rsbinder::{Deserialize, ParcelableMetadata, Result, Serialize};
 /// it in a parcelable, or carries it as [`Bytes`].
 pub trait Payload: Sized {
     /// The name the publisher and the subscriber compare when a subscription is set up.
+    ///
+    /// The empty name is reserved: a subscriber that sends it ([`AnyType`]) asks for a topic of
+    /// any type, and a publisher of a type with that name is refused when it is built.
     fn type_name() -> &'static str;
 
     /// Write the record's bytes to `out`, in order, with its methods.
@@ -110,6 +113,36 @@ pub struct Bytes(pub Vec<u8>);
 impl Payload for Bytes {
     fn type_name() -> &'static str {
         "bytes"
+    }
+
+    fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> Result<()> {
+        out.borrow(&self.0);
+        Ok(())
+    }
+
+    fn decode(record: &mut Record<'_>) -> Result<Self> {
+        Ok(Self(record.take()))
+    }
+}
+
+/// The bytes of a record of any topic, whatever its type: a subscriber of `AnyType` sends the
+/// empty type name, which every publisher of this crate takes. For a tool that watches topics it
+/// knows nothing of; [`Subscriber::topic_type`](crate::Subscriber::topic_type) says what the
+/// type is.
+///
+/// The bytes are those the publisher's [`Payload::encode`] wrote: for a parcelable,
+/// [`rsbinder::to_bytes`]' encoding, which [`rsbinder::from_bytes`] turns back into the value
+/// for a reader that knows the type. A value lent from a pool arrives as its bytes, as for
+/// [`Bytes`].
+///
+/// A publisher of `rsbinder-topic` 0.1 compares names exactly and refuses the subscription with
+/// `BadType`. No publisher of `AnyType` can be built: its name is the reserved one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct AnyType(pub Vec<u8>);
+
+impl Payload for AnyType {
+    fn type_name() -> &'static str {
+        ""
     }
 
     fn encode<'a>(&'a self, out: &mut Encoding<'a>) -> Result<()> {

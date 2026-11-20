@@ -14,8 +14,9 @@ use crate::aidl::ISubscription::ISubscription;
 use crate::backpressure::Readers;
 use crate::layout::{seen_field, ControlView, CLOSED, WAITING};
 use crate::pool::{self, Pins};
+use crate::trace::event;
 use crate::wake::{send_wake, Sent};
-use crate::SubscriberInfo;
+use crate::{SubscriberInfo, Subscribers};
 
 /// Link `recipient` to `binder`'s death, removed when the link drops; `None` for a binder of
 /// this process, which has none.
@@ -118,10 +119,14 @@ pub(crate) struct Link {
     hung_up: AtomicBool,
     /// Where the subscription started: no record before it is one the subscriber reads.
     start: AtomicU64,
+    /// The publisher's number for it, from 1: given with `start` as the list takes it in.
+    id: AtomicU64,
     /// The subscriber's token, told through when the subscription is taken out.
     subscription: Strong<dyn ISubscription>,
     /// Taken out by a wait for room (plan 15 §6.5): no longer waited for, its pin still kept.
     evicted: AtomicBool,
+    /// Asked not to be waited for (`FLAG_UNWAITED`): from the start, as an evicted one is.
+    unwaited: bool,
     _death: Option<DeathLink>,
 }
 
@@ -136,13 +141,14 @@ enum Wanted {
 
 impl Link {
     /// A subscription through `control` from `uid` and `pid`, woken by `socket` if any, gone with
-    /// `token`, which is `subscription`.
+    /// `token`, which is `subscription`; one no publish waits for if `unwaited`.
     pub(crate) fn new(
         control: ControlView,
         (uid, pid): (u32, i32),
         socket: Option<OwnedFd>,
         (token, subscription): (&SIBinder, Strong<dyn ISubscription>),
         list: Weak<dyn Forget>,
+        unwaited: bool,
     ) -> rsbinder::Result<Self> {
         let dead = Arc::new(Dead::default());
         let watch = Watch {
@@ -160,8 +166,10 @@ impl Link {
             socket,
             hung_up: AtomicBool::new(false),
             start: AtomicU64::new(0),
+            id: AtomicU64::new(0),
             subscription,
             evicted: AtomicBool::new(false),
+            unwaited,
         })
     }
 
@@ -175,8 +183,27 @@ impl Link {
         self.evicted.store(true, Ordering::Relaxed);
         Eviction {
             subscription: self.subscription.clone(),
+            id: self.id.load(Ordering::Relaxed),
             uid: self.uid,
             pid: self.pid,
+        }
+    }
+
+    /// The publisher's number for the subscription.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn id(&self) -> u64 {
+        self.id.load(Ordering::Relaxed)
+    }
+
+    /// Why an ended subscription ended, the first of its reasons.
+    #[cfg(feature = "tracing")]
+    pub(crate) fn end_reason(&self) -> &'static str {
+        if self.dead.get() {
+            "death"
+        } else if self.hung_up.load(Ordering::Relaxed) {
+            "hung up"
+        } else {
+            "closed"
         }
     }
 
@@ -228,6 +255,7 @@ impl Link {
     /// The subscription as its control page reports it, against the publisher's `write`.
     fn info(&self, write: u64) -> SubscriberInfo {
         SubscriberInfo {
+            id: self.id.load(Ordering::Relaxed),
             uid: self.uid,
             pid: self.pid,
             // The subscriber writes `read`: one ahead of `write` is a wrong report, not a lag.
@@ -235,6 +263,7 @@ impl Link {
             lost: self.control.lost(),
             waiting: self.control.state().load() & WAITING != 0,
             evicted: self.evicted(),
+            unwaited: self.unwaited,
             pinned: self.pinned(),
         }
     }
@@ -251,6 +280,7 @@ impl Link {
 /// is let go: a binder call made under it could run a death notice that takes the lock.
 pub(crate) struct Eviction {
     subscription: Strong<dyn ISubscription>,
+    id: u64,
     uid: u32,
     pid: i32,
 }
@@ -259,10 +289,20 @@ impl Eviction {
     /// Tell the subscriber, and log it for the topic of `payload` that waited `waited`.
     pub(crate) fn tell(self, payload: &str, waited: Duration) {
         log::warn!(
-            "rsbinder-topic {payload}: took out the subscription of uid {} pid {}, which kept a \
+            "rsbinder-topic {payload}: took out subscription #{} of uid {} pid {}, which kept a \
              publish waiting {waited:?}",
+            self.id,
             self.uid,
             self.pid
+        );
+        event!(
+            warn,
+            payload,
+            id = self.id,
+            uid = self.uid,
+            pid = self.pid,
+            waited = ?waited,
+            "subscription taken out"
         );
         // One way: nothing to wait for, and a subscriber gone already needs no telling.
         let _ = self.subscription.r#evicted();
@@ -273,6 +313,11 @@ impl Eviction {
 #[derive(Default)]
 pub(crate) struct Links {
     links: Vec<Arc<Link>>,
+    /// Bumped by every change of `links`; `changed` is raised with it until the unlock takes it.
+    generation: u64,
+    changed: bool,
+    /// The number the last subscription taken in was given; the first is 1.
+    last_id: u64,
     /// Wake bytes sent.
     #[cfg(test)]
     sends: u64,
@@ -292,13 +337,35 @@ impl Links {
         self.links.iter().map(|link| link.info(write)).collect()
     }
 
-    /// Add a subscription that starts at `start`.
-    pub(crate) fn push(&mut self, link: Arc<Link>, start: u64) {
+    /// Add a subscription that starts at `start`; the number it is given.
+    pub(crate) fn push(&mut self, link: Arc<Link>, start: u64) -> u64 {
+        self.last_id += 1;
         link.start.store(start, Ordering::Relaxed);
+        link.id.store(self.last_id, Ordering::Relaxed);
         self.links.push(link);
+        self.bump();
+        self.last_id
     }
 
-    /// The lowest read position among the subscriptions that have not ended, each as its control
+    /// The list as it is now: its generation and its length.
+    pub(crate) fn subscribers(&self) -> Subscribers {
+        Subscribers {
+            generation: self.generation,
+            count: self.links.len(),
+        }
+    }
+
+    /// Whether the list changed since the last call, which lowers the flag.
+    pub(crate) fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    fn bump(&mut self) {
+        self.generation += 1;
+        self.changed = true;
+    }
+
+    /// The lowest read position among the subscriptions waited for, each as its control
     /// page reports it and no lower than where it started; `u64::MAX` with none. A slot whose
     /// record ends at or below it is one no subscriber still has to read (`pool.rs`), and a record
     /// that overwrites nothing above it is one a publish need not wait for (`backpressure.rs`).
@@ -307,11 +374,11 @@ impl Links {
         reads.min().unwrap_or(u64::MAX)
     }
 
-    /// The subscriptions a publish reads past or waits for: not ended, not taken out.
+    /// The subscriptions a publish reads past or waits for: none ended, taken out or unwaited.
     fn waited_for(&self) -> impl Iterator<Item = &Arc<Link>> {
         self.links
             .iter()
-            .filter(|link| !link.ended() && !link.evicted())
+            .filter(|link| !link.ended() && !link.evicted() && !link.unwaited)
     }
 
     /// Take out every subscription waited for that has not read up to `need`: what to tell them.
@@ -363,7 +430,11 @@ impl Links {
 
     /// Take out the subscriptions that ended.
     pub(crate) fn prune(&mut self) -> Vec<Arc<Link>> {
-        pool::take_ended(&mut self.links, |link| link.ended())
+        let gone = pool::take_ended(&mut self.links, |link| link.ended());
+        if !gone.is_empty() {
+            self.bump();
+        }
+        gone
     }
 
     /// Take out the subscription flagged by `dead`.
@@ -374,6 +445,7 @@ impl Links {
             .links
             .iter()
             .position(|link| Arc::ptr_eq(&link.dead, dead))?;
+        self.bump();
         Some(self.links.swap_remove(at))
     }
 }

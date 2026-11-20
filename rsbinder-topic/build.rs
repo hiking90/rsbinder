@@ -17,6 +17,8 @@ fn main() {
         "aidl/rsbinder/topic/SubscribeRequest.aidl",
         "aidl/rsbinder/topic/TopicEndpoint.aidl",
         "aidl/rsbinder/topic/Pool.aidl",
+        "aidl/rsbinder/topic/SubscriberStatus.aidl",
+        "aidl/rsbinder/topic/TopicStatus.aidl",
         "aidl/rsbinder/topic/ISubscription.aidl",
         "aidl/rsbinder/topic/ITopic.aidl",
         "aidl/rsbinder/topic/TopicRef.aidl",

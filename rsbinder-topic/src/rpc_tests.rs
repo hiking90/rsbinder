@@ -12,7 +12,7 @@ use rsbinder::rpc::transport::TcpDebugTransport;
 use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
 use rsbinder::{ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode, Strong};
 
-use crate::aidl::ITopic::{ITopic, WAKE_FUTEX};
+use crate::aidl::ITopic::{BnTopic, ITopic, WAKE_FUTEX};
 use crate::aidl::ITopicRegistry::ITopicRegistry;
 use crate::aidl::ITopicWatcher::BnTopicWatcher;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
@@ -21,6 +21,7 @@ use crate::layout::{ControlPage, VERSION};
 use crate::link::{link_death, Dead};
 use crate::pool::MAX_PINS;
 use crate::registry::{AllowAll, Registry, RegistryResolver};
+use crate::subscribers_tests::{woken_by, LONG};
 use crate::{Bytes, Closed, Payload, Publisher, RecvError, Subscriber};
 
 const WIRE: u32 = 2;
@@ -65,6 +66,7 @@ fn request(token: SIBinder) -> (SubscribeRequest, ControlPage) {
         pins: MAX_PINS as i32,
         wake: WAKE_FUTEX,
         wakeFd: None,
+        flags: 0,
     };
     (request, page)
 }
@@ -180,6 +182,71 @@ fn a_session_that_passes_fds_and_has_an_incoming_connection_subscribes() {
         Err(RecvError::Closed(Closed::PublisherDied))
     );
     session.close_session();
+}
+
+#[test]
+fn a_subscriber_over_rpc_that_drops_tells_the_publisher_at_once() {
+    let publisher = publisher();
+    let (name, server) = serve(publisher.as_binder());
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    let mut subscriber = Some(Subscriber::<Bytes>::builder().subscribe(&topic).unwrap());
+    let (now, took) = woken_by(&publisher, || drop(subscriber.take()));
+    assert!(took < LONG / 2, "not told: {took:?}");
+    assert_eq!(now.count, 0);
+    session.close_session();
+    server.terminate();
+}
+
+/// A 0.1 publisher: its `on_transact` fails every code past `subscribe`, `UNKNOWN_TRANSACTION`.
+struct Predating(crate::Acceptor);
+
+impl Interface for Predating {}
+
+impl rsbinder::Remotable for Predating {
+    fn descriptor() -> &'static str {
+        <BnTopic as rsbinder::Remotable>::descriptor()
+    }
+
+    fn on_transact(
+        &self,
+        code: rsbinder::TransactionCode,
+        reader: &mut rsbinder::Parcel,
+        reply: &mut rsbinder::Parcel,
+    ) -> rsbinder::Result<()> {
+        if code != rsbinder::FIRST_CALL_TRANSACTION {
+            return Err(StatusCode::UnknownTransaction);
+        }
+        let request: SubscribeRequest = reader.read()?;
+        match self.0.accept(&request) {
+            Ok(endpoint) => {
+                reply.write(&rsbinder::Status::from(StatusCode::Ok))?;
+                reply.write(&endpoint)
+            }
+            Err(status) => reply.write(&status),
+        }
+    }
+
+    fn on_dump(&self, _: &mut dyn std::io::Write, _: &[String]) -> rsbinder::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_publisher_that_predates_the_notice_keeps_the_session_it_comes_over() {
+    let publisher = publisher();
+    let predating = Interface::as_binder(&rsbinder::Binder::new(Predating(publisher.acceptor())));
+    let (name, server) = serve(predating);
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    drop(Subscriber::<Bytes>::builder().subscribe(&topic).unwrap());
+    // The session that carried the refused notice still carries a subscription.
+    let mut again = Subscriber::<Bytes>::builder().subscribe(&topic).unwrap();
+    assert_eq!(publisher.subscriber_count(), 1);
+    publisher.publish(&Bytes(vec![2])).unwrap();
+    assert_eq!(again.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+    session.close_session();
+    server.terminate();
 }
 
 #[test]

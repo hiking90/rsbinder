@@ -485,6 +485,7 @@ fn pinning(publisher: &Publisher<Bytes>) -> (ControlPage, LoadedPool) {
         pins: MAX_PINS as i32,
         wake: WAKE_FUTEX,
         wakeFd: None,
+        flags: 0,
     };
     let endpoint = {
         let _asking = Asking::new(&request);

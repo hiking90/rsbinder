@@ -25,7 +25,9 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/topic.rs"));
 }
 
-pub use generated::rsbinder::topic::{ITopic, ITopicRegistry, SubscribeRequest, TopicEndpoint};
+pub use generated::rsbinder::topic::{
+    ITopic, ITopicRegistry, SubscribeRequest, SubscriberStatus, TopicEndpoint, TopicStatus,
+};
 
 #[doc(hidden)]
 pub use generated::rsbinder::topic::{ISubscription, ITopicWatcher, Pool, TopicInfo, TopicRef};

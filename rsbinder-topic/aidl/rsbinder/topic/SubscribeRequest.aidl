@@ -23,7 +23,9 @@ parcelable SubscribeRequest {
      * The name of the payload type the subscriber decodes. The publisher
      * compares it with the name of its own type and refuses a different one
      * with `BAD_TYPE`. In rsbinder it is the parcelable's descriptor, or
-     * the name a custom `Payload` gives.
+     * the name a custom `Payload` gives. The empty name asks for a topic of
+     * any type, which TopicEndpoint.typeName then names; no publisher has
+     * it as its own.
      */
     String type;
 
@@ -78,4 +80,12 @@ parcelable SubscribeRequest {
      * same socket.
      */
     @nullable ParcelFileDescriptor wakeFd;
+
+    /**
+     * ITopic.FLAG_* bits the subscriber asks for. The publisher takes the
+     * bits it knows, returns them in TopicEndpoint.flags and leaves out the
+     * rest; a subscriber that finds a bit it asked for left out ends the
+     * subscription. A subscriber that sends no such field asks for none.
+     */
+    int flags;
 }

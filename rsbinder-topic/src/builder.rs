@@ -103,6 +103,7 @@ pub struct PublisherBuilder<T, K> {
     max_subscribers: usize,
     max_per_uid: usize,
     authorize: Option<Authorize>,
+    inspect: Option<Authorize>,
     lend: Option<usize>,
     max_loans: Option<usize>,
     lend_keep: Option<usize>,
@@ -120,6 +121,7 @@ impl<T, K> Clone for PublisherBuilder<T, K> {
             max_subscribers: self.max_subscribers,
             max_per_uid: self.max_per_uid,
             authorize: self.authorize.clone(),
+            inspect: self.inspect.clone(),
             lend: self.lend,
             max_loans: self.max_loans,
             lend_keep: self.lend_keep,
@@ -139,6 +141,7 @@ impl<T, K> fmt::Debug for PublisherBuilder<T, K> {
             .field("max_subscribers", &self.max_subscribers)
             .field("max_per_uid", &self.max_per_uid)
             .field("authorize", &self.authorize)
+            .field("inspect", &self.inspect)
             .field("lend", &self.lend)
             .field("max_loans", &self.max_loans)
             .field("lend_keep", &self.lend_keep)
@@ -207,6 +210,7 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
             max_subscribers: spec.max_subscribers,
             max_per_uid: spec.max_per_uid,
             authorize: None,
+            inspect: None,
             lend: None,
             max_loans: None,
             lend_keep: None,
@@ -282,6 +286,24 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
         admit: impl Fn(&CallingContext) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.authorize = Some(Authorize::new(admit));
+        self
+    }
+
+    /// Who may look at the topic from outside its process: the callers of
+    /// [`ITopic::status`](crate::aidl::ITopic::ITopic::status) and of a binder dump (`dumpsys`
+    /// on Android) for which `admit` returns `true`. Both name the uid and pid of every
+    /// subscriber, so this is a check of its own, apart from
+    /// [`authorize`](Self::authorize).
+    ///
+    /// Without it the callers admitted are those of the publisher's own uid, uid 0, and on
+    /// Android uid 2000 (`shell`), which `adb shell dumpsys` runs as and which AOSP's
+    /// `android.permission.DUMP` is granted to. A refusal is `EX_SECURITY`. A caller in the
+    /// publisher's process is seen with the process's own uid.
+    pub fn inspect(
+        mut self,
+        admit: impl Fn(&CallingContext) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.inspect = Some(Authorize::new(admit));
         self
     }
 
@@ -363,6 +385,7 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
             max_subscribers: self.max_subscribers,
             max_per_uid: self.max_per_uid,
             authorize: self.authorize.clone(),
+            inspect: self.inspect.clone(),
             pool: self.lend.map(|slot_bytes| PoolSpec {
                 slot_bytes,
                 depth: lend_keep,
@@ -649,6 +672,30 @@ impl<T: Payload> SubscriberBuilder<T> {
     /// How the publisher wakes this subscriber. Default [`Wake::Futex`].
     pub fn wake(mut self, wake: Wake) -> Self {
         self.settings.wake = wake;
+        self
+    }
+
+    /// Ask the publisher not to wait for this subscriber: for a tool that watches a topic
+    /// without holding up the subscribers it serves.
+    ///
+    /// On a [`lossless`](crate::PublisherBuilder::lossless) topic a publish does not wait for
+    /// this subscriber's reads and no wait for room takes it out: records it has not read when
+    /// the ring comes round are lost, and a receive reports them as
+    /// [`RecvError::Lagged`](crate::RecvError::Lagged). On a topic that lends slots
+    /// ([`PublisherBuilder::lend`]) a slot this subscriber has not read past is lent again unless
+    /// it pins it, and the value is lost. On any other topic nothing changes: nothing waits for a
+    /// subscriber there.
+    ///
+    /// The subscription counts against
+    /// [`max_subscribers`](crate::PublisherBuilder::max_subscribers) and
+    /// [`max_per_uid`](crate::PublisherBuilder::max_per_uid) as any other, so it can be refused
+    /// with [`ITopic::ERROR_FULL`](crate::aidl::ITopic::ERROR_FULL), and it takes a place another
+    /// subscriber could have had. A publisher of `rsbinder-topic` 0.1 does not know the request
+    /// and takes the subscription as one it waits for: this side refuses it with
+    /// `InvalidOperation` and marks its control page closed, so the publisher waits for it no
+    /// more and takes it out at its next publish or subscription.
+    pub fn unwaited(mut self) -> Self {
+        self.settings.unwaited = true;
         self
     }
 

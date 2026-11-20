@@ -1152,6 +1152,17 @@ impl UdsResolver {
         builder.connect_with(Endpoint::Fd(address), &self.host.publisher)
     }
 
+    /// The status of the topic `name` has now, as its publisher answers
+    /// [`ITopic::status`] over a session opened and
+    /// closed for the call: `NameNotFound` as for [`subscribe`](Self::subscribe), `EX_SECURITY`
+    /// when the publisher's [`inspect`](crate::PublisherBuilder::inspect) does not admit this
+    /// process.
+    pub fn status(&self, name: &str) -> BinderResult<crate::aidl::TopicStatus::TopicStatus> {
+        let (address, _) = parts(self.host.registry.r#lookup(name)?);
+        let address = address.ok_or(StatusCode::NameNotFound)?;
+        uds::status(Endpoint::Fd(address), &self.host.publisher)
+    }
+
     /// A watch the host knows nothing of: a test tells it of a notice with `heard`.
     #[cfg(test)]
     pub(super) fn reconciler(&self, name: &str, on_resolved: OnResolved) -> Arc<Reconciler> {
