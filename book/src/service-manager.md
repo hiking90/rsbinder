@@ -838,14 +838,24 @@ reason it is denied, to the caller's fd on a thread of its own and replies
 at once, and the dump ends when that thread closes the fd. It writes one
 dump at a time. A dump that arrives while one is still being written is
 refused with `WOULD_BLOCK`, and the hub's log names the uid and pid of the
-caller being written to. On Linux and Android a write that the reader takes
-no byte of for 30 seconds is given up: the hub closes the fd, logs the
-caller, and writes the next dump. The 30 seconds count time without
-progress, so a reader that is slow, a pager for instance, still gets the
-whole dump. A caller that passes a pipe and never reads it therefore holds
-later dumps off for 30 seconds, not until the hub restarts. The hub sets no
-flag on the fd, which shares its open file description with the caller: a
-timer interrupts the writer thread's blocked `write`.
+caller being written to, at most once a minute. A dump that is refused costs
+the hub's thread one lock: the text is made only for the dump that is
+written. A write that the reader takes no byte of for 30 seconds is given
+up: the hub closes the fd, logs the caller, and writes the next dump. The 30
+seconds count time without progress, so a reader that is slow, a pager for
+instance, still gets the whole dump. A caller that passes a pipe or a socket
+and never reads it therefore holds later dumps off for 30 seconds, not until
+the hub restarts.
+
+The hub sets no flag on the fd, which shares its open file description with
+the caller: the writer thread waits with `poll` and then writes at most
+`PIPE_BUF` bytes. Three callers are not bounded by the 30 seconds: one that
+fills the same pipe from its own copy of the fd between the `poll` and the
+`write`, one that passes an fd whose writes it answers itself (a FUSE file
+it serves), and one that passes a terminal that takes no output. Each holds
+later dumps off until it closes the fd or exits, and nothing else: the
+caller is one the policy allows `list`, and every other call is answered.
+`rsb_service dump` passes a pipe it reads itself, so it is none of the three.
 
 A hub on a socket has a serve thread and a reaper thread per session and no call
 restriction; what holds it up is in [Topics](./topics.md#what-differs-from-kernel-binder).

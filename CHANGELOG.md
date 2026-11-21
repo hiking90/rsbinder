@@ -152,10 +152,15 @@ peers; peers of either release still subscribe to each other.
   30 seconds (`with_stall`) is given up and its fd closed. The writer thread
   blocks `SIGPIPE` for itself, so a caller that closed its end of a pipe does
   not end a process that keeps the signal's default disposition.
-- `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds, on
-  Linux and Android: it closes the fd and writes the next dump. A caller
-  that passed a pipe and never read it left every later dump refused with
-  `WOULD_BLOCK` until the hub restarted.
+- `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds: it
+  closes the fd and writes the next dump. A caller that passed a pipe and
+  never read it left every later dump refused with `WOULD_BLOCK` until the
+  hub restarted. The hub writes with `rsbinder::DumpWriter`, so the 30
+  seconds do not bound a caller that fills the same pipe itself, an fd whose
+  writes the caller answers, or a terminal that takes no output; each holds
+  later dumps off until it closes the fd. A dump refused with `WOULD_BLOCK`
+  no longer makes its text, and its log line is written at most once a
+  minute.
 - `rsb_service wait NAME [--timeout SECS] [--start]` returns once the name
   is registered: exit 0, 1 when the timeout passes first, 2 when the hub
   denies `find` on the name or cannot be reached. `--start` looks up with
