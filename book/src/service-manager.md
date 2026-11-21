@@ -144,6 +144,15 @@ substring (`rsb_service dump manager com.example`), and `dump` works on any
 service, not just the HUB — it sends `DUMP_TRANSACTION`, which for an
 rsbinder service lands in its `Interface::dump` implementation.
 
+The service writes to a pipe that only `rsb_service` reads, as with
+`dumpsys`: the command reads until the service closes its end, then prints.
+Nothing appears before the dump has ended, and a pager on the command's
+stdout cannot hold the service's write. If the dump has not ended after 10
+seconds, or `--timeout SECS`, the command prints what arrived, says so on
+stderr and exits `2`. That covers a service that is stopped and never takes
+the call. A `--timeout` meant for the service's own dump handler goes after
+`--`.
+
 `wait NAME` returns once the name is registered, polling five times a second.
 With `--timeout SECS` it exits `1` when the time passes first; without it, it
 waits without end. It starts nothing unless given `--start`, which looks the

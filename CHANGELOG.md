@@ -136,6 +136,14 @@ peers; peers of either release still subscribe to each other.
   by the subscriber with `InvalidOperation`. A 0.1.0 subscriber ignores the
   new fields and never calls the new methods: its drop is seen at the next
   publish, as before.
+- `rsb_service dump` passes the service a pipe of its own, as AOSP `dumpsys`
+  does, and prints what it read once the service has closed it; the service
+  wrote to a duplicate of the command's stdout. Output no longer appears
+  while the dump is being written. A dump that has not ended after 10
+  seconds prints what arrived, reports `dump of NAME timed out` on stderr
+  and exits 2; `--timeout SECS` sets the time, and 0 or less is refused. A
+  `--timeout` among the service's own arguments goes after `--`. The time
+  also bounds a service that never takes the call.
 - `rsb_hub`: an `exec` start that ends before any name it starts was
   registered holds the next start of that argv off for 1, 2, 4, 8, 16, then
   30 seconds, by the count of such ends in a row. A program that registers

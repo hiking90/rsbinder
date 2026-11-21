@@ -49,6 +49,12 @@ The additions and fixes themselves are listed in
   registered, now runs it at most once per hold-off; a service that registers
   is unaffected. See
   [Declaring services](./service-manager.md#declaring-services).
+- `rsb_service dump NAME` hands the service a pipe and prints what it read
+  once the service closes it. In 0.13.0 the service wrote to the command's
+  stdout itself, so output appeared as it was written. A dump that has not
+  ended in 10 seconds now prints what arrived and exits 2; `--timeout SECS`
+  changes the 10. An argument `--timeout` meant for the service goes after
+  `--`.
 
 The sections below are about `rsbinder-topic`.
 

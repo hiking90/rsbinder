@@ -268,30 +268,96 @@ fn print_topics(
     }
 }
 
-/// `dumpsys <service>`: sends a dup of stdout, since the parcel closes the fd it carries.
-fn cmd_dump(name: &str, args: &[String]) -> ExitCode {
+/// What `reader` gives until end-of-file, and whether that came before `deadline`.
+fn read_dump(reader: std::os::fd::OwnedFd, deadline: std::time::Instant) -> (Vec<u8>, bool) {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    use std::io::Read;
+    let mut reader = std::fs::File::from(reader);
+    let mut text = Vec::new();
+    let mut chunk = vec![0; 64 << 10];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return (text, false);
+        }
+        let mut fds = [PollFd::new(&reader, PollFlags::IN)];
+        match poll(&mut fds, Timespec::try_from(left).ok().as_ref()) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("rsb_service: waiting for the dump failed: {e}");
+                return (text, false);
+            }
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => return (text, true),
+            Ok(n) => text.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                eprintln!("rsb_service: reading the dump failed: {e}");
+                return (text, false);
+            }
+        }
+    }
+}
+
+/// `dumpsys <service>`: the service writes to a pipe only this process reads, as `dumpsys` has it.
+fn cmd_dump(name: &str, args: &[String], timeout: std::time::Duration) -> ExitCode {
     let Some(binder) = hub::check_service(name) else {
         eprintln!("rsb_service: {name}: not registered (or not visible to this caller)");
         return ExitCode::from(exit::NO);
     };
     // A kernel proxy, or the RPC proxy of a service the hub reaches through an accessor.
-    let Some(proxy) = binder.as_remote() else {
+    if binder.as_remote().is_none() {
         // Only a binder local to this process lacks a proxy; `rsb_service` registers none.
         eprintln!("rsb_service: {name}: not a remote binder, nothing to dump");
         return ExitCode::from(exit::ERR);
-    };
-    // Flush first, or buffered output interleaves with what the service writes.
-    let _ = std::io::stdout().flush();
-    let fd = match rustix::io::dup(std::io::stdout()) {
-        Ok(fd) => fd,
+    }
+    let (reader, writer) = match rustix::pipe::pipe() {
+        Ok(pipe) => pipe,
         Err(e) => {
-            eprintln!("rsb_service: cannot duplicate stdout: {e}");
+            eprintln!("rsb_service: cannot make the pipe the dump is read from: {e}");
             return ExitCode::from(exit::ERR);
         }
     };
-    match proxy.dump(fd, args) {
-        Ok(()) => ExitCode::from(exit::OK),
-        Err(code) => {
+    let deadline = std::time::Instant::now() + timeout;
+    let (sent, answered) = std::sync::mpsc::channel();
+    let passed = args.to_vec();
+    // A kernel binder call has no deadline: one to a stopped service waits for ever.
+    let asking = std::thread::Builder::new()
+        .name("rsb_service-dump".into())
+        .spawn(move || {
+            // The parcel closes `writer` as the call returns, so end-of-file is the service's.
+            let reply = match binder.as_remote() {
+                Some(proxy) => proxy.dump(writer, &passed),
+                None => Err(rsbinder::StatusCode::BadType),
+            };
+            let _ = sent.send(reply);
+        });
+    if asking.is_err() {
+        eprintln!("rsb_service: cannot start the thread that asks");
+        return ExitCode::from(exit::ERR);
+    }
+    // Read whole before any goes to stdout: a pager the user has not paged would stall the service.
+    let (text, ended) = read_dump(reader, deadline);
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let reply = ended.then(|| answered.recv_timeout(left).ok()).flatten();
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout.write_all(&text).and_then(|()| stdout.flush()) {
+        // `rsb_service dump NAME | head -1`: the reader has what it wanted.
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("rsb_service: writing the dump to stdout failed: {e}");
+            return ExitCode::from(exit::ERR);
+        }
+    }
+    match reply {
+        // The asking thread may be left waiting; the process ends with it.
+        None => {
+            eprintln!("rsb_service: dump of {name} timed out after {timeout:?}");
+            ExitCode::from(exit::ERR)
+        }
+        Some(Ok(())) => ExitCode::from(exit::OK),
+        Some(Err(code)) => {
             eprintln!("rsb_service: dump of {name} failed: {code:?}");
             if code == rsbinder::StatusCode::PermissionDenied {
                 eprintln!(
@@ -408,6 +474,17 @@ fn cli() -> clap::Command {
             clap::Command::new("dump")
                 .about("Ask a service to dump its state to stdout")
                 .arg(name_arg("Service name to dump"))
+                .arg(
+                    clap::Arg::new("timeout")
+                        .long("timeout")
+                        .value_name("SECS")
+                        .default_value("10")
+                        .value_parser(clap::value_parser!(f64))
+                        .help(
+                            "Exit 2, after printing what arrived, if the dump has not ended \
+                             by then; a `--timeout` for the service itself goes after `--`",
+                        ),
+                )
                 .arg(
                     clap::Arg::new("args")
                         .value_name("ARGS")
@@ -718,7 +795,18 @@ fn main() -> ExitCode {
                 .get_many::<String>("args")
                 .map(|v| v.cloned().collect())
                 .unwrap_or_default();
-            cmd_dump(name_of(m), &args)
+            let secs = *m
+                .get_one::<f64>("timeout")
+                .expect("timeout has a default value");
+            // Zero is refused too, as `dumpsys -t 0` is: no dump ends in no time.
+            let timeout = match std::time::Duration::try_from_secs_f64(secs) {
+                Ok(timeout) if !timeout.is_zero() => timeout,
+                _ => {
+                    eprintln!("rsb_service: --timeout takes seconds, more than 0; got {secs}");
+                    return ExitCode::from(exit::ERR);
+                }
+            };
+            cmd_dump(name_of(m), &args, timeout)
         }
         // Unreachable: `subcommand_required` rejects this before we get here.
         _ => ExitCode::from(exit::ERR),
@@ -733,6 +821,48 @@ mod tests {
     #[test]
     fn the_command_line_surface_is_well_formed() {
         cli().debug_assert();
+    }
+
+    /// What `dump` parsed: its timeout in seconds and the arguments the service is passed.
+    fn dump_line(line: &[&str]) -> (f64, Vec<String>) {
+        let matches = cli().try_get_matches_from(line).expect("parses");
+        let (_, m) = matches.subcommand().expect("a subcommand");
+        let args = m.get_many::<String>("args").map(|v| v.cloned().collect());
+        let timeout = *m.get_one::<f64>("timeout").expect("a default");
+        (timeout, args.unwrap_or_default())
+    }
+
+    /// `--timeout` is this command's wherever it stands; after `--` it is the service's.
+    #[test]
+    fn dump_keeps_its_timeout_apart_from_the_arguments_of_the_service() {
+        let (timeout, args) = dump_line(&["rsb_service", "dump", "--timeout", "3", "manager"]);
+        assert_eq!((timeout, args.len()), (3.0, 0));
+        let (timeout, args) = dump_line(&["rsb_service", "dump", "manager", "--timeout", "3"]);
+        assert_eq!((timeout, args.len()), (3.0, 0));
+        let line = ["rsb_service", "dump", "manager", "--", "--timeout", "3"];
+        let (timeout, args) = dump_line(&line);
+        assert_eq!(
+            (timeout, args),
+            (10.0, vec!["--timeout".into(), "3".into()])
+        );
+        let (timeout, args) = dump_line(&["rsb_service", "dump", "manager", "-a", "x"]);
+        assert_eq!((timeout, args), (10.0, vec!["-a".into(), "x".into()]));
+    }
+
+    /// The reader's timeout ends a dump whose writer keeps the pipe open and writes no more.
+    #[test]
+    fn a_dump_that_does_not_end_is_read_until_the_deadline() {
+        use std::time::{Duration, Instant};
+        let (reader, writer) = rustix::pipe::pipe().expect("pipe");
+        rustix::io::write(&writer, b"part").expect("write");
+        let (text, ended) = read_dump(reader, Instant::now() + Duration::from_millis(100));
+        assert_eq!((text.as_slice(), ended), (&b"part"[..], false));
+
+        let (reader, writer) = rustix::pipe::pipe().expect("pipe");
+        rustix::io::write(&writer, b"whole").expect("write");
+        drop(writer);
+        let (text, ended) = read_dump(reader, Instant::now() + Duration::from_secs(10));
+        assert_eq!((text.as_slice(), ended), (&b"whole"[..], true));
     }
 
     #[test]
