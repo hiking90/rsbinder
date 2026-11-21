@@ -93,6 +93,7 @@ Android's `service` and `dumpsys -l`:
 $ rsb_service list                                  # what is registered
 $ rsb_service info                                  # ... and which pid owns each
 $ rsb_service check com.example.IFoo/default        # is it up yet?
+$ rsb_service wait com.example.IFoo/default --timeout 30   # hold a script until it is up
 $ rsb_service declared com.example.IFoo/default     # is it even configured?
 $ rsb_service instances com.example.IFoo            # every declared instance
 $ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
@@ -142,6 +143,14 @@ waiting on that nothing has registered. Arguments narrow the listing by
 substring (`rsb_service dump manager com.example`), and `dump` works on any
 service, not just the HUB — it sends `DUMP_TRANSACTION`, which for an
 rsbinder service lands in its `Interface::dump` implementation.
+
+`wait NAME` returns once the name is registered, polling five times a second.
+With `--timeout SECS` it exits `1` when the time passes first; without it, it
+waits without end. It starts nothing unless given `--start`, which looks the
+name up with `getService` and so starts a declared service that is down, as a
+client's own lookup would. A name the policy does not let the caller `find`
+exits `2` at once and says so, where `check` would answer "not registered";
+so does a hub that cannot be reached, or one that goes away during the wait.
 
 Exit status is the answer: `0` yes, `1` no, `2` the question could not be
 answered (no service manager, or its policy denied it), so

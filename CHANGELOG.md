@@ -148,6 +148,10 @@ peers; peers of either release still subscribe to each other.
   Linux and Android: it closes the fd and writes the next dump. A caller
   that passed a pipe and never read it left every later dump refused with
   `WOULD_BLOCK` until the hub restarted.
+- `rsb_service wait NAME [--timeout SECS] [--start]` returns once the name
+  is registered: exit 0, 1 when the timeout passes first, 2 when the hub
+  denies `find` on the name or cannot be reached. `--start` looks up with
+  `getService`, which starts a declared service.
 - `rsbinder-tools`: `config::Activator::registered` tells the activator a
   name of an activation was registered.
 - `rsb_hub --check-config` loads the configuration as a start or a `SIGHUP`

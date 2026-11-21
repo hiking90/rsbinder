@@ -5,7 +5,8 @@
 //!
 //! The Linux counterpart of Android's `service` and `dumpsys -l`: what is
 //! registered, who registered it, what is declared but not started, and
-//! what a service says about itself when asked to dump.
+//! what a service says about itself when asked to dump. `wait` holds a
+//! script until a name is registered.
 //!
 //! `topic` (feature `topic`) looks at a topic of `rsbinder-topic` from
 //! outside its publisher: its status, the rate of its records, the records
@@ -91,6 +92,42 @@ fn cmd_check(name: &str) -> ExitCode {
             ExitCode::from(exit::NO)
         }
     }
+}
+
+/// No delay a script shows, and five transactions a second to the hub.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Polls, so the command needs no thread pool for a callback; `start` looks up with `getService`.
+fn cmd_wait(name: &str, timeout: Option<std::time::Duration>, start: bool) -> ExitCode {
+    let began = std::time::Instant::now();
+    for poll in 0u64.. {
+        // A lookup answers a denial, and without `start` a hub that is gone, as "not registered";
+        // `isDeclared` takes the same `find` and reports both. Once a second is enough.
+        if poll % 5 == 0 {
+            if let Err(status) = hub::try_is_declared(name) {
+                return report("isDeclared", &status);
+            }
+        }
+        let found = if start {
+            match hub::try_get_service(name) {
+                Ok(found) => found,
+                Err(status) => return report("getService", &status),
+            }
+        } else {
+            hub::check_service(name)
+        };
+        if let Some(binder) = found {
+            println!("{name}: registered{}", descriptor_suffix(&binder));
+            return ExitCode::from(exit::OK);
+        }
+        let left = timeout.map(|timeout| timeout.saturating_sub(began.elapsed()));
+        if left.is_some_and(|left| left.is_zero()) {
+            break;
+        }
+        std::thread::sleep(left.map_or(WAIT_POLL, |left| left.min(WAIT_POLL)));
+    }
+    println!("{name}: not registered");
+    ExitCode::from(exit::NO)
 }
 
 /// Empty only for a binder whose interface descriptor is empty.
@@ -324,6 +361,30 @@ fn cli() -> clap::Command {
             clap::Command::new("check")
                 .about("Report whether a service is registered (exit 1 if it is not)")
                 .arg(name_arg("Service name to look up")),
+        )
+        .subcommand(
+            clap::Command::new("wait")
+                .about(
+                    "Wait until a service is registered (exit 1 if --timeout passes first, \
+                     2 if the hub denies `find` on the name or cannot be reached)",
+                )
+                .arg(name_arg("Service name to wait for"))
+                .arg(
+                    clap::Arg::new("timeout")
+                        .long("timeout")
+                        .value_name("SECS")
+                        .value_parser(clap::value_parser!(f64))
+                        .help("Give up after this many seconds (default: wait without end)"),
+                )
+                .arg(
+                    clap::Arg::new("start")
+                        .long("start")
+                        .action(clap::ArgAction::SetTrue)
+                        .help(
+                            "Look the name up with getService, which starts a declared \
+                             service that is not registered. Without it nothing is started",
+                        ),
+                ),
         )
         .subcommand(
             clap::Command::new("info").about("List the registered services with their owning pid"),
@@ -635,6 +696,19 @@ fn main() -> ExitCode {
             }
         }
         Some(("check", m)) => cmd_check(name_of(m)),
+        Some(("wait", m)) => {
+            let timeout = match m.get_one::<f64>("timeout") {
+                None => None,
+                Some(secs) => match std::time::Duration::try_from_secs_f64(*secs) {
+                    Ok(timeout) => Some(timeout),
+                    Err(_) => {
+                        eprintln!("rsb_service: --timeout takes seconds, 0 or more; got {secs}");
+                        return ExitCode::from(exit::ERR);
+                    }
+                },
+            };
+            cmd_wait(name_of(m), timeout, m.get_flag("start"))
+        }
         Some(("info", _)) => cmd_info(),
         Some(("declared", m)) => cmd_declared(name_of(m)),
         Some(("instances", m)) => cmd_instances(name_of(m)),

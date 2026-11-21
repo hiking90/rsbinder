@@ -417,6 +417,28 @@ kill -HUP "$HUB_PID"; sleep 1
 run_svc dump manager
 want_out "last reload: ok"            "and the next good reload replaces it"
 
+note "6-7 O5  rsb_service wait"
+run_svc wait ac61.allowed.live --timeout 5
+want_rc 0 "wait for a registered name exits 0"
+run_svc wait ac61.allowed.absent --timeout 0.5
+want_rc 1 "wait that times out exits 1"
+run_svc wait ac61.hidden.live --timeout 5
+want_rc 2 "wait for a name the policy hides exits 2, at once"
+want_out "grant it in the hub's configuration" "and says where to grant it"
+$SVC wait ac61.allowed.later --timeout 10 >/tmp/rsb61-wait.out 2>&1 &
+WAIT_PID=$!
+sleep 0.5
+$PROBE add:ac61.allowed.later hold:3 >/dev/null 2>&1 &
+wait "$WAIT_PID"; rc=$?
+[ "$rc" -eq 0 ] && ok "wait returns 0 once the name is registered" || bad "wait exits $rc: $(cat /tmp/rsb61-wait.out)"
+STARTED='ac61.declared.IFoo/default is not registered; starting it'
+BEFORE=$(grep -c "$STARTED" "$LOG")
+run_svc wait ac61.declared.IFoo/default --timeout 0.5
+want_rc 1 "wait for a declared service that is down times out"
+[ "$(grep -c "$STARTED" "$LOG")" -eq "$BEFORE" ] && ok "and starts nothing without --start" || bad "wait started a service"
+run_svc wait ac61.declared.IFoo/default --timeout 0.5 --start
+[ "$(grep -c "$STARTED" "$LOG")" -gt "$BEFORE" ] && ok "--start starts it" || bad "--start started nothing"
+
 run_svc dump manager ac61.allowed
 want_rc 0 "dump with a filter exits 0"
 want_out "filter: ac61.allowed"       "dump echoes the filter"
@@ -492,6 +514,10 @@ want_result add       ac61.reloaded.svc2 OK        "AC-6.1.7b previous policy st
 want_result debuginfo ""                 FAILEDTXN "AC-6.1.7c previous policy's list denial still in force"
 
 stop_hub
+
+note "6-7 O5  rsb_service wait with no hub"
+run_svc wait ac61.allowed.live --timeout 0.5
+want_rc 2 "wait with no hub to ask exits 2"
 
 ######################################################################
 # Plan 6-4: running under a service supervisor. Readiness has to be
