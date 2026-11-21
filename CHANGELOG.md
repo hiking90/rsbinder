@@ -252,6 +252,17 @@ peers; peers of either release still subscribe to each other.
   its sync handle, which panicked before. A call from a current-thread
   runtime's own `Runtime::block_on` body or within a `LocalSet` still panics,
   with `block_in_place`'s message.
+- `ProcessState::become_context_manager` returns the kernel's refusal as a
+  `std::io::Error` that keeps its errno, in the same `Box<dyn Error>`; it
+  was a `String` reading "Binder ioctl to become context manager failed: …".
+- `rsb_hub` that cannot become the service manager says which case it is in:
+  one is running on the device (`EBUSY`), one ran before as another uid and
+  the kernel keeps the device to that uid (`EPERM`, with the commands that
+  make the device again), or neither. It said "one is already running" for
+  all three.
+- `rsb_hub`'s dump has more lines (`uptime:`, `last reload:`,
+  `refused lookups:`, `age=`, the `declared` section); a script that reads
+  it by line number has to read it by key.
 
 ### Fixed
 

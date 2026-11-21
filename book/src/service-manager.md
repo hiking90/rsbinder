@@ -643,6 +643,20 @@ A device that was in use keeps its first service manager's uid in the kernel
 and its open descriptors, so it moves to another owner by `rm` and a second
 `rsb_device`, not by a rerun with another `--owner`.
 
+That uid is the effective uid of whichever process first became the device's
+context manager, and with `--mode 0660` any member of the group can open the
+device and take that role before `rsb_hub` does. From then on the kernel
+refuses every other uid, `rsb_hub`'s included, until the device is removed.
+So create the device and start `rsb_hub` in one ordered step (one unit, or a
+unit `After=` the one that runs `rsb_device`), before anything else on the
+machine can open it. When it is refused, `rsb_hub` says which case it is in:
+
+| The kernel's answer | What `rsb_hub` reports |
+| --- | --- |
+| `EBUSY` | a service manager is running on the device now |
+| `EPERM` | none is running, but one ran before as another uid; the message names `rsb_hub`'s uid and the `rm` and `rsb_device` commands that make the device again |
+| anything else | neither of the two; a security module refusing `set_context_mgr` is the usual cause |
+
 An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
 platform provides one, but it is never what makes the first two unnecessary.
 

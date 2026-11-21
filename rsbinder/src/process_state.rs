@@ -1044,6 +1044,17 @@ impl ProcessState {
     /// registers the *process*, not a specific binder — so a second call with
     /// a different binder is logged and the passed binder dropped rather than
     /// silently believed to have taken effect.
+    ///
+    /// # Errors
+    ///
+    /// The error the kernel refused the ioctl with, as a [`std::io::Error`]
+    /// that keeps its errno (`downcast_ref::<std::io::Error>()`, then
+    /// `raw_os_error`). The binder driver answers `EBUSY` when the device
+    /// has a context manager, and `EPERM` when the device had one before
+    /// under another effective uid: it keeps the first one's uid until the
+    /// device is removed. `BINDER_SET_CONTEXT_MGR_EXT` is tried first and
+    /// `BINDER_SET_CONTEXT_MGR` after any failure of it, as libbinder does,
+    /// so the errno is the second ioctl's.
     pub fn become_context_manager(
         &self,
         binder: SIBinder,
@@ -1070,7 +1081,7 @@ impl ProcessState {
 
         if binder::set_context_mgr_ext(&self.driver, obj).is_err() {
             if let Err(e) = binder::set_context_mgr(&self.driver, 0) {
-                return Err(format!("Binder ioctl to become context manager failed: {e}").into());
+                return Err(Box::new(std::io::Error::from(e)));
             }
         }
         *context_manager = Some(binder);

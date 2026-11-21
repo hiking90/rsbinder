@@ -2013,6 +2013,37 @@ fn exit_without_config(path: &Path, err: &config::ConfigError, on_a_socket: bool
     ))
 }
 
+/// What to do about a refused `BINDER_SET_CONTEXT_MGR`: the errno alone does not name the cause.
+fn context_manager_hint(errno: Option<i32>, binder_path: &str, device: &str, uid: u32) -> String {
+    match errno {
+        // The driver's first check: the device has a context manager now.
+        Some(libc::EBUSY) => format!(
+            "A binder device has exactly one service manager, and one is running on\n\
+             {binder_path}. Check with:\n    \
+             rsb_service --device {device} check manager\n\n\
+             To run a second, independent service manager, give it its own device:\n    \
+             sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other"
+        ),
+        // Its last: the device keeps the uid of the first context manager it had.
+        Some(libc::EPERM) => format!(
+            "No service manager is running on {binder_path}, but one ran before as another\n\
+             uid, and the kernel keeps a device to the uid of its first service manager\n\
+             until the device is removed. rsb_hub runs as uid {uid}. A process that opened\n\
+             the device before rsb_hub and took the role counts too, so create the device\n\
+             and start rsb_hub in one unit, before anything else can open it.\n\n\
+             Run rsb_hub as the uid that ran it before, or remove the device, create it\n\
+             again and restart its clients:\n    \
+             sudo rm {binder_path} && sudo rsb_device {device} --group binder --mode 0660"
+        ),
+        _ => format!(
+            "The kernel refused for a reason that is neither a running service manager\n\
+             (EBUSY) nor one that ran before as another uid (EPERM). A security module\n\
+             (SELinux `binder set_context_mgr`) refusing uid {uid} is the usual one: see\n\
+             the kernel log."
+        ),
+    }
+}
+
 /// An error the hub exits 1 on, through [`report`]: at `err` unless `RUST_LOG` hides it.
 fn fail(message: std::fmt::Arguments<'_>) -> ! {
     report(log::Level::Error, message);
@@ -2739,15 +2770,14 @@ fn main() {
         }
     }
 
-    // The kernel enforces one context manager; the raw ioctl error does not name the cause.
     if let Err(e) = ProcessState::as_self().become_context_manager(service.as_binder()) {
+        let errno = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error);
+        let uid = rustix::process::geteuid().as_raw();
         fail(format_args!(
-            "rsb_hub: cannot become the service manager for {binder_path}: {e}\n\n\
-             A binder device has exactly one service manager, so this usually means\n\
-             one is already running on {binder_path}. Check with:\n    \
-             rsb_service --device {device_name} check manager\n\n\
-             To run a second, independent service manager, give it its own device:\n    \
-             sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other"
+            "rsb_hub: cannot become the service manager for {binder_path}: {e}\n\n{}",
+            context_manager_hint(errno, &binder_path, device_name, uid)
         ));
     }
 
@@ -3817,6 +3847,35 @@ mod tests {
             refused.rows.keys().next().map(|k| k.1.as_str()),
             Some(NOT_A_NAME)
         );
+    }
+
+    /// "Already running" sent an operator looking for a hub that was not there.
+    #[test]
+    fn a_refused_context_manager_is_explained_by_its_errno() {
+        let hint = |errno| context_manager_hint(errno, "/dev/binderfs/b", "b", 1000);
+        let busy = hint(Some(libc::EBUSY));
+        assert!(
+            busy.contains("one is running on\n/dev/binderfs/b"),
+            "{busy}"
+        );
+        assert!(
+            busy.contains("rsb_service --device b check manager"),
+            "{busy}"
+        );
+
+        let perm = hint(Some(libc::EPERM));
+        assert!(perm.contains("No service manager is running"), "{perm}");
+        assert!(perm.contains("rsb_hub runs as uid 1000"), "{perm}");
+        assert!(
+            perm.contains("sudo rm /dev/binderfs/b && sudo rsb_device b"),
+            "{perm}"
+        );
+
+        for other in [Some(libc::EACCES), Some(libc::EINVAL), None] {
+            let text = hint(other);
+            assert!(text.contains("security module"), "{text}");
+            assert!(!text.contains("is running on"), "{text}");
+        }
     }
 
     /// "Declared but not started" is the question `declarations: N` alone could not answer.
