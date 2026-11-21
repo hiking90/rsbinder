@@ -155,12 +155,13 @@ too.
 `ITopic` has two more methods, `unsubscribed` and `status`, and a type of the
 application's own that implements it does not compile until it has them. Each
 hands over to the `Acceptor` method of the same name, as `subscribe` hands over
-to `accept`, and the type's `rsbinder::Interface::dump` to `Acceptor::dump`:
+to `accept`, and the type's `rsbinder::Interface::dump_fd` to
+`Acceptor::dump_fd`, which writes the dump on a thread of its own:
 
 ```rust,ignore
 impl rsbinder::Interface for Guarded {
-    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
-        self.acceptor.dump(writer, args)
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> rsbinder::Result<()> {
+        self.acceptor.dump_fd(fd, args)
     }
 }
 

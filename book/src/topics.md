@@ -663,6 +663,12 @@ reads a topic registered with Android's service manager, and `rsb_service dump
 NAME` one on Linux. The lag, losses and pins are what each subscriber wrote in
 its control page: what it reports.
 
+The publisher writes the text of a dump on a thread that exists for that
+dump, with `rsbinder::DumpWriter`: a caller that passes a pipe and does not
+read it holds that thread for up to 30 seconds and no binder thread, so
+subscriptions are still taken. A topic writes one dump at a time; a dump
+that arrives meanwhile is refused with `WOULD_BLOCK`.
+
 Both name other processes, so `PublisherBuilder::inspect` decides who may ask.
 Without it the publisher's uid, root, and on Android `shell` (uid 2000, which
 `dumpsys` runs as) may; any other caller gets `EX_SECURITY`, and a dump says so.

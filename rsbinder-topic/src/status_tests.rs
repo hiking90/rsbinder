@@ -88,6 +88,48 @@ fn a_dropped_publisher_answers_closed_and_its_dump_says_so() {
     let mut text = Vec::new();
     acceptor.dump(&mut text, &[]).unwrap();
     assert_eq!(text, b"rsbinder-topic: the publisher has been dropped\n");
+    assert_eq!(dumped_to_an_fd(&acceptor), text);
+}
+
+/// What `dump_fd` writes, read to the end-of-file its writer thread leaves.
+fn dumped_to_an_fd(acceptor: &crate::Acceptor) -> Vec<u8> {
+    use std::io::Read;
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    acceptor.dump_fd(writer.into(), &[]).unwrap();
+    let mut text = Vec::new();
+    { reader }.read_to_end(&mut text).unwrap();
+    text
+}
+
+#[test]
+fn a_dump_to_an_fd_is_the_dump_to_a_writer() {
+    let publisher = Publisher::<Bytes>::events().build().unwrap();
+    let _subscriber = Subscriber::<Bytes>::builder()
+        .subscribe(&publisher.as_binder())
+        .unwrap();
+    let acceptor = publisher.acceptor();
+    let mut text = Vec::new();
+    acceptor.dump(&mut text, &[]).unwrap();
+    assert_eq!(text.iter().filter(|byte| **byte == b'\n').count(), 2);
+    assert_eq!(dumped_to_an_fd(&acceptor), text);
+}
+
+/// The slot is the topic's: a dump one acceptor writes refuses the next at another.
+#[test]
+fn a_topic_writes_one_dump_at_a_time_across_its_acceptors() {
+    use std::io::Write;
+    let publisher = Publisher::<Bytes>::events().build().unwrap();
+    // Full before the dump: its writer waits whatever the size of the text.
+    let (_reader, mut full) = std::os::unix::net::UnixStream::pair().unwrap();
+    full.set_nonblocking(true).unwrap();
+    while full.write(&[0; 4096]).is_ok() {}
+    full.set_nonblocking(false).unwrap();
+    assert_eq!(publisher.acceptor().dump_fd(full.into(), &[]), Ok(()));
+    let (_other, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert_eq!(
+        publisher.acceptor().dump_fd(writer.into(), &[]),
+        Err(rsbinder::StatusCode::WouldBlock)
+    );
 }
 
 #[test]

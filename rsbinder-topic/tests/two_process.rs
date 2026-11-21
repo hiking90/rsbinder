@@ -153,6 +153,24 @@ fn another_process_of_the_publishers_uid_reads_its_status_and_its_dump() {
     assert_eq!(publisher.subscriber_count(), 1);
 }
 
+/// The dump call returns with nothing written: the publisher writes on no binder thread.
+#[test]
+#[ignore = "needs a binder device and rsb_hub"]
+fn a_dump_to_a_full_pipe_nobody_reads_holds_no_binder_thread() {
+    let (name, publisher) = publish("clog");
+    let clogged = Peer::spawn("clog", &name);
+    assert_eq!(clogged.says(), "dumped");
+    let subscriber = Peer::spawn("subscribe", &name);
+    assert_eq!(subscriber.says(), "subscribed");
+    assert_eq!(publisher.subscriber_count(), 1);
+    // The topic writes one dump at a time, and the first is still held.
+    let (_read_end, write_end) = rustix::pipe::pipe().unwrap();
+    assert_eq!(
+        publisher.acceptor().dump_fd(write_end, &[]),
+        Err(rsbinder::StatusCode::WouldBlock)
+    );
+}
+
 #[test]
 #[ignore = "needs a binder device and rsb_hub"]
 fn a_subscriber_of_another_process_reads_a_state_topics_value_at_once() {
@@ -764,6 +782,20 @@ fn child() {
                 .read_to_string(&mut text)
                 .unwrap();
             say(&format!("dump {}", text.lines().count()));
+            wait_for_eof();
+        }
+        "clog" => {
+            use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+            let topic = hub::check_service(&name).unwrap();
+            let (_read_end, write_end) = rustix::pipe::pipe().unwrap();
+            // One page, filled before the call: the dump waits whatever its size.
+            rustix::pipe::fcntl_setpipe_size(&write_end, 4096).unwrap();
+            let blocking = fcntl_getfl(&write_end).unwrap();
+            fcntl_setfl(&write_end, blocking | OFlags::NONBLOCK).unwrap();
+            while rustix::io::write(&write_end, &[0; 4096]).is_ok() {}
+            fcntl_setfl(&write_end, blocking).unwrap();
+            topic.as_proxy().unwrap().dump(write_end, &[]).unwrap();
+            say("dumped");
             wait_for_eof();
         }
         "state" => {

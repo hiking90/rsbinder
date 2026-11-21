@@ -118,7 +118,7 @@ peers; peers of either release still subscribe to each other.
   `oneway void unsubscribed()` and `TopicStatus status()`. An `ITopic` of the
   application's own does not compile until it implements them; each hands
   over to the `Acceptor` method of the same name, and its
-  `rsbinder::Interface::dump` to `Acceptor::dump`. A struct literal of
+  `rsbinder::Interface::dump_fd` to `Acceptor::dump_fd`. A struct literal of
   `SubscribeRequest` or `TopicEndpoint` names the new fields or ends in
   `..Default::default()`, and `SubscriberInfo` has the fields `id` and
   `unwaited`.
@@ -228,7 +228,11 @@ peers; peers of either release still subscribe to each other.
 - `rsbinder-topic`: `ITopic.status` and the binder dump of a publisher
   (`dumpsys` on Android), which name each subscription's uid, pid, lag and
   losses, for callers `PublisherBuilder::inspect` admits: by default the
-  publisher's uid, root, and on Android `shell`. `RegistryResolver::lookup`
+  publisher's uid, root, and on Android `shell`. The dump is written by
+  `Acceptor::dump_fd` on a thread of its own (`rsbinder::DumpWriter`), one
+  dump of a topic at a time, so a caller that does not read its pipe holds
+  no binder thread of the publisher; `Acceptor::dump` writes the same text
+  to a writer on the calling thread. `RegistryResolver::lookup`
   gives the `ITopic` binder of a registry name; `uds::status` and
   `UdsResolver::status` ask for the status over a socket; `TopicStatus`
   implements `Display`, the text of the dump.
