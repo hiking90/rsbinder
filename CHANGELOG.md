@@ -153,6 +153,10 @@ peers; peers of either release still subscribe to each other.
 - `rsb_hub`'s dump has a `last reload:` line (`none`, `ok, N s ago`,
   `FAILED N s ago`), and a failed reload sets the systemd status line. A
   failed `SIGHUP` showed only in the hub's log.
+- `rsb_hub` logs a lookup its policy refuses (`getService`, `checkService`,
+  `getService2`, `checkService2`) at `warn`, once a minute for each uid and
+  name, and its dump counts them in `refused lookups:`. The caller is still
+  answered as for a name that is not registered.
 
 - `connect_async_with`, `connect_async` with `ClientOptions`. Without
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds

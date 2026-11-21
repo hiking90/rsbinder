@@ -376,6 +376,19 @@ reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
 want_out "hidden by policy"           "dump says the view is partial"
 want_out "declarations: 5"           "dump counts the loaded declarations"
 
+note "6-7 O3  a lookup the policy refuses is in the hub's log, once"
+BEFORE=$(grep -c 'find on "ac61.hidden.live"' "$LOG")
+run_probe find:ac61.hidden.live find:ac61.hidden.live get:ac61.hidden.live
+want_result find ac61.hidden.live NOTFOUND "the caller is answered as for an unregistered name"
+AFTER=$(grep -c 'find on "ac61.hidden.live"' "$LOG")
+[ "$((AFTER - BEFORE))" -le 1 ] && [ "$AFTER" -ge 1 ] && ok "three refused lookups, one log line at most" \
+    || bad "log lines before=$BEFORE after=$AFTER"
+grep 'find on "ac61.hidden.live"' "$LOG" | grep -q "uid=$MY_UID" && ok "the line names the caller's uid" \
+    || bad "no uid in: $(grep 'find on "ac61.hidden.live"' "$LOG" | head -1)"
+run_svc dump manager
+REFUSED=$(sed -n 's/^refused lookups: //p' "$OUT")
+[ "${REFUSED:-0}" -ge 3 ] && ok "the dump counts them ($REFUSED)" || bad "refused lookups: '$REFUSED'"
+
 note "6-7 O1  --check-config, and a failed reload shows in the dump"
 out=$($HUB --check-config --config "$POLDIR" --device rsb61-absent 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "a configuration that loads exits 0, with no device" || bad "check exits $rc: $out"

@@ -501,6 +501,14 @@ That matches AOSP (`getService` returns ok regardless of result) and keeps a
 denied caller from using the error to probe which names exist. Every other
 denial returns `ExceptionCode::Security`.
 
+The caller is told nothing; the operator is. The hub logs a denied lookup at
+`warn` with the name and the caller's uid and pid, once a minute for each
+uid and name, and the line says how many more it left out. A caller that
+asks for a new name each time gets a line for 8 names a minute. The dump's
+`refused lookups:` line counts every one since the hub started, logged or
+not. So a client that cannot find a service that is registered shows up in
+the log as a denial, not as a missing service.
+
 The two `list` calls apply *both* gates: the caller must be allowed to
 enumerate at all, and each name it would learn about must be one it may
 `find`. A name you cannot look up is a name you do not get told about.

@@ -445,6 +445,8 @@ struct ServiceManager {
     topics: Option<rsbinder_topic::registry::Registry>,
     /// Set while a dump writer holds a caller's fd; one only, as an unread pipe fills any number.
     dump_writer: DumpWriter,
+    /// `find` refusals answered as "not registered".
+    refused_lookups: Mutex<RefusedLookups>,
 }
 
 impl ServiceManager {
@@ -472,6 +474,7 @@ impl ServiceManager {
             #[cfg(feature = "topic")]
             topics: None,
             dump_writer: Arc::new(Mutex::new(None)),
+            refused_lookups: Mutex::new(RefusedLookups::default()),
         };
 
         this.run_death_receiver(death_receiver);
@@ -629,6 +632,34 @@ impl ServiceManager {
         }
     }
 
+    /// A lookup the policy refused and the caller sees as a miss: counted, logged once a minute.
+    fn note_refused_lookup(&self, name: &str) {
+        let ctx = rsbinder::CallingContext::current();
+        let due =
+            lock_recover(&self.refused_lookups).note(ctx.uid, name, std::time::Instant::now());
+        let Some(unlogged) = due else { return };
+        let unmapped = unmapped_caller(rsbinder::calling_caller().as_ref());
+        let why = if unmapped {
+            "rsb_hub refused"
+        } else {
+            "policy denied"
+        };
+        let more = if unlogged > 0 {
+            format!("; {unlogged} more of these since the last such line")
+        } else {
+            String::new()
+        };
+        let shown = if config::is_valid_service_name(name) {
+            name
+        } else {
+            NOT_A_NAME
+        };
+        log::warn!(
+            "{why} find on {shown:?} for {}, answered as not registered{more}",
+            denied_to(&ctx, unmapped)
+        );
+    }
+
     /// Tells the activator a start registered: `name` is an instance or an instance's accessor.
     fn note_registered(&self, name: &str) {
         let config = self.enforcer.config();
@@ -649,6 +680,7 @@ impl ServiceManager {
         let caller = rsbinder::calling_caller();
         let accessor = config.declarations.accessor(name);
         if !self.allows_service_in(&config, caller.as_ref(), Permission::Find, name) {
+            self.note_refused_lookup(name);
             return Ok(classify_for_service_union(None, accessor.is_some()));
         }
         let order = lock_recover(&self.fire_order);
@@ -767,6 +799,8 @@ struct DumpSnapshot {
     /// Names with callbacks held but nothing registered.
     awaited: Vec<(String, usize, usize)>,
     death_subscriptions: usize,
+    /// Lookups answered "not registered" because the policy refused `find`, since the start.
+    refused_lookups: u64,
     /// `None` when running under `--insecure-allow-all`.
     rules: Option<usize>,
     /// How long ago the last SIGHUP was handled and whether it loaded; `None` before the first.
@@ -808,6 +842,7 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
     }
     writeln!(w, "declarations: {}", snap.declarations)?;
     writeln!(w, "death subscriptions: {}", snap.death_subscriptions)?;
+    writeln!(w, "refused lookups: {}", snap.refused_lookups)?;
     if !snap.filter.is_empty() {
         writeln!(w, "filter: {}", snap.filter.join(" "))?;
     }
@@ -974,6 +1009,7 @@ impl ServiceManager {
             services: rows,
             awaited,
             death_subscriptions,
+            refused_lookups: lock_recover(&self.refused_lookups).total,
             rules: (!self.enforcer.is_allow_all()).then_some(config.policy.rules.len()),
             last_reload: (*lock_recover(&LAST_RELOAD)).map(|(at, ok)| (at.elapsed(), ok)),
             declarations: config.declarations.len(),
@@ -1020,6 +1056,64 @@ impl Interface for ServiceManager {
         )
         .map_err(|_| StatusCode::NoMemory)?;
         send_dump(&self.dump_writer, fd, text, &ctx)
+    }
+}
+
+/// A client polling once a second writes one line a minute, not sixty.
+const REFUSED_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the table against a caller that asks for a new name each time.
+const REFUSED_ROWS: usize = 1024;
+/// Names of one uid logged within [`REFUSED_LOG_EVERY`]: bounds that caller's lines, not the table.
+const REFUSED_NAMES_PER_UID: usize = 8;
+/// What an argument that is no service name is filed under, so it cannot size a row.
+const NOT_A_NAME: &str = "(not a service name)";
+
+/// `find` refusals the caller sees as "not registered", as AOSP answers null: for the operator.
+#[derive(Default)]
+struct RefusedLookups {
+    total: u64,
+    /// `(uid, name)` to when its line was logged and the lookups since that wrote none.
+    rows: std::collections::HashMap<(u32, String), (std::time::Instant, u64)>,
+}
+
+impl RefusedLookups {
+    /// Counts one; `Some(n)` when a line is due, `n` the lookups of this row that wrote none.
+    fn note(&mut self, uid: u32, name: &str, now: std::time::Instant) -> Option<u64> {
+        self.total = self.total.saturating_add(1);
+        let name = if config::is_valid_service_name(name) {
+            name
+        } else {
+            NOT_A_NAME
+        };
+        let recent = |at: std::time::Instant| now.saturating_duration_since(at) < REFUSED_LOG_EVERY;
+        if let Some((at, unlogged)) = self.rows.get_mut(&(uid, name.to_owned())) {
+            if recent(*at) {
+                *unlogged = unlogged.saturating_add(1);
+                return None;
+            }
+            *at = now;
+            return Some(std::mem::take(unlogged));
+        }
+        let names_of_uid = self
+            .rows
+            .iter()
+            .filter(|((row_uid, _), (at, _))| *row_uid == uid && recent(*at))
+            .count();
+        if names_of_uid >= REFUSED_NAMES_PER_UID {
+            return None;
+        }
+        if self.rows.len() >= REFUSED_ROWS {
+            let oldest = self
+                .rows
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.rows.remove(&oldest);
+            }
+        }
+        self.rows.insert((uid, name.to_owned()), (now, 0));
+        Some(0)
     }
 }
 
@@ -1099,6 +1193,7 @@ impl IServiceManager for ServiceManager {
         let config = self.enforcer.config();
         let caller = rsbinder::calling_caller();
         if !self.allows_in(&config, caller.as_ref(), Permission::Find, name) {
+            self.note_refused_lookup(name);
             return Ok(None);
         }
         let order = lock_recover(&self.fire_order);
@@ -1281,6 +1376,7 @@ impl IServiceManager for ServiceManager {
     /// Non-blocking; never starts anything, but sets `guarantee_client` as AOSP does.
     fn checkService(&self, name: &str) -> rsbinder::BinderResult<Option<SIBinder>> {
         if !self.allows(Permission::Find, name) {
+            self.note_refused_lookup(name);
             return Ok(None);
         }
         let _order = lock_recover(&self.fire_order);
@@ -2971,6 +3067,7 @@ mod tests {
             services: Vec::new(),
             awaited: Vec::new(),
             death_subscriptions: 0,
+            refused_lookups: 0,
             rules: Some(0),
             last_reload: None,
             declarations: 0,
@@ -3322,6 +3419,97 @@ mod tests {
 
         snap.services = vec![dump_row("com.example.IFoo/default", DUMP_FLAG_PRIORITY_ALL)];
         assert!(!dump_to_string(&snap).contains("no priority bit"));
+    }
+
+    /// The caller is answered as for an unregistered name; the log and the count are the operator's.
+    #[test]
+    fn a_refused_lookup_is_counted_each_time_and_logged_once_a_minute() {
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let mut refused = RefusedLookups::default();
+        assert_eq!(
+            refused.note(1000, "a.b", at(0)),
+            Some(0),
+            "the first is logged"
+        );
+        assert_eq!(refused.note(1000, "a.b", at(1)), None);
+        assert_eq!(refused.note(1000, "a.b", at(59)), None);
+        assert_eq!(refused.total, 3);
+        assert_eq!(
+            refused.note(1000, "a.b", at(60)),
+            Some(2),
+            "and says what it left out"
+        );
+        assert_eq!(refused.note(1000, "a.b", at(61)), None);
+
+        assert_eq!(
+            refused.note(1001, "a.b", at(61)),
+            Some(0),
+            "another uid is its own row"
+        );
+        assert_eq!(
+            refused.note(1000, "c.d", at(61)),
+            Some(0),
+            "and another name"
+        );
+        assert_eq!(refused.total, 7);
+    }
+
+    /// A new name each call would otherwise be a line each call.
+    #[test]
+    fn one_uid_asking_for_many_names_is_logged_for_a_few() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedLookups::default();
+        let logged = (0..100)
+            .filter(|i| refused.note(1000, &format!("n.{i}"), t0).is_some())
+            .count();
+        assert_eq!(logged, REFUSED_NAMES_PER_UID);
+        assert_eq!(refused.total, 100, "every one is counted");
+        assert_eq!(refused.rows.len(), REFUSED_NAMES_PER_UID);
+        assert_eq!(
+            refused.note(1001, "n.0", t0),
+            Some(0),
+            "another uid is not held to it"
+        );
+        let later = t0 + REFUSED_LOG_EVERY;
+        assert_eq!(
+            refused.note(1000, "n.99", later),
+            Some(0),
+            "nor the uid a minute on"
+        );
+    }
+
+    /// The table is bounded whatever the callers; the oldest row goes first.
+    #[test]
+    fn the_refused_table_is_bounded_and_drops_its_oldest_row() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedLookups::default();
+        for uid in 0..REFUSED_ROWS {
+            let at = t0 + std::time::Duration::from_millis(uid as u64);
+            assert_eq!(refused.note(uid as u32, "a.b", at), Some(0));
+        }
+        assert_eq!(refused.rows.len(), REFUSED_ROWS);
+        let at = t0 + std::time::Duration::from_secs(2);
+        assert_eq!(refused.note(u32::MAX, "a.b", at), Some(0));
+        assert_eq!(refused.rows.len(), REFUSED_ROWS);
+        assert!(
+            !refused.rows.contains_key(&(0, "a.b".to_owned())),
+            "uid 0 was the oldest"
+        );
+        assert!(refused.rows.contains_key(&(1, "a.b".to_owned())));
+    }
+
+    /// An argument that is no service name is not kept: it could be megabytes.
+    #[test]
+    fn a_refused_argument_that_is_no_name_shares_one_row() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedLookups::default();
+        assert_eq!(refused.note(1000, &"x".repeat(4096), t0), Some(0));
+        assert_eq!(refused.note(1000, "has a space", t0), None);
+        assert_eq!(
+            refused.rows.keys().next().map(|k| k.1.as_str()),
+            Some(NOT_A_NAME)
+        );
     }
 
     /// A failed SIGHUP leaves `kill` at exit 0 and the registry as it was; the dump is where it shows.
