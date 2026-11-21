@@ -180,12 +180,16 @@
 //! round trip goes through, so every thread that touched the driver gets
 //! exactly one.
 //!
-//! Once `THREAD_STATE` is torn down (a TLS destructor that runs after its
-//! own), `queue_cmd` writes a `fallback` command to the driver directly and
-//! refuses any other with `InvalidOperation`. Its `build` only writes. A
-//! command taken back with nothing sent, as an `inc_*` is, does not fall
-//! back: a count it raised alone would let the matching decrement take
-//! another holder's.
+//! What a TLS destructor that runs after `THREAD_STATE`'s finds follows from
+//! how the target builds `thread_local!`. With native TLS (Linux) the cell
+//! stays torn down: `queue_cmd` writes a `fallback` command to the driver
+//! directly and refuses any other with `InvalidOperation`. Its `build` only
+//! writes. A command taken back with nothing sent, as an `inc_*` is, does not
+//! fall back: a count it raised alone would let the matching decrement take
+//! another holder's. With pthread keys (Android) a key is empty again once its
+//! destructor returns, so that destructor gets a new `ThreadState`, which
+//! queues and flushes as any other, and `talk_with_driver` arms the guard
+//! again if it has run; only `ThreadState`'s own drop finds the cell torn down.
 //!
 //! # Dispatch notes
 //!
@@ -4042,9 +4046,87 @@ mod tests {
         );
     }
 
+    /// A TLS destructor after `THREAD_STATE`'s gets a new one; the proxy it drops is released.
+    #[test]
+    #[cfg(target_os = "android")]
+    #[serial_test::serial(binder)]
+    fn a_drop_after_the_teardown_leaves_no_ref_or_thread() {
+        /// The driver's lines on handle 0 and on thread `tid`; `None` if its log cannot be read.
+        fn driver_lines(tid: u32) -> Option<Vec<String>> {
+            let pid = std::process::id();
+            let log = std::fs::read_to_string(format!("/dev/binderfs/binder_logs/proc/{pid}"))
+                .or_else(|_| {
+                    std::fs::read_to_string(format!("/sys/kernel/debug/binder/proc/{pid}"))
+                })
+                .ok()?;
+            let thread = format!("thread {tid}:");
+            let lines = log.lines().map(str::trim);
+            let about = lines.filter(|l| l.contains(": desc 0 ") || l.starts_with(&thread));
+            Some(about.map(String::from).collect())
+        }
+        in_child_process(
+            "thread_state::tests::a_drop_after_the_teardown_leaves_no_ref_or_thread",
+            || {
+                use std::sync::atomic::{AtomicI32, Ordering};
+                const MARK: i32 = 0x5a5a;
+                type Last = Box<dyn FnOnce() + Send>;
+                struct Late(RefCell<Option<Last>>);
+                impl Drop for Late {
+                    fn drop(&mut self) {
+                        if let Some(last) = self.0.borrow_mut().take() {
+                            last();
+                        }
+                    }
+                }
+                thread_local! {
+                    static LATE: Late = const { Late(RefCell::new(None)) };
+                }
+                ProcessState::init_default().expect("init_default");
+                // Bionic destroys keys in index order, and this key is made before `LATE`'s.
+                THREAD_STATE.with(|_| ());
+                let found = Arc::new(AtomicI32::new(-1));
+                let found_late = Arc::clone(&found);
+                let (tid, while_held) = std::thread::spawn(move || {
+                    LATE.with(|_| ());
+                    let held = ProcessState::as_self()
+                        .strong_proxy_for_handle(0)
+                        .expect("a proxy for handle 0");
+                    set_strict_mode_policy(MARK);
+                    let last: Last = Box::new(move || {
+                        let policy = THREAD_STATE.with(|ts| ts.borrow().strict_mode_policy);
+                        found_late.store(policy, Ordering::SeqCst);
+                        drop(held);
+                    });
+                    LATE.with(|late| *late.0.borrow_mut() = Some(last));
+                    let link = std::fs::read_link("/proc/thread-self").expect("thread-self");
+                    let tid = link.file_name().and_then(|name| name.to_str());
+                    let tid: u32 = tid.and_then(|name| name.parse().ok()).expect("a tid");
+                    (tid, driver_lines(tid))
+                })
+                .join()
+                .expect("the thread and its destructors ran without a panic");
+                assert_eq!(
+                    found.load(Ordering::SeqCst),
+                    0,
+                    "not the marked ThreadState"
+                );
+                let Some(while_held) = while_held else {
+                    eprintln!("the driver's log cannot be read: its ref and thread are unchecked");
+                    return;
+                };
+                assert_eq!(
+                    while_held.len(),
+                    2,
+                    "the ref and the thread: {while_held:?}"
+                );
+                assert_eq!(driver_lines(tid), Some(Vec::new()));
+            },
+        );
+    }
+
     /// After `THREAD_STATE`'s teardown an `inc_*` and a lookup are refused; a dropped proxy sends.
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     #[serial_test::serial(binder)]
     fn after_the_teardown_an_inc_is_refused_and_a_drop_sends() {
         in_child_process(

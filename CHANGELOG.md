@@ -98,7 +98,9 @@ peers; peers of either release still subscribe to each other.
 - `rsbinder-topic`: a `NamedSubscriber` with `Start::Newest` connected again to
   a publisher it read before starts at that publisher's newest record, and
   steps over it when it is the record returned last, where it started at the
-  next record. The same holds after a session over a socket ends.
+  next record. After a session over a socket ended, 0.1.0 started at the newest
+  record and could return the record it returned last again; it now steps over
+  that record.
 - `rsbinder-topic`: a `NamedSubscriber` remembers the 170 publishers it connected
   to last, where it remembered every publisher until a connection to it saw its
   end. A publisher connected to before those is read as one it never connected
@@ -152,8 +154,9 @@ peers; peers of either release still subscribe to each other.
   accessor's session carries no fds, as in AOSP, and the tool says so.
 - `rsbinder-topic`: state topics. `Publisher::state()` makes a topic whose
   newest record is its current value, with a first value given to `build` or
-  written by `build_with`. A subscriber learns the kind as it subscribes
-  (`TopicKind`, `TopicEndpoint.topicKind`, `topic_kind()`). The new default
+  written by `build_with`. A subscriber learns the kind from each subscription
+  (`TopicKind`, `TopicEndpoint.topicKind`, `topic_kind()`, an `Option` on a
+  `NamedSubscriber`). The new default
   `Start::Auto` starts a state topic at its newest record and an event topic
   at the next one, and every receive of a state topic returns the newest value
   with no `RecvError::Lagged`.
@@ -219,6 +222,10 @@ peers; peers of either release still subscribe to each other.
 
 ### Fixed
 
+- A stream or topic `*_async` wait made as soon as the last one ended takes the
+  thread that ran that wait. The thread was not counted as free until it had
+  told its caller, so waits made one after another could hold two or three
+  threads where one serves them.
 - Dropping a stream `Sink` no longer blocks until a blocking-pool thread is
   free when a dropped `send_async` left a record or batch queued behind a
   full pool: the ring path gives the record up at once, the RPC path sends

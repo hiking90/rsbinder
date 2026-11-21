@@ -194,8 +194,6 @@ mod made {
             let refused = builder.build().expect_err("refused");
             assert_eq!(refused.exception_code(), ExceptionCode::IllegalArgument);
         }
-        let largest = events().ring_bytes(1 << 30).event_spec().expect("a spec");
-        assert_eq!(largest.ring_bytes, 1 << 30);
     }
 
     #[test]

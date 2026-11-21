@@ -59,6 +59,7 @@ fn a_ring_is_rounded_up_to_eight_bytes_and_bounded() {
     assert!(bad_value(create_topic(0).map(|_| ())).contains("ring size"));
     // Refused before anything is allocated.
     assert!(bad_value(create_topic(MAX_RING + 1).map(|_| ())).contains("ring size"));
+    assert_eq!(ring_capacity(MAX_RING).ok(), Some(MAX_RING));
     let (fd, stored) = create_topic(MIN_RING + 1).unwrap();
     assert_eq!(Stores::capacity(&stored), MIN_RING as u64 + 8);
     assert_eq!(shm::region_size(fd.as_fd()), Ok(TOPIC_SIZE + 8));

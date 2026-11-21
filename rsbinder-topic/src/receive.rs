@@ -65,11 +65,12 @@ pub enum Disconnected {
     /// which ends the connection at the check that failed.
     ///
     /// After [`Closed::End`], [`Closed::Status`] or [`Closed::PublisherDied`] the subscriber
-    /// looks the name up once and connects to the next binder the name is given to. It forgets
-    /// that publisher, except where [`NamedSubscriber`](crate::NamedSubscriber) says it remembers
-    /// one whose session over a socket ended. After `Corrupted` it keeps the publisher and does
-    /// not connect again until the name is registered anew, to the same binder or another: while
-    /// that publisher holds the name, a receive waits with nothing more to report.
+    /// looks the name up once and connects to the next binder the name is given to. Whether it
+    /// forgets that publisher depends on what the connection saw, as
+    /// [`NamedSubscriber`](crate::NamedSubscriber) says, not on this reason. After `Corrupted` it
+    /// keeps the publisher and does not connect again until the name is registered anew, to the
+    /// same binder or another: while that publisher holds the name, a receive waits with nothing
+    /// more to report.
     Ended(Closed),
     /// The publisher, or the resolver's check of it, refused the subscription with this status;
     /// a connection the subscriber has to an earlier publisher goes on. Refusals that a retry

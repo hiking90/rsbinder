@@ -329,7 +329,7 @@ fn a_dead_resolver_closes_a_subscriber_without_a_connection_at_once() {
 
 /// It lives on, so it stays remembered: given the name again, it is read from `Next`.
 #[test]
-fn a_publisher_that_shut_its_wake_socket_down_is_connected_to_again_at_latest() {
+fn a_publisher_that_shut_its_wake_socket_down_is_connected_to_again_at_next() {
     let names = Names::default();
     let first = advertise(&names, policy());
     let mut subscriber = subscribe_on(&names, NAME, Wake::Fd);

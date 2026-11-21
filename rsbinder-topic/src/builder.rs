@@ -222,7 +222,7 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
 
     /// The most bytes a value encodes to, which sizes the ring. Without it the ring is sized for
     /// values of 8 bytes: the smallest, 4 KiB, whose records carry at most 2040 bytes, unless
-    /// [`keep`](PublisherBuilder::keep) is 256 or more.
+    /// [`keep`](PublisherBuilder::keep) is 256 or more (170 with [`lend`](Self::lend)).
     ///
     /// A record is at most half the ring, its payload at most `ring_bytes / 2`, rounded down to a
     /// multiple of 8, less 8 bytes; a value encoded past that fails to publish with
@@ -317,12 +317,14 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
     /// through the ring, is written once.
     ///
     /// The pool has `max_subscribers + 1 + keep + max_loans` slots (with the `keep` of
-    /// `lend_keep`): every subscriber pinning one still leaves a slot to lend, with the values
-    /// kept for subscribers that have not pinned them yet. All of its pages are written when the
-    /// topic is made and stay the publisher's memory: the default 64 subscribers with 1 MiB slots
-    /// are 68 MiB of the publisher's resident memory, whether or not anyone subscribes. Lower
-    /// [`max_subscribers`](Self::max_subscribers) for a pool of large slots. A pool larger than
-    /// 4 GiB is refused.
+    /// `lend_keep`, 1 on a state topic): every subscriber pinning one still leaves a slot to lend,
+    /// with the values kept for subscribers that have not pinned them yet. All of its pages are
+    /// written when the topic is made and stay the publisher's memory: on an event topic the
+    /// default 64 subscribers with 1 MiB slots are 68 MiB of the publisher's resident memory,
+    /// whether or not anyone subscribes. Lower [`max_subscribers`](Self::max_subscribers) for a
+    /// pool of large slots. A pool larger than 4 GiB is refused. A subscriber maps at most 1 GiB
+    /// of pool by default (256 MiB on a 32-bit target), and refuses a larger one unless its
+    /// [`max_pool_bytes`](SubscriberBuilder::max_pool_bytes) is raised.
     ///
     /// Only a topic of [`Bytes`](crate::Bytes) can lend: [`Publisher::loan_slice`] is a method of
     /// `Publisher<Bytes>`. On a topic of another payload the pool is made all the same, with its
@@ -357,6 +359,10 @@ impl<T: Payload + 'static, K> PublisherBuilder<T, K> {
     /// [`max_value_bytes`](Self::max_value_bytes) and the records to keep work out. For a ring of
     /// a size chosen elsewhere: one to compare with another transport's, or a small one that a
     /// test laps. [`Publisher::ring_bytes`] reads the size a topic was made with.
+    ///
+    /// A subscriber maps at most 256 MiB of ring by default (16 MiB on a 32-bit target), whichever
+    /// way the size was worked out, and refuses a larger one unless its
+    /// [`max_ring_bytes`](SubscriberBuilder::max_ring_bytes) is raised.
     pub fn ring_bytes(mut self, bytes: usize) -> Self {
         self.ring_bytes = Some(bytes);
         self
@@ -563,10 +569,10 @@ impl<T: Payload + 'static> PublisherBuilder<T, StateTopic> {
     /// The ring holds two values of `max_value_bytes` besides the one being written, the newest
     /// and the one before it, and no less than 4 KiB: a subscriber that copies the newest value
     /// while the publisher writes the next one reads it whole, and one slower than that skips to
-    /// a newer value. A value larger than half the ring
-    /// ([`max_value_bytes`](PublisherBuilder::max_value_bytes)) does not fit a record; on a topic
-    /// that lends ([`lend`](PublisherBuilder::lend)), [`build_with`](Self::build_with) writes a
-    /// first value of up to a slot's bytes into a slot.
+    /// a newer value. A value larger than a record's payload
+    /// ([`max_value_bytes`](PublisherBuilder::max_value_bytes) says how large) does not fit a
+    /// record; on a topic that lends ([`lend`](PublisherBuilder::lend)),
+    /// [`build_with`](Self::build_with) writes a first value of up to a slot's bytes into a slot.
     ///
     /// The refusals of [`events`](Publisher::events)' `build`, and `EX_ILLEGAL_ARGUMENT` when
     /// `initial` does not fit a record, its message naming both sizes, or the status code of its

@@ -1000,7 +1000,7 @@ fn a_subscriber_whose_session_ended_connects_again_with_no_new_generation() {
     ));
     assert!(subscriber.wait_connected(WAIT));
     publisher.publish(&Bytes(vec![2])).unwrap();
-    // A session's end reads as the publisher's death, which forgets it: from the oldest again.
+    // An event topic read from `Next` forgets a ring whose session ended: from the oldest again.
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![1])));
     assert_eq!(subscriber.recv_timeout(WAIT), Ok(Bytes(vec![2])));
 }

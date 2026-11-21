@@ -2151,13 +2151,19 @@ mod android_10_tests {
         if crate::get_android_sdk_version() != sdk_versions::ANDROID_10 {
             return;
         }
-        ProcessState::init_default().expect("init_default");
-        assert!(ProcessState::as_self().context_object().is_ok());
-        let sm = default();
-        if cfg!(feature = "android_10") {
-            assert!(sm.is_ok(), "{:?}", sm.err());
-        } else {
-            assert_eq!(sm.err(), Some(StatusCode::InvalidOperation));
-        }
+        // In a child: `default`'s static keeps a handle-0 proxy the `process_state` tests forbid.
+        crate::tests::in_child_process(
+            "hub::android_10_tests::android_10_hands_out_its_service_manager_only_with_its_feature",
+            || {
+                ProcessState::init_default().expect("init_default");
+                assert!(ProcessState::as_self().context_object().is_ok());
+                let sm = default();
+                if cfg!(feature = "android_10") {
+                    assert!(sm.is_ok(), "{:?}", sm.err());
+                } else {
+                    assert_eq!(sm.err(), Some(StatusCode::InvalidOperation));
+                }
+            },
+        );
     }
 }

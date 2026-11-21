@@ -120,7 +120,9 @@ A `NamedSubscriber` with `Start::Newest`, connected again to a publisher it read
 before, starts at that publisher's newest record and steps over it when it is
 the record returned last. 0.1.0 started at the next record, so a value published
 while the name was elsewhere was never returned, and the subscriber got nothing
-until the next publish. The same holds after a session over a socket ends.
+until the next publish. After a session over a socket ended, 0.1.0 started at the
+newest record and could return the record it returned last again; it now steps
+over that record.
 
 A `NamedSubscriber` remembers the 170 publishers it connected to last. A
 publisher connected to before those is read as one it never connected to, so a

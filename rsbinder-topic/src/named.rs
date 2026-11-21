@@ -392,7 +392,7 @@ struct State<T: Payload> {
     wake: Option<Interrupter>,
     /// Topics joined, each once, oldest first; [`Connection::forgets`] says which one leaves.
     joined: Vec<Joined>,
-    /// A connection has joined: a later one to a topic not joined starts at `Oldest`, or `Last`.
+    /// A connection has joined: a later one to a topic not joined starts at `Oldest`, or `Newest`.
     later: bool,
     /// The wait before asking again a publisher whose connection failed to join; zero after a join.
     rejoin: Duration,

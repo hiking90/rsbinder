@@ -158,8 +158,9 @@ same for a future, with no thread of its own.
 
 ## Event topics and state topics
 
-The publisher says what its records are by the builder it starts, and every
-subscriber learns it as it subscribes (`topic_kind`):
+The publisher says what its records are by the builder it starts. A `Subscriber`
+learns it as it subscribes (`topic_kind`); a `NamedSubscriber` learns it for each
+connection, and its `topic_kind` is `None` while it holds none:
 
 | | Event topic: `Publisher::events()` | State topic: `Publisher::state()` |
 |---|---|---|
