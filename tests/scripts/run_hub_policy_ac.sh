@@ -243,6 +243,10 @@ name = "ac61.declared.IBar/default"
 [[service]]
 name = "ac61.declared.ISleep/default"
 start = { exec = ["/usr/bin/sleep", "61.25"] }
+
+[[service]]
+name = "ac61.declared.IFalse/default"
+start = { exec = ["/usr/bin/false"] }
 EOF
 kill -HUP "$HUB_PID"; sleep 1
 grep -q "service declaration(s)" "$LOG" && ok "reload reports the declarations" || bad "no declaration count: $(tail -2 "$LOG")"
@@ -291,6 +295,18 @@ if [ -n "$CHILD" ]; then
 else
     bad "the exec child did not start"
 fi
+
+note "6-7 E3  an exec that ends with nothing registered is not started once a lookup"
+# 20 lookups over 2 s and more: starts at 0 s and after 1 s, the third not before 3 s.
+for _ in $(seq 20); do run_probe get:ac61.declared.IFalse/default; sleep 0.1; done
+STARTS=$(grep -c "ac61.declared.IFalse/default is not registered; starting it" "$LOG")
+if [ "$STARTS" -ge 1 ] && [ "$STARTS" -le 3 ]; then
+    ok "20 lookups started it $STARTS time(s)"
+else
+    bad "20 lookups started it $STARTS time(s), want 1 to 3"
+fi
+grep -q "start of ac61.declared.IFalse/default ended with nothing registered" "$LOG" \
+    && ok "the hub's log says the next start is held off" || bad "no hold-off in the log"
 ######################################################################
 # Plan 6-5: the diagnostic CLI. It is a plain binder client, so these gates
 # also re-prove the policy from a second, independent implementation of the
@@ -358,7 +374,70 @@ want_out "ac61.allowed.live"          "dump lists a findable registration"
 want_out "pid=$HOLD_PID"              "dump attributes it to the registering pid"
 reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
 want_out "hidden by policy"           "dump says the view is partial"
-want_out "declarations: 4"            "dump counts the loaded declarations"
+want_out "declarations: 5"           "dump counts the loaded declarations"
+
+note "6-7 O2  the dump says where each declaration's start stands"
+want_out "^uptime: [0-9]* s"          "dump has the hub's uptime"
+want_out "^declared (5):"             "dump lists the declarations"
+want_out "ac61.declared.IFoo/secondary  start=none registered=no" "one with no start"
+want_out "ac61.declared.IFalse/default  start=exec registered=no outstanding=no failures=[1-9]" \
+    "the exec that registers nothing, with its failures"
+want_out "age=[0-9]*s"                "a registration has its age"
+
+note "6-7 O3  a lookup the policy refuses is in the hub's log, once"
+BEFORE=$(grep -c 'find on "ac61.hidden.live"' "$LOG")
+run_probe find:ac61.hidden.live find:ac61.hidden.live get:ac61.hidden.live
+want_result find ac61.hidden.live NOTFOUND "the caller is answered as for an unregistered name"
+AFTER=$(grep -c 'find on "ac61.hidden.live"' "$LOG")
+[ "$((AFTER - BEFORE))" -le 1 ] && [ "$AFTER" -ge 1 ] && ok "three refused lookups, one log line at most" \
+    || bad "log lines before=$BEFORE after=$AFTER"
+grep 'find on "ac61.hidden.live"' "$LOG" | grep -q "uid=$MY_UID" && ok "the line names the caller's uid" \
+    || bad "no uid in: $(grep 'find on "ac61.hidden.live"' "$LOG" | head -1)"
+run_svc dump manager
+REFUSED=$(sed -n 's/^refused lookups: //p' "$OUT")
+[ "${REFUSED:-0}" -ge 3 ] && ok "the dump counts them ($REFUSED)" || bad "refused lookups: '$REFUSED'"
+
+note "6-7 O1  --check-config, and a failed reload shows in the dump"
+out=$($HUB --check-config --config "$POLDIR" --device rsb61-absent 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a configuration that loads exits 0, with no device" || bad "check exits $rc: $out"
+echo "$out" | grep -q "service declaration(s)" && ok "and says what it holds" || bad "no summary: $out"
+echo 'name = [[[' > "$POLDIR/31-broken.toml"
+out=$($HUB --check-config --config "$POLDIR" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a configuration that does not load exits 1" || bad "check exits $rc: $out"
+echo "$out" | grep -q "31-broken.toml" && ok "and names the file" || bad "no file named: $out"
+out=$($HUB --check-config --insecure-allow-all 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--check-config with --insecure-allow-all is refused" || bad "exits $rc: $out"
+kill -0 "$HUB_PID" 2>/dev/null && ok "the running hub is untouched by the checks" || bad "hub died"
+kill -HUP "$HUB_PID"; sleep 1
+run_svc dump manager
+want_out "last reload: FAILED"        "a failed reload shows in the dump"
+reject_out "31-broken"                "the dump does not quote the file"
+rm -f "$POLDIR/31-broken.toml"
+kill -HUP "$HUB_PID"; sleep 1
+run_svc dump manager
+want_out "last reload: ok"            "and the next good reload replaces it"
+
+note "6-7 O5  rsb_service wait"
+run_svc wait ac61.allowed.live --timeout 5
+want_rc 0 "wait for a registered name exits 0"
+run_svc wait ac61.allowed.absent --timeout 0.5
+want_rc 1 "wait that times out exits 1"
+run_svc wait ac61.hidden.live --timeout 5
+want_rc 2 "wait for a name the policy hides exits 2, at once"
+want_out "grant it in the hub's configuration" "and says where to grant it"
+$SVC wait ac61.allowed.later --timeout 10 >/tmp/rsb61-wait.out 2>&1 &
+WAIT_PID=$!
+sleep 0.5
+$PROBE add:ac61.allowed.later hold:3 >/dev/null 2>&1 &
+wait "$WAIT_PID"; rc=$?
+[ "$rc" -eq 0 ] && ok "wait returns 0 once the name is registered" || bad "wait exits $rc: $(cat /tmp/rsb61-wait.out)"
+STARTED='ac61.declared.IFoo/default is not registered; starting it'
+BEFORE=$(grep -c "$STARTED" "$LOG")
+run_svc wait ac61.declared.IFoo/default --timeout 0.5
+want_rc 1 "wait for a declared service that is down times out"
+[ "$(grep -c "$STARTED" "$LOG")" -eq "$BEFORE" ] && ok "and starts nothing without --start" || bad "wait started a service"
+run_svc wait ac61.declared.IFoo/default --timeout 0.5 --start
+[ "$(grep -c "$STARTED" "$LOG")" -gt "$BEFORE" ] && ok "--start starts it" || bad "--start started nothing"
 
 run_svc dump manager ac61.allowed
 want_rc 0 "dump with a filter exits 0"
@@ -435,6 +514,10 @@ want_result add       ac61.reloaded.svc2 OK        "AC-6.1.7b previous policy st
 want_result debuginfo ""                 FAILEDTXN "AC-6.1.7c previous policy's list denial still in force"
 
 stop_hub
+
+note "6-7 O5  rsb_service wait with no hub"
+run_svc wait ac61.allowed.live --timeout 0.5
+want_rc 2 "wait with no hub to ask exits 2"
 
 ######################################################################
 # Plan 6-4: running under a service supervisor. Readiness has to be

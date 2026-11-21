@@ -22,6 +22,8 @@ struct Service {
     has_clients: bool,
     guarantee_client: bool,
     context: rsbinder::CallingContext,
+    /// For the dump's `age=`.
+    registered_at: std::time::Instant,
 }
 
 /// Collected under the `Inner` lock, fired after it drops: no outbound transaction under it (R1).
@@ -445,6 +447,8 @@ struct ServiceManager {
     topics: Option<rsbinder_topic::registry::Registry>,
     /// Set while a dump writer holds a caller's fd; one only, as an unread pipe fills any number.
     dump_writer: DumpWriter,
+    /// `find` refusals answered as "not registered".
+    refused_lookups: Mutex<RefusedLookups>,
 }
 
 impl ServiceManager {
@@ -472,6 +476,7 @@ impl ServiceManager {
             #[cfg(feature = "topic")]
             topics: None,
             dump_writer: Arc::new(Mutex::new(None)),
+            refused_lookups: Mutex::new(RefusedLookups::default()),
         };
 
         this.run_death_receiver(death_receiver);
@@ -629,6 +634,44 @@ impl ServiceManager {
         }
     }
 
+    /// A lookup the policy refused and the caller sees as a miss: counted, logged once a minute.
+    fn note_refused_lookup(&self, name: &str) {
+        let ctx = rsbinder::CallingContext::current();
+        let due =
+            lock_recover(&self.refused_lookups).note(ctx.uid, name, std::time::Instant::now());
+        let Some(unlogged) = due else { return };
+        let unmapped = unmapped_caller(rsbinder::calling_caller().as_ref());
+        let why = if unmapped {
+            "rsb_hub refused"
+        } else {
+            "policy denied"
+        };
+        let more = if unlogged > 0 {
+            format!("; {unlogged} more of these since the last such line")
+        } else {
+            String::new()
+        };
+        let shown = if config::is_valid_service_name(name) {
+            name
+        } else {
+            NOT_A_NAME
+        };
+        log::warn!(
+            "{why} find on {shown:?} for {}, answered as not registered{more}",
+            denied_to(&ctx, unmapped)
+        );
+    }
+
+    /// Tells the activator a start registered: `name` is an instance or an instance's accessor.
+    fn note_registered(&self, name: &str) {
+        let config = self.enforcer.config();
+        let declarations = &config.declarations;
+        let instance = declarations.accessor_for(name).unwrap_or(name);
+        if let Some(activation) = declarations.activation(instance) {
+            self.activator.registered(activation);
+        }
+    }
+
     /// AOSP `tryGetService`: looks the declared accessor up in the instance's stead; judges both.
     fn try_get_service(
         &self,
@@ -639,6 +682,7 @@ impl ServiceManager {
         let caller = rsbinder::calling_caller();
         let accessor = config.declarations.accessor(name);
         if !self.allows_service_in(&config, caller.as_ref(), Permission::Find, name) {
+            self.note_refused_lookup(name);
             return Ok(classify_for_service_union(None, accessor.is_some()));
         }
         let order = lock_recover(&self.fire_order);
@@ -749,16 +793,37 @@ struct DumpRow {
     is_accessor: bool,
     registration_callbacks: usize,
     client_callbacks: usize,
+    /// Since the registration that holds the name now.
+    age: Duration,
 }
+
+/// A `[[service]]` declaration the caller may `find`, with where its start stands.
+struct DeclaredRow {
+    name: String,
+    /// `exec`, `systemd`, or `none` for a declaration with no `start`.
+    start: &'static str,
+    registered: bool,
+    /// `None` without a `start`.
+    status: Option<config::StartStatus>,
+}
+
+/// When `main` began, for the dump's `uptime:`.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Everything [`render_dump`] needs, so it is testable without a registry or binder.
 struct DumpSnapshot {
+    uptime: Duration,
+    declared: Vec<DeclaredRow>,
     services: Vec<DumpRow>,
     /// Names with callbacks held but nothing registered.
     awaited: Vec<(String, usize, usize)>,
     death_subscriptions: usize,
+    /// Lookups answered "not registered" because the policy refused `find`, since the start.
+    refused_lookups: u64,
     /// `None` when running under `--insecure-allow-all`.
     rules: Option<usize>,
+    /// How long ago the last SIGHUP was handled and whether it loaded; `None` before the first.
+    last_reload: Option<(std::time::Duration, bool)>,
     declarations: usize,
     /// The `args` the caller passed, if they narrowed the listing.
     filter: Vec<String>,
@@ -775,6 +840,7 @@ fn dump_filter_matches(filter: &[String], name: &str) -> bool {
 
 fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Result<()> {
     writeln!(w, "rsb_hub {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(w, "uptime: {} s", snap.uptime.as_secs())?;
     match snap.rules {
         Some(rules) => writeln!(w, "access control: enforcing, {rules} rule(s)")?,
         None => writeln!(
@@ -783,8 +849,20 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
              register, look up and enumerate everything"
         )?,
     }
+    match snap.last_reload {
+        None => writeln!(w, "last reload: none")?,
+        Some((age, true)) => writeln!(w, "last reload: ok, {} s ago", age.as_secs())?,
+        // Not the error: a TOML message can quote the file, and `list` is all a dump takes.
+        Some((age, false)) => writeln!(
+            w,
+            "last reload: FAILED {} s ago; the configuration loaded before it is in force, \
+             see rsb_hub's log",
+            age.as_secs()
+        )?,
+    }
     writeln!(w, "declarations: {}", snap.declarations)?;
     writeln!(w, "death subscriptions: {}", snap.death_subscriptions)?;
+    writeln!(w, "refused lookups: {}", snap.refused_lookups)?;
     if !snap.filter.is_empty() {
         writeln!(w, "filter: {}", snap.filter.join(" "))?;
     }
@@ -816,12 +894,40 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
         )?;
         writeln!(
             w,
-            "    clients={} guarantee_client={} callbacks: registration={} client={}",
+            "    clients={} guarantee_client={} callbacks: registration={} client={} age={}s",
             yes_no(row.has_clients),
             yes_no(row.guarantee_client),
             row.registration_callbacks,
             row.client_callbacks,
+            row.age.as_secs(),
         )?;
+    }
+
+    if !snap.declared.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "declared ({}):", snap.declared.len())?;
+        for row in &snap.declared {
+            write!(
+                w,
+                "  {}  start={} registered={}",
+                row.name,
+                row.start,
+                yes_no(row.registered)
+            )?;
+            if let Some(status) = &row.status {
+                write!(
+                    w,
+                    " outstanding={} failures={}",
+                    yes_no(status.outstanding),
+                    status.failures
+                )?;
+                if let Some(left) = status.retry_in {
+                    // Rounded up: `retry_in=0s` would read as "not held off".
+                    write!(w, " retry_in={}s", left.as_secs_f64().ceil())?;
+                }
+            }
+            writeln!(w)?;
+        }
     }
 
     if !snap.awaited.is_empty() {
@@ -918,6 +1024,7 @@ impl ServiceManager {
                     is_accessor: config.declarations.accessor_for(name).is_some(),
                     registration_callbacks: count(&inner.name_to_registration_callbacks, name),
                     client_callbacks: count(&inner.name_to_client_callbacks, name),
+                    age: service.registered_at.elapsed(),
                 })
                 .collect();
             let awaited: Vec<(String, usize, usize)> = inner
@@ -938,20 +1045,51 @@ impl ServiceManager {
             (rows, awaited, inner.death_links.len())
         };
 
+        // A declared instance is registered under its accessor's name when it declares one.
+        let holds_its_name = |name: &str| {
+            let under = config.declarations.accessor(name).unwrap_or(name);
+            rows.iter().any(|row| row.name == under)
+        };
+        let mut declared: Vec<DeclaredRow> = config
+            .declarations
+            .iter()
+            .map(|(name, declaration)| DeclaredRow {
+                name: name.to_owned(),
+                start: match &declaration.activation {
+                    Some(config::Activation::Exec(_)) => "exec",
+                    Some(config::Activation::Systemd(_)) => "systemd",
+                    None => "none",
+                },
+                registered: holds_its_name(name),
+                status: declaration
+                    .activation
+                    .as_ref()
+                    .map(|activation| self.activator.status(activation)),
+            })
+            .collect();
+
         // Policy first: a `hidden` counted after the caller's filter tells which substrings exist.
         let before = rows.len() + awaited.len();
+        // A declared name the caller may not find is dropped, uncounted: registered or awaited,
+        // `hidden` has it already, and a count of the rest would tell what is declared.
+        declared.retain(|row| self.allows_service_in(config, caller, Permission::Find, &row.name));
         rows.retain(|row| self.allows_in(config, caller, Permission::Find, &row.name));
         awaited.retain(|(name, _, _)| self.allows_in(config, caller, Permission::Find, name));
         let hidden = before - rows.len() - awaited.len();
 
+        declared.retain(|row| dump_filter_matches(&filter, &row.name));
         rows.retain(|row| dump_filter_matches(&filter, &row.name));
         awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
 
         DumpSnapshot {
+            uptime: STARTED.get().map_or(Duration::ZERO, |at| at.elapsed()),
+            declared,
             services: rows,
             awaited,
             death_subscriptions,
+            refused_lookups: lock_recover(&self.refused_lookups).total,
             rules: (!self.enforcer.is_allow_all()).then_some(config.policy.rules.len()),
+            last_reload: (*lock_recover(&LAST_RELOAD)).map(|(at, ok)| (at.elapsed(), ok)),
             declarations: config.declarations.len(),
             filter,
             hidden,
@@ -999,8 +1137,162 @@ impl Interface for ServiceManager {
     }
 }
 
+/// A client polling once a second writes one line a minute, not sixty.
+const REFUSED_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds the table against a caller that asks for a new name each time.
+const REFUSED_ROWS: usize = 1024;
+/// Names of one uid logged within [`REFUSED_LOG_EVERY`]: bounds that caller's lines, not the table.
+const REFUSED_NAMES_PER_UID: usize = 8;
+/// What an argument that is no service name is filed under, so it cannot size a row.
+const NOT_A_NAME: &str = "(not a service name)";
+
+/// `find` refusals the caller sees as "not registered", as AOSP answers null: for the operator.
+#[derive(Default)]
+struct RefusedLookups {
+    total: u64,
+    /// `(uid, name)` to when its line was logged and the lookups since that wrote none.
+    rows: std::collections::HashMap<(u32, String), (std::time::Instant, u64)>,
+}
+
+impl RefusedLookups {
+    /// Counts one; `Some(n)` when a line is due, `n` the lookups of this row that wrote none.
+    fn note(&mut self, uid: u32, name: &str, now: std::time::Instant) -> Option<u64> {
+        self.total = self.total.saturating_add(1);
+        let name = if config::is_valid_service_name(name) {
+            name
+        } else {
+            NOT_A_NAME
+        };
+        let recent = |at: std::time::Instant| now.saturating_duration_since(at) < REFUSED_LOG_EVERY;
+        if let Some((at, unlogged)) = self.rows.get_mut(&(uid, name.to_owned())) {
+            if recent(*at) {
+                *unlogged = unlogged.saturating_add(1);
+                return None;
+            }
+            *at = now;
+            return Some(std::mem::take(unlogged));
+        }
+        let names_of_uid = self
+            .rows
+            .iter()
+            .filter(|((row_uid, _), (at, _))| *row_uid == uid && recent(*at))
+            .count();
+        if names_of_uid >= REFUSED_NAMES_PER_UID {
+            return None;
+        }
+        if self.rows.len() >= REFUSED_ROWS {
+            let oldest = self
+                .rows
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.rows.remove(&oldest);
+            }
+        }
+        self.rows.insert((uid, name.to_owned()), (now, 0));
+        Some(0)
+    }
+}
+
 /// The caller whose dump a writer thread is writing, as `uid=.. (pid=..)`; `None` when idle.
 type DumpWriter = Arc<Mutex<Option<String>>>;
+
+/// A dump write that takes no byte for this long is given up; a pager a person reads keeps it.
+const DUMP_STALL: Duration = Duration::from_secs(30);
+
+/// Interrupts this thread's blocking `write` at an interval, so a stalled one can be given up.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+struct StallTicks(libc::timer_t);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl StallTicks {
+    /// Periodic, not one shot: a tick that lands before `write` is entered interrupts nothing.
+    fn start(stall: Duration) -> std::io::Result<Self> {
+        extern "C" fn on_tick(_: libc::c_int) {}
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        let signo = libc::SIGRTMIN();
+        // SAFETY: `action` is zeroed then filled; the handler does nothing, so it is signal-safe.
+        HANDLER.call_once(|| unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            // No `SA_RESTART`: the interrupted `write` has to return.
+            action.sa_sigaction = on_tick as extern "C" fn(libc::c_int) as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signo, &action, std::ptr::null_mut());
+        });
+        let tick = (stall / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        // SAFETY: every struct is zeroed then filled, and outlives the call it is passed to.
+        unsafe {
+            let mut event: libc::sigevent = std::mem::zeroed();
+            event.sigev_notify = libc::SIGEV_THREAD_ID;
+            event.sigev_signo = signo;
+            event.sigev_notify_thread_id = libc::gettid();
+            let mut timer: libc::timer_t = std::mem::zeroed();
+            if libc::timer_create(libc::CLOCK_MONOTONIC, &mut event, &mut timer) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let ticks = StallTicks(timer);
+            let mut every: libc::itimerspec = std::mem::zeroed();
+            every.it_value.tv_sec = libc::time_t::try_from(tick.as_secs()).unwrap_or(1);
+            // `as`: `c_long` is 32 bits on some targets, and the value is under 1e9 on all.
+            every.it_value.tv_nsec = tick.subsec_nanos() as libc::c_long;
+            every.it_interval = every.it_value;
+            if libc::timer_settime(ticks.0, 0, &every, std::ptr::null_mut()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(ticks)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for StallTicks {
+    fn drop(&mut self) {
+        // SAFETY: the timer is the one `timer_create` gave, deleted once.
+        unsafe { libc::timer_delete(self.0) };
+    }
+}
+
+/// All of `text`, or an error once `stall` passes with no byte taken; the fd's flags stay as
+/// the caller, who shares its open file description, set them.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn write_within(file: &std::fs::File, text: &[u8], stall: Duration) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let _ticks = StallTicks::start(stall)?;
+    let mut rest = text;
+    let mut progressed = std::time::Instant::now();
+    while !rest.is_empty() {
+        // SAFETY: `rest` is a live slice of `rest.len()` bytes and `file` holds the fd open.
+        let n = unsafe { libc::write(file.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
+        match usize::try_from(n) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                rest = rest.get(n..).unwrap_or_default();
+                progressed = std::time::Instant::now();
+            }
+            // Not `write_all`: it retries `Interrupted`, which is how a tick ends a stalled write.
+            Err(_) => {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+                if progressed.elapsed() >= stall {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("the reader took nothing for {stall:?}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Without a timer that interrupts one thread, the write waits for the reader.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn write_within(mut file: &std::fs::File, text: &[u8], _stall: Duration) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut file, text)
+}
 
 /// Writes on a thread of its own: a caller that never reads then holds it, not the binder thread.
 fn send_dump(
@@ -1008,6 +1300,17 @@ fn send_dump(
     fd: std::os::fd::OwnedFd,
     text: Vec<u8>,
     caller: &rsbinder::CallingContext,
+) -> rsbinder::Result<()> {
+    send_dump_within(writer, fd, text, caller, DUMP_STALL)
+}
+
+/// [`send_dump`] with the stall a test can wait out.
+fn send_dump_within(
+    writer: &DumpWriter,
+    fd: std::os::fd::OwnedFd,
+    text: Vec<u8>,
+    caller: &rsbinder::CallingContext,
+    stall: Duration,
 ) -> rsbinder::Result<()> {
     let who = format!("uid={} (pid={})", caller.uid, caller.pid);
     {
@@ -1022,8 +1325,8 @@ fn send_dump(
     let spawned = std::thread::Builder::new()
         .name("rsb_hub:dump".to_owned())
         .spawn(move || {
-            let mut file = std::fs::File::from(fd);
-            if let Err(e) = std::io::Write::write_all(&mut file, &text) {
+            let file = std::fs::File::from(fd);
+            if let Err(e) = write_within(&file, &text, stall) {
                 log::error!("dump: writing to the fd of {who} failed: {e}");
             }
             // Closed before the slot frees: the caller's end-of-file is the dump's end.
@@ -1075,6 +1378,7 @@ impl IServiceManager for ServiceManager {
         let config = self.enforcer.config();
         let caller = rsbinder::calling_caller();
         if !self.allows_in(&config, caller.as_ref(), Permission::Find, name) {
+            self.note_refused_lookup(name);
             return Ok(None);
         }
         let order = lock_recover(&self.fire_order);
@@ -1211,6 +1515,7 @@ impl IServiceManager for ServiceManager {
                         has_clients: prev_clients,
                         guarantee_client: false,
                         context: caller,
+                        registered_at: std::time::Instant::now(),
                     },
                 )?;
             }
@@ -1248,6 +1553,7 @@ impl IServiceManager for ServiceManager {
         })();
 
         result?;
+        self.note_registered(name);
         fire_pending(client_pending);
         fire_pending(reg_pending);
         Ok(())
@@ -1256,6 +1562,7 @@ impl IServiceManager for ServiceManager {
     /// Non-blocking; never starts anything, but sets `guarantee_client` as AOSP does.
     fn checkService(&self, name: &str) -> rsbinder::BinderResult<Option<SIBinder>> {
         if !self.allows(Permission::Find, name) {
+            self.note_refused_lookup(name);
             return Ok(None);
         }
         let _order = lock_recover(&self.fire_order);
@@ -1706,6 +2013,37 @@ fn exit_without_config(path: &Path, err: &config::ConfigError, on_a_socket: bool
     ))
 }
 
+/// What to do about a refused `BINDER_SET_CONTEXT_MGR`: the errno alone does not name the cause.
+fn context_manager_hint(errno: Option<i32>, binder_path: &str, device: &str, uid: u32) -> String {
+    match errno {
+        // The driver's first check: the device has a context manager now.
+        Some(libc::EBUSY) => format!(
+            "A binder device has exactly one service manager, and one is running on\n\
+             {binder_path}. Check with:\n    \
+             rsb_service --device {device} check manager\n\n\
+             To run a second, independent service manager, give it its own device:\n    \
+             sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other"
+        ),
+        // Its last: the device keeps the uid of the first context manager it had.
+        Some(libc::EPERM) => format!(
+            "No service manager is running on {binder_path}, but one ran before as another\n\
+             uid, and the kernel keeps a device to the uid of its first service manager\n\
+             until the device is removed. rsb_hub runs as uid {uid}. A process that opened\n\
+             the device before rsb_hub and took the role counts too, so create the device\n\
+             and start rsb_hub in one unit, before anything else can open it.\n\n\
+             Run rsb_hub as the uid that ran it before, or remove the device, create it\n\
+             again and restart its clients:\n    \
+             sudo rm {binder_path} && sudo rsb_device {device} --group binder --mode 0660"
+        ),
+        _ => format!(
+            "The kernel refused for a reason that is neither a running service manager\n\
+             (EBUSY) nor one that ran before as another uid (EPERM). A security module\n\
+             (SELinux `binder set_context_mgr`) refusing uid {uid} is the usual one: see\n\
+             the kernel log."
+        ),
+    }
+}
+
 /// An error the hub exits 1 on, through [`report`]: at `err` unless `RUST_LOG` hides it.
 fn fail(message: std::fmt::Arguments<'_>) -> ! {
     report(log::Level::Error, message);
@@ -1777,19 +2115,44 @@ struct Reloadable {
     not(feature = "topic"),
     expect(unused_variables, reason = "only `topic` warns")
 )]
-fn warn_of_config(config: &config::Config, on_a_socket: bool) {
+fn config_warning(config: &config::Config, on_a_socket: bool) -> Option<String> {
     #[cfg(feature = "topic")]
     {
-        let warning = if on_a_socket {
+        if on_a_socket {
             config::unused_on_a_topic_socket(config)
         } else {
             config::registry_out_of_reach(config)
-        };
-        if let Some(warning) = warning {
-            log::warn!("rsb_hub: {warning}");
+        }
+    }
+    #[cfg(not(feature = "topic"))]
+    None
+}
+
+fn warn_of_config(config: &config::Config, on_a_socket: bool) {
+    if let Some(warning) = config_warning(config, on_a_socket) {
+        log::warn!("rsb_hub: {warning}");
+    }
+}
+
+/// `--check-config`: what a start or a SIGHUP would load, judged without a device or a socket.
+fn check_config(path: &Path, on_a_socket: bool) -> ! {
+    match config::load(path, &SystemResolver) {
+        Ok(loaded) => {
+            println!("rsb_hub: {} loads: {}", path.display(), summary(&loaded));
+            if let Some(warning) = config_warning(&loaded, on_a_socket) {
+                eprintln!("rsb_hub: warning: {warning}");
+            }
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("rsb_hub: {} does not load\n  {err}", path.display());
+            std::process::exit(1);
         }
     }
 }
+
+/// When the last SIGHUP was handled and whether it loaded, for `dump`; `None` before the first.
+static LAST_RELOAD: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
 
 /// A failed reload keeps the config in force: deny-all breaks IPC, permissive opens it.
 fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifier: Arc<Notifier>) {
@@ -1868,14 +2231,22 @@ fn reload(reloadable: Option<&Reloadable>, on_a_socket: bool, notifier: &Notifie
             let summary = summary(&loaded);
             warn_of_config(&loaded, on_a_socket);
             enforcer.replace(loaded);
+            *lock_recover(&LAST_RELOAD) = Some((std::time::Instant::now(), true));
             log::info!("rsb_hub: SIGHUP reloaded {summary} from {}", path.display());
             notifier.status(&format!("serving; {summary}"));
         }
-        Err(err) => log::error!(
-            "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
-             force: {err}",
-            path.display()
-        ),
+        Err(err) => {
+            *lock_recover(&LAST_RELOAD) = Some((std::time::Instant::now(), false));
+            log::error!(
+                "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
+                 force: {err}",
+                path.display()
+            );
+            notifier.status(&format!(
+                "serving; {}; the last reload FAILED, see the log",
+                summary(&enforcer.config())
+            ));
+        }
     }
 }
 
@@ -2127,6 +2498,7 @@ fn abort_on_a_background_panic() {
 }
 
 fn main() {
+    let _ = STARTED.set(std::time::Instant::now());
     rsbinder_tools::logging::init_daemon("rsb_hub", "warn");
     // Before any thread: the mask is inherited.
     if let Err(e) = block_handled_signals() {
@@ -2175,6 +2547,17 @@ fn main() {
                      different UID. Off by default: a cross-UID overwrite is the \
                      signature of a service-name hijack, so it is rejected unless \
                      this flag is set.",
+                ),
+        )
+        .arg(
+            clap::Arg::new("check-config")
+                .long("check-config")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Load the configuration as a start or a SIGHUP would, say what it holds, \
+                     and exit: 0 if it loads, 1 if not. Opens no binder device and no socket. \
+                     Run it as rsb_hub's user: whether a file is trusted depends on who reads \
+                     it. With --topic-socket, warns of what a hub on a socket would not use",
                 ),
         )
         // Also without the features, hidden: a usage error would say nothing of why.
@@ -2256,6 +2639,16 @@ fn main() {
         fail(format_args!(
             "rsb_hub: --config and --insecure-allow-all are mutually exclusive"
         ));
+    }
+    if matches.get_flag("check-config") {
+        if insecure_allow_all {
+            fail(format_args!(
+                "rsb_hub: --check-config and --insecure-allow-all are mutually exclusive: \
+                 there is no configuration to check"
+            ));
+        }
+        let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR));
+        check_config(&path, on_a_socket);
     }
 
     let (enforcer, reloadable, ready_status) = if insecure_allow_all {
@@ -2377,15 +2770,14 @@ fn main() {
         }
     }
 
-    // The kernel enforces one context manager; the raw ioctl error does not name the cause.
     if let Err(e) = ProcessState::as_self().become_context_manager(service.as_binder()) {
+        let errno = e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error);
+        let uid = rustix::process::geteuid().as_raw();
         fail(format_args!(
-            "rsb_hub: cannot become the service manager for {binder_path}: {e}\n\n\
-             A binder device has exactly one service manager, so this usually means\n\
-             one is already running on {binder_path}. Check with:\n    \
-             rsb_service --device {device_name} check manager\n\n\
-             To run a second, independent service manager, give it its own device:\n    \
-             sudo rsb_device other --group binder --mode 0660 && rsb_hub --device other"
+            "rsb_hub: cannot become the service manager for {binder_path}: {e}\n\n{}",
+            context_manager_hint(errno, &binder_path, device_name, uid)
         ));
     }
 
@@ -2878,6 +3270,7 @@ mod tests {
             is_accessor: false,
             registration_callbacks: 0,
             client_callbacks: 0,
+            age: Duration::from_secs(7),
         }
     }
 
@@ -2889,10 +3282,14 @@ mod tests {
 
     fn empty_snapshot() -> DumpSnapshot {
         DumpSnapshot {
+            uptime: Duration::ZERO,
+            declared: Vec::new(),
             services: Vec::new(),
             awaited: Vec::new(),
             death_subscriptions: 0,
+            refused_lookups: 0,
             rules: Some(0),
+            last_reload: None,
             declarations: 0,
             filter: Vec::new(),
             hidden: 0,
@@ -2959,6 +3356,47 @@ mod tests {
             // An undeclared name is judged by itself.
             assert!(manager.allows_service_in(&config, Some(&caller), permission, "open.x"));
         }
+    }
+
+    /// A declaration tells that a name exists; the dump lists what the caller could look up.
+    #[test]
+    fn the_dump_lists_a_declaration_only_to_a_caller_that_may_find_it() {
+        let (manager, config) = a_manager_over(
+            r#"
+            [[rule]]
+            name = "open.*"
+            find = { uid = [1000] }
+
+            [[service]]
+            name = "open.IFoo/default"
+            start = { exec = ["/usr/bin/food"] }
+
+            [[service]]
+            name = "open.IBar/default"
+            accessor = "closed.bar"
+
+            [[service]]
+            name = "closed.IBaz/default"
+            "#,
+        );
+        let listed = |uid: u32, filter: &[&str]| -> Vec<String> {
+            let filter = filter.iter().map(|f| (*f).to_owned()).collect();
+            manager
+                .dump_snapshot(&config, Some(&kernel_caller(uid)), filter)
+                .declared
+                .into_iter()
+                .map(|row| format!("{} {}", row.name, row.start))
+                .collect()
+        };
+        // The accessor is judged with the instance, as a lookup judges it.
+        assert_eq!(listed(1000, &[]), ["open.IFoo/default exec"]);
+        assert!(listed(1001, &[]).is_empty());
+        assert!(listed(1000, &["IBar"]).is_empty());
+        let snap = manager.dump_snapshot(&config, Some(&kernel_caller(1001)), Vec::new());
+        assert_eq!(
+            snap.hidden, 0,
+            "a declaration alone is not counted as hidden"
+        );
     }
 
     /// AOSP `canFindService`: a refusal over the accessor does not name it to the caller.
@@ -3171,6 +3609,82 @@ mod tests {
         (reader, writer.into())
     }
 
+    /// A caller that never reads would otherwise hold the one writer until the hub restarts.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_dump_nobody_reads_is_given_up_and_the_next_is_written() {
+        use std::io::Read;
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+
+        let caller = rsbinder::CallingContext::current();
+        let stall = Duration::from_millis(200);
+        let unread_socket = || {
+            let (reader, writer) = UnixStream::pair().expect("socketpair");
+            (Box::new(reader) as Box<dyn Send>, OwnedFd::from(writer))
+        };
+        let unread_pipe = || {
+            let mut fds = [0; 2];
+            // SAFETY: `fds` has room for the two descriptors, each owned once below.
+            let (reader, writer) = unsafe {
+                assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+                (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+            };
+            (Box::new(reader) as Box<dyn Send>, writer)
+        };
+        for (what, (_reader, fd)) in [("socket", unread_socket()), ("pipe", unread_pipe())] {
+            let writing = DumpWriter::default();
+            let began = std::time::Instant::now();
+            // More than a pipe (64 KiB) or a socket buffer holds: the write has to wait.
+            let sent = send_dump_within(&writing, fd, vec![b'x'; 4 << 20], &caller, stall);
+            assert_eq!(sent, Ok(()), "{what}");
+            wait_for_the_dump_writer(&writing);
+            assert!(
+                began.elapsed() >= stall,
+                "{what}: given up before the stall"
+            );
+
+            let (mut reader, fd) = UnixStream::pair().expect("socketpair");
+            let sent = send_dump_within(&writing, fd.into(), b"y".to_vec(), &caller, stall);
+            assert_eq!(sent, Ok(()), "{what}: the writer is free again");
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).expect("read the dump");
+            assert_eq!(got, b"y", "{what}");
+        }
+    }
+
+    /// The stall is time without a byte taken, not the time the whole dump may take.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_dump_read_slowly_arrives_whole() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        const LEN: usize = 2 << 20;
+        let stall = Duration::from_millis(200);
+        let writing = DumpWriter::default();
+        let caller = rsbinder::CallingContext::current();
+        let (mut reader, fd) = UnixStream::pair().expect("socketpair");
+        let began = std::time::Instant::now();
+        let sent = send_dump_within(&writing, fd.into(), vec![b'x'; LEN], &caller, stall);
+        assert_eq!(sent, Ok(()));
+        let mut got = 0;
+        let mut chunk = vec![0; 64 << 10];
+        loop {
+            let n = reader.read(&mut chunk).expect("read the dump");
+            if n == 0 {
+                break;
+            }
+            got += n;
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(got, LEN);
+        assert!(
+            began.elapsed() > stall * 2,
+            "the read did outlast the stall"
+        );
+    }
+
     /// A denial writes its reason to the fd too, and that write must not wait on the caller.
     #[test]
     fn a_dump_denial_returns_while_its_fd_is_full() {
@@ -3244,6 +3758,196 @@ mod tests {
         assert!(!dump_to_string(&snap).contains("no priority bit"));
     }
 
+    /// The caller is answered as for an unregistered name; the log and the count are the operator's.
+    #[test]
+    fn a_refused_lookup_is_counted_each_time_and_logged_once_a_minute() {
+        let t0 = std::time::Instant::now();
+        let at = |secs: u64| t0 + std::time::Duration::from_secs(secs);
+        let mut refused = RefusedLookups::default();
+        assert_eq!(
+            refused.note(1000, "a.b", at(0)),
+            Some(0),
+            "the first is logged"
+        );
+        assert_eq!(refused.note(1000, "a.b", at(1)), None);
+        assert_eq!(refused.note(1000, "a.b", at(59)), None);
+        assert_eq!(refused.total, 3);
+        assert_eq!(
+            refused.note(1000, "a.b", at(60)),
+            Some(2),
+            "and says what it left out"
+        );
+        assert_eq!(refused.note(1000, "a.b", at(61)), None);
+
+        assert_eq!(
+            refused.note(1001, "a.b", at(61)),
+            Some(0),
+            "another uid is its own row"
+        );
+        assert_eq!(
+            refused.note(1000, "c.d", at(61)),
+            Some(0),
+            "and another name"
+        );
+        assert_eq!(refused.total, 7);
+    }
+
+    /// A new name each call would otherwise be a line each call.
+    #[test]
+    fn one_uid_asking_for_many_names_is_logged_for_a_few() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedLookups::default();
+        let logged = (0..100)
+            .filter(|i| refused.note(1000, &format!("n.{i}"), t0).is_some())
+            .count();
+        assert_eq!(logged, REFUSED_NAMES_PER_UID);
+        assert_eq!(refused.total, 100, "every one is counted");
+        assert_eq!(refused.rows.len(), REFUSED_NAMES_PER_UID);
+        assert_eq!(
+            refused.note(1001, "n.0", t0),
+            Some(0),
+            "another uid is not held to it"
+        );
+        let later = t0 + REFUSED_LOG_EVERY;
+        assert_eq!(
+            refused.note(1000, "n.99", later),
+            Some(0),
+            "nor the uid a minute on"
+        );
+    }
+
+    /// The table is bounded whatever the callers; the oldest row goes first.
+    #[test]
+    fn the_refused_table_is_bounded_and_drops_its_oldest_row() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedLookups::default();
+        for uid in 0..REFUSED_ROWS {
+            let at = t0 + std::time::Duration::from_millis(uid as u64);
+            assert_eq!(refused.note(uid as u32, "a.b", at), Some(0));
+        }
+        assert_eq!(refused.rows.len(), REFUSED_ROWS);
+        let at = t0 + std::time::Duration::from_secs(2);
+        assert_eq!(refused.note(u32::MAX, "a.b", at), Some(0));
+        assert_eq!(refused.rows.len(), REFUSED_ROWS);
+        assert!(
+            !refused.rows.contains_key(&(0, "a.b".to_owned())),
+            "uid 0 was the oldest"
+        );
+        assert!(refused.rows.contains_key(&(1, "a.b".to_owned())));
+    }
+
+    /// An argument that is no service name is not kept: it could be megabytes.
+    #[test]
+    fn a_refused_argument_that_is_no_name_shares_one_row() {
+        let t0 = std::time::Instant::now();
+        let mut refused = RefusedLookups::default();
+        assert_eq!(refused.note(1000, &"x".repeat(4096), t0), Some(0));
+        assert_eq!(refused.note(1000, "has a space", t0), None);
+        assert_eq!(
+            refused.rows.keys().next().map(|k| k.1.as_str()),
+            Some(NOT_A_NAME)
+        );
+    }
+
+    /// "Already running" sent an operator looking for a hub that was not there.
+    #[test]
+    fn a_refused_context_manager_is_explained_by_its_errno() {
+        let hint = |errno| context_manager_hint(errno, "/dev/binderfs/b", "b", 1000);
+        let busy = hint(Some(libc::EBUSY));
+        assert!(
+            busy.contains("one is running on\n/dev/binderfs/b"),
+            "{busy}"
+        );
+        assert!(
+            busy.contains("rsb_service --device b check manager"),
+            "{busy}"
+        );
+
+        let perm = hint(Some(libc::EPERM));
+        assert!(perm.contains("No service manager is running"), "{perm}");
+        assert!(perm.contains("rsb_hub runs as uid 1000"), "{perm}");
+        assert!(
+            perm.contains("sudo rm /dev/binderfs/b && sudo rsb_device b"),
+            "{perm}"
+        );
+
+        for other in [Some(libc::EACCES), Some(libc::EINVAL), None] {
+            let text = hint(other);
+            assert!(text.contains("security module"), "{text}");
+            assert!(!text.contains("is running on"), "{text}");
+        }
+    }
+
+    /// "Declared but not started" is the question `declarations: N` alone could not answer.
+    #[test]
+    fn a_declaration_is_listed_with_where_its_start_stands() {
+        let mut snap = empty_snapshot();
+        assert!(
+            !dump_to_string(&snap).contains("declared ("),
+            "absent when empty"
+        );
+        snap.uptime = Duration::from_secs(90);
+        let mut held_off = config::StartStatus::default();
+        held_off.failures = 3;
+        held_off.retry_in = Some(Duration::from_millis(3200));
+        let mut running = config::StartStatus::default();
+        running.outstanding = true;
+        snap.declared = vec![
+            DeclaredRow {
+                name: "a.IFoo/default".to_owned(),
+                start: "exec",
+                registered: false,
+                status: Some(held_off),
+            },
+            DeclaredRow {
+                name: "a.IBar/default".to_owned(),
+                start: "systemd",
+                registered: true,
+                status: Some(running),
+            },
+            DeclaredRow {
+                name: "a.IBaz/default".to_owned(),
+                start: "none",
+                registered: false,
+                status: None,
+            },
+        ];
+        let out = dump_to_string(&snap);
+        assert!(out.contains("uptime: 90 s\n"), "{out}");
+        assert!(out.contains("declared (3):\n"), "{out}");
+        assert!(
+            out.contains(
+                "  a.IFoo/default  start=exec registered=no outstanding=no failures=3 retry_in=4s\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "  a.IBar/default  start=systemd registered=yes outstanding=yes failures=0\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  a.IBaz/default  start=none registered=no\n"),
+            "{out}"
+        );
+    }
+
+    /// A failed SIGHUP leaves `kill` at exit 0 and the registry as it was; the dump is where it shows.
+    #[test]
+    fn the_last_reload_and_its_outcome_are_reported() {
+        let mut snap = empty_snapshot();
+        assert!(dump_to_string(&snap).contains("last reload: none\n"));
+
+        snap.last_reload = Some((std::time::Duration::from_secs(12), true));
+        assert!(dump_to_string(&snap).contains("last reload: ok, 12 s ago\n"));
+
+        snap.last_reload = Some((std::time::Duration::from_secs(3), false));
+        let out = dump_to_string(&snap);
+        assert!(out.contains("last reload: FAILED 3 s ago;"), "{out}");
+        assert!(out.contains("see rsb_hub's log"), "{out}");
+    }
+
     #[test]
     fn names_that_are_only_waited_on_get_their_own_section() {
         let mut snap = empty_snapshot();
@@ -3306,6 +4010,7 @@ mod tests {
                 has_clients: false,
                 guarantee_client: false,
                 context: rsbinder::CallingContext::current(),
+                registered_at: std::time::Instant::now(),
             };
             lock_recover(&manager.inner)
                 .add_service(name, service)

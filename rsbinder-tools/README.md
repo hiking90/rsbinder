@@ -114,7 +114,9 @@ program; a configuration or program under `/tmp` is refused. For an
 unprivileged run put them under `$XDG_RUNTIME_DIR` or `$HOME`. The program is
 checked at load and again right before each start, which is refused and logged
 if the program fails it then. `SIGHUP` reloads the policy in place; a
-reload that fails keeps the policy already in force. A reload judges requests
+reload that fails keeps the policy already in force, and `rsb_service dump
+manager` says so (`last reload: FAILED`); `rsb_hub --check-config` judges the
+files beforehand and exits 1 if they do not load. A reload judges requests
 made after it: a `registerForNotifications` callback registered before it keeps
 receiving the name's binder, because `find` is checked when the callback is
 registered, as in AOSP `servicemanager`. Restart `rsb_hub` or the client to
@@ -134,6 +136,7 @@ After=dev-binderfs.mount
 [Service]
 Type=notify
 ExecStart=/usr/bin/rsb_hub --config /etc/rsbinder/hub.d
+ExecReload=/usr/bin/rsb_hub --check-config --config /etc/rsbinder/hub.d
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 

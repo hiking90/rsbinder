@@ -163,6 +163,12 @@ impl Declarations {
             .map(|(name, _)| name.as_str())
     }
 
+    /// Every declared instance's full name with its declaration, in name
+    /// order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Declaration)> {
+        self.by_name.iter().map(|(name, d)| (name.as_str(), d))
+    }
+
     /// Number of declarations, for startup logging.
     pub fn len(&self) -> usize {
         self.by_name.len()

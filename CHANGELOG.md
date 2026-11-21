@@ -136,8 +136,41 @@ peers; peers of either release still subscribe to each other.
   by the subscriber with `InvalidOperation`. A 0.1.0 subscriber ignores the
   new fields and never calls the new methods: its drop is seen at the next
   publish, as before.
+- `rsb_hub`: an `exec` start that ends before any name it starts was
+  registered holds the next start of that argv off for 1, 2, 4, 8, 16, then
+  30 seconds, by the count of such ends in a row. A program that registers
+  nothing no longer runs once per lookup. A registration ends the hold-off;
+  `systemd` starts are not held off.
 
 ### Added
+
+- `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds, on
+  Linux and Android: it closes the fd and writes the next dump. A caller
+  that passed a pipe and never read it left every later dump refused with
+  `WOULD_BLOCK` until the hub restarted.
+- `rsb_service wait NAME [--timeout SECS] [--start]` returns once the name
+  is registered: exit 0, 1 when the timeout passes first, 2 when the hub
+  denies `find` on the name or cannot be reached. `--start` looks up with
+  `getService`, which starts a declared service.
+- `rsbinder-tools`: `config::Activator::registered` tells the activator a
+  name of an activation was registered.
+- `rsb_hub --check-config` loads the configuration as a start or a `SIGHUP`
+  would and exits 0 if it loads, 1 with the error if not, opening no binder
+  device and no socket. As a first `ExecReload=` line it makes
+  `systemctl reload` fail on a configuration that does not load.
+- `rsb_hub`'s dump has a `last reload:` line (`none`, `ok, N s ago`,
+  `FAILED N s ago`), and a failed reload sets the systemd status line. A
+  failed `SIGHUP` showed only in the hub's log.
+- `rsb_hub` logs a lookup its policy refuses (`getService`, `checkService`,
+  `getService2`, `checkService2`) at `warn`, once a minute for each uid and
+  name, and its dump counts them in `refused lookups:`. The caller is still
+  answered as for a name that is not registered.
+- `rsb_hub`'s dump has `uptime:`, an `age=` for each registration, and a
+  `declared (N):` section: each `[[service]]` the caller may `find`, with its
+  `start` kind, whether it is registered, and for one with a `start` whether
+  a start is outstanding, its failures in a row and the hold-off left.
+- `rsbinder-tools`: `config::Activator::status` with `StartStatus`, and
+  `config::Declarations::iter`.
 
 - `connect_async_with`, `connect_async` with `ClientOptions`. Without
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds
@@ -219,6 +252,17 @@ peers; peers of either release still subscribe to each other.
   its sync handle, which panicked before. A call from a current-thread
   runtime's own `Runtime::block_on` body or within a `LocalSet` still panics,
   with `block_in_place`'s message.
+- `ProcessState::become_context_manager` returns the kernel's refusal as a
+  `std::io::Error` that keeps its errno, in the same `Box<dyn Error>`; it
+  was a `String` reading "Binder ioctl to become context manager failed: …".
+- `rsb_hub` that cannot become the service manager says which case it is in:
+  one is running on the device (`EBUSY`), one ran before as another uid and
+  the kernel keeps the device to that uid (`EPERM`, with the commands that
+  make the device again), or neither. It said "one is already running" for
+  all three.
+- `rsb_hub`'s dump has more lines (`uptime:`, `last reload:`,
+  `refused lookups:`, `age=`, the `declared` section); a script that reads
+  it by line number has to read it by key.
 
 ### Fixed
 

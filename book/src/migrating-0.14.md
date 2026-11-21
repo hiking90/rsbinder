@@ -40,6 +40,16 @@ The additions and fixes themselves are listed in
   timing out sends the caller's end. In 0.13.0 it sent `EX_ILLEGAL_STATE` naming
   that item.
 
+## `rsb_hub`
+
+- An `exec` start that ends before any name it starts was registered holds the
+  next start of that argv off: 1, 2, 4, 8, 16, then 30 seconds, by the count of
+  such ends in a row. In 0.13.0 every lookup that missed ran the program again.
+  A declaration that used `exec` to run a command on each lookup, with nothing
+  registered, now runs it at most once per hold-off; a service that registers
+  is unaffected. See
+  [Declaring services](./service-manager.md#declaring-services).
+
 The sections below are about `rsbinder-topic`.
 
 ## Making a publisher

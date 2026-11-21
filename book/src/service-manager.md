@@ -56,12 +56,18 @@ After=dev-binderfs.mount
 [Service]
 Type=notify
 ExecStart=/usr/bin/rsb_hub --config /etc/rsbinder/hub.d
+ExecReload=/usr/bin/rsb_hub --check-config --config /etc/rsbinder/hub.d
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The first `ExecReload=` makes `systemctl reload` fail on a configuration that
+does not load: systemd runs the lines in order and stops at the first that
+fails, so the signal is not sent. Without it `kill` exits 0 whatever the hub
+then makes of the files.
 
 Its log goes to stderr, filtered by `RUST_LOG` (default `warn`). When systemd
 connects stderr to the journal, `rsb_hub` leaves the timestamp to the journal
@@ -87,6 +93,7 @@ Android's `service` and `dumpsys -l`:
 $ rsb_service list                                  # what is registered
 $ rsb_service info                                  # ... and which pid owns each
 $ rsb_service check com.example.IFoo/default        # is it up yet?
+$ rsb_service wait com.example.IFoo/default --timeout 30   # hold a script until it is up
 $ rsb_service declared com.example.IFoo/default     # is it even configured?
 $ rsb_service instances com.example.IFoo            # every declared instance
 $ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
@@ -100,27 +107,50 @@ files:
 
 ```text
 rsb_hub 0.13.0
+uptime: 5124 s
 access control: enforcing, 4 rule(s)
+last reload: ok, 312 s ago
 declarations: 2
 death subscriptions: 3
+refused lookups: 0
 
 services (2):
   com.example.IFoo/default
     pid=92338 uid=973 dump_priority=0x8 lazy=no accessor=no
-    clients=no guarantee_client=no callbacks: registration=0 client=0
+    clients=no guarantee_client=no callbacks: registration=0 client=0 age=5101s
   manager
     pid=92334 uid=973 dump_priority=0x8 lazy=no accessor=no
-    clients=no guarantee_client=yes callbacks: registration=0 client=0
+    clients=no guarantee_client=yes callbacks: registration=0 client=0 age=5124s
+
+declared (2):
+  com.example.IBar/default  start=exec registered=no outstanding=no failures=3 retry_in=4s
+  com.example.IFoo/default  start=systemd registered=yes outstanding=no failures=0
 
 awaiting registration (1):
   com.example.INope/default  callbacks: registration=1 client=0
 ```
 
-That last section is usually the one you came for: a name something is
+`declared` is what is configured against what is up: for each `[[service]]`
+the caller may `find`, its `start` (`exec`, `systemd` or `none`), whether its
+name is registered now, and for one with a `start` whether a start is
+outstanding (for `exec`, the program is running), how many `exec` starts in a
+row ended with nothing registered, and how long the next is still
+[held off](#declaring-services). A declaration the caller may not look up is
+left out and not counted.
+
+The last section is usually the one you came for: a name something is
 waiting on that nothing has registered. Arguments narrow the listing by
 substring (`rsb_service dump manager com.example`), and `dump` works on any
 service, not just the HUB — it sends `DUMP_TRANSACTION`, which for an
 rsbinder service lands in its `Interface::dump` implementation.
+
+`wait NAME` returns once the name is registered, polling five times a second.
+With `--timeout SECS` it exits `1` when the time passes first; without it, it
+waits without end. It starts nothing unless given `--start`, which looks the
+name up with `getService` and so starts a declared service that is down, as a
+client's own lookup would. A name the policy does not let the caller `find`
+exits `2` at once and says so, where `check` would answer "not registered";
+so does a hub that cannot be reached, or one that goes away during the wait.
 
 Exit status is the answer: `0` yes, `1` no, `2` the question could not be
 answered (no service manager, or its policy denied it), so
@@ -495,6 +525,14 @@ That matches AOSP (`getService` returns ok regardless of result) and keeps a
 denied caller from using the error to probe which names exist. Every other
 denial returns `ExceptionCode::Security`.
 
+The caller is told nothing; the operator is. The hub logs a denied lookup at
+`warn` with the name and the caller's uid and pid, once a minute for each
+uid and name, and the line says how many more it left out. A caller that
+asks for a new name each time gets a line for 8 names a minute. The dump's
+`refused lookups:` line counts every one since the hub started, logged or
+not. So a client that cannot find a service that is registered shows up in
+the log as a denial, not as a missing service.
+
 The two `list` calls apply *both* gates: the caller must be allowed to
 enumerate at all, and each name it would learn about must be one it may
 `find`. A name you cannot look up is a name you do not get told about.
@@ -556,7 +594,23 @@ $ sudo kill -HUP "$(pidof rsb_hub)"
 
 A reload that fails to parse or resolve **keeps the policy already in
 force** and logs the error. Dropping to deny-all would take the machine's IPC
-down over a typo; falling back to permissive would be worse. The reload also
+down over a typo; falling back to permissive would be worse. The signal's
+sender is told nothing, so check the files first:
+
+```bash
+$ rsb_hub --check-config --config /etc/rsbinder/hub.d
+rsb_hub: /etc/rsbinder/hub.d loads: 3 rule(s), 1 service declaration(s)
+```
+
+`--check-config` loads the configuration as a start or a reload would and
+exits 0 if it loads, 1 with the error if not. It opens no binder device and
+no socket, so it runs beside a serving hub. Run it as the hub's user: whether
+a file is trusted depends on who reads it. A file can still change between
+the check and the signal, so the hub also keeps the outcome of its last
+reload: `rsb_service dump manager` prints `last reload: ok, N s ago` or
+`last reload: FAILED N s ago`, and under systemd the unit's status line says
+the same. The dump leaves the error itself to the log, as a parser's message
+can quote the file and a dump takes `list` only. The reload also
 drops the memoized uid → groups sets, so group-membership changes take effect
 with it. A group *added* to a caller is also picked up without a reload — a
 call that a group rule denies re-reads the name service, at most once every
@@ -588,6 +642,20 @@ $ sudo rsb_device binder-alice --owner alice
 A device that was in use keeps its first service manager's uid in the kernel
 and its open descriptors, so it moves to another owner by `rm` and a second
 `rsb_device`, not by a rerun with another `--owner`.
+
+That uid is the effective uid of whichever process first became the device's
+context manager, and with `--mode 0660` any member of the group can open the
+device and take that role before `rsb_hub` does. From then on the kernel
+refuses every other uid, `rsb_hub`'s included, until the device is removed.
+So create the device and start `rsb_hub` in one ordered step (one unit, or a
+unit `After=` the one that runs `rsb_device`), before anything else on the
+machine can open it. When it is refused, `rsb_hub` says which case it is in:
+
+| The kernel's answer | What `rsb_hub` reports |
+| --- | --- |
+| `EBUSY` | a service manager is running on the device now |
+| `EPERM` | none is running, but one ran before as another uid; the message names `rsb_hub`'s uid and the `rm` and `rsb_device` commands that make the device again |
+| anything else | neither of the two; a security module refusing `set_context_mgr` is the usual cause |
 
 An LSM (SELinux, AppArmor) can sit on top as a third, AND-ed layer where the
 platform provides one, but it is never what makes the first two unnecessary.
@@ -769,9 +837,15 @@ no room for fails and is sent again later.
 reason it is denied, to the caller's fd on a thread of its own and replies
 at once, and the dump ends when that thread closes the fd. It writes one
 dump at a time. A dump that arrives while one is still being written is
-refused with `WOULD_BLOCK`, so a caller that passes a pipe and never reads
-it leaves every later dump refused until the hub restarts, and the hub's
-log names that caller's uid and pid.
+refused with `WOULD_BLOCK`, and the hub's log names the uid and pid of the
+caller being written to. On Linux and Android a write that the reader takes
+no byte of for 30 seconds is given up: the hub closes the fd, logs the
+caller, and writes the next dump. The 30 seconds count time without
+progress, so a reader that is slow, a pager for instance, still gets the
+whole dump. A caller that passes a pipe and never reads it therefore holds
+later dumps off for 30 seconds, not until the hub restarts. The hub sets no
+flag on the fd, which shares its open file description with the caller: a
+timer interrupts the writer thread's blocked `write`.
 
 A hub on a socket has a serve thread and a reaper thread per session and no call
 restriction; what holds it up is in [Topics](./topics.md#what-differs-from-kernel-binder).
@@ -829,6 +903,19 @@ a client polling a service that cannot come up does not spawn a copy per
 attempt. An `exec` start stays
 outstanding for the process's lifetime. `exec` takes an argv list, never a
 shell string.
+
+An `exec` program that ends before any name it starts was registered holds
+its next start off: 1, 2, 4, 8, 16, then 30 seconds, by the count of such
+ends in a row. The hub judges the registration, not the exit code: a program
+that exits 0 at once is held off too, a program that could not be run counts
+the same, and a lazy service that exits when its clients are gone is started
+again by the next lookup. A registration of the name, by any process, ends
+the hold-off and the count. A program that registers and then crashes is
+therefore started again by each lookup that misses it. The hub's log names
+each held-off start at `warn`. `systemd` starts are not held off: the unit's
+`StartLimitIntervalSec=` and `StartLimitBurst=` do that. So `exec` is not a
+way to run a command on every lookup: a program that registers nothing runs
+at most once per hold-off.
 
 > **The configuration is a trust boundary.** A `start` entry runs with
 > `rsb_hub`'s privileges, and any client allowed to look the name up can
