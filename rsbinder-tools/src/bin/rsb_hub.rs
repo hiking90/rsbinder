@@ -769,6 +769,8 @@ struct DumpSnapshot {
     death_subscriptions: usize,
     /// `None` when running under `--insecure-allow-all`.
     rules: Option<usize>,
+    /// How long ago the last SIGHUP was handled and whether it loaded; `None` before the first.
+    last_reload: Option<(std::time::Duration, bool)>,
     declarations: usize,
     /// The `args` the caller passed, if they narrowed the listing.
     filter: Vec<String>,
@@ -791,6 +793,17 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
             w,
             "access control: DISABLED (--insecure-allow-all); every caller may \
              register, look up and enumerate everything"
+        )?,
+    }
+    match snap.last_reload {
+        None => writeln!(w, "last reload: none")?,
+        Some((age, true)) => writeln!(w, "last reload: ok, {} s ago", age.as_secs())?,
+        // Not the error: a TOML message can quote the file, and `list` is all a dump takes.
+        Some((age, false)) => writeln!(
+            w,
+            "last reload: FAILED {} s ago; the configuration loaded before it is in force, \
+             see rsb_hub's log",
+            age.as_secs()
         )?,
     }
     writeln!(w, "declarations: {}", snap.declarations)?;
@@ -962,6 +975,7 @@ impl ServiceManager {
             awaited,
             death_subscriptions,
             rules: (!self.enforcer.is_allow_all()).then_some(config.policy.rules.len()),
+            last_reload: (*lock_recover(&LAST_RELOAD)).map(|(at, ok)| (at.elapsed(), ok)),
             declarations: config.declarations.len(),
             filter,
             hidden,
@@ -1788,19 +1802,44 @@ struct Reloadable {
     not(feature = "topic"),
     expect(unused_variables, reason = "only `topic` warns")
 )]
-fn warn_of_config(config: &config::Config, on_a_socket: bool) {
+fn config_warning(config: &config::Config, on_a_socket: bool) -> Option<String> {
     #[cfg(feature = "topic")]
     {
-        let warning = if on_a_socket {
+        if on_a_socket {
             config::unused_on_a_topic_socket(config)
         } else {
             config::registry_out_of_reach(config)
-        };
-        if let Some(warning) = warning {
-            log::warn!("rsb_hub: {warning}");
+        }
+    }
+    #[cfg(not(feature = "topic"))]
+    None
+}
+
+fn warn_of_config(config: &config::Config, on_a_socket: bool) {
+    if let Some(warning) = config_warning(config, on_a_socket) {
+        log::warn!("rsb_hub: {warning}");
+    }
+}
+
+/// `--check-config`: what a start or a SIGHUP would load, judged without a device or a socket.
+fn check_config(path: &Path, on_a_socket: bool) -> ! {
+    match config::load(path, &SystemResolver) {
+        Ok(loaded) => {
+            println!("rsb_hub: {} loads: {}", path.display(), summary(&loaded));
+            if let Some(warning) = config_warning(&loaded, on_a_socket) {
+                eprintln!("rsb_hub: warning: {warning}");
+            }
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("rsb_hub: {} does not load\n  {err}", path.display());
+            std::process::exit(1);
         }
     }
 }
+
+/// When the last SIGHUP was handled and whether it loaded, for `dump`; `None` before the first.
+static LAST_RELOAD: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
 
 /// A failed reload keeps the config in force: deny-all breaks IPC, permissive opens it.
 fn spawn_signal_thread(reloadable: Option<Reloadable>, on_a_socket: bool, notifier: Arc<Notifier>) {
@@ -1879,14 +1918,22 @@ fn reload(reloadable: Option<&Reloadable>, on_a_socket: bool, notifier: &Notifie
             let summary = summary(&loaded);
             warn_of_config(&loaded, on_a_socket);
             enforcer.replace(loaded);
+            *lock_recover(&LAST_RELOAD) = Some((std::time::Instant::now(), true));
             log::info!("rsb_hub: SIGHUP reloaded {summary} from {}", path.display());
             notifier.status(&format!("serving; {summary}"));
         }
-        Err(err) => log::error!(
-            "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
-             force: {err}",
-            path.display()
-        ),
+        Err(err) => {
+            *lock_recover(&LAST_RELOAD) = Some((std::time::Instant::now(), false));
+            log::error!(
+                "rsb_hub: SIGHUP reload of {} failed, keeping the policy already in \
+                 force: {err}",
+                path.display()
+            );
+            notifier.status(&format!(
+                "serving; {}; the last reload FAILED, see the log",
+                summary(&enforcer.config())
+            ));
+        }
     }
 }
 
@@ -2188,6 +2235,17 @@ fn main() {
                      this flag is set.",
                 ),
         )
+        .arg(
+            clap::Arg::new("check-config")
+                .long("check-config")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Load the configuration as a start or a SIGHUP would, say what it holds, \
+                     and exit: 0 if it loads, 1 if not. Opens no binder device and no socket. \
+                     Run it as rsb_hub's user: whether a file is trusted depends on who reads \
+                     it. With --topic-socket, warns of what a hub on a socket would not use",
+                ),
+        )
         // Also without the features, hidden: a usage error would say nothing of why.
         .arg(
             clap::Arg::new("topic-socket")
@@ -2267,6 +2325,16 @@ fn main() {
         fail(format_args!(
             "rsb_hub: --config and --insecure-allow-all are mutually exclusive"
         ));
+    }
+    if matches.get_flag("check-config") {
+        if insecure_allow_all {
+            fail(format_args!(
+                "rsb_hub: --check-config and --insecure-allow-all are mutually exclusive: \
+                 there is no configuration to check"
+            ));
+        }
+        let path = config_path.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_DIR));
+        check_config(&path, on_a_socket);
     }
 
     let (enforcer, reloadable, ready_status) = if insecure_allow_all {
@@ -2904,6 +2972,7 @@ mod tests {
             awaited: Vec::new(),
             death_subscriptions: 0,
             rules: Some(0),
+            last_reload: None,
             declarations: 0,
             filter: Vec::new(),
             hidden: 0,
@@ -3253,6 +3322,21 @@ mod tests {
 
         snap.services = vec![dump_row("com.example.IFoo/default", DUMP_FLAG_PRIORITY_ALL)];
         assert!(!dump_to_string(&snap).contains("no priority bit"));
+    }
+
+    /// A failed SIGHUP leaves `kill` at exit 0 and the registry as it was; the dump is where it shows.
+    #[test]
+    fn the_last_reload_and_its_outcome_are_reported() {
+        let mut snap = empty_snapshot();
+        assert!(dump_to_string(&snap).contains("last reload: none\n"));
+
+        snap.last_reload = Some((std::time::Duration::from_secs(12), true));
+        assert!(dump_to_string(&snap).contains("last reload: ok, 12 s ago\n"));
+
+        snap.last_reload = Some((std::time::Duration::from_secs(3), false));
+        let out = dump_to_string(&snap);
+        assert!(out.contains("last reload: FAILED 3 s ago;"), "{out}");
+        assert!(out.contains("see rsb_hub's log"), "{out}");
     }
 
     #[test]

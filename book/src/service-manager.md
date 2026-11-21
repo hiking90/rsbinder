@@ -56,12 +56,18 @@ After=dev-binderfs.mount
 [Service]
 Type=notify
 ExecStart=/usr/bin/rsb_hub --config /etc/rsbinder/hub.d
+ExecReload=/usr/bin/rsb_hub --check-config --config /etc/rsbinder/hub.d
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+The first `ExecReload=` makes `systemctl reload` fail on a configuration that
+does not load: systemd runs the lines in order and stops at the first that
+fails, so the signal is not sent. Without it `kill` exits 0 whatever the hub
+then makes of the files.
 
 Its log goes to stderr, filtered by `RUST_LOG` (default `warn`). When systemd
 connects stderr to the journal, `rsb_hub` leaves the timestamp to the journal
@@ -556,7 +562,23 @@ $ sudo kill -HUP "$(pidof rsb_hub)"
 
 A reload that fails to parse or resolve **keeps the policy already in
 force** and logs the error. Dropping to deny-all would take the machine's IPC
-down over a typo; falling back to permissive would be worse. The reload also
+down over a typo; falling back to permissive would be worse. The signal's
+sender is told nothing, so check the files first:
+
+```bash
+$ rsb_hub --check-config --config /etc/rsbinder/hub.d
+rsb_hub: /etc/rsbinder/hub.d loads: 3 rule(s), 1 service declaration(s)
+```
+
+`--check-config` loads the configuration as a start or a reload would and
+exits 0 if it loads, 1 with the error if not. It opens no binder device and
+no socket, so it runs beside a serving hub. Run it as the hub's user: whether
+a file is trusted depends on who reads it. A file can still change between
+the check and the signal, so the hub also keeps the outcome of its last
+reload: `rsb_service dump manager` prints `last reload: ok, N s ago` or
+`last reload: FAILED N s ago`, and under systemd the unit's status line says
+the same. The dump leaves the error itself to the log, as a parser's message
+can quote the file and a dump takes `list` only. The reload also
 drops the memoized uid → groups sets, so group-membership changes take effect
 with it. A group *added* to a caller is also picked up without a reload — a
 call that a group rule denies re-reads the name service, at most once every

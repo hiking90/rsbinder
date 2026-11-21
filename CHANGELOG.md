@@ -146,6 +146,13 @@ peers; peers of either release still subscribe to each other.
 
 - `rsbinder-tools`: `config::Activator::registered` tells the activator a
   name of an activation was registered.
+- `rsb_hub --check-config` loads the configuration as a start or a `SIGHUP`
+  would and exits 0 if it loads, 1 with the error if not, opening no binder
+  device and no socket. As a first `ExecReload=` line it makes
+  `systemctl reload` fail on a configuration that does not load.
+- `rsb_hub`'s dump has a `last reload:` line (`none`, `ok, N s ago`,
+  `FAILED N s ago`), and a failed reload sets the systemd status line. A
+  failed `SIGHUP` showed only in the hub's log.
 
 - `connect_async_with`, `connect_async` with `ClientOptions`. Without
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds

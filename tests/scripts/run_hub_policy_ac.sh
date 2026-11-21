@@ -376,6 +376,26 @@ reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
 want_out "hidden by policy"           "dump says the view is partial"
 want_out "declarations: 5"           "dump counts the loaded declarations"
 
+note "6-7 O1  --check-config, and a failed reload shows in the dump"
+out=$($HUB --check-config --config "$POLDIR" --device rsb61-absent 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "a configuration that loads exits 0, with no device" || bad "check exits $rc: $out"
+echo "$out" | grep -q "service declaration(s)" && ok "and says what it holds" || bad "no summary: $out"
+echo 'name = [[[' > "$POLDIR/31-broken.toml"
+out=$($HUB --check-config --config "$POLDIR" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "a configuration that does not load exits 1" || bad "check exits $rc: $out"
+echo "$out" | grep -q "31-broken.toml" && ok "and names the file" || bad "no file named: $out"
+out=$($HUB --check-config --insecure-allow-all 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "--check-config with --insecure-allow-all is refused" || bad "exits $rc: $out"
+kill -0 "$HUB_PID" 2>/dev/null && ok "the running hub is untouched by the checks" || bad "hub died"
+kill -HUP "$HUB_PID"; sleep 1
+run_svc dump manager
+want_out "last reload: FAILED"        "a failed reload shows in the dump"
+reject_out "31-broken"                "the dump does not quote the file"
+rm -f "$POLDIR/31-broken.toml"
+kill -HUP "$HUB_PID"; sleep 1
+run_svc dump manager
+want_out "last reload: ok"            "and the next good reload replaces it"
+
 run_svc dump manager ac61.allowed
 want_rc 0 "dump with a filter exits 0"
 want_out "filter: ac61.allowed"       "dump echoes the filter"
