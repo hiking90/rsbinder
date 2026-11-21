@@ -37,7 +37,10 @@ done
 
 PROBE=target/$TARGET/debug/stream_probe
 TEST=
-for f in target/"$TARGET"/debug/deps/stream_rpc-*; do
+# Cargo 1.100 puts test executables in `debug/build/<pkg>/<hash>/out/`, older cargo in `deps/`.
+for f in target/"$TARGET"/debug/build/tests/*/out/stream_rpc-* \
+         target/"$TARGET"/debug/deps/stream_rpc-*; do
+    [ -f "$f" ] || continue
     case $f in *.d) continue ;; esac
     { [ -z "$TEST" ] || [ "$f" -nt "$TEST" ]; } && TEST=$f
 done

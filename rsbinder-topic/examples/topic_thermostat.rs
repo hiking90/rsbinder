@@ -12,8 +12,8 @@
 //! cargo run -p rsbinder-topic --example topic_thermostat -- get
 //! ```
 //!
-//! `watch` prints the current target as it subscribes and every later one; `set` prints the target
-//! the service settled on, which is 30 for anything above 30.
+//! `watch` prints the current target as it subscribes and every later one, with how long ago it
+//! was set; `set` prints the target the service settled on, which is 30 for anything above 30.
 
 use std::sync::Mutex;
 
@@ -31,8 +31,21 @@ const WARMEST: f64 = 30.0;
 #[parcelable(descriptor = "example.topic.Target")]
 struct Target {
     celsius: f64,
+    /// When the service settled on it: `CLOCK_MONOTONIC` nanoseconds. `i64`: AIDL has no `u64`.
+    set_at_ns: i64,
 }
 // ANCHOR_END: value
+
+// ANCHOR: clock
+/// `CLOCK_MONOTONIC` in nanoseconds, the clock `rsb_service topic record` stamps receives with.
+fn monotonic_ns() -> i64 {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    now.tv_sec
+        .saturating_mul(1_000_000_000)
+        // `tv_nsec` is a `c_long`, 32 bits on 32-bit targets.
+        .saturating_add(now.tv_nsec as i64)
+}
+// ANCHOR_END: clock
 
 // ANCHOR: interface
 #[rsbinder::interface(descriptor = "example.topic.IThermostat")]
@@ -76,11 +89,13 @@ impl IThermostat for Thermostat {
                 "not a number",
             )));
         }
-        let settled = Target {
-            celsius: celsius.clamp(COLDEST, WARMEST),
-        };
         // One lock over both: two setters leave the getter and the topic with the same value.
         let mut target = self.target.lock().expect("the target's lock");
+        // Read under the lock, so a later value never carries an earlier time.
+        let settled = Target {
+            celsius: celsius.clamp(COLDEST, WARMEST),
+            set_at_ns: monotonic_ns(),
+        };
         self.topic
             .publish(&settled)
             .map_err(|why| Status::from((ExceptionCode::IllegalState, why.to_string().as_str())))?;
@@ -107,7 +122,8 @@ fn watch() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // The first receive returns the current target; a slow reader skips to the newest.
         let target = subscriber.recv()?;
-        println!("target: {} °C", target.celsius);
+        let age = monotonic_ns().saturating_sub(target.set_at_ns).max(0) as f64 / 1e9;
+        println!("target: {} °C, set {age:.1} s ago", target.celsius);
     }
 }
 // ANCHOR_END: watch
@@ -118,7 +134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => {
-            let service = Thermostat::new(Target { celsius: 21.0 })?;
+            let service = Thermostat::new(Target {
+                celsius: 21.0,
+                set_at_ns: monotonic_ns(),
+            })?;
             hub::add_service(NAME, BnThermostat::new_binder(service).as_binder())?;
             Ok(ProcessState::join_thread_pool()?)
         }
