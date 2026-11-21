@@ -144,6 +144,14 @@ peers; peers of either release still subscribe to each other.
 
 ### Added
 
+- `rsbinder::DumpWriter` writes a dump to the caller's fd on a thread of its
+  own, for a service that overrides `Interface::dump_fd`:
+  `send_with(fd, render)` makes the text on the binder thread and returns. It
+  writes one dump at a time and answers `WouldBlock` to a call that arrives
+  meanwhile, without making its text. A dump whose reader takes no byte for
+  30 seconds (`with_stall`) is given up and its fd closed. The writer thread
+  blocks `SIGPIPE` for itself, so a caller that closed its end of a pipe does
+  not end a process that keeps the signal's default disposition.
 - `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds, on
   Linux and Android: it closes the fd and writes the next dump. A caller
   that passed a pipe and never read it left every later dump refused with

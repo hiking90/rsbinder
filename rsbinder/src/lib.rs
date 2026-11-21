@@ -272,6 +272,8 @@ mod command_stream;
 mod error;
 // Death recipients of every proxy, and the per-handle kernel registration behind them.
 mod death;
+// Dump writer thread; the crate-root re-export is the public path.
+mod dump;
 // `ParcelFileDescriptor`, re-exported at the crate root.
 mod file_descriptor;
 // Per-handle freeze-notification bookkeeping behind `IBinder::add_frozen_state_change_callback`.
@@ -397,6 +399,7 @@ pub use binder_async::{BinderAsyncPool, BinderAsyncRuntime, BoxFuture};
 #[doc(hidden)]
 pub use binder_async::__spawn_transact;
 pub use death::DeathLink;
+pub use dump::DumpWriter;
 pub use error::{Result, StatusCode};
 // `rsbinder-topic` logs the panics it catches with the same text.
 #[doc(hidden)]

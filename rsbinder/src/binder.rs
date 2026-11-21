@@ -174,6 +174,8 @@ pub trait Interface: Send + Sync {
     /// transaction queued for that thread. Override this to hand the fd to
     /// another thread and return; the dump stays open until that thread drops
     /// the fd, which is the end-of-file a reader such as `dumpsys` waits for.
+    /// [`DumpWriter`](crate::DumpWriter) is that thread, with a bound on how
+    /// long a reader that takes nothing can hold it.
     fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
         self.dump(&mut std::fs::File::from(fd), args)
     }
