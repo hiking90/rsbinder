@@ -376,6 +376,14 @@ reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
 want_out "hidden by policy"           "dump says the view is partial"
 want_out "declarations: 5"           "dump counts the loaded declarations"
 
+note "6-7 O2  the dump says where each declaration's start stands"
+want_out "^uptime: [0-9]* s"          "dump has the hub's uptime"
+want_out "^declared (5):"             "dump lists the declarations"
+want_out "ac61.declared.IFoo/secondary  start=none registered=no" "one with no start"
+want_out "ac61.declared.IFalse/default  start=exec registered=no outstanding=no failures=[1-9]" \
+    "the exec that registers nothing, with its failures"
+want_out "age=[0-9]*s"                "a registration has its age"
+
 note "6-7 O3  a lookup the policy refuses is in the hub's log, once"
 BEFORE=$(grep -c 'find on "ac61.hidden.live"' "$LOG")
 run_probe find:ac61.hidden.live find:ac61.hidden.live get:ac61.hidden.live

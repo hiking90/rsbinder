@@ -22,6 +22,8 @@ struct Service {
     has_clients: bool,
     guarantee_client: bool,
     context: rsbinder::CallingContext,
+    /// For the dump's `age=`.
+    registered_at: std::time::Instant,
 }
 
 /// Collected under the `Inner` lock, fired after it drops: no outbound transaction under it (R1).
@@ -791,10 +793,27 @@ struct DumpRow {
     is_accessor: bool,
     registration_callbacks: usize,
     client_callbacks: usize,
+    /// Since the registration that holds the name now.
+    age: Duration,
 }
+
+/// A `[[service]]` declaration the caller may `find`, with where its start stands.
+struct DeclaredRow {
+    name: String,
+    /// `exec`, `systemd`, or `none` for a declaration with no `start`.
+    start: &'static str,
+    registered: bool,
+    /// `None` without a `start`.
+    status: Option<config::StartStatus>,
+}
+
+/// When `main` began, for the dump's `uptime:`.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 /// Everything [`render_dump`] needs, so it is testable without a registry or binder.
 struct DumpSnapshot {
+    uptime: Duration,
+    declared: Vec<DeclaredRow>,
     services: Vec<DumpRow>,
     /// Names with callbacks held but nothing registered.
     awaited: Vec<(String, usize, usize)>,
@@ -821,6 +840,7 @@ fn dump_filter_matches(filter: &[String], name: &str) -> bool {
 
 fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Result<()> {
     writeln!(w, "rsb_hub {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(w, "uptime: {} s", snap.uptime.as_secs())?;
     match snap.rules {
         Some(rules) => writeln!(w, "access control: enforcing, {rules} rule(s)")?,
         None => writeln!(
@@ -874,12 +894,40 @@ fn render_dump(w: &mut dyn std::io::Write, snap: &DumpSnapshot) -> std::io::Resu
         )?;
         writeln!(
             w,
-            "    clients={} guarantee_client={} callbacks: registration={} client={}",
+            "    clients={} guarantee_client={} callbacks: registration={} client={} age={}s",
             yes_no(row.has_clients),
             yes_no(row.guarantee_client),
             row.registration_callbacks,
             row.client_callbacks,
+            row.age.as_secs(),
         )?;
+    }
+
+    if !snap.declared.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "declared ({}):", snap.declared.len())?;
+        for row in &snap.declared {
+            write!(
+                w,
+                "  {}  start={} registered={}",
+                row.name,
+                row.start,
+                yes_no(row.registered)
+            )?;
+            if let Some(status) = &row.status {
+                write!(
+                    w,
+                    " outstanding={} failures={}",
+                    yes_no(status.outstanding),
+                    status.failures
+                )?;
+                if let Some(left) = status.retry_in {
+                    // Rounded up: `retry_in=0s` would read as "not held off".
+                    write!(w, " retry_in={}s", left.as_secs_f64().ceil())?;
+                }
+            }
+            writeln!(w)?;
+        }
     }
 
     if !snap.awaited.is_empty() {
@@ -976,6 +1024,7 @@ impl ServiceManager {
                     is_accessor: config.declarations.accessor_for(name).is_some(),
                     registration_callbacks: count(&inner.name_to_registration_callbacks, name),
                     client_callbacks: count(&inner.name_to_client_callbacks, name),
+                    age: service.registered_at.elapsed(),
                 })
                 .collect();
             let awaited: Vec<(String, usize, usize)> = inner
@@ -996,16 +1045,45 @@ impl ServiceManager {
             (rows, awaited, inner.death_links.len())
         };
 
+        // A declared instance is registered under its accessor's name when it declares one.
+        let holds_its_name = |name: &str| {
+            let under = config.declarations.accessor(name).unwrap_or(name);
+            rows.iter().any(|row| row.name == under)
+        };
+        let mut declared: Vec<DeclaredRow> = config
+            .declarations
+            .iter()
+            .map(|(name, declaration)| DeclaredRow {
+                name: name.to_owned(),
+                start: match &declaration.activation {
+                    Some(config::Activation::Exec(_)) => "exec",
+                    Some(config::Activation::Systemd(_)) => "systemd",
+                    None => "none",
+                },
+                registered: holds_its_name(name),
+                status: declaration
+                    .activation
+                    .as_ref()
+                    .map(|activation| self.activator.status(activation)),
+            })
+            .collect();
+
         // Policy first: a `hidden` counted after the caller's filter tells which substrings exist.
         let before = rows.len() + awaited.len();
+        // A declared name the caller may not find is dropped, uncounted: registered or awaited,
+        // `hidden` has it already, and a count of the rest would tell what is declared.
+        declared.retain(|row| self.allows_service_in(config, caller, Permission::Find, &row.name));
         rows.retain(|row| self.allows_in(config, caller, Permission::Find, &row.name));
         awaited.retain(|(name, _, _)| self.allows_in(config, caller, Permission::Find, name));
         let hidden = before - rows.len() - awaited.len();
 
+        declared.retain(|row| dump_filter_matches(&filter, &row.name));
         rows.retain(|row| dump_filter_matches(&filter, &row.name));
         awaited.retain(|(name, _, _)| dump_filter_matches(&filter, name));
 
         DumpSnapshot {
+            uptime: STARTED.get().map_or(Duration::ZERO, |at| at.elapsed()),
+            declared,
             services: rows,
             awaited,
             death_subscriptions,
@@ -1330,6 +1408,7 @@ impl IServiceManager for ServiceManager {
                         has_clients: prev_clients,
                         guarantee_client: false,
                         context: caller,
+                        registered_at: std::time::Instant::now(),
                     },
                 )?;
             }
@@ -2281,6 +2360,7 @@ fn abort_on_a_background_panic() {
 }
 
 fn main() {
+    let _ = STARTED.set(std::time::Instant::now());
     rsbinder_tools::logging::init_daemon("rsb_hub", "warn");
     // Before any thread: the mask is inherited.
     if let Err(e) = block_handled_signals() {
@@ -3053,6 +3133,7 @@ mod tests {
             is_accessor: false,
             registration_callbacks: 0,
             client_callbacks: 0,
+            age: Duration::from_secs(7),
         }
     }
 
@@ -3064,6 +3145,8 @@ mod tests {
 
     fn empty_snapshot() -> DumpSnapshot {
         DumpSnapshot {
+            uptime: Duration::ZERO,
+            declared: Vec::new(),
             services: Vec::new(),
             awaited: Vec::new(),
             death_subscriptions: 0,
@@ -3136,6 +3219,47 @@ mod tests {
             // An undeclared name is judged by itself.
             assert!(manager.allows_service_in(&config, Some(&caller), permission, "open.x"));
         }
+    }
+
+    /// A declaration tells that a name exists; the dump lists what the caller could look up.
+    #[test]
+    fn the_dump_lists_a_declaration_only_to_a_caller_that_may_find_it() {
+        let (manager, config) = a_manager_over(
+            r#"
+            [[rule]]
+            name = "open.*"
+            find = { uid = [1000] }
+
+            [[service]]
+            name = "open.IFoo/default"
+            start = { exec = ["/usr/bin/food"] }
+
+            [[service]]
+            name = "open.IBar/default"
+            accessor = "closed.bar"
+
+            [[service]]
+            name = "closed.IBaz/default"
+            "#,
+        );
+        let listed = |uid: u32, filter: &[&str]| -> Vec<String> {
+            let filter = filter.iter().map(|f| (*f).to_owned()).collect();
+            manager
+                .dump_snapshot(&config, Some(&kernel_caller(uid)), filter)
+                .declared
+                .into_iter()
+                .map(|row| format!("{} {}", row.name, row.start))
+                .collect()
+        };
+        // The accessor is judged with the instance, as a lookup judges it.
+        assert_eq!(listed(1000, &[]), ["open.IFoo/default exec"]);
+        assert!(listed(1001, &[]).is_empty());
+        assert!(listed(1000, &["IBar"]).is_empty());
+        let snap = manager.dump_snapshot(&config, Some(&kernel_caller(1001)), Vec::new());
+        assert_eq!(
+            snap.hidden, 0,
+            "a declaration alone is not counted as hidden"
+        );
     }
 
     /// AOSP `canFindService`: a refusal over the accessor does not name it to the caller.
@@ -3512,6 +3636,61 @@ mod tests {
         );
     }
 
+    /// "Declared but not started" is the question `declarations: N` alone could not answer.
+    #[test]
+    fn a_declaration_is_listed_with_where_its_start_stands() {
+        let mut snap = empty_snapshot();
+        assert!(
+            !dump_to_string(&snap).contains("declared ("),
+            "absent when empty"
+        );
+        snap.uptime = Duration::from_secs(90);
+        let mut held_off = config::StartStatus::default();
+        held_off.failures = 3;
+        held_off.retry_in = Some(Duration::from_millis(3200));
+        let mut running = config::StartStatus::default();
+        running.outstanding = true;
+        snap.declared = vec![
+            DeclaredRow {
+                name: "a.IFoo/default".to_owned(),
+                start: "exec",
+                registered: false,
+                status: Some(held_off),
+            },
+            DeclaredRow {
+                name: "a.IBar/default".to_owned(),
+                start: "systemd",
+                registered: true,
+                status: Some(running),
+            },
+            DeclaredRow {
+                name: "a.IBaz/default".to_owned(),
+                start: "none",
+                registered: false,
+                status: None,
+            },
+        ];
+        let out = dump_to_string(&snap);
+        assert!(out.contains("uptime: 90 s\n"), "{out}");
+        assert!(out.contains("declared (3):\n"), "{out}");
+        assert!(
+            out.contains(
+                "  a.IFoo/default  start=exec registered=no outstanding=no failures=3 retry_in=4s\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "  a.IBar/default  start=systemd registered=yes outstanding=yes failures=0\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  a.IBaz/default  start=none registered=no\n"),
+            "{out}"
+        );
+    }
+
     /// A failed SIGHUP leaves `kill` at exit 0 and the registry as it was; the dump is where it shows.
     #[test]
     fn the_last_reload_and_its_outcome_are_reported() {
@@ -3589,6 +3768,7 @@ mod tests {
                 has_clients: false,
                 guarantee_client: false,
                 context: rsbinder::CallingContext::current(),
+                registered_at: std::time::Instant::now(),
             };
             lock_recover(&manager.inner)
                 .add_service(name, service)

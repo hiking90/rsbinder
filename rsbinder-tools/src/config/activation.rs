@@ -69,6 +69,19 @@ struct State {
     failing: Vec<Failing>,
 }
 
+/// What [`Activator::status`] reports of one activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct StartStatus {
+    /// A start of it has not ended: for `exec`, the program is running.
+    pub outstanding: bool,
+    /// Starts in a row that ended with nothing registered; 0 once a name of
+    /// it is registered.
+    pub failures: u32,
+    /// How long the next start is still held off, if it is.
+    pub retry_in: Option<Duration>,
+}
+
 /// Starts declared services, at most one attempt at a time per name and per activation.
 pub struct Activator {
     state: Arc<Mutex<State>>,
@@ -164,6 +177,21 @@ impl Activator {
         if let Err(e) = spawned {
             // The closure, and the slot in it, dropped with the error: the slot is free.
             log::error!("failed to spawn the start thread for {name}: {e}");
+        }
+    }
+
+    /// Where `activation` stands, for a dump: whether a start of it is
+    /// outstanding, and the hold-off its last ends left.
+    pub fn status(&self, activation: &Activation) -> StartStatus {
+        let state = self.state.lock().expect("activator lock poisoned");
+        let now = (self.clock)();
+        let failing = state.failing.iter().find(|f| &f.activation == activation);
+        StartStatus {
+            outstanding: state.in_flight.iter().any(|s| &s.activation == activation),
+            failures: failing.map_or(0, |f| f.failures),
+            retry_in: failing
+                .map(|f| f.retry_at.saturating_duration_since(now))
+                .filter(|left| !left.is_zero()),
         }
     }
 

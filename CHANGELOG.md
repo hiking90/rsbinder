@@ -157,6 +157,12 @@ peers; peers of either release still subscribe to each other.
   `getService2`, `checkService2`) at `warn`, once a minute for each uid and
   name, and its dump counts them in `refused lookups:`. The caller is still
   answered as for a name that is not registered.
+- `rsb_hub`'s dump has `uptime:`, an `age=` for each registration, and a
+  `declared (N):` section: each `[[service]]` the caller may `find`, with its
+  `start` kind, whether it is registered, and for one with a `start` whether
+  a start is outstanding, its failures in a row and the hold-off left.
+- `rsbinder-tools`: `config::Activator::status` with `StartStatus`, and
+  `config::Declarations::iter`.
 
 - `connect_async_with`, `connect_async` with `ClientOptions`. Without
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds

@@ -106,23 +106,38 @@ files:
 
 ```text
 rsb_hub 0.13.0
+uptime: 5124 s
 access control: enforcing, 4 rule(s)
+last reload: ok, 312 s ago
 declarations: 2
 death subscriptions: 3
+refused lookups: 0
 
 services (2):
   com.example.IFoo/default
     pid=92338 uid=973 dump_priority=0x8 lazy=no accessor=no
-    clients=no guarantee_client=no callbacks: registration=0 client=0
+    clients=no guarantee_client=no callbacks: registration=0 client=0 age=5101s
   manager
     pid=92334 uid=973 dump_priority=0x8 lazy=no accessor=no
-    clients=no guarantee_client=yes callbacks: registration=0 client=0
+    clients=no guarantee_client=yes callbacks: registration=0 client=0 age=5124s
+
+declared (2):
+  com.example.IBar/default  start=exec registered=no outstanding=no failures=3 retry_in=4s
+  com.example.IFoo/default  start=systemd registered=yes outstanding=no failures=0
 
 awaiting registration (1):
   com.example.INope/default  callbacks: registration=1 client=0
 ```
 
-That last section is usually the one you came for: a name something is
+`declared` is what is configured against what is up: for each `[[service]]`
+the caller may `find`, its `start` (`exec`, `systemd` or `none`), whether its
+name is registered now, and for one with a `start` whether a start is
+outstanding (for `exec`, the program is running), how many `exec` starts in a
+row ended with nothing registered, and how long the next is still
+[held off](#declaring-services). A declaration the caller may not look up is
+left out and not counted.
+
+The last section is usually the one you came for: a name something is
 waiting on that nothing has registered. Arguments narrow the listing by
 substring (`rsb_service dump manager com.example`), and `dump` works on any
 service, not just the HUB — it sends `DUMP_TRANSACTION`, which for an
