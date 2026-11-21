@@ -629,6 +629,16 @@ impl ServiceManager {
         }
     }
 
+    /// Tells the activator a start registered: `name` is an instance or an instance's accessor.
+    fn note_registered(&self, name: &str) {
+        let config = self.enforcer.config();
+        let declarations = &config.declarations;
+        let instance = declarations.accessor_for(name).unwrap_or(name);
+        if let Some(activation) = declarations.activation(instance) {
+            self.activator.registered(activation);
+        }
+    }
+
     /// AOSP `tryGetService`: looks the declared accessor up in the instance's stead; judges both.
     fn try_get_service(
         &self,
@@ -1248,6 +1258,7 @@ impl IServiceManager for ServiceManager {
         })();
 
         result?;
+        self.note_registered(name);
         fire_pending(client_pending);
         fire_pending(reg_pending);
         Ok(())

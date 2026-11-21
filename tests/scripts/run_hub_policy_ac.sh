@@ -243,6 +243,10 @@ name = "ac61.declared.IBar/default"
 [[service]]
 name = "ac61.declared.ISleep/default"
 start = { exec = ["/usr/bin/sleep", "61.25"] }
+
+[[service]]
+name = "ac61.declared.IFalse/default"
+start = { exec = ["/usr/bin/false"] }
 EOF
 kill -HUP "$HUB_PID"; sleep 1
 grep -q "service declaration(s)" "$LOG" && ok "reload reports the declarations" || bad "no declaration count: $(tail -2 "$LOG")"
@@ -291,6 +295,18 @@ if [ -n "$CHILD" ]; then
 else
     bad "the exec child did not start"
 fi
+
+note "6-7 E3  an exec that ends with nothing registered is not started once a lookup"
+# 20 lookups over 2 s and more: starts at 0 s and after 1 s, the third not before 3 s.
+for _ in $(seq 20); do run_probe get:ac61.declared.IFalse/default; sleep 0.1; done
+STARTS=$(grep -c "ac61.declared.IFalse/default is not registered; starting it" "$LOG")
+if [ "$STARTS" -ge 1 ] && [ "$STARTS" -le 3 ]; then
+    ok "20 lookups started it $STARTS time(s)"
+else
+    bad "20 lookups started it $STARTS time(s), want 1 to 3"
+fi
+grep -q "start of ac61.declared.IFalse/default ended with nothing registered" "$LOG" \
+    && ok "the hub's log says the next start is held off" || bad "no hold-off in the log"
 ######################################################################
 # Plan 6-5: the diagnostic CLI. It is a plain binder client, so these gates
 # also re-prove the policy from a second, independent implementation of the
@@ -358,7 +374,7 @@ want_out "ac61.allowed.live"          "dump lists a findable registration"
 want_out "pid=$HOLD_PID"              "dump attributes it to the registering pid"
 reject_out "ac61.hidden.live"         "dump filtered the non-findable name"
 want_out "hidden by policy"           "dump says the view is partial"
-want_out "declarations: 4"            "dump counts the loaded declarations"
+want_out "declarations: 5"           "dump counts the loaded declarations"
 
 run_svc dump manager ac61.allowed
 want_rc 0 "dump with a filter exits 0"

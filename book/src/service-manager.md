@@ -830,6 +830,19 @@ attempt. An `exec` start stays
 outstanding for the process's lifetime. `exec` takes an argv list, never a
 shell string.
 
+An `exec` program that ends before any name it starts was registered holds
+its next start off: 1, 2, 4, 8, 16, then 30 seconds, by the count of such
+ends in a row. The hub judges the registration, not the exit code: a program
+that exits 0 at once is held off too, a program that could not be run counts
+the same, and a lazy service that exits when its clients are gone is started
+again by the next lookup. A registration of the name, by any process, ends
+the hold-off and the count. A program that registers and then crashes is
+therefore started again by each lookup that misses it. The hub's log names
+each held-off start at `warn`. `systemd` starts are not held off: the unit's
+`StartLimitIntervalSec=` and `StartLimitBurst=` do that. So `exec` is not a
+way to run a command on every lookup: a program that registers nothing runs
+at most once per hold-off.
+
 > **The configuration is a trust boundary.** A `start` entry runs with
 > `rsb_hub`'s privileges, and any client allowed to look the name up can
 > trigger it. `rsb_hub` therefore refuses to start if the configuration,

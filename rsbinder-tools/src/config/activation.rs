@@ -15,6 +15,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::declaration::Activation;
 use super::trust::{check_program, open_root, At};
@@ -32,19 +33,60 @@ pub trait ActivationRunner: Send + Sync {
     fn run(&self, name: &str, activation: &Activation);
 }
 
+/// By failures in a row: 1 s is `wait_for_service`'s poll, 30 s bounds a repaired program's wait.
+const RETRY_AFTER_SECS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+
+/// The hold-off after `failures` ends in a row; `failures` is at least 1.
+fn retry_after(failures: u32) -> Duration {
+    let index = usize::try_from(failures.saturating_sub(1)).unwrap_or(usize::MAX);
+    let secs = RETRY_AFTER_SECS.get(index).copied().unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// A start that is outstanding.
+struct Start {
+    name: String,
+    activation: Activation,
+    /// A name of the activation was registered since the start began.
+    registered: bool,
+}
+
+/// An `exec` activation whose last start ended with nothing registered.
+struct Failing {
+    activation: Activation,
+    failures: u32,
+    /// No start of the activation before this.
+    retry_at: Instant,
+}
+
+#[derive(Default)]
+struct State {
+    /// A match on either half blocks a new start (see [`Activator::try_start`]).
+    in_flight: Vec<Start>,
+    /// Only activations held off: a registration removes the entry.
+    failing: Vec<Failing>,
+}
+
 /// Starts declared services, at most one attempt at a time per name and per activation.
 pub struct Activator {
-    /// Starts outstanding; a match on either half blocks a new start (see [`Self::try_start`]).
-    in_flight: Arc<Mutex<Vec<(String, Activation)>>>,
+    state: Arc<Mutex<State>>,
     runner: Arc<dyn ActivationRunner>,
+    clock: Clock,
 }
 
 impl Activator {
     /// An activator driving `runner`.
     pub fn new(runner: Arc<dyn ActivationRunner>) -> Self {
+        Self::with_clock(runner, Arc::new(Instant::now))
+    }
+
+    fn with_clock(runner: Arc<dyn ActivationRunner>, clock: Clock) -> Self {
         Activator {
-            in_flight: Arc::new(Mutex::new(Vec::new())),
+            state: Arc::new(Mutex::new(State::default())),
             runner,
+            clock,
         }
     }
 
@@ -57,54 +99,132 @@ impl Activator {
     /// registration. Returns immediately; the work happens on its own
     /// thread.
     ///
+    /// An [`Activation::Exec`] start that ends with none of its names
+    /// registered since it began ([`Self::registered`]) holds the next start
+    /// of that activation off: 1, 2, 4, 8, 16, then 30 seconds, by the count
+    /// of such ends in a row. The exit code is not what is judged, so a
+    /// program that exits 0 at once is held off too, and one that runs only
+    /// while it has clients is not. A program that could not be spawned
+    /// counts the same. A registration clears the count, so a program that
+    /// registers and then exits is started again by the next lookup. An
+    /// [`Activation::Systemd`] start is not held off: `systemctl --no-block`
+    /// always ends at once, and the unit has `StartLimit*=`.
+    ///
     /// Nothing here reports success. A start that fails is logged and
     /// forgotten: the caller is a `getService` that has already answered
     /// "not registered", and the client's own wait is what will notice the
     /// service appearing.
     pub fn try_start(&self, name: &str, activation: &Activation) {
         {
-            let mut in_flight = self.in_flight.lock().expect("activator lock poisoned");
-            if in_flight.iter().any(|(n, a)| n == name || a == activation) {
+            let mut state = self.state.lock().expect("activator lock poisoned");
+            if state
+                .in_flight
+                .iter()
+                .any(|s| s.name == name || &s.activation == activation)
+            {
                 log::debug!(
                     "not starting {name}: a start of it or of its activation is outstanding"
                 );
                 return;
             }
-            in_flight.push((name.to_owned(), activation.clone()));
+            let now = (self.clock)();
+            if let Some(failing) = state.failing.iter().find(|f| &f.activation == activation) {
+                if now < failing.retry_at {
+                    log::debug!(
+                        "not starting {name}: its last {} start(s) registered nothing, the next \
+                         is held off for {:?}",
+                        failing.failures,
+                        failing.retry_at - now
+                    );
+                    return;
+                }
+            }
+            state.in_flight.push(Start {
+                name: name.to_owned(),
+                activation: activation.clone(),
+                registered: false,
+            });
         }
 
         let runner = Arc::clone(&self.runner);
-        let entry = (name.to_owned(), activation.clone());
-        let in_flight = Arc::clone(&self.in_flight);
+        let slot = InFlightSlot {
+            state: Arc::clone(&self.state),
+            clock: Arc::clone(&self.clock),
+            name: name.to_owned(),
+            activation: activation.clone(),
+        };
         let spawned = std::thread::Builder::new()
             .name(START_THREAD_NAME.to_owned())
             .spawn(move || {
-                let slot = InFlightSlot { in_flight, entry };
-                let (name, activation) = &slot.entry;
-                log::info!("{name} is not registered; starting it on demand");
-                runner.run(name, activation);
+                // Moved in whole: the slot is freed, and the start judged, on a panic too.
+                let slot = slot;
+                log::info!("{} is not registered; starting it on demand", slot.name);
+                runner.run(&slot.name, &slot.activation);
             });
         if let Err(e) = spawned {
+            // The closure, and the slot in it, dropped with the error: the slot is free.
             log::error!("failed to spawn the start thread for {name}: {e}");
-            self.in_flight
-                .lock()
-                .expect("activator lock poisoned")
-                .retain(|(n, a)| !(n == name && a == activation));
         }
+    }
+
+    /// A name `activation` starts was registered: an outstanding start of it
+    /// is not one to hold the next off for, and a hold-off in force ends.
+    /// `rsb_hub` calls this from `addService`, for the instance's own name
+    /// and for its declared accessor's.
+    pub fn registered(&self, activation: &Activation) {
+        let mut state = self.state.lock().expect("activator lock poisoned");
+        for start in &mut state.in_flight {
+            if &start.activation == activation {
+                start.registered = true;
+            }
+        }
+        state.failing.retain(|f| &f.activation != activation);
     }
 }
 
-/// Frees a start's in-flight slot on drop, so a panicking runner does not wedge it.
+/// Frees a start's in-flight slot on drop, so a panicking runner does not wedge it, and judges
+/// the start there: an `exec` that ended with nothing registered holds the next one off.
 struct InFlightSlot {
-    in_flight: Arc<Mutex<Vec<(String, Activation)>>>,
-    entry: (String, Activation),
+    state: Arc<Mutex<State>>,
+    clock: Clock,
+    name: String,
+    activation: Activation,
 }
 
 impl Drop for InFlightSlot {
     fn drop(&mut self) {
         // Poison-tolerant: a panic here during unwind would abort the whole hub.
-        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        in_flight.retain(|e| e != &self.entry);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = state
+            .in_flight
+            .iter()
+            .position(|s| s.name == self.name && s.activation == self.activation)
+        else {
+            return;
+        };
+        let start = state.in_flight.swap_remove(at);
+        if start.registered || !matches!(start.activation, Activation::Exec(_)) {
+            return;
+        }
+        let now = (self.clock)();
+        let known = state
+            .failing
+            .iter()
+            .position(|f| f.activation == start.activation);
+        let failures = known
+            .map_or(0, |at| state.failing.swap_remove(at).failures)
+            .saturating_add(1);
+        let hold = retry_after(failures);
+        state.failing.push(Failing {
+            activation: start.activation,
+            failures,
+            retry_at: now + hold,
+        });
+        log::warn!(
+            "the start of {} ended with nothing registered ({failures} in a row); the next \
+             start of it is held off for {hold:?}",
+            self.name
+        );
     }
 }
 
@@ -467,12 +587,148 @@ mod tests {
         activator.try_start("a/b", &act);
         rx.recv().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !activator.in_flight.lock().unwrap().is_empty() {
+        while !activator.state.lock().unwrap().in_flight.is_empty() {
             assert!(std::time::Instant::now() < deadline, "slot never freed");
             std::thread::sleep(Duration::from_millis(10));
         }
         activator.try_start("a/b", &act);
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the name must start again after a panic");
+    }
+
+    /// Ends at once, as a program that exits before it registers; `hold` keeps it running.
+    struct Ending {
+        started: mpsc::Sender<String>,
+        hold: Arc<Mutex<bool>>,
+    }
+
+    impl ActivationRunner for Ending {
+        fn run(&self, name: &str, _activation: &Activation) {
+            self.started.send(name.to_owned()).unwrap();
+            while *self.hold.lock().unwrap() {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// An activator on a clock the test moves, with what its runner started.
+    struct Timed {
+        activator: Activator,
+        now: Arc<Mutex<Instant>>,
+        started: mpsc::Receiver<String>,
+        hold: Arc<Mutex<bool>>,
+    }
+
+    impl Timed {
+        fn new() -> Self {
+            let (tx, started) = mpsc::channel();
+            let hold = Arc::new(Mutex::new(false));
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock = Arc::clone(&now);
+            let activator = Activator::with_clock(
+                Arc::new(Ending {
+                    started: tx,
+                    hold: Arc::clone(&hold),
+                }),
+                Arc::new(move || *clock.lock().unwrap()),
+            );
+            Timed {
+                activator,
+                now,
+                started,
+                hold,
+            }
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.now.lock().unwrap() += by;
+        }
+
+        /// Whether the request ran the runner; returns once its slot is free again.
+        fn starts(&self, name: &str, activation: &Activation) -> bool {
+            self.activator.try_start(name, activation);
+            let ran = self
+                .started
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok();
+            self.idle();
+            ran
+        }
+
+        fn idle(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.activator.state.lock().unwrap().in_flight.is_empty() {
+                assert!(Instant::now() < deadline, "slot never freed");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    fn exec(program: &str) -> Activation {
+        Activation::Exec(vec![program.to_owned()])
+    }
+
+    /// `/usr/bin/false` under a client that polls would otherwise run once a lookup.
+    #[test]
+    fn an_exec_that_registers_nothing_is_held_off_longer_each_time() {
+        let t = Timed::new();
+        let act = exec("/usr/bin/false");
+        assert!(t.starts("a/b", &act), "the first request runs");
+        for secs in [1, 2, 4, 8, 16, 30, 30] {
+            assert!(!t.starts("a/b", &act), "held off at once ({secs} s step)");
+            t.advance(Duration::from_secs(secs) - Duration::from_millis(1));
+            assert!(!t.starts("a/b", &act), "held off 1 ms short of {secs} s");
+            t.advance(Duration::from_millis(1));
+            assert!(t.starts("a/b", &act), "runs again after {secs} s");
+        }
+    }
+
+    /// A lazy service exits when its clients go; that is not a failed start.
+    #[test]
+    fn a_registration_during_the_start_holds_nothing_off() {
+        let t = Timed::new();
+        let act = exec("/usr/bin/lazyd");
+        *t.hold.lock().unwrap() = true;
+        t.activator.try_start("a/b", &act);
+        assert_eq!(t.started.recv().unwrap(), "a/b");
+        t.activator.registered(&act);
+        *t.hold.lock().unwrap() = false;
+        t.idle();
+        assert!(t.starts("a/b", &act), "the next lookup starts it again");
+    }
+
+    /// The program was repaired and registered by hand: the count starts over.
+    #[test]
+    fn a_registration_ends_a_hold_off_and_its_count() {
+        let t = Timed::new();
+        let act = exec("/usr/bin/false");
+        assert!(t.starts("a/b", &act));
+        t.advance(Duration::from_secs(1));
+        assert!(t.starts("a/b", &act));
+        assert!(!t.starts("a/b", &act), "held off for 2 s now");
+        t.activator.registered(&act);
+        assert!(t.starts("a/b", &act), "a registration ends the hold-off");
+        t.advance(Duration::from_secs(1));
+        assert!(t.starts("a/b", &act), "and the count: 1 s again, not 4 s");
+    }
+
+    /// A reload that changes the argv is another program to judge.
+    #[test]
+    fn a_hold_off_is_of_one_activation() {
+        let t = Timed::new();
+        assert!(t.starts("a/b", &exec("/usr/bin/false")));
+        assert!(!t.starts("a/b", &exec("/usr/bin/false")));
+        assert!(t.starts("a/b", &exec("/usr/bin/true")));
+        assert!(t.starts("c/d", &exec("/usr/bin/other")));
+    }
+
+    /// `systemctl --no-block start` ends at once every time; the unit has `StartLimit*=`.
+    #[test]
+    fn a_systemd_start_is_never_held_off() {
+        let t = Timed::new();
+        let act = Activation::Systemd("x.service".to_owned());
+        for _ in 0..3 {
+            assert!(t.starts("a/b", &act));
+        }
     }
 }

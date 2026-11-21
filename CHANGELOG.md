@@ -136,8 +136,16 @@ peers; peers of either release still subscribe to each other.
   by the subscriber with `InvalidOperation`. A 0.1.0 subscriber ignores the
   new fields and never calls the new methods: its drop is seen at the next
   publish, as before.
+- `rsb_hub`: an `exec` start that ends before any name it starts was
+  registered holds the next start of that argv off for 1, 2, 4, 8, 16, then
+  30 seconds, by the count of such ends in a row. A program that registers
+  nothing no longer runs once per lookup. A registration ends the hold-off;
+  `systemd` starts are not held off.
 
 ### Added
+
+- `rsbinder-tools`: `config::Activator::registered` tells the activator a
+  name of an activation was registered.
 
 - `connect_async_with`, `connect_async` with `ClientOptions`. Without
   `ClientOptions::timeout`, an RPC peer that accepts and never answers holds
