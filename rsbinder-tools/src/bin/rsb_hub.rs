@@ -445,7 +445,7 @@ struct ServiceManager {
     /// The topic registry `main` registers; read by `dump` only.
     #[cfg(feature = "topic")]
     topics: Option<rsbinder_topic::registry::Registry>,
-    /// Set while a dump writer holds a caller's fd; one only, as an unread pipe fills any number.
+    /// Writes one dump at a time off the binder thread: an unread pipe would fill any number.
     dump_writer: DumpWriter,
     /// `find` refusals answered as "not registered".
     refused_lookups: Mutex<RefusedLookups>,
@@ -475,7 +475,7 @@ impl ServiceManager {
             activator,
             #[cfg(feature = "topic")]
             topics: None,
-            dump_writer: Arc::new(Mutex::new(None)),
+            dump_writer: DumpWriter::new(),
             refused_lookups: Mutex::new(RefusedLookups::default()),
         };
 
@@ -1124,16 +1124,16 @@ impl Interface for ServiceManager {
             } else {
                 format!("rsb_hub: policy denies `list` to {who}\n")
             };
-            let _ = send_dump(&self.dump_writer, fd, text.into_bytes(), &ctx);
+            let _ = self.dump_writer.send_with(fd, || Ok(text.into_bytes()));
             return Err(StatusCode::PermissionDenied);
         }
-        let mut text = Vec::new();
-        render_dump(
-            &mut text,
-            &self.dump_snapshot(&config, caller.as_ref(), args.to_vec()),
-        )
-        .map_err(|_| StatusCode::NoMemory)?;
-        send_dump(&self.dump_writer, fd, text, &ctx)
+        // Rendered once the writer is free: a dump refused `WOULD_BLOCK` takes no registry lock.
+        self.dump_writer.send_with(fd, || {
+            let mut text = Vec::new();
+            let snap = self.dump_snapshot(&config, caller.as_ref(), args.to_vec());
+            render_dump(&mut text, &snap).map_err(|_| StatusCode::NoMemory)?;
+            Ok(text)
+        })
     }
 }
 
@@ -1193,152 +1193,6 @@ impl RefusedLookups {
         self.rows.insert((uid, name.to_owned()), (now, 0));
         Some(0)
     }
-}
-
-/// The caller whose dump a writer thread is writing, as `uid=.. (pid=..)`; `None` when idle.
-type DumpWriter = Arc<Mutex<Option<String>>>;
-
-/// A dump write that takes no byte for this long is given up; a pager a person reads keeps it.
-const DUMP_STALL: Duration = Duration::from_secs(30);
-
-/// Interrupts this thread's blocking `write` at an interval, so a stalled one can be given up.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-struct StallTicks(libc::timer_t);
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl StallTicks {
-    /// Periodic, not one shot: a tick that lands before `write` is entered interrupts nothing.
-    fn start(stall: Duration) -> std::io::Result<Self> {
-        extern "C" fn on_tick(_: libc::c_int) {}
-        static HANDLER: std::sync::Once = std::sync::Once::new();
-        let signo = libc::SIGRTMIN();
-        // SAFETY: `action` is zeroed then filled; the handler does nothing, so it is signal-safe.
-        HANDLER.call_once(|| unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            // No `SA_RESTART`: the interrupted `write` has to return.
-            action.sa_sigaction = on_tick as extern "C" fn(libc::c_int) as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(signo, &action, std::ptr::null_mut());
-        });
-        let tick = (stall / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
-        // SAFETY: every struct is zeroed then filled, and outlives the call it is passed to.
-        unsafe {
-            let mut event: libc::sigevent = std::mem::zeroed();
-            event.sigev_notify = libc::SIGEV_THREAD_ID;
-            event.sigev_signo = signo;
-            event.sigev_notify_thread_id = libc::gettid();
-            let mut timer: libc::timer_t = std::mem::zeroed();
-            if libc::timer_create(libc::CLOCK_MONOTONIC, &mut event, &mut timer) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let ticks = StallTicks(timer);
-            let mut every: libc::itimerspec = std::mem::zeroed();
-            every.it_value.tv_sec = libc::time_t::try_from(tick.as_secs()).unwrap_or(1);
-            // `as`: `c_long` is 32 bits on some targets, and the value is under 1e9 on all.
-            every.it_value.tv_nsec = tick.subsec_nanos() as libc::c_long;
-            every.it_interval = every.it_value;
-            if libc::timer_settime(ticks.0, 0, &every, std::ptr::null_mut()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(ticks)
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl Drop for StallTicks {
-    fn drop(&mut self) {
-        // SAFETY: the timer is the one `timer_create` gave, deleted once.
-        unsafe { libc::timer_delete(self.0) };
-    }
-}
-
-/// All of `text`, or an error once `stall` passes with no byte taken; the fd's flags stay as
-/// the caller, who shares its open file description, set them.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn write_within(file: &std::fs::File, text: &[u8], stall: Duration) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let _ticks = StallTicks::start(stall)?;
-    let mut rest = text;
-    let mut progressed = std::time::Instant::now();
-    while !rest.is_empty() {
-        // SAFETY: `rest` is a live slice of `rest.len()` bytes and `file` holds the fd open.
-        let n = unsafe { libc::write(file.as_raw_fd(), rest.as_ptr().cast(), rest.len()) };
-        match usize::try_from(n) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) => {
-                rest = rest.get(n..).unwrap_or_default();
-                progressed = std::time::Instant::now();
-            }
-            // Not `write_all`: it retries `Interrupted`, which is how a tick ends a stalled write.
-            Err(_) => {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(err);
-                }
-                if progressed.elapsed() >= stall {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("the reader took nothing for {stall:?}"),
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Without a timer that interrupts one thread, the write waits for the reader.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn write_within(mut file: &std::fs::File, text: &[u8], _stall: Duration) -> std::io::Result<()> {
-    std::io::Write::write_all(&mut file, text)
-}
-
-/// Writes on a thread of its own: a caller that never reads then holds it, not the binder thread.
-fn send_dump(
-    writer: &DumpWriter,
-    fd: std::os::fd::OwnedFd,
-    text: Vec<u8>,
-    caller: &rsbinder::CallingContext,
-) -> rsbinder::Result<()> {
-    send_dump_within(writer, fd, text, caller, DUMP_STALL)
-}
-
-/// [`send_dump`] with the stall a test can wait out.
-fn send_dump_within(
-    writer: &DumpWriter,
-    fd: std::os::fd::OwnedFd,
-    text: Vec<u8>,
-    caller: &rsbinder::CallingContext,
-    stall: Duration,
-) -> rsbinder::Result<()> {
-    let who = format!("uid={} (pid={})", caller.uid, caller.pid);
-    {
-        let mut slot = lock_recover(writer);
-        if let Some(holder) = slot.as_deref() {
-            log::warn!("dump: refused {who}, the dump of {holder} is still being written");
-            return Err(StatusCode::WouldBlock);
-        }
-        *slot = Some(who.clone());
-    }
-    let slot = Arc::clone(writer);
-    let spawned = std::thread::Builder::new()
-        .name("rsb_hub:dump".to_owned())
-        .spawn(move || {
-            let file = std::fs::File::from(fd);
-            if let Err(e) = write_within(&file, &text, stall) {
-                log::error!("dump: writing to the fd of {who} failed: {e}");
-            }
-            // Closed before the slot frees: the caller's end-of-file is the dump's end.
-            drop(file);
-            *lock_recover(&slot) = None;
-        });
-    if let Err(e) = spawned {
-        *lock_recover(writer) = None;
-        log::error!("dump: cannot spawn the writer thread: {e}");
-        return Err(StatusCode::NoMemory);
-    }
-    Ok(())
 }
 
 /// A registered service, as `getService2`/`checkService2` need to see it.
@@ -3544,55 +3398,6 @@ mod tests {
         assert!(out.contains("access control DISABLED"), "{out}");
     }
 
-    /// Polls until the writer thread of [`send_dump`] lets go of the caller's fd.
-    fn wait_for_the_dump_writer(writing: &DumpWriter) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lock_recover(writing).is_some() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the dump writer never finished"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// The binder thread returns while the writer waits on a caller that does not read.
-    #[test]
-    fn a_dump_to_an_unread_fd_holds_only_its_writer() {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-
-        const LEN: usize = 4 << 20;
-        let writing = DumpWriter::default();
-        let (mut reader, fd) = UnixStream::pair().expect("socketpair");
-        let (tx, rx) = mpsc::channel();
-        let slot = Arc::clone(&writing);
-        std::thread::spawn(move || {
-            let caller = rsbinder::CallingContext::current();
-            let _ = tx.send(send_dump(&slot, fd.into(), vec![b'x'; LEN], &caller));
-        });
-        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(Ok(())));
-
-        let caller = rsbinder::CallingContext::current();
-        let (_, other) = UnixStream::pair().expect("socketpair");
-        let reply = send_dump(&writing, other.into(), b"y".to_vec(), &caller);
-        assert_eq!(reply, Err(StatusCode::WouldBlock));
-
-        let mut got = Vec::new();
-        reader.read_to_end(&mut got).expect("read the dump");
-        assert_eq!(got.len(), LEN);
-        wait_for_the_dump_writer(&writing);
-
-        let (mut reader, fd) = UnixStream::pair().expect("socketpair");
-        assert_eq!(
-            send_dump(&writing, fd.into(), b"y".to_vec(), &caller),
-            Ok(())
-        );
-        let mut got = Vec::new();
-        reader.read_to_end(&mut got).expect("read the dump");
-        assert_eq!(got, b"y");
-    }
-
     /// A socket whose send buffer is full, so the next blocking write to its fd waits for a read.
     fn a_full_socket() -> (std::os::unix::net::UnixStream, std::os::fd::OwnedFd) {
         use std::io::Write;
@@ -3607,82 +3412,6 @@ mod tests {
         }
         writer.set_nonblocking(false).expect("blocking");
         (reader, writer.into())
-    }
-
-    /// A caller that never reads would otherwise hold the one writer until the hub restarts.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn a_dump_nobody_reads_is_given_up_and_the_next_is_written() {
-        use std::io::Read;
-        use std::os::fd::{FromRawFd, OwnedFd};
-        use std::os::unix::net::UnixStream;
-
-        let caller = rsbinder::CallingContext::current();
-        let stall = Duration::from_millis(200);
-        let unread_socket = || {
-            let (reader, writer) = UnixStream::pair().expect("socketpair");
-            (Box::new(reader) as Box<dyn Send>, OwnedFd::from(writer))
-        };
-        let unread_pipe = || {
-            let mut fds = [0; 2];
-            // SAFETY: `fds` has room for the two descriptors, each owned once below.
-            let (reader, writer) = unsafe {
-                assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
-                (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
-            };
-            (Box::new(reader) as Box<dyn Send>, writer)
-        };
-        for (what, (_reader, fd)) in [("socket", unread_socket()), ("pipe", unread_pipe())] {
-            let writing = DumpWriter::default();
-            let began = std::time::Instant::now();
-            // More than a pipe (64 KiB) or a socket buffer holds: the write has to wait.
-            let sent = send_dump_within(&writing, fd, vec![b'x'; 4 << 20], &caller, stall);
-            assert_eq!(sent, Ok(()), "{what}");
-            wait_for_the_dump_writer(&writing);
-            assert!(
-                began.elapsed() >= stall,
-                "{what}: given up before the stall"
-            );
-
-            let (mut reader, fd) = UnixStream::pair().expect("socketpair");
-            let sent = send_dump_within(&writing, fd.into(), b"y".to_vec(), &caller, stall);
-            assert_eq!(sent, Ok(()), "{what}: the writer is free again");
-            let mut got = Vec::new();
-            reader.read_to_end(&mut got).expect("read the dump");
-            assert_eq!(got, b"y", "{what}");
-        }
-    }
-
-    /// The stall is time without a byte taken, not the time the whole dump may take.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[test]
-    fn a_dump_read_slowly_arrives_whole() {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-
-        const LEN: usize = 2 << 20;
-        let stall = Duration::from_millis(200);
-        let writing = DumpWriter::default();
-        let caller = rsbinder::CallingContext::current();
-        let (mut reader, fd) = UnixStream::pair().expect("socketpair");
-        let began = std::time::Instant::now();
-        let sent = send_dump_within(&writing, fd.into(), vec![b'x'; LEN], &caller, stall);
-        assert_eq!(sent, Ok(()));
-        let mut got = 0;
-        let mut chunk = vec![0; 64 << 10];
-        loop {
-            let n = reader.read(&mut chunk).expect("read the dump");
-            if n == 0 {
-                break;
-            }
-            got += n;
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert_eq!(got, LEN);
-        assert!(
-            began.elapsed() > stall * 2,
-            "the read did outlast the stall"
-        );
     }
 
     /// A denial writes its reason to the fd too, and that write must not wait on the caller.
@@ -3705,20 +3434,6 @@ mod tests {
             text.ends_with("\n") && text.contains("policy denies `list`"),
             "{text}"
         );
-    }
-
-    /// A broken caller fd answers OK: `DEAD_OBJECT` (`-EPIPE`) would mark rsb_hub dead in AOSP.
-    #[test]
-    fn a_dump_to_a_broken_fd_answers_ok() {
-        let writing = DumpWriter::default();
-        let caller = rsbinder::CallingContext::current();
-        let (reader, fd) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        drop(reader);
-        assert_eq!(
-            send_dump(&writing, fd.into(), b"y".to_vec(), &caller),
-            Ok(())
-        );
-        wait_for_the_dump_writer(&writing);
     }
 
     /// Flags decoded, not just hex: `lazy=yes` decides whether the binder may be cached.

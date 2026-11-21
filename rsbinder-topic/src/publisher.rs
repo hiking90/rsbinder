@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use rsbinder::{
-    BinderResult, CallingContext, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, Status,
-    StatusCode, Strong,
+    BinderResult, CallingContext, DumpWriter, ExceptionCode, Interface, ParcelFileDescriptor,
+    SIBinder, Status, StatusCode, Strong,
 };
 
 use crate::aidl::ISubscription::ISubscription;
@@ -99,6 +99,8 @@ struct Shared<T> {
     authorize: Option<Authorize>,
     inspect: Option<Authorize>,
     lossless: bool,
+    /// Writes one dump of this topic at a time; every acceptor of the topic has it.
+    dumps: Arc<DumpWriter>,
 }
 
 impl<T: Payload + 'static> Publisher<T> {
@@ -123,9 +125,11 @@ impl<T: Payload + 'static> Publisher<T> {
             authorize: spec.authorize.clone(),
             inspect: spec.inspect.clone(),
             lossless: spec.backpressure.is_some(),
+            dumps: Arc::default(),
         });
         let acceptor = Acceptor {
             topic: Arc::downgrade(&shared) as Weak<dyn Accept>,
+            dumps: Arc::clone(&shared.dumps),
         };
         let binder = BnTopic::new_binder(Service { acceptor }).as_binder();
         Ok(Self {
@@ -410,6 +414,7 @@ impl<T: Payload + 'static> Publisher<T> {
     pub fn acceptor(&self) -> Acceptor {
         Acceptor {
             topic: Arc::downgrade(&self.shared) as Weak<dyn Accept>,
+            dumps: Arc::clone(&self.shared.dumps),
         }
     }
 
@@ -585,8 +590,8 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 /// }
 ///
 /// impl rsbinder::Interface for Guarded {
-///     fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
-///         self.acceptor.dump(writer, args)
+///     fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> rsbinder::Result<()> {
+///         self.acceptor.dump_fd(fd, args)
 ///     }
 /// }
 ///
@@ -622,6 +627,8 @@ impl<T: Payload> fmt::Debug for Publisher<T> {
 #[derive(Clone)]
 pub struct Acceptor {
     topic: Weak<dyn Accept>,
+    /// The topic's; kept with the publisher dropped, to write that it is.
+    dumps: Arc<DumpWriter>,
 }
 
 impl Acceptor {
@@ -698,17 +705,41 @@ impl Acceptor {
         Ok(topic.status())
     }
 
-    /// Answer a binder dump (`dumpsys` on Android): [`status`](Self::status)'s reply as text,
-    /// one line for the topic and one per subscription. A caller the topic's
-    /// [`inspect`](crate::PublisherBuilder::inspect) refuses is told so in the text, and a
-    /// publisher dropped writes that it is. `args` are not read.
+    /// Answer a binder dump (`dumpsys` on Android) without writing on the binder thread:
+    /// [`status`](Self::status)'s reply as text, one line for the topic and one per
+    /// subscription. A caller the topic's [`inspect`](crate::PublisherBuilder::inspect) refuses
+    /// is told so in the text, and a publisher dropped writes that it is. `args` are not read.
     ///
-    /// An `ITopic` of the application's own calls it from its `rsbinder::Interface::dump`.
-    /// The status is read under the topic's lock, as [`status`](Self::status) reads it, waiting
-    /// for it as that does; the text is made once the lock is let go and written in one call. The
-    /// writer is the caller's fd, which a caller that does not read can hold up.
+    /// An `ITopic` of the application's own calls it from its `rsbinder::Interface::dump_fd`,
+    /// on the thread the call arrived on: the caller it checks is that call's. The status is
+    /// read on that thread under the topic's lock, as [`status`](Self::status) reads it, waiting
+    /// for it as that does. The text is written by the topic's [`rsbinder::DumpWriter`], on a
+    /// thread of its own, so a caller that passes a pipe and does not read it holds that
+    /// thread and no binder thread; the return is not the end of the dump.
+    ///
+    /// A topic writes one dump at a time, whichever of its acceptors is asked:
+    /// `StatusCode::WouldBlock` while another is being written, without reading the status.
+    /// What bounds the time a caller can hold the writer, and what does not, is
+    /// [`rsbinder::DumpWriter`]'s.
+    pub fn dump_fd(&self, fd: OwnedFd, _args: &[String]) -> rsbinder::Result<()> {
+        self.dumps
+            .send_with(fd, || Ok(self.dump_text().into_bytes()))
+    }
+
+    /// [`dump_fd`](Self::dump_fd)'s text, written to `writer` on the calling thread.
+    ///
+    /// The default `rsbinder::Interface::dump_fd` of an `ITopic` that overrides only `dump`
+    /// ends here, on the binder thread, where `writer` is the caller's fd: a caller that does
+    /// not read it holds that thread once the fd is full. Override `dump_fd` instead.
     pub fn dump(&self, writer: &mut dyn std::io::Write, _args: &[String]) -> rsbinder::Result<()> {
-        let text = match self.status() {
+        writer
+            .write_all(self.dump_text().as_bytes())
+            .map_err(StatusCode::from)
+    }
+
+    /// The status as text, or why the caller of this thread's transaction gets none.
+    fn dump_text(&self) -> String {
+        match self.status() {
             Ok(status) => format!("{status}"),
             Err(refused) if refused.exception_code() == ExceptionCode::Security => {
                 let caller = CallingContext::current();
@@ -718,8 +749,7 @@ impl Acceptor {
                 )
             }
             Err(_) => "rsbinder-topic: the publisher has been dropped\n".to_owned(),
-        };
-        writer.write_all(text.as_bytes()).map_err(StatusCode::from)
+        }
     }
 }
 
@@ -954,8 +984,8 @@ struct Service {
 }
 
 impl Interface for Service {
-    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
-        self.acceptor.dump(writer, args)
+    fn dump_fd(&self, fd: OwnedFd, args: &[String]) -> rsbinder::Result<()> {
+        self.acceptor.dump_fd(fd, args)
     }
 }
 
