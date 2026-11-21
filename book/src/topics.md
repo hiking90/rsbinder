@@ -274,6 +274,73 @@ cargo run -p rsbinder-topic --example topic_thermostat -- watch
 cargo run -p rsbinder-topic --example topic_thermostat -- set 23.5
 ```
 
+### When a value was published
+
+A record carries no time: its header holds its kind, its length and its
+index. A subscriber that has to know how old the current value is reads a time
+the publisher puts in the value, as the thermostat does:
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:value}}
+```
+
+```rust,ignore
+{{#include ../../rsbinder-topic/examples/topic_thermostat.rs:clock}}
+```
+
+- The service reads the clock under the lock it publishes under, so a later
+  value never carries an earlier time.
+- `CLOCK_MONOTONIC` is the clock `rsb_service topic record` stamps its receive
+  times with, so a recording and the times in its values compare. It stops
+  while the system is suspended; an age that has to count the time asleep
+  reads `CLOCK_BOOTTIME`.
+- A time namespace (`time_namespaces(7)`) shifts both by its offsets, so a
+  publisher and a subscriber in different time namespaces do not compare them.
+  `CLOCK_REALTIME` reads the same in every namespace, and goes back when the
+  system clock is set back.
+- A tool that does not know the payload, as `rsb_service topic hz` and `echo`
+  do not, cannot read the time.
+
+### A value for each key
+
+A state topic holds one value. Where a subscriber needs the newest value of
+each of many keys, such as the state of each device, an application builds
+one of two compositions on this API, and what the publisher builds is what
+every subscriber reads:
+
+| | A topic for each key (`sensor/1`, `sensor/2`, …) | One value that holds every key |
+|---|---|---|
+| A change publishes | that key's value | every key's value |
+| A subscriber reads | the keys it subscribed to | every key |
+| Each key takes | a ring of its own (`3 × (max_value_bytes rounded up to 8, plus 8)`, at least 4 KiB), a subscription of each subscriber, and a name | its bytes in the value, which `max_value_bytes` bounds |
+| A new key | is a new topic, which a subscriber has to find | is in the next value |
+
+A topic for each key:
+
+- One thread waits for many subscriptions with `Wake::Fd` and `wait_any`. A
+  `Wake::Futex` wait holds a thread for each subscription.
+- Each `Wake::Fd` subscription holds two file descriptors in the subscriber's
+  process and one in the publisher's, so the publisher holds one for each key
+  and subscriber.
+- A name in the registry is 1 to 127 bytes of `[A-Za-z0-9._/-]`, and the
+  registry holds at most `registry::MAX_NAMES` (10,000). There is no watch of
+  a prefix: a subscriber finds keys added later by calling `list(prefix)`
+  again.
+
+One value that holds every key:
+
+- A subscriber that falls behind skips to the newest value, which has every
+  key, so it misses no key's newest value.
+- Every publish encodes and copies the whole map, and a subscriber that has to
+  know which keys changed compares it with the one before. A map larger than a
+  record goes on a topic of `Bytes` into a slot of the pool
+  ([loans](#large-values-loans-and-samples)).
+
+The first fits keys known when the subscribers start, read a few at a time;
+the second a set of keys that changes, read whole. Keeping each key's newest
+value in one ring, which overwrites its oldest records, would need a table
+beside the ring or values published again, and the layout has neither.
+
 ## Finding a topic by name
 
 `Publisher::advertise_on` registers a topic under a name, and a
