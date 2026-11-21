@@ -144,6 +144,10 @@ peers; peers of either release still subscribe to each other.
 
 ### Added
 
+- `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds, on
+  Linux and Android: it closes the fd and writes the next dump. A caller
+  that passed a pipe and never read it left every later dump refused with
+  `WOULD_BLOCK` until the hub restarted.
 - `rsbinder-tools`: `config::Activator::registered` tells the activator a
   name of an activation was registered.
 - `rsb_hub --check-config` loads the configuration as a start or a `SIGHUP`

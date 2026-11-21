@@ -814,9 +814,15 @@ no room for fails and is sent again later.
 reason it is denied, to the caller's fd on a thread of its own and replies
 at once, and the dump ends when that thread closes the fd. It writes one
 dump at a time. A dump that arrives while one is still being written is
-refused with `WOULD_BLOCK`, so a caller that passes a pipe and never reads
-it leaves every later dump refused until the hub restarts, and the hub's
-log names that caller's uid and pid.
+refused with `WOULD_BLOCK`, and the hub's log names the uid and pid of the
+caller being written to. On Linux and Android a write that the reader takes
+no byte of for 30 seconds is given up: the hub closes the fd, logs the
+caller, and writes the next dump. The 30 seconds count time without
+progress, so a reader that is slow, a pager for instance, still gets the
+whole dump. A caller that passes a pipe and never reads it therefore holds
+later dumps off for 30 seconds, not until the hub restarts. The hub sets no
+flag on the fd, which shares its open file description with the caller: a
+timer interrupts the writer thread's blocked `write`.
 
 A hub on a socket has a serve thread and a reaper thread per session and no call
 restriction; what holds it up is in [Topics](./topics.md#what-differs-from-kernel-binder).
