@@ -2025,7 +2025,9 @@ pub fn rsbinder::hub::ServiceManager::try_list_services(&self, i32) -> core::res
 pub fn rsbinder::hub::ServiceManager::try_unregister_service(&self, &str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::ServiceManager::unregister_for_notifications(&self, &str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::ServiceManager::wait_for_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::hub::ServiceManager::wait_for_interface_timeout<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str, core::time::Duration) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::ServiceManager::wait_for_service(&self, &str) -> core::option::Option<rsbinder::SIBinder>
+pub fn rsbinder::hub::ServiceManager::wait_for_service_timeout(&self, &str, core::time::Duration) -> core::result::Result<rsbinder::SIBinder, rsbinder::Status>
 impl core::fmt::Debug for rsbinder::hub::ServiceManager
 pub fn rsbinder::hub::ServiceManager::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::hub::ServiceManager
@@ -2231,7 +2233,9 @@ pub fn rsbinder::hub::try_list_services(i32) -> core::result::Result<alloc::vec:
 pub fn rsbinder::hub::try_unregister_service(&str, &rsbinder::SIBinder) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::unregister_for_notifications(&str, &rsbinder::Strong<dyn rsbinder::hub::android_16::android::os::IServiceCallback::IServiceCallback>) -> rsbinder::BinderResult<()>
 pub fn rsbinder::hub::wait_for_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::hub::wait_for_interface_timeout<T: rsbinder::FromIBinder + ?core::marker::Sized>(&str, core::time::Duration) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::wait_for_service(&str) -> core::option::Option<rsbinder::SIBinder>
+pub fn rsbinder::hub::wait_for_service_timeout(&str, core::time::Duration) -> core::result::Result<rsbinder::SIBinder, rsbinder::Status>
 pub fn rsbinder::hub::watch(&str, impl core::ops::function::Fn(rsbinder::SIBinder) + core::marker::Send + core::marker::Sync + 'static) -> core::result::Result<rsbinder::hub::ServiceWatch, rsbinder::Status>
 pub mod rsbinder::lazy_service
 pub struct rsbinder::lazy_service::LazyServiceRegistrar

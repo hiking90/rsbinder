@@ -156,6 +156,13 @@ peers; peers of either release still subscribe to each other.
 
 ### Added
 
+- `wait_for_service_timeout` and `wait_for_interface_timeout`, on
+  `hub::ServiceManager` and as `hub::` functions: the synchronous wait with a
+  bound. It is the same wait as `wait_for_service` and returns
+  `StatusCode::TimedOut` once the `Duration` passes, with its callback
+  unregistered by then; `Duration::ZERO` is one lookup. A refusal by the
+  service manager or a failed lookup is returned, not logged. AOSP's
+  `waitForService` has no timeout.
 - `rsbinder::DumpWriter` writes a dump to the caller's fd on a thread of its
   own, for a service that overrides `Interface::dump_fd`:
   `send_with(fd, render)` makes the text on the binder thread and returns. It

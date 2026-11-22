@@ -26,9 +26,14 @@
 //!     wait occupies it, and dropping the future has to give it back;
 //!   * that a dropped wait leaves **no callback registered**, using the
 //!     per-name callback cap as the instrument;
+//!   * the synchronous **timed waits** (`wait_for_service_timeout`,
+//!     `wait_for_interface_timeout`): found, `ZERO`, and a timed-out wait
+//!     that has unregistered its callback, by the same instrument;
 //!   * that both async lookups are `Send + 'static` (compile-time).
 //!
-//! None of them asserts a wall-clock duration. Which of the two mechanisms
+//! None of them asserts how soon a wait answers; the one duration asserted is
+//! a lower bound, that a timed-out wait did not return before its timeout,
+//! which a monotonic clock decides. Which of the two mechanisms
 //! answered a given wait is not observable from here, and timing it is not a
 //! substitute — see plan 11-1 §8.5.
 
@@ -538,6 +543,92 @@ fn a_dropped_service_watch_leaves_no_callback_registered() {
     drop(watch);
     sm.register_for_notifications(&name, &probe)
         .expect("the dropped watch kept its callback registered");
+}
+
+/// The timed waits: `ZERO` answers from the one lookup, a wait finds a name registered while it
+/// waits, and `TimedOut` is returned for an absent name (mutant: the zero check or the found path).
+#[test]
+#[ignore = "needs a kernel binder device and a running service manager"]
+fn a_timed_wait_resolves_on_registration() {
+    ProcessState::init_default().expect("ProcessState::init_default");
+    ProcessState::start_thread_pool();
+    let name = service_name("timed");
+
+    let absent = hub::wait_for_interface_timeout::<dyn IAsyncRt>(&name, Duration::ZERO);
+    assert_eq!(
+        absent.err(),
+        Some(StatusCode::TimedOut),
+        "an absent name, zero timeout"
+    );
+
+    let service = BnAsyncRt::new_binder(Svc);
+    let (tx_added, rx_added) = std::sync::mpsc::sync_channel::<std::result::Result<(), String>>(1);
+    let reg_name = name.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        let added = hub::add_service(&reg_name, &service).map_err(|e| format!("{e:?}"));
+        let _ = tx_added.try_send(added);
+    });
+    // Bounded so a registration that never lands fails; not a measurement.
+    let found = hub::wait_for_interface_timeout::<dyn IAsyncRt>(&name, Duration::from_secs(20));
+    rx_added
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the registrar never reported back")
+        .expect("add_service");
+    let found = found.expect("the timed wait missed a name registered during it");
+    assert_eq!(found.echo("timed").expect("echo"), "echo:timed");
+
+    hub::wait_for_service_timeout(&name, Duration::ZERO)
+        .expect("a registered name, zero timeout: the fast path answers");
+}
+
+/// A timed wait that runs out returns `TimedOut` no sooner than its timeout, with its callback
+/// unregistered by then (mutant: no deadline check in the loop, or a return past the watch guard).
+#[test]
+#[ignore = "needs a kernel binder device and a running rsb_hub"]
+fn a_timed_out_wait_leaves_no_callback_registered() {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    if !registrations_supported() {
+        return;
+    }
+    ProcessState::init_default().expect("ProcessState::init_default");
+    ProcessState::start_thread_pool();
+
+    let sm = hub::default().expect("service manager");
+    let name = service_name("timedleak");
+    let _occupants = fill_to_one_below_the_cap(&sm, &name);
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let waiting_name = name.clone();
+    std::thread::spawn(move || {
+        let began = Instant::now();
+        let end = hub::wait_for_service_timeout(&waiting_name, TIMEOUT).map(|_| ());
+        let _ = tx.try_send((end, began.elapsed()));
+    });
+    // Well inside the wait, whose callback then holds the last slot.
+    std::thread::sleep(Duration::from_millis(300));
+    let probe = hub::BnServiceCallback::new_binder(Occupant);
+    let armed = sm.register_for_notifications(&name, &probe).is_err();
+
+    let (end, waited) = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the timed wait never returned");
+    let status = end.expect_err("nothing registered the name");
+    assert_eq!(StatusCode::from(status), StatusCode::TimedOut);
+    assert!(
+        waited >= TIMEOUT,
+        "returned after {waited:?}, before {TIMEOUT:?}"
+    );
+
+    if !armed {
+        if cfg!(target_os = "android") {
+            println!("skipped: no per-name callback cap on this service manager");
+            return;
+        }
+        panic!("the list never reached the cap ({CAP}): the timed wait registered no callback");
+    }
+    sm.register_for_notifications(&name, &probe)
+        .expect("the timed-out wait kept its callback registered");
 }
 
 /// AC-11-1.6 — both futures are `Send + 'static`, so they can be spawned and
