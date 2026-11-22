@@ -452,8 +452,15 @@ mod tests {
     #[test]
     fn a_dump_read_slowly_arrives_whole() {
         const LEN: usize = 2 << 20;
+        // A reader thread held off the CPU for most of a second still reads before the stall.
+        const STALL: Duration = Duration::from_secs(1);
+        const PAUSE: Duration = Duration::from_millis(100);
+        // 64 KiB a read on every host: XNU's 8 KiB default would make 256 pauses of the dump.
+        const BUFFER: usize = 64 << 10;
         let socket = || {
             let (reader, writer) = UnixStream::pair().expect("socketpair");
+            rustix::net::sockopt::set_socket_recv_buffer_size(&reader, BUFFER).expect("SO_RCVBUF");
+            rustix::net::sockopt::set_socket_send_buffer_size(&writer, BUFFER).expect("SO_SNDBUF");
             (
                 std::fs::File::from(OwnedFd::from(reader)),
                 OwnedFd::from(writer),
@@ -472,14 +479,14 @@ mod tests {
                 "{what}"
             );
             let mut got = 0;
-            let mut chunk = vec![0; 64 << 10];
+            let mut chunk = vec![0; BUFFER];
             loop {
                 let n = reader.read(&mut chunk).expect("read the dump");
                 if n == 0 {
                     break;
                 }
                 got += n;
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(PAUSE);
             }
             assert_eq!(got, LEN, "{what}");
             assert!(
