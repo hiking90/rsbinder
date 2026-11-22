@@ -1181,7 +1181,7 @@ impl<T: FromIBinder + ?Sized + 'static> Shared<T> {
             st.waiter = Some(Arc::clone(&waiter));
         }
         self.notify();
-        let found = sm.wait_for_service_cancellable(name, waiter);
+        let found = sm.wait_for_service_cancellable(name, waiter, None);
         {
             let mut st = self.lock();
             st.waiter = None;
@@ -1362,13 +1362,11 @@ fn wait_failure(end: WaitEnd) -> Failure {
         WaitEnd::Transient(code) => Failure::transient(code),
         WaitEnd::Refused(status) => {
             log::error!("Reconnecting: the service manager refused to watch the name ({status})");
-            // `StatusCode::from` would fold both exceptions into `FailedTransaction`.
-            Failure::permanent(match status.exception_code() {
-                crate::ExceptionCode::Security => StatusCode::PermissionDenied,
-                _ => StatusCode::BadValue,
-            })
+            Failure::permanent(WaitEnd::refused_code(&status))
         }
         WaitEnd::Cancelled => Failure::permanent(StatusCode::DeadObject),
+        // Not reached: the reconnect wait passes no deadline.
+        WaitEnd::TimedOut => Failure::transient(StatusCode::TimedOut),
     }
 }
 

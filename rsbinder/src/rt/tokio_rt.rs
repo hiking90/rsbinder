@@ -252,7 +252,7 @@ pub fn wait_for_interface_async<T: FromIBinder + ?Sized + 'static>(
     let wait = blocking_op(move || {
         // `hub::default()` may probe the wire; casting here matches the sync path's `BadType`.
         let binder = hub::default()?
-            .wait_for_service_cancellable(&name, wait_state)
+            .wait_for_service_cancellable(&name, wait_state, None)
             .map_err(|end| {
                 end.log(&name);
                 StatusCode::NameNotFound

@@ -1594,9 +1594,41 @@ impl ServiceManager {
     /// before the thread blocks stays set, so that wait also gives up.
     pub fn wait_for_service(&self, name: &str) -> Option<SIBinder> {
         // Private state is never cancelled, so this is AOSP's `while(true)`.
-        self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()))
+        self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()), None)
             .map_err(|end| end.log(name))
             .ok()
+    }
+
+    /// [`wait_for_service`](Self::wait_for_service) that gives up after
+    /// `timeout`.
+    ///
+    /// The wait is the same one (the `getService` fast path, the
+    /// `onRegistration` callback, the per-second re-poll), and it ends at the
+    /// first of: `name` registered, `timeout` passed, or a failure. Where
+    /// `wait_for_service` logs a failure and returns `None`, this returns it:
+    ///
+    /// - [`StatusCode::TimedOut`] once `timeout` passes. The callback is
+    ///   unregistered before this returns. `Duration::ZERO` makes the one
+    ///   `getService` lookup and registers nothing; a `timeout` too long for
+    ///   an [`Instant`](std::time::Instant) does not bound the wait.
+    /// - The service manager's `Status` when it refuses
+    ///   `registerForNotifications` for `name`: `EX_SECURITY` for an SELinux
+    ///   `find` denial, `EX_ILLEGAL_ARGUMENT` for an invalid name.
+    /// - The status of the lookup when the service manager is unreachable.
+    ///   On Android 10 a failed lookup does not end the wait (see
+    ///   `wait_for_service`), so there only the timeout does.
+    ///
+    /// AOSP's `waitForService` has no timeout; this one is rsbinder's. An
+    /// async caller bounds [`crate::wait_for_interface_async`] with its
+    /// runtime's timer instead, since dropping that future cancels the wait.
+    pub fn wait_for_service_timeout(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<SIBinder, Status> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()), deadline)
+            .map_err(WaitEnd::into_status)
     }
 
     /// Calls `on_registered` with each binder registered under `name` until the guard drops.
@@ -1608,12 +1640,16 @@ impl ServiceManager {
         WatchGuard::register(self, name, on_registered)
     }
 
-    /// `wait_for_service` that `state.cancel()` ends at once; see its rustdoc "Cancellation".
+    /// `wait_for_service` that `state.cancel()` ends at once (its rustdoc "Cancellation"), and
+    /// `deadline`, when there is one, ends with `TimedOut`.
     pub(crate) fn wait_for_service_cancellable(
         &self,
         name: &str,
         state: Arc<WaiterState>,
+        deadline: Option<std::time::Instant>,
     ) -> std::result::Result<SIBinder, WaitEnd> {
+        const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+        let passed = || deadline.is_some_and(|at| std::time::Instant::now() >= at);
         // Fast path; a transport error means SM unreachable (AOSP `realGetService` → nullptr).
         if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
             return Ok(binder);
@@ -1622,6 +1658,10 @@ impl ServiceManager {
         // Cancelled during the fast path: leave the service manager's callback list untouched.
         if state.is_cancelled() {
             return Err(WaitEnd::Cancelled);
+        }
+        // A zero timeout is the one lookup, with nothing registered either.
+        if passed() {
+            return Err(WaitEnd::TimedOut);
         }
 
         let woken = Arc::clone(&state);
@@ -1637,13 +1677,15 @@ impl ServiceManager {
 
         let mut waited_secs: u64 = 0;
         loop {
+            let tick = deadline.map_or(TICK, |at| {
+                at.saturating_duration_since(std::time::Instant::now())
+                    .min(TICK)
+            });
             {
                 let guard = state.inner.lock().unwrap_or_else(|e| e.into_inner());
                 let (guard, _) = state
                     .cv
-                    .wait_timeout_while(guard, std::time::Duration::from_secs(1), |st| {
-                        st.binder.is_none() && !st.cancelled
-                    })
+                    .wait_timeout_while(guard, tick, |st| st.binder.is_none() && !st.cancelled)
                     .unwrap_or_else(|e| e.into_inner());
                 if let Some(binder) = guard.binder.as_ref() {
                     return Ok(binder.clone());
@@ -1662,6 +1704,9 @@ impl ServiceManager {
             if let Some(binder) = self.try_get_service(name).map_err(WaitEnd::lookup)? {
                 return Ok(binder);
             }
+            if passed() {
+                return Err(WaitEnd::TimedOut);
+            }
         }
     }
 
@@ -1676,6 +1721,25 @@ impl ServiceManager {
             None => Err(StatusCode::NameNotFound),
         }
     }
+
+    /// Interface-typed [`wait_for_service_timeout`](Self::wait_for_service_timeout):
+    /// wait up to `timeout` for `name`, then cast it to `T`.
+    ///
+    /// Returns [`StatusCode::TimedOut`] once `timeout` passes,
+    /// [`StatusCode::PermissionDenied`] or [`StatusCode::BadValue`] when the
+    /// service manager refuses to watch `name` (`EX_SECURITY`,
+    /// `EX_ILLEGAL_ARGUMENT`), the lookup's code when it is unreachable, and
+    /// [`StatusCode::BadType`] when the binder is not a `T`.
+    pub fn wait_for_interface_timeout<T: FromIBinder + ?Sized>(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Strong<T>> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        self.wait_for_service_cancellable(name, Arc::new(WaiterState::default()), deadline)
+            .map_err(WaitEnd::into_code)?
+            .into_interface_checked()
+    }
 }
 
 /// Why [`ServiceManager::wait_for_service_cancellable`] returned without a binder.
@@ -1686,6 +1750,8 @@ pub(crate) enum WaitEnd {
     /// The service manager refused `registerForNotifications` (bad name, SELinux `find`).
     Refused(Status),
     Cancelled,
+    /// The deadline of `wait_for_service_timeout` passed.
+    TimedOut,
 }
 
 impl WaitEnd {
@@ -1711,7 +1777,33 @@ impl WaitEnd {
             WaitEnd::Refused(status) => {
                 log::warn!("wait_for_service: registerForNotifications({name}) failed ({status})")
             }
-            WaitEnd::Cancelled => {}
+            WaitEnd::Cancelled | WaitEnd::TimedOut => {}
+        }
+    }
+
+    /// What `wait_for_service_timeout` returns; its waiter state is never cancelled.
+    pub(crate) fn into_status(self) -> Status {
+        match self {
+            WaitEnd::Transient(code) => code.into(),
+            WaitEnd::Refused(status) => status,
+            WaitEnd::Cancelled | WaitEnd::TimedOut => StatusCode::TimedOut.into(),
+        }
+    }
+
+    /// What `wait_for_interface_timeout` returns; the refusal keeps its kind as a code.
+    pub(crate) fn into_code(self) -> StatusCode {
+        match self {
+            WaitEnd::Transient(code) => code,
+            WaitEnd::Refused(status) => Self::refused_code(&status),
+            WaitEnd::Cancelled | WaitEnd::TimedOut => StatusCode::TimedOut,
+        }
+    }
+
+    /// `StatusCode::from` would fold both refusals into `FailedTransaction`.
+    pub(crate) fn refused_code(status: &Status) -> StatusCode {
+        match status.exception_code() {
+            ExceptionCode::Security => StatusCode::PermissionDenied,
+            _ => StatusCode::BadValue,
         }
     }
 }
@@ -1957,6 +2049,36 @@ pub fn wait_for_service(name: &str) -> Option<SIBinder> {
 #[inline]
 pub fn wait_for_interface<T: FromIBinder + ?Sized>(name: &str) -> Result<Strong<T>> {
     default()?.wait_for_interface(name)
+}
+
+/// Convenience function to wait up to `timeout` for a service from the
+/// default ServiceManager.
+///
+/// Equivalent to `default()?.wait_for_service_timeout(name, timeout)`; see
+/// [`ServiceManager::wait_for_service_timeout`].
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
+#[inline]
+pub fn wait_for_service_timeout(
+    name: &str,
+    timeout: std::time::Duration,
+) -> std::result::Result<SIBinder, Status> {
+    default()?.wait_for_service_timeout(name, timeout)
+}
+
+/// Convenience function to wait up to `timeout` for an interface from the
+/// default ServiceManager.
+///
+/// Equivalent to `default()?.wait_for_interface_timeout(name, timeout)`; see
+/// [`ServiceManager::wait_for_interface_timeout`].
+///
+/// Panics on an uninitialized `ProcessState` — see [`default`]'s `# Panics`.
+#[inline]
+pub fn wait_for_interface_timeout<T: FromIBinder + ?Sized>(
+    name: &str,
+    timeout: std::time::Duration,
+) -> Result<Strong<T>> {
+    default()?.wait_for_interface_timeout(name, timeout)
 }
 
 /// Convenience function to check if a service is available from the default ServiceManager.
