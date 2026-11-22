@@ -9,17 +9,16 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
+#[cfg(not(target_vendor = "apple"))]
 use rustix::net::{send, SendFlags};
 
 use crate::{CallingContext, Result, StatusCode};
 
 /// A write that takes no byte for this long is given up; a pager a person reads keeps it.
 const DEFAULT_STALL: Duration = Duration::from_secs(30);
-/// Never waits in `send`; rustix has no Apple `MSG_NOSIGNAL`, where `F_SETNOSIGPIPE` is the guard.
+/// Never waits in `send`, and a reader that is gone is `EPIPE` without the signal.
 #[cfg(not(target_vendor = "apple"))]
 const SEND_FLAGS: SendFlags = SendFlags::DONTWAIT.union(SendFlags::NOSIGNAL);
-#[cfg(target_vendor = "apple")]
-const SEND_FLAGS: SendFlags = SendFlags::DONTWAIT;
 /// A caller that retries once a second writes one refusal line a minute, not sixty.
 const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
 
@@ -64,9 +63,13 @@ const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
 /// that takes a little at a time receives all of it.
 ///
 /// The fd shares its open file description with the caller, so the writer
-/// leaves its blocking mode alone and waits with `poll` before each write of
-/// at most `PIPE_BUF` bytes. That bounds the wait on a caller that merely
-/// does not read a pipe or a socket, such as a pager left open. It does not
+/// leaves its blocking mode alone. A socket is sent to with `MSG_DONTWAIT`;
+/// any other fd is waited on with `poll` before each write of at most
+/// `PIPE_BUF` bytes. On Apple platforms, where `send` on a blocking socket
+/// waits for room whatever its flags, a socket is written like a pipe, in
+/// pieces of its send low-water mark (`SO_SNDLOWAT`), the room XNU's `poll`
+/// answers writable for. That bounds the wait on a caller that merely does
+/// not read a pipe or a socket, such as a pager left open. It does not
 /// bound:
 ///
 /// - a caller that fills the same pipe from its own copy of the fd between
@@ -259,31 +262,83 @@ fn writable(fd: &OwnedFd, wait: Duration) -> std::io::Result<bool> {
     }
 }
 
+/// How the writer puts bytes on the fd without waiting in the call.
+#[derive(Clone, Copy)]
+enum Way {
+    /// One `send` with `MSG_DONTWAIT`, which a socket outside Apple platforms honors.
+    #[cfg(not(target_vendor = "apple"))]
+    Send,
+    /// `poll`, then a write of at most this many bytes, which an fd that polled writable takes.
+    Fits(usize),
+}
+
+impl Way {
+    fn of(fd: &OwnedFd) -> std::io::Result<Self> {
+        use rustix::fs::FileType;
+        if FileType::from_raw_mode(rustix::fs::fstat(fd)?.st_mode) == FileType::Socket {
+            Ok(socket_way(fd))
+        } else {
+            Ok(Self::Fits(rustix::pipe::PIPE_BUF))
+        }
+    }
+
+    fn write(self, fd: &OwnedFd, rest: &[u8], tick: Duration) -> std::io::Result<usize> {
+        match self {
+            #[cfg(not(target_vendor = "apple"))]
+            Self::Send => match send(fd, rest, SEND_FLAGS) {
+                Err(Errno::AGAIN) => writable(fd, tick).and(Err(Errno::AGAIN.into())),
+                other => other.map_err(Into::into),
+            },
+            Self::Fits(most) => {
+                if !writable(fd, tick)? {
+                    return Err(Errno::AGAIN.into());
+                }
+                let piece = rest.get(..most).unwrap_or(rest);
+                rustix::io::write(fd, piece).map_err(Into::into)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn socket_way(_fd: &OwnedFd) -> Way {
+    Way::Send
+}
+
+/// XNU polls a socket writable once its room reaches `SO_SNDLOWAT`; a write that size never waits.
+#[cfg(target_vendor = "apple")]
+fn socket_way(fd: &OwnedFd) -> Way {
+    use std::os::fd::AsRawFd;
+    let mut lowat: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `lowat` and `len` outlive the call, and `len` is the size of `lowat`.
+    let got = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDLOWAT,
+            (&mut lowat as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    // One byte fits any socket that polled writable, whatever its low-water mark.
+    let most = if got == 0 {
+        usize::try_from(lowat).unwrap_or(1)
+    } else {
+        1
+    };
+    Way::Fits(most.max(1))
+}
+
 /// All of `text`, or an error once `stall` passes with no byte taken; the fd's flags stay as
 /// the caller, who shares its open file description, set them.
 fn write_within(fd: &OwnedFd, text: &[u8], stall: Duration) -> std::io::Result<()> {
     let tick = (stall / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+    let way = Way::of(fd)?;
     let mut rest = text;
-    let mut is_socket = true;
     let mut progressed = Instant::now();
     while !rest.is_empty() {
-        let wrote = if is_socket {
-            match send(fd, rest, SEND_FLAGS) {
-                Err(Errno::NOTSOCK) => {
-                    is_socket = false;
-                    continue;
-                }
-                Err(Errno::AGAIN) => writable(fd, tick).and(Err(Errno::AGAIN.into())),
-                other => other.map_err(Into::into),
-            }
-        } else if writable(fd, tick)? {
-            // At most `PIPE_BUF`: a pipe that polls writable takes that much without waiting.
-            let piece = rest.get(..rustix::pipe::PIPE_BUF).unwrap_or(rest);
-            rustix::io::write(fd, piece).map_err(Into::into)
-        } else {
-            Err(Errno::AGAIN.into())
-        };
-        match wrote {
+        match way.write(fd, rest, tick) {
             Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
             Ok(n) => {
                 rest = rest.get(n..).unwrap_or_default();
@@ -371,12 +426,8 @@ mod tests {
             let (reader, writer) = UnixStream::pair().expect("socketpair");
             (OwnedFd::from(reader), OwnedFd::from(writer))
         };
-        let mut cases = vec![("socket", unread_socket())];
-        // An Apple pipe can poll writable with no room (type rustdoc); the stall cannot bound it.
-        if cfg!(not(target_vendor = "apple")) {
-            cases.push(("pipe", rustix::pipe::pipe().expect("pipe")));
-        }
-        for (what, (_reader, fd)) in cases {
+        let unread_pipe = || rustix::pipe::pipe().expect("pipe");
+        for (what, (_reader, fd)) in [("socket", unread_socket()), ("pipe", unread_pipe())] {
             let writer = DumpWriter::with_stall(STALL);
             let began = Instant::now();
             // More than a pipe (64 KiB) or a socket buffer holds: the write has to wait.
