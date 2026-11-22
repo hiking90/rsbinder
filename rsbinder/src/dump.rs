@@ -15,7 +15,7 @@ use crate::{CallingContext, Result, StatusCode};
 
 /// A write that takes no byte for this long is given up; a pager a person reads keeps it.
 const DEFAULT_STALL: Duration = Duration::from_secs(30);
-/// Never waits in `send`; Apple has no `MSG_NOSIGNAL`, where the thread's mask is the guard.
+/// Never waits in `send`; rustix has no Apple `MSG_NOSIGNAL`, where `F_SETNOSIGPIPE` is the guard.
 #[cfg(not(target_vendor = "apple"))]
 const SEND_FLAGS: SendFlags = SendFlags::DONTWAIT.union(SendFlags::NOSIGNAL);
 #[cfg(target_vendor = "apple")]
@@ -64,9 +64,10 @@ const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
 /// that takes a little at a time receives all of it.
 ///
 /// The fd shares its open file description with the caller, so the writer
-/// leaves its flags alone and waits with `poll` before each write of at most
-/// `PIPE_BUF` bytes. That bounds the wait on a caller that merely does not
-/// read a pipe or a socket, such as a pager left open. It does not bound:
+/// leaves its blocking mode alone and waits with `poll` before each write of
+/// at most `PIPE_BUF` bytes. That bounds the wait on a caller that merely
+/// does not read a pipe or a socket, such as a pager left open. It does not
+/// bound:
 ///
 /// - a caller that fills the same pipe from its own copy of the fd between
 ///   the `poll` and the `write`;
@@ -74,7 +75,11 @@ const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
 ///   FUSE file it serves;
 /// - a terminal that takes no output (a pty nobody reads, or one stopped with
 ///   Ctrl-S): it polls writable while it has room for less than the piece,
-///   and the `write` then waits for the rest.
+///   and the `write` then waits for the rest;
+/// - on Apple platforms, a pipe whose buffer is below 16 KiB and cannot grow,
+///   which happens once the pipes of the whole system hold
+///   `kern.ipc.maxpipekva`: XNU polls a pipe writable against 16 KiB, and the
+///   `write` waits for room in the smaller buffer.
 ///
 /// In each the writer thread, and so this `DumpWriter`, stays held until the
 /// caller closes the fd or exits. Every other transaction of the service is
@@ -84,9 +89,13 @@ const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
 /// # `SIGPIPE`
 ///
 /// A caller that closed its end makes the write fail with `EPIPE`, which ends
-/// the dump. A socket is sent to with `MSG_NOSIGNAL` where the platform has
-/// it. The writer thread also blocks `SIGPIPE` for itself, so a process that
-/// keeps the signal at its default disposition is not ended by it.
+/// the dump, and a process that keeps the signal at its default disposition
+/// is not ended by it. Elsewhere than on Apple platforms, a socket is sent to
+/// with `MSG_NOSIGNAL` and the writer thread blocks `SIGPIPE` for itself.
+/// XNU raises the signal on the process rather than on the writing thread,
+/// so there the writer sets `F_SETNOSIGPIPE` on the fd. That flag belongs to
+/// the open file description: a write the caller makes through its own copy
+/// of the fd then also fails with `EPIPE` instead of raising the signal.
 pub struct DumpWriter {
     state: Arc<Mutex<State>>,
     stall: Duration,
@@ -195,7 +204,7 @@ impl DumpWriter {
         let spawned = std::thread::Builder::new()
             .name("rsbinder:dump".to_owned())
             .spawn(move || {
-                block_sigpipe();
+                guard_sigpipe(&fd);
                 if let Err(e) = write_within(&fd, &text, stall) {
                     log::error!("dump: writing to the fd of {who} failed: {e}");
                 }
@@ -217,13 +226,25 @@ impl DumpWriter {
 }
 
 /// For this thread only: a `write` to a pipe whose reader is gone then fails with `EPIPE` alone.
-fn block_sigpipe() {
+#[cfg(not(target_vendor = "apple"))]
+fn guard_sigpipe(_fd: &OwnedFd) {
     // SAFETY: `set` is zeroed, then initialized by `sigemptyset` before it is read.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGPIPE);
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// XNU raises `SIGPIPE` on the process, which a thread's mask does not keep; the fd's flag does.
+#[cfg(target_vendor = "apple")]
+fn guard_sigpipe(fd: &OwnedFd) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `fd` is open for the call, and `F_SETNOSIGPIPE` takes an int and no pointer.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETNOSIGPIPE, 1) } == -1 {
+        let e = std::io::Error::last_os_error();
+        log::warn!("dump: cannot set F_SETNOSIGPIPE, a closed reader raises SIGPIPE: {e}");
     }
 }
 
@@ -350,8 +371,12 @@ mod tests {
             let (reader, writer) = UnixStream::pair().expect("socketpair");
             (OwnedFd::from(reader), OwnedFd::from(writer))
         };
-        let unread_pipe = || rustix::pipe::pipe().expect("pipe");
-        for (what, (_reader, fd)) in [("socket", unread_socket()), ("pipe", unread_pipe())] {
+        let mut cases = vec![("socket", unread_socket())];
+        // An Apple pipe can poll writable with no room (type rustdoc); the stall cannot bound it.
+        if cfg!(not(target_vendor = "apple")) {
+            cases.push(("pipe", rustix::pipe::pipe().expect("pipe")));
+        }
+        for (what, (_reader, fd)) in cases {
             let writer = DumpWriter::with_stall(STALL);
             let began = Instant::now();
             // More than a pipe (64 KiB) or a socket buffer holds: the write has to wait.

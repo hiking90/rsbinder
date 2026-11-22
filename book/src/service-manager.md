@@ -856,15 +856,20 @@ instance, still gets the whole dump. A caller that passes a pipe or a socket
 and never reads it therefore holds later dumps off for 30 seconds, not until
 the hub restarts.
 
-The hub sets no flag on the fd, which shares its open file description with
-the caller: the writer thread waits with `poll` and then writes at most
-`PIPE_BUF` bytes. Three callers are not bounded by the 30 seconds: one that
-fills the same pipe from its own copy of the fd between the `poll` and the
-`write`, one that passes an fd whose writes it answers itself (a FUSE file
-it serves), and one that passes a terminal that takes no output. Each holds
+The hub leaves the blocking mode of the fd alone, as the fd shares its open
+file description with the caller: the writer thread waits with `poll` and
+then writes at most `PIPE_BUF` bytes. These callers are not bounded by the
+30 seconds: one that fills the same pipe from its own copy of the fd between
+the `poll` and the `write`, one that passes an fd whose writes it answers
+itself (a FUSE file it serves), one that passes a terminal that takes no
+output, and, on macOS, one that passes a pipe whose buffer cannot grow to
+16 KiB because the system's pipes hold `kern.ipc.maxpipekva`. Each holds
 later dumps off until it closes the fd or exits, and nothing else: the
 caller is one the policy allows `list`, and every other call is answered.
-`rsb_service dump` passes a pipe it reads itself, so it is none of the three.
+`rsb_service dump` passes a pipe it reads itself, so it is none of these.
+On macOS the writer sets `F_SETNOSIGPIPE` on the fd, so a write the caller
+makes through its own copy of it after the reader is gone fails with
+`EPIPE` instead of raising `SIGPIPE`.
 
 A hub on a socket has a serve thread and a reaper thread per session and no call
 restriction; what holds it up is in [Topics](./topics.md#what-differs-from-kernel-binder).

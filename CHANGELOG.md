@@ -157,9 +157,12 @@ peers; peers of either release still subscribe to each other.
   `send_with(fd, render)` makes the text on the binder thread and returns. It
   writes one dump at a time and answers `WouldBlock` to a call that arrives
   meanwhile, without making its text. A dump whose reader takes no byte for
-  30 seconds (`with_stall`) is given up and its fd closed. The writer thread
-  blocks `SIGPIPE` for itself, so a caller that closed its end of a pipe does
-  not end a process that keeps the signal's default disposition.
+  30 seconds (`with_stall`) is given up and its fd closed. A caller that
+  closed its end of a pipe does not end a process that keeps `SIGPIPE`'s
+  default disposition: the writer thread blocks the signal for itself, and
+  on Apple platforms, where XNU raises it on the process, sets
+  `F_SETNOSIGPIPE` on the fd. On Apple platforms the 30 seconds do not bound
+  a pipe whose buffer cannot grow to 16 KiB (`kern.ipc.maxpipekva`).
 - `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds: it
   closes the fd and writes the next dump. A caller that passed a pipe and
   never read it left every later dump refused with `WOULD_BLOCK` until the
