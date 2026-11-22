@@ -118,7 +118,7 @@ peers; peers of either release still subscribe to each other.
   `oneway void unsubscribed()` and `TopicStatus status()`. An `ITopic` of the
   application's own does not compile until it implements them; each hands
   over to the `Acceptor` method of the same name, and its
-  `rsbinder::Interface::dump` to `Acceptor::dump`. A struct literal of
+  `rsbinder::Interface::dump_fd` to `Acceptor::dump_fd`. A struct literal of
   `SubscribeRequest` or `TopicEndpoint` names the new fields or ends in
   `..Default::default()`, and `SubscriberInfo` has the fields `id` and
   `unwaited`.
@@ -136,6 +136,14 @@ peers; peers of either release still subscribe to each other.
   by the subscriber with `InvalidOperation`. A 0.1.0 subscriber ignores the
   new fields and never calls the new methods: its drop is seen at the next
   publish, as before.
+- `rsb_service dump` passes the service a pipe of its own, as AOSP `dumpsys`
+  does, and prints what it read once the service has closed it; the service
+  wrote to a duplicate of the command's stdout. Output no longer appears
+  while the dump is being written. A dump that has not ended after 10
+  seconds prints what arrived, reports `dump of NAME timed out` on stderr
+  and exits 2; `--timeout SECS` sets the time, and 0 or less is refused. A
+  `--timeout` among the service's own arguments goes after `--`. The time
+  also bounds a service that never takes the call.
 - `rsb_hub`: an `exec` start that ends before any name it starts was
   registered holds the next start of that argv off for 1, 2, 4, 8, 16, then
   30 seconds, by the count of such ends in a row. A program that registers
@@ -144,10 +152,26 @@ peers; peers of either release still subscribe to each other.
 
 ### Added
 
-- `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds, on
-  Linux and Android: it closes the fd and writes the next dump. A caller
-  that passed a pipe and never read it left every later dump refused with
-  `WOULD_BLOCK` until the hub restarted.
+- `rsbinder::DumpWriter` writes a dump to the caller's fd on a thread of its
+  own, for a service that overrides `Interface::dump_fd`:
+  `send_with(fd, render)` makes the text on the binder thread and returns. It
+  writes one dump at a time and answers `WouldBlock` to a call that arrives
+  meanwhile, without making its text. A dump whose reader takes no byte for
+  30 seconds (`with_stall`) is given up and its fd closed. A caller that
+  closed its end of a pipe does not end a process that keeps `SIGPIPE`'s
+  default disposition: the writer thread blocks the signal for itself, and
+  on Apple platforms, where XNU raises it on the process, sets
+  `F_SETNOSIGPIPE` on the fd. On Apple platforms the 30 seconds do not bound
+  a pipe whose buffer cannot grow to 16 KiB (`kern.ipc.maxpipekva`).
+- `rsb_hub` gives up a dump whose reader takes no byte for 30 seconds: it
+  closes the fd and writes the next dump. A caller that passed a pipe and
+  never read it left every later dump refused with `WOULD_BLOCK` until the
+  hub restarted. The hub writes with `rsbinder::DumpWriter`, so the 30
+  seconds do not bound a caller that fills the same pipe itself, an fd whose
+  writes the caller answers, or a terminal that takes no output; each holds
+  later dumps off until it closes the fd. A dump refused with `WOULD_BLOCK`
+  no longer makes its text, and its log line is written at most once a
+  minute.
 - `rsb_service wait NAME [--timeout SECS] [--start]` returns once the name
   is registered: exit 0, 1 when the timeout passes first, 2 when the hub
   denies `find` on the name or cannot be reached. `--start` looks up with
@@ -207,7 +231,11 @@ peers; peers of either release still subscribe to each other.
 - `rsbinder-topic`: `ITopic.status` and the binder dump of a publisher
   (`dumpsys` on Android), which name each subscription's uid, pid, lag and
   losses, for callers `PublisherBuilder::inspect` admits: by default the
-  publisher's uid, root, and on Android `shell`. `RegistryResolver::lookup`
+  publisher's uid, root, and on Android `shell`. The dump is written by
+  `Acceptor::dump_fd` on a thread of its own (`rsbinder::DumpWriter`), one
+  dump of a topic at a time, so a caller that does not read its pipe holds
+  no binder thread of the publisher; `Acceptor::dump` writes the same text
+  to a writer on the calling thread. `RegistryResolver::lookup`
   gives the `ITopic` binder of a registry name; `uds::status` and
   `UdsResolver::status` ask for the status over a socket; `TopicStatus`
   implements `Display`, the text of the dump.

@@ -3792,6 +3792,22 @@ impl core::marker::Unpin for rsbinder::DeathSignal
 impl core::marker::UnsafeUnpin for rsbinder::DeathSignal
 impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::DeathSignal
 impl !core::panic::unwind_safe::UnwindSafe for rsbinder::DeathSignal
+pub struct rsbinder::DumpWriter
+impl rsbinder::DumpWriter
+pub fn rsbinder::DumpWriter::new() -> Self
+pub fn rsbinder::DumpWriter::send_with(&self, std::os::fd::owned::OwnedFd, impl core::ops::function::FnOnce() -> rsbinder::Result<alloc::vec::Vec<u8>>) -> rsbinder::Result<()>
+pub fn rsbinder::DumpWriter::with_stall(core::time::Duration) -> Self
+impl core::default::Default for rsbinder::DumpWriter
+pub fn rsbinder::DumpWriter::default() -> Self
+impl core::fmt::Debug for rsbinder::DumpWriter
+pub fn rsbinder::DumpWriter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::DumpWriter
+impl core::marker::Send for rsbinder::DumpWriter
+impl core::marker::Sync for rsbinder::DumpWriter
+impl core::marker::Unpin for rsbinder::DumpWriter
+impl core::marker::UnsafeUnpin for rsbinder::DumpWriter
+impl core::panic::unwind_safe::RefUnwindSafe for rsbinder::DumpWriter
+impl core::panic::unwind_safe::UnwindSafe for rsbinder::DumpWriter
 pub struct rsbinder::ExtendedError
 pub rsbinder::ExtendedError::command: u32
 pub rsbinder::ExtendedError::id: u32

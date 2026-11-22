@@ -445,6 +445,22 @@ want_out "filter: ac61.allowed"       "dump echoes the filter"
 want_out "ac61.allowed.live"          "dump keeps the matching name"
 reject_out "^  manager$"              "dump dropped the non-matching name"
 
+note "6-8  dump reads a pipe of its own until end-of-file or --timeout"
+run_svc dump --timeout 0 manager
+want_rc 2 "--timeout 0 is refused"
+want_out "more than 0"                "and the message says what it takes"
+# The reader of stdout is gone before the dump is written to it: `:` reads nothing.
+$SVC dump manager 2>"$OUT" | :
+SVC_RC=${PIPESTATUS[0]}
+want_rc 0 "a dump whose stdout closed first exits 0"
+[ -s "$OUT" ] && bad "and it wrote to stderr: $(head -3 "$OUT")" || ok "and it says nothing on stderr"
+# A stopped registrant takes the transaction and never answers it.
+kill -STOP "$HOLD_PID"
+run_svc dump --timeout 1 ac61.allowed.live
+want_rc 2 "a dump of a stopped service exits 2"
+want_out "dump of ac61.allowed.live timed out after 1s" "and says it timed out"
+kill -CONT "$HOLD_PID"
+
 kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null
 
 rm -f "$MARKER" "$POLDIR/30-declared.toml"

@@ -49,6 +49,12 @@ The additions and fixes themselves are listed in
   registered, now runs it at most once per hold-off; a service that registers
   is unaffected. See
   [Declaring services](./service-manager.md#declaring-services).
+- `rsb_service dump NAME` hands the service a pipe and prints what it read
+  once the service closes it. In 0.13.0 the service wrote to the command's
+  stdout itself, so output appeared as it was written. A dump that has not
+  ended in 10 seconds now prints what arrived and exits 2; `--timeout SECS`
+  changes the 10. An argument `--timeout` meant for the service goes after
+  `--`.
 
 The sections below are about `rsbinder-topic`.
 
@@ -149,12 +155,13 @@ too.
 `ITopic` has two more methods, `unsubscribed` and `status`, and a type of the
 application's own that implements it does not compile until it has them. Each
 hands over to the `Acceptor` method of the same name, as `subscribe` hands over
-to `accept`, and the type's `rsbinder::Interface::dump` to `Acceptor::dump`:
+to `accept`, and the type's `rsbinder::Interface::dump_fd` to
+`Acceptor::dump_fd`, which writes the dump on a thread of its own:
 
 ```rust,ignore
 impl rsbinder::Interface for Guarded {
-    fn dump(&self, writer: &mut dyn std::io::Write, args: &[String]) -> rsbinder::Result<()> {
-        self.acceptor.dump(writer, args)
+    fn dump_fd(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> rsbinder::Result<()> {
+        self.acceptor.dump_fd(fd, args)
     }
 }
 
