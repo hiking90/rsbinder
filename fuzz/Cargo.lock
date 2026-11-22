@@ -502,7 +502,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rsbinder"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "getrandom 0.4.3",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-aidl"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "miette",
  "pest",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-fmq"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "libc",
  "log",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "rsbinder-macros"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "proc-macro2",
  "quote",

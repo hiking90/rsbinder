@@ -26,7 +26,7 @@ distinguish RPC from kernel binder.
 >
 > ```toml
 > [dependencies]
-> rsbinder = { version = "0.13", features = ["rpc"] }
+> rsbinder = { version = "0.14", features = ["rpc"] }
 > ```
 
 ## When to use RPC vs. kernel binder
@@ -280,7 +280,7 @@ Add the matching feature in `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsbinder = { version = "0.13", features = ["rpc", "rpc-vsock"] }
+rsbinder = { version = "0.14", features = ["rpc", "rpc-vsock"] }
 ```
 
 Each backend implements the

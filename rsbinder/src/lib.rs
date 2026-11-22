@@ -168,7 +168,7 @@
 //!
 //! ```toml
 //! [build-dependencies]
-//! rsbinder-aidl = "0.13"
+//! rsbinder-aidl = "0.14"
 //! ```
 //!
 //! ## Implementing the Service
