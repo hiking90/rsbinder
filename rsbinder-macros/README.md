@@ -44,7 +44,7 @@ type table. `#[deprecated]` renders AIDL's `@deprecated`.
 Enable it through `rsbinder`:
 
 ```toml
-rsbinder = { version = "0.13", features = ["macros"] }
+rsbinder = { version = "0.14", features = ["macros"] }
 ```
 
 Part of [rsbinder](https://github.com/hiking90/rsbinder). Apache-2.0.

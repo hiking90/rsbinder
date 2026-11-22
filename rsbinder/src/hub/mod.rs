@@ -502,6 +502,13 @@ pub mod sdk_versions {
 ///
 /// For version-specific features not covered by the common API, cast to the specific
 /// version's ServiceManager implementation or use the version-specific modules directly.
+///
+/// A variant is one wire generation of `IServiceManager`, and the set depends on the
+/// target and the `android_*` features compiled in. The enum is `#[non_exhaustive]`: a
+/// generation added later, such as one that answers `checkServiceAccess` (appended in
+/// `android-16.0.0_r3`), is a new variant, so a `match` outside this crate carries a
+/// wildcard arm.
+#[non_exhaustive]
 pub enum ServiceManager {
     #[cfg(all(target_os = "android", feature = "android_10"))]
     Android10(android_10::BpServiceManager),

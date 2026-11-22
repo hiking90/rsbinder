@@ -49,6 +49,10 @@ peers; peers of either release still subscribe to each other.
   recipients have run: those run on the session's reaper thread.
 - `end` after an awaited ring `send_async` whose record failed other than by
   timing out sends the caller's end, where it sent `EX_ILLEGAL_STATE`.
+- `hub::ServiceManager` is `#[non_exhaustive]`: a `match` on it outside
+  rsbinder needs a wildcard arm. A later `IServiceManager` generation, such as
+  the one that appends `checkServiceAccess` (`android-16.0.0_r3`), is then a
+  new variant without a breaking release.
 
 - **`rsbinder-topic` (breaking): both ends are made by a builder.**
   `PublisherPolicy`, `PoolPolicy`, `Backpressure`, `Authorize`,

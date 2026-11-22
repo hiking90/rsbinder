@@ -24,10 +24,10 @@ transports, chosen at run time by a `Uri`:
 
 ```toml
 [dependencies]
-rsbinder = "0.13"
+rsbinder = "0.14"
 
 [build-dependencies]
-rsbinder-aidl = { version = "0.13", features = ["async"] }
+rsbinder-aidl = { version = "0.14", features = ["async"] }
 ```
 
 `build.rs` generates the Rust code for an interface:

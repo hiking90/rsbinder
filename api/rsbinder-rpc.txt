@@ -2186,7 +2186,7 @@ pub fn rsbinder::hub::android_16::unregister_for_notifications(&rsbinder::hub::a
 pub type rsbinder::hub::android_16::AccessorAddrProvider = alloc::boxed::Box<(dyn core::ops::function::Fn(&str) -> rsbinder::Result<rsbinder::hub::android_16::AccessorSockAddr> + core::marker::Send + core::marker::Sync)>
 pub type rsbinder::hub::android_16::AccessorProviderFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&str) -> core::option::Option<rsbinder::SIBinder> + core::marker::Send + core::marker::Sync)>
 pub type rsbinder::hub::android_16::IAccessorDefaultRef = alloc::sync::Arc<dyn rsbinder::hub::android_16::IAccessorDefault>
-pub enum rsbinder::hub::ServiceManager
+#[non_exhaustive] pub enum rsbinder::hub::ServiceManager
 pub rsbinder::hub::ServiceManager::Android16(rsbinder::hub::android_16::android::os::IServiceManager::BpServiceManager)
 impl rsbinder::hub::ServiceManager
 pub fn rsbinder::hub::ServiceManager::add_service(&self, &str, impl core::convert::Into<rsbinder::SIBinder>) -> core::result::Result<(), rsbinder::Status>

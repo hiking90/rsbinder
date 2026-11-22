@@ -116,16 +116,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    #[cfg(target_os = "android")]
     let numbering = match &*sm {
+        #[cfg(target_os = "android")]
         hub::ServiceManager::Android14(_) => "pre-r6",
+        #[cfg(target_os = "android")]
         hub::ServiceManager::Android15(_) => "r6+",
         _ => "neither Android 15 numbering",
-    };
-    // Off-device builds only ever see the Android 16 fallback variant.
-    #[cfg(not(target_os = "android"))]
-    let numbering = match &*sm {
-        hub::ServiceManager::Android16(_) => "neither Android 15 numbering",
     };
     println!("probe picked: the {numbering} module");
     if let Some(expected) = std::env::args().nth(2) {
