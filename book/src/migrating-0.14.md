@@ -39,6 +39,9 @@ The additions and fixes themselves are listed in
 - `end` after an awaited ring `send_async` whose record failed other than by
   timing out sends the caller's end. In 0.13.0 it sent `EX_ILLEGAL_STATE` naming
   that item.
+- `hub::ServiceManager` is `#[non_exhaustive]`. A `match` on the value
+  `hub::default()` returns needs a `_` arm; one that names every variant of
+  your build no longer compiles. An `if let` on one variant is unchanged.
 
 ## `rsb_hub`
 

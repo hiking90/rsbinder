@@ -57,7 +57,6 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let swm = match &*sm {
         hub::ServiceManager::Android16(inner) => hub::android_16::get_service(inner, &instance)
             .ok_or_else(|| format!("get_service({instance}) returned None"))?,
-        #[allow(unreachable_patterns, reason = "android_N features add variants")]
         _ => return Err("servicemanager is not Android16 — wrong AVD?".into()),
     };
     let accessor_binder = swm
