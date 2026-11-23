@@ -84,6 +84,52 @@ not `rsb_hub` — so a second instance on the same device exits 1 and says so.
 To run an independent one, give it its own device: `sudo rsb_device other`
 then `rsb_hub --device other`.
 
+### When the hub restarts
+
+The names, the notification callbacks and the client callbacks live in
+`rsb_hub`'s memory and end with it. A hub that starts again knows the
+configuration and nothing else:
+
+| | After the hub restarts |
+|---|---|
+| A call on a binder a client already holds | Goes on: it never passed through the hub |
+| A lookup of a service that was registered | Finds nothing until the service adds itself again |
+| `register_for_notifications`, `hub::watch`, a wait | Registered with the hub that ended; the new one does not call it |
+| A service's process | Still runs, under no name |
+
+Neither `rsb_hub` nor the library puts a name back: a service registers when
+it starts, so what puts the names back is starting the services again, and
+that is the init system's to do. `rsb_hub` does not know a service's
+program, user or sandbox; its unit does. Tie each service's unit to the
+hub's:
+
+```ini
+[Unit]
+Description=example service
+Requires=rsb_hub.service
+After=rsb_hub.service
+
+[Service]
+ExecStart=/usr/bin/exampled
+```
+
+| The service's dependency on the hub | When the hub is restarted, by `systemctl restart` or by `Restart=` after it was killed |
+|---|---|
+| `Requires=` or `PartOf=`, with `After=` | The service is restarted and registers again |
+| `BindsTo=` | The service is stopped and **stays stopped**, unless it has a `Restart=` of its own |
+| none | The service goes on running and has no name |
+
+`Requires=` also starts the hub when the service is started; `PartOf=` does
+not. A service started again drops the connections its clients held: a
+client hears of it through [`link_to_death`](./callbacks-and-interfaces.md)
+and finds the new one, which [`Reconnecting`](./reconnecting.md) does for it.
+
+Another init system needs the same two things said in its own
+configuration: the service starts after the hub, and a restart of the hub
+restarts the service. Where nothing supervises the processes, as in a
+container that runs the hub and its services by hand, restarting the hub
+means restarting them too.
+
 ### Inspecting a running HUB
 
 The `rsb_service` CLI, also from `rsbinder-tools`, is the Linux counterpart of

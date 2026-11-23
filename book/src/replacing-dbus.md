@@ -181,6 +181,11 @@ running.
 - **Name ownership.** A name is replaced by a later `add` of the same uid and
   refused to another uid while its service lives. There is no queue of
   waiting owners.
+- **A restart of the hub.** The names end with `rsb_hub`, as a bus's do with
+  its daemon, and the init system restarts the services that depend on it;
+  see [When the hub restarts](./service-manager.md#when-the-hub-restarts).
+  Unlike a D-Bus connection, a call on a binder a client already holds goes
+  on while the hub is down.
 
 ## Looking at a running system
 
