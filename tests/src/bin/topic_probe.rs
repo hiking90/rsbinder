@@ -16,6 +16,8 @@
 //!   fill:PREFIX:N            one such advertise of each of PREFIX0 .. PREFIX<N-1>
 //!   watchmany:PREFIX:N       a watch of each of PREFIX0 .. PREFIX<N-1>, told nothing
 //!   subscribe:NAME           a NamedSubscriber (`Start::Newest`), a `GOT` line per new value
+//!   spublish:NAME:VALUE      `publish` with the session bus (`rsbinder::bus::session`) for names
+//!   ssubscribe:NAME          `subscribe` with the session bus for names
 //!   addreserved              addService of the registry's own name
 //!   capture:NAME             advertise NAME as a topic that keeps the first subscriber's token
 //!   relay:CALL:TARGET        hand the kept token to the hub under TARGET: CALL is `add`
@@ -231,10 +233,14 @@ fn resolver() -> BinderResult<RegistryResolver> {
     RegistryResolver::find()
 }
 
-fn subscribe(name: &str, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
+fn session() -> BinderResult<rsbinder::bus::Bus> {
+    Ok(rsbinder::bus::session()?)
+}
+
+fn subscribe(name: &str, on: &dyn Resolver, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
     let mut subscriber = Subscriber::<Bytes>::builder()
         .start_at(Start::Newest)
-        .subscribe_named_on(name, &resolver()?)?;
+        .subscribe_named_on(name, on)?;
     let name = name.to_owned();
     kept.push(Box::new(std::thread::spawn(move || {
         let mut last = None;
@@ -255,9 +261,14 @@ fn subscribe(name: &str, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
     Ok(())
 }
 
-fn publish(name: &str, value: &str, kept: &mut Vec<Box<dyn Any>>) -> BinderResult<()> {
+fn publish(
+    name: &str,
+    value: &str,
+    on: &dyn Resolver,
+    kept: &mut Vec<Box<dyn Any>>,
+) -> BinderResult<()> {
     let publisher = Publisher::<Bytes>::events().ring_bytes(64 << 10).build()?;
-    publisher.advertise_on(name, &resolver()?)?;
+    publisher.advertise_on(name, on)?;
     let value = Bytes(value.as_bytes().to_vec());
     kept.push(Box::new(std::thread::spawn(move || loop {
         let _ = publisher.publish(&value);
@@ -273,10 +284,18 @@ fn step(op: &str, arg: &str, kept: &mut Vec<Box<dyn Any>>) {
     };
     match op {
         "find" => done(resolver().map(drop)),
+        "spublish" => {
+            let (name, value) = arg.split_once(':').expect("NAME:VALUE");
+            match session().and_then(|session| publish(name, value, &session, kept)) {
+                Ok(()) => result(op, name, "OK"),
+                Err(status) => result(op, name, &outcome(&status)),
+            }
+        }
+        "ssubscribe" => done(session().and_then(|session| subscribe(arg, &session, kept))),
         "publish" => {
             let (name, value) = arg.split_once(':').expect("NAME:VALUE");
             let began = Instant::now();
-            let got = publish(name, value, kept);
+            let got = resolver().and_then(|registry| publish(name, value, &registry, kept));
             time(op, name, began.elapsed());
             match got {
                 Ok(()) => result(op, name, "OK"),
@@ -328,7 +347,7 @@ fn step(op: &str, arg: &str, kept: &mut Vec<Box<dyn Any>>) {
             }
             Ok(())
         })()),
-        "subscribe" => done(subscribe(arg, kept)),
+        "subscribe" => done(resolver().and_then(|registry| subscribe(arg, &registry, kept))),
         "addreserved" => done(hub::add_service(SERVICE_NAME, ended())),
         "capture" => done((|| {
             let topic: Strong<dyn ITopic> = BnTopic::new_binder(Capture);

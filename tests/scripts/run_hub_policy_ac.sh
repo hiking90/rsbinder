@@ -9,7 +9,7 @@
 # stand in for it, which is why none of this can run on macOS.
 #
 #   cargo build -p rsbinder-tools --bin rsb_hub --bin rsb_service
-#   cargo build -p tests --bin ac61_probe
+#   cargo build -p tests --bin ac61_probe --bin topic_probe
 #   ./tests/scripts/run_hub_policy_ac.sh
 #
 # Runs entirely as the invoking unprivileged user. The "two different uids"
@@ -26,6 +26,7 @@ cd "$(dirname "$0")/../.." || exit 1
 HUB=./target/debug/rsb_hub
 SVC=./target/debug/rsb_service
 PROBE=./target/debug/ac61_probe
+TOPIC_PROBE=./target/debug/topic_probe
 # Not under /tmp: it is world-writable and rsb_hub refuses a configuration there (gated below).
 POLDIR="${XDG_RUNTIME_DIR:-${HOME:?}}/rsb61-policy"
 LOG=/tmp/rsb61-hub.log
@@ -578,6 +579,17 @@ want_line   "SLIST ac20.session"                         "its list has the sessi
 want_line   "SLIST ac20.own"                             "all of them"
 reject_line "SLIST manager"                              "and none of the system bus's"
 reject_line "SLIST user/abc/ac20.plain"                  "whatever their spelling"
+# A topic by a session name: the publisher and the subscriber are two processes.
+$TOPIC_PROBE spublish:ac20.topic:hello hold:20 >/tmp/rsb61-topic-pub.out 2>&1 &
+TOPIC_PUB=$!
+sleep 1
+grep -qx "RESULT spublish ac20.topic OK" /tmp/rsb61-topic-pub.out && ok "a publisher advertises a topic on the session bus" \
+    || bad "spublish: $(head -3 /tmp/rsb61-topic-pub.out)"
+$TOPIC_PROBE ssubscribe:ac20.topic hold:2 >"$OUT" 2>&1
+want_line "GOT ac20.topic hello" "a subscriber of another process reads it by the session name"
+run_probe "find:user/$MY_UID/ac20.topic"
+want_result find "user/$MY_UID/ac20.topic" OK "the hub holds the topic as user/<uid>/NAME"
+kill "$TOPIC_PUB" 2>/dev/null; wait "$TOPIC_PUB" 2>/dev/null
 echo 'name = "app/{uid}/*"' | sed 's/^/[[rule]]\n/' > "$USERPOL/20-bad.toml"
 $HUB --check-config --config "$USERPOL" >"$OUT" 2>&1 && bad "a placeholder outside user/{uid}/* loaded" \
     || ok "a placeholder outside user/{uid}/* fails the load"
