@@ -200,6 +200,13 @@ peers; peers of either release still subscribe to each other.
   `getService2`, `checkService2`) at `warn`, once a minute for each uid and
   name, and its dump counts them in `refused lookups:`. The caller is still
   answered as for a name that is not registered.
+- `rsb_hub` policy: the pattern `user/{uid}/*`, in `[[rule]]` and `[[topic]]`,
+  covers every name that starts with `user/<digits>/` and grants one only to
+  the caller whose uid the digits spell, so each uid has names no other uid
+  can add or find. `{` and `}` in any other pattern fail the load; such a
+  pattern loaded before and matched no name.
+  `rsbinder_tools::config::NamePattern` has the variant `UserNamespace` and
+  `PolicyError` the variant `UnsupportedPlaceholder`.
 - `rsb_hub`'s dump has `uptime:`, an `age=` for each registration, and a
   `declared (N):` section: each `[[service]]` the caller may `find`, with its
   `start` kind, whether it is registered, and for one with a `start` whether

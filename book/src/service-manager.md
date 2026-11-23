@@ -593,6 +593,25 @@ catch-alls last.
 Patterns support a trailing `*` and nothing else. A leading or interior `*`
 is rejected at load time rather than silently matching nothing.
 
+One pattern is spelled differently: `user/{uid}/*`, the names each uid has to
+itself.
+
+```toml
+[[rule]]
+name = "user/{uid}/*"
+add  = "any"
+find = "any"
+```
+
+The rule matches every name that starts with `user/<digits>/`, and grants one
+only to the caller whose uid those digits spell: uid 1000 may add and find
+`user/1000/player`, and nobody else may, uid 0 included. `add` and `find`
+narrow that further, to a group for instance. Because the rule matches another
+uid's names and refuses them, a catch-all after it does not grant them; put it
+before any rule that would. The digits are the uid as it prints in decimal, so
+`user/01000/player` is nobody's. `{` and `}` are rejected at load time in any
+other pattern, and `[[topic]]` rules take the same one.
+
 ### Reloading
 
 `SIGHUP` reloads the policy in place:
