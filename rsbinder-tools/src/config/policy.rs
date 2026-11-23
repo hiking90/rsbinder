@@ -137,6 +137,23 @@ pub enum NamePattern {
     /// `"com.example.*"` — matches any name with this prefix (the stored
     /// string excludes the `*`). An empty prefix is [`NamePattern::Any`].
     Prefix(String),
+    /// `"user/{uid}/*"` — the names every uid has to itself: it matches any name that starts
+    /// with `user/<digits>/`, and a rule under it grants a name only to the caller whose uid
+    /// those digits spell ([`NamePattern::is_callers`]).
+    ///
+    /// It matches by the name alone, whoever calls, so that the rule governs another uid's
+    /// names too and refuses them: were they left unmatched, the first-match evaluation would
+    /// hand them to a later rule, which a catch-all `"*"` would then grant.
+    UserNamespace,
+}
+
+/// The spelling of [`NamePattern::UserNamespace`] in a policy file.
+const USER_NAMESPACE: &str = "user/{uid}/*";
+
+/// The digits of a name that starts with `user/<digits>/`.
+fn uid_segment(name: &str) -> Option<&str> {
+    let (digits, _) = name.strip_prefix("user/")?.split_once('/')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
 impl NamePattern {
@@ -146,9 +163,19 @@ impl NamePattern {
     /// they mean something and would silently match nothing, which in a
     /// default-deny policy is a hole that fails *open* for whatever later
     /// rule catches the name instead.
+    ///
+    /// `{` and `}` are refused for the same reason everywhere but in `"user/{uid}/*"`, the one
+    /// placeholder there is ([`NamePattern::UserNamespace`]): no name holds a brace, so
+    /// `"app/{uid}/*"` would match nothing.
     pub fn parse(spec: &str) -> Result<NamePattern, PolicyError> {
         if spec.is_empty() {
             return Err(PolicyError::EmptyPattern);
+        }
+        if spec == USER_NAMESPACE {
+            return Ok(NamePattern::UserNamespace);
+        }
+        if spec.contains(['{', '}']) {
+            return Err(PolicyError::UnsupportedPlaceholder(spec.to_owned()));
         }
         match spec.find('*') {
             None => Ok(NamePattern::Exact(spec.to_owned())),
@@ -170,6 +197,20 @@ impl NamePattern {
             NamePattern::Any => true,
             NamePattern::Exact(exact) => exact == name,
             NamePattern::Prefix(prefix) => name.starts_with(prefix.as_str()),
+            NamePattern::UserNamespace => uid_segment(name).is_some(),
+        }
+    }
+
+    /// Is `name`, which this pattern [`matches`](Self::matches), one a rule under it may grant
+    /// to `uid`? Always, but for [`NamePattern::UserNamespace`]: there the digits of the name
+    /// have to be `uid` as it prints in decimal, so `user/01000/x` is no uid's name.
+    pub fn is_callers(&self, name: &str, uid: u32) -> bool {
+        match self {
+            NamePattern::Any | NamePattern::Exact(_) | NamePattern::Prefix(_) => true,
+            NamePattern::UserNamespace => uid_segment(name).is_some_and(|digits| {
+                let canonical = digits == "0" || !digits.starts_with('0');
+                canonical && digits.parse() == Ok(uid)
+            }),
         }
     }
 }
@@ -180,6 +221,7 @@ impl fmt::Display for NamePattern {
             NamePattern::Any => f.write_str("*"),
             NamePattern::Exact(exact) => f.write_str(exact),
             NamePattern::Prefix(prefix) => write!(f, "{prefix}*"),
+            NamePattern::UserNamespace => f.write_str(USER_NAMESPACE),
         }
     }
 }
@@ -261,26 +303,30 @@ impl Policy {
             return self.list.allows_parts(uid, gids);
         }
         match self.rules.iter().find(|rule| rule.pattern.matches(name)) {
-            Some(rule) => rule.subjects_for(permission).allows_parts(uid, gids),
+            Some(rule) => {
+                rule.pattern.is_callers(name, uid)
+                    && rule.subjects_for(permission).allows_parts(uid, gids)
+            }
             None => false,
         }
     }
 
     /// Could a larger group set change the answer to
-    /// [`check(permission, name, _)`](Self::check)?
+    /// [`check(permission, name, _)`](Self::check) for a caller of `uid`?
     ///
     /// True only when the governing subject set (the global `list` gate, or
     /// the first rule covering `name`) grants to at least one group. An
     /// `any` set has already allowed, and `none` or a uid-only set answers
-    /// the same whatever the groups are. `Enforcer` uses this to decide
-    /// whether a deny is worth a fresh name-service read.
-    pub fn group_could_grant(&self, permission: Permission, name: &str) -> bool {
+    /// the same whatever the groups are. Nor does a group lift the deny of a
+    /// name that is not `uid`'s ([`NamePattern::is_callers`]). `Enforcer` uses
+    /// this to decide whether a deny is worth a fresh name-service read.
+    pub fn group_could_grant(&self, permission: Permission, name: &str, uid: u32) -> bool {
         let subjects = if permission == Permission::List {
             &self.list
         } else {
             match self.rules.iter().find(|rule| rule.pattern.matches(name)) {
-                Some(rule) => rule.subjects_for(permission),
-                None => return false,
+                Some(rule) if rule.pattern.is_callers(name, uid) => rule.subjects_for(permission),
+                _ => return false,
             }
         };
         matches!(subjects, Subjects::Set { gids, .. } if !gids.is_empty())
@@ -362,21 +408,38 @@ impl TopicPolicy {
         uid: u32,
         gids: &BTreeSet<u32>,
     ) -> bool {
-        self.subjects_for(permission, name)
-            .is_some_and(|subjects| subjects.allows_parts(uid, gids))
+        self.is_callers(permission, name, uid)
+            && self
+                .subjects_for(permission, name)
+                .is_some_and(|subjects| subjects.allows_parts(uid, gids))
     }
 
-    /// Could a larger group set change the answer? See [`Policy::group_could_grant`].
-    pub fn group_could_grant(&self, permission: TopicPermission, name: &str) -> bool {
-        matches!(
-            self.subjects_for(permission, name),
-            Some(Subjects::Set { gids, .. }) if !gids.is_empty()
-        )
+    /// The rule that governs `name`: the first whose pattern covers it.
+    fn rule_of(&self, name: &str) -> Option<&TopicRule> {
+        self.rules.iter().find(|rule| rule.pattern.matches(name))
+    }
+
+    /// Is `name` one its rule may grant to `uid`? `List` has no name, so always.
+    fn is_callers(&self, permission: TopicPermission, name: &str, uid: u32) -> bool {
+        permission == TopicPermission::List
+            || self
+                .rule_of(name)
+                .is_some_and(|rule| rule.pattern.is_callers(name, uid))
+    }
+
+    /// Could a larger group set change the answer for a caller of `uid`? See
+    /// [`Policy::group_could_grant`].
+    pub fn group_could_grant(&self, permission: TopicPermission, name: &str, uid: u32) -> bool {
+        self.is_callers(permission, name, uid)
+            && matches!(
+                self.subjects_for(permission, name),
+                Some(Subjects::Set { gids, .. }) if !gids.is_empty()
+            )
     }
 
     /// The set that governs `permission` on `name`; `None` when no rule covers it.
     fn subjects_for(&self, permission: TopicPermission, name: &str) -> Option<&Subjects> {
-        let rule = || self.rules.iter().find(|rule| rule.pattern.matches(name));
+        let rule = || self.rule_of(name);
         match permission {
             TopicPermission::List => Some(&self.list),
             TopicPermission::Advertise => rule().map(|rule| &rule.advertise),
@@ -394,6 +457,9 @@ pub enum PolicyError {
     /// A `*` appeared anywhere but the end. See [`NamePattern::parse`].
     #[error("unsupported wildcard in {0:?}: only a trailing `*` is supported")]
     UnsupportedWildcard(String),
+    /// A `{` or `}` in anything but `"user/{uid}/*"`. See [`NamePattern::parse`].
+    #[error("unsupported placeholder in {0:?}: the only one is `user/{{uid}}/*`")]
+    UnsupportedPlaceholder(String),
 }
 
 #[cfg(test)]
@@ -610,13 +676,13 @@ mod tests {
             ],
         };
         // The first rule covers it and grants to no group; the catch-all's group is irrelevant.
-        assert!(!policy.group_could_grant(Permission::Find, "com.a.x"));
-        assert!(policy.group_could_grant(Permission::Find, "other"));
-        assert!(!policy.group_could_grant(Permission::Add, "other"));
-        assert!(!policy.group_could_grant(Permission::List, "other"));
+        assert!(!policy.group_could_grant(Permission::Find, "com.a.x", 2));
+        assert!(policy.group_could_grant(Permission::Find, "other", 2));
+        assert!(!policy.group_could_grant(Permission::Add, "other", 2));
+        assert!(!policy.group_could_grant(Permission::List, "other", 2));
         policy.list = Subjects::set([], [50]);
-        assert!(policy.group_could_grant(Permission::List, "other"));
-        assert!(!Policy::deny_all().group_could_grant(Permission::Find, "other"));
+        assert!(policy.group_could_grant(Permission::List, "other", 2));
+        assert!(!Policy::deny_all().group_could_grant(Permission::Find, "other", 2));
     }
 
     fn topic_policy() -> TopicPolicy {
@@ -651,9 +717,9 @@ mod tests {
 
         assert!(policy.check(TopicPermission::List, "", &subject(3000, &[50])));
         assert!(!policy.check(TopicPermission::List, "", &reader));
-        assert!(policy.group_could_grant(TopicPermission::Subscribe, "sensors.imu"));
-        assert!(!policy.group_could_grant(TopicPermission::Advertise, "sensors.imu"));
-        assert!(policy.group_could_grant(TopicPermission::List, "ignored"));
+        assert!(policy.group_could_grant(TopicPermission::Subscribe, "sensors.imu", 2000));
+        assert!(!policy.group_could_grant(TopicPermission::Advertise, "sensors.imu", 2000));
+        assert!(policy.group_could_grant(TopicPermission::List, "ignored", 2000));
     }
 
     /// An empty topic policy, what a configuration without `[[topic]]` loads, denies root too.
@@ -669,12 +735,155 @@ mod tests {
                 !TopicPolicy::default().check(permission, "x", &root),
                 "{permission}"
             );
-            assert!(!TopicPolicy::default().group_could_grant(permission, "x"));
+            assert!(!TopicPolicy::default().group_could_grant(permission, "x", 0));
         }
         let unmatched = TopicPolicy {
             list: Subjects::None,
             rules: vec![TopicRule::deny_all(NamePattern::Exact("a".into()))],
         };
         assert!(!unmatched.check(TopicPermission::Subscribe, "b", &root));
+    }
+
+    #[test]
+    fn the_user_namespace_parses_from_its_one_spelling() {
+        let pattern = NamePattern::parse("user/{uid}/*").unwrap();
+        assert_eq!(pattern, NamePattern::UserNamespace);
+        assert_eq!(pattern.to_string(), "user/{uid}/*");
+        for spec in [
+            "user/{uid}/",
+            "user/{uid}/a",
+            "app/{uid}/*",
+            "user/{gid}/*",
+            "a}b",
+            "{",
+        ] {
+            assert_eq!(
+                NamePattern::parse(spec),
+                Err(PolicyError::UnsupportedPlaceholder(spec.to_owned())),
+                "{spec}"
+            );
+        }
+    }
+
+    /// The pattern covers every uid's names; only whose they are depends on the caller.
+    #[test]
+    fn the_user_namespace_matches_by_name_and_is_the_callers_by_uid() {
+        let pattern = NamePattern::UserNamespace;
+        for (name, matches, of_1000) in [
+            ("user/1000/x", true, true),
+            ("user/1000/", true, true),
+            ("user/1000/a/b", true, true),
+            ("user/2000/x", true, false),
+            ("user/10000/x", true, false),
+            ("user/100/x", true, false),
+            ("user/01000/x", true, false),
+            ("user/4294968296/x", true, false),
+            ("user/1000", false, false),
+            ("user//x", false, false),
+            ("user/abc/x", false, false),
+            ("user/+1000/x", false, false),
+            ("users/1000/x", false, false),
+            ("a/user/1000/x", false, false),
+        ] {
+            assert_eq!(pattern.matches(name), matches, "{name}");
+            assert_eq!(pattern.is_callers(name, 1000), of_1000, "{name}");
+        }
+        assert!(pattern.is_callers("user/0/x", 0));
+        assert!(!pattern.is_callers("user/00/x", 0));
+        assert!(pattern.is_callers("user/4294967295/x", u32::MAX));
+    }
+
+    /// Another uid's name stops at the namespace rule: the catch-all behind it never grants it.
+    #[test]
+    fn the_user_namespace_rule_refuses_another_uids_names() {
+        let policy = Policy {
+            list: Subjects::Any,
+            rules: vec![
+                Rule {
+                    pattern: NamePattern::UserNamespace,
+                    add: Subjects::Any,
+                    find: Subjects::Any,
+                },
+                Rule {
+                    pattern: NamePattern::Any,
+                    add: Subjects::Any,
+                    find: Subjects::Any,
+                },
+            ],
+        };
+        let (alice, bob, root) = (subject(1000, &[]), subject(2000, &[]), subject(0, &[0]));
+        for permission in [Permission::Add, Permission::Find] {
+            assert!(policy.check(permission, "user/1000/svc", &alice));
+            assert!(!policy.check(permission, "user/1000/svc", &bob));
+            assert!(
+                !policy.check(permission, "user/1000/svc", &root),
+                "root is uid 0"
+            );
+            assert!(!policy.check(permission, "user/01000/svc", &alice));
+            assert!(
+                policy.check(permission, "user/abc/svc", &bob),
+                "not in the namespace"
+            );
+        }
+    }
+
+    /// The rule's subjects still apply to the caller's own names.
+    #[test]
+    fn the_user_namespace_rule_keeps_its_subjects() {
+        let policy = Policy {
+            list: Subjects::None,
+            rules: vec![Rule {
+                pattern: NamePattern::UserNamespace,
+                add: Subjects::set([], [50]),
+                find: Subjects::Any,
+            }],
+        };
+        assert!(policy.check(Permission::Add, "user/1000/svc", &subject(1000, &[50])));
+        assert!(!policy.check(Permission::Add, "user/1000/svc", &subject(1000, &[])));
+        assert!(!policy.check(Permission::Add, "user/1000/svc", &subject(2000, &[50])));
+        assert!(policy.group_could_grant(Permission::Add, "user/1000/svc", 1000));
+        // No group makes the name another uid's, so that deny is not worth a re-read.
+        assert!(!policy.group_could_grant(Permission::Add, "user/1000/svc", 2000));
+
+        let topics = TopicPolicy {
+            list: Subjects::set([], [50]),
+            rules: vec![TopicRule {
+                pattern: NamePattern::UserNamespace,
+                advertise: Subjects::set([], [50]),
+                subscribe: Subjects::Any,
+            }],
+        };
+        assert!(topics.group_could_grant(TopicPermission::Advertise, "user/1000/t", 1000));
+        assert!(!topics.group_could_grant(TopicPermission::Advertise, "user/1000/t", 2000));
+        assert!(topics.group_could_grant(TopicPermission::List, "user/1000/t", 2000));
+    }
+
+    #[test]
+    fn the_user_namespace_governs_topic_names_too() {
+        let policy = TopicPolicy {
+            list: Subjects::Any,
+            rules: vec![
+                TopicRule {
+                    pattern: NamePattern::UserNamespace,
+                    advertise: Subjects::Any,
+                    subscribe: Subjects::Any,
+                },
+                TopicRule {
+                    pattern: NamePattern::Any,
+                    advertise: Subjects::Any,
+                    subscribe: Subjects::Any,
+                },
+            ],
+        };
+        let (alice, bob) = (subject(1000, &[]), subject(2000, &[]));
+        for permission in [TopicPermission::Advertise, TopicPermission::Subscribe] {
+            assert!(policy.check(permission, "user/1000/t", &alice));
+            assert!(!policy.check(permission, "user/1000/t", &bob));
+            assert!(policy.check(permission, "other", &bob));
+        }
+        assert!(
+            policy.check(TopicPermission::List, "user/1000/t", &bob),
+            "list has no name"
+        );
     }
 }

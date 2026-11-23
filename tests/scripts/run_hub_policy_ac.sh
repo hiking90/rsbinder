@@ -9,7 +9,7 @@
 # stand in for it, which is why none of this can run on macOS.
 #
 #   cargo build -p rsbinder-tools --bin rsb_hub --bin rsb_service
-#   cargo build -p tests --bin ac61_probe
+#   cargo build -p tests --bin ac61_probe --bin topic_probe
 #   ./tests/scripts/run_hub_policy_ac.sh
 #
 # Runs entirely as the invoking unprivileged user. The "two different uids"
@@ -26,6 +26,7 @@ cd "$(dirname "$0")/../.." || exit 1
 HUB=./target/debug/rsb_hub
 SVC=./target/debug/rsb_service
 PROBE=./target/debug/ac61_probe
+TOPIC_PROBE=./target/debug/topic_probe
 # Not under /tmp: it is world-writable and rsb_hub refuses a configuration there (gated below).
 POLDIR="${XDG_RUNTIME_DIR:-${HOME:?}}/rsb61-policy"
 LOG=/tmp/rsb61-hub.log
@@ -534,6 +535,67 @@ stop_hub
 note "6-7 O5  rsb_service wait with no hub"
 run_svc wait ac61.allowed.live --timeout 0.5
 want_rc 2 "wait with no hub to ask exits 2"
+
+######################################################################
+# Plan 20 E1a: the names a uid has to itself, and the session bus over them.
+# The catch-all behind the namespace rule grants everything, so another uid's
+# name refused below was refused by the namespace rule and not for want of one.
+note "20 E1a  user/{uid}/* and the session bus"
+USERPOL="$POLDIR.user"
+OTHER_UID=$((MY_UID + 1))
+rm -rf "$USERPOL"; mkdir -p "$USERPOL"
+cat > "$USERPOL/10-rules.toml" <<'EOF'
+[global]
+list = "any"
+
+[[rule]]
+name = "user/{uid}/*"
+add  = "any"
+find = "any"
+
+[[rule]]
+name = "*"
+add  = "any"
+find = "any"
+EOF
+if ! start_hub --config "$USERPOL"; then bad "hub did not start with a user/{uid}/* rule"; cat "$LOG"; exit 1; fi
+run_probe "add:user/$MY_UID/ac20.own" "add:user/$OTHER_UID/ac20.other" "add:user/0$MY_UID/ac20.padded" \
+          add:user/abc/ac20.plain "notify:user/$OTHER_UID/ac20.other" \
+          sadd:ac20.session "find:user/$MY_UID/ac20.session" sfind:ac20.session sfind:ac20.own \
+          sfind:ac20.none swatch:ac20.session slist
+want_result add    "user/$MY_UID/ac20.own"      OK       "a uid adds a name of its own"
+want_result add    "user/$OTHER_UID/ac20.other" SECURITY "another uid's name is refused, a catch-all behind the rule or not"
+want_result add    "user/0$MY_UID/ac20.padded"  SECURITY "digits that are not the uid's decimal are nobody's"
+want_result add    user/abc/ac20.plain          OK       "a name outside user/<digits>/ goes on to the next rule"
+want_result notify "user/$OTHER_UID/ac20.other" SECURITY "another uid's name cannot be watched"
+want_result sadd   ac20.session                 OK       "the session bus adds a name"
+want_result find   "user/$MY_UID/ac20.session"  OK       "which the hub holds as user/<uid>/NAME"
+want_result sfind  ac20.session                 OK       "the session bus finds it"
+want_result sfind  ac20.own                     OK       "and a name added as user/<uid>/NAME"
+want_result sfind  ac20.none                    NOTFOUND "a session name nobody added is not found"
+want_result swatch ac20.session                 OK       "a session watch is called for a name that is registered"
+want_result slist  ""                           OK       "the session bus lists"
+want_line   "SLIST ac20.session"                         "its list has the session's names without user/<uid>/"
+want_line   "SLIST ac20.own"                             "all of them"
+reject_line "SLIST manager"                              "and none of the system bus's"
+reject_line "SLIST user/abc/ac20.plain"                  "whatever their spelling"
+# A topic by a session name: the publisher and the subscriber are two processes.
+$TOPIC_PROBE spublish:ac20.topic:hello hold:20 >/tmp/rsb61-topic-pub.out 2>&1 &
+TOPIC_PUB=$!
+sleep 1
+grep -qx "RESULT spublish ac20.topic OK" /tmp/rsb61-topic-pub.out && ok "a publisher advertises a topic on the session bus" \
+    || bad "spublish: $(head -3 /tmp/rsb61-topic-pub.out)"
+$TOPIC_PROBE ssubscribe:ac20.topic hold:2 >"$OUT" 2>&1
+want_line "GOT ac20.topic hello" "a subscriber of another process reads it by the session name"
+run_probe "find:user/$MY_UID/ac20.topic"
+want_result find "user/$MY_UID/ac20.topic" OK "the hub holds the topic as user/<uid>/NAME"
+kill "$TOPIC_PUB" 2>/dev/null; wait "$TOPIC_PUB" 2>/dev/null
+echo 'name = "app/{uid}/*"' | sed 's/^/[[rule]]\n/' > "$USERPOL/20-bad.toml"
+$HUB --check-config --config "$USERPOL" >"$OUT" 2>&1 && bad "a placeholder outside user/{uid}/* loaded" \
+    || ok "a placeholder outside user/{uid}/* fails the load"
+want_out "unsupported placeholder" "and the message says which"
+stop_hub
+rm -rf "$USERPOL"
 
 ######################################################################
 # Plan 6-4: running under a service supervisor. Readiness has to be

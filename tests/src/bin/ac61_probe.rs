@@ -12,7 +12,12 @@
 //! ```text
 //! ac61_probe add:NAME addsame:NAME find:NAME get:NAME notify:NAME unnotify:NAME
 //!            declared:NAME instances:IFACE conninfo:NAME list debuginfo hold:SECS
+//!            sadd:NAME sfind:NAME swatch:NAME slist
 //! ```
+//!
+//! The `s` steps go through the session bus (`rsbinder::bus::session`), whose
+//! names are the hub's `user/<uid>/NAME`; `swatch` waits up to two seconds
+//! for a watch of the name to be called.
 //!
 //! `addsame` registers *one* binder under every name it is given, which is
 //! what exercises the hub's per-binder death-subscription accounting: the
@@ -78,6 +83,10 @@ fn outcome_of_code(err: StatusCode) -> &'static str {
         StatusCode::FailedTransaction => "FAILEDTXN",
         _ => "ERROR",
     }
+}
+
+fn session() -> bus::Bus {
+    bus::session().expect("session bus")
 }
 
 fn main() {
@@ -170,6 +179,41 @@ fn main() {
                 }
                 "OK"
             }
+            "sadd" => {
+                let binder = Binder::new(ProbeBinder);
+                let result = match session().add(arg, Interface::as_binder(&binder)) {
+                    Ok(()) => "OK",
+                    Err(err) => outcome_of_status(&err),
+                };
+                registered.push(binder);
+                result
+            }
+            "sfind" => match session().check(arg) {
+                Some(_) => "OK",
+                None => "NOTFOUND",
+            },
+            "swatch" => {
+                let (called, calls) = std::sync::mpsc::channel();
+                let watch = session().watch(arg, move |_| {
+                    let _ = called.send(());
+                });
+                match watch {
+                    Ok(_watch) => match calls.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(()) => "OK",
+                        Err(_) => "SILENT",
+                    },
+                    Err(err) => outcome_of_status(&err),
+                }
+            }
+            "slist" => match session().list() {
+                Ok(names) => {
+                    for name in names {
+                        println!("SLIST {name}");
+                    }
+                    "OK"
+                }
+                Err(err) => outcome_of_status(&err),
+            },
             "debuginfo" => match hub::get_service_debug_info() {
                 Ok(entries) => {
                     for entry in entries {

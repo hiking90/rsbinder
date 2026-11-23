@@ -273,3 +273,36 @@ impl Resolver for ServiceManager {
         }))
     }
 }
+
+/// A bus as a [`Resolver`]: a topic's name is a service name of the bus, so on
+/// `rsbinder::bus::session()` it is one of the calling uid's own.
+///
+/// It is [`ServiceManager`] with the bus's names: `advertise` is `Bus::add`, `watch` is
+/// `Bus::watch`, the watch's lookup is `Bus::check`, and the [`Advertisement`] does nothing.
+///
+/// ```no_run
+/// use rsbinder::bus;
+/// use rsbinder_topic::{Bytes, Publisher};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let session = bus::session()?;
+/// let volume = Publisher::<Bytes>::state().build(&Bytes(b"40".to_vec()))?;
+/// volume.advertise_on("player.volume", &session)?;
+/// # Ok(()) }
+/// ```
+impl Resolver for rsbinder::bus::Bus {
+    fn advertise(&self, name: &str, topic: SIBinder) -> BinderResult<Advertisement> {
+        self.add(name, topic)?;
+        Ok(Advertisement::none())
+    }
+
+    fn watch(
+        &self,
+        name: &str,
+        on_registered: Box<dyn Fn(SIBinder) + Send + Sync>,
+    ) -> BinderResult<Watch> {
+        let watch = rsbinder::bus::Bus::watch(self, name, on_registered)?;
+        let (bus, looked_up) = (self.clone(), name.to_owned());
+        Ok(Watch::with_lookup(watch, move || Ok(bus.check(&looked_up))))
+    }
+}

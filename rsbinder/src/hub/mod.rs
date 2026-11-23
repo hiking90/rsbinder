@@ -1894,7 +1894,7 @@ impl<S: Borrow<ServiceManager>> Drop for WatchGuard<S> {
     }
 }
 
-/// A registration callback on the default service manager, from [`watch`].
+/// A registration callback on a service manager, from [`watch`] or [`ServiceManager::watch`].
 ///
 /// Dropping it unregisters the callback (`unregisterForNotifications`) on
 /// the service manager it was registered with. A failed unregister is not
@@ -1972,11 +1972,24 @@ pub fn watch(
     name: &str,
     on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
 ) -> std::result::Result<ServiceWatch, Status> {
-    Ok(ServiceWatch(WatchGuard::register(
-        default()?,
-        name,
-        on_registered,
-    )?))
+    default()?.watch(name, on_registered)
+}
+
+impl ServiceManager {
+    /// [`watch`] on this service manager: `on_registered` is called with the
+    /// binder each time a service is registered under `name`, until the
+    /// returned [`ServiceWatch`] is dropped, which unregisters it here.
+    pub fn watch(
+        self: &Arc<Self>,
+        name: &str,
+        on_registered: impl Fn(SIBinder) + Send + Sync + 'static,
+    ) -> std::result::Result<ServiceWatch, Status> {
+        Ok(ServiceWatch(WatchGuard::register(
+            Arc::clone(self),
+            name,
+            on_registered,
+        )?))
+    }
 }
 
 /// Convenience function to register a client-presence callback on the default

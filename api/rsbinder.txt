@@ -111,6 +111,30 @@ impl<I> core::marker::Unpin for rsbinder::bridge::Rewrap<I> where I: ?core::mark
 impl<I> core::marker::UnsafeUnpin for rsbinder::bridge::Rewrap<I> where I: ?core::marker::Sized
 impl<I> !core::panic::unwind_safe::RefUnwindSafe for rsbinder::bridge::Rewrap<I>
 impl<I> !core::panic::unwind_safe::UnwindSafe for rsbinder::bridge::Rewrap<I>
+pub mod rsbinder::bus
+pub struct rsbinder::bus::Bus
+impl rsbinder::bus::Bus
+pub fn rsbinder::bus::Bus::add(&self, &str, impl core::convert::Into<rsbinder::SIBinder>) -> core::result::Result<(), rsbinder::Status>
+pub fn rsbinder::bus::Bus::check(&self, &str) -> core::option::Option<rsbinder::SIBinder>
+pub fn rsbinder::bus::Bus::check_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::bus::Bus::list(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, rsbinder::Status>
+pub fn rsbinder::bus::Bus::name(&self, &str) -> alloc::string::String
+pub fn rsbinder::bus::Bus::wait_for(&self, &str, core::time::Duration) -> core::result::Result<rsbinder::SIBinder, rsbinder::Status>
+pub fn rsbinder::bus::Bus::wait_for_interface<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str, core::time::Duration) -> rsbinder::Result<rsbinder::Strong<T>>
+pub fn rsbinder::bus::Bus::watch(&self, &str, impl core::ops::function::Fn(rsbinder::SIBinder) + core::marker::Send + core::marker::Sync + 'static) -> core::result::Result<rsbinder::hub::ServiceWatch, rsbinder::Status>
+impl core::clone::Clone for rsbinder::bus::Bus
+pub fn rsbinder::bus::Bus::clone(&self) -> rsbinder::bus::Bus
+impl core::fmt::Debug for rsbinder::bus::Bus
+pub fn rsbinder::bus::Bus::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for rsbinder::bus::Bus
+impl core::marker::Send for rsbinder::bus::Bus
+impl core::marker::Sync for rsbinder::bus::Bus
+impl core::marker::Unpin for rsbinder::bus::Bus
+impl core::marker::UnsafeUnpin for rsbinder::bus::Bus
+impl !core::panic::unwind_safe::RefUnwindSafe for rsbinder::bus::Bus
+impl !core::panic::unwind_safe::UnwindSafe for rsbinder::bus::Bus
+pub fn rsbinder::bus::session() -> rsbinder::Result<rsbinder::bus::Bus>
+pub fn rsbinder::bus::system() -> rsbinder::Result<rsbinder::bus::Bus>
 pub mod rsbinder::cancel
 pub struct rsbinder::cancel::BnCancellationSignal(_)
 impl rsbinder::cancel::BnCancellationSignal
@@ -2028,6 +2052,8 @@ pub fn rsbinder::hub::ServiceManager::wait_for_interface<T: rsbinder::FromIBinde
 pub fn rsbinder::hub::ServiceManager::wait_for_interface_timeout<T: rsbinder::FromIBinder + ?core::marker::Sized>(&self, &str, core::time::Duration) -> rsbinder::Result<rsbinder::Strong<T>>
 pub fn rsbinder::hub::ServiceManager::wait_for_service(&self, &str) -> core::option::Option<rsbinder::SIBinder>
 pub fn rsbinder::hub::ServiceManager::wait_for_service_timeout(&self, &str, core::time::Duration) -> core::result::Result<rsbinder::SIBinder, rsbinder::Status>
+impl rsbinder::hub::ServiceManager
+pub fn rsbinder::hub::ServiceManager::watch(&alloc::sync::Arc<Self>, &str, impl core::ops::function::Fn(rsbinder::SIBinder) + core::marker::Send + core::marker::Sync + 'static) -> core::result::Result<rsbinder::hub::ServiceWatch, rsbinder::Status>
 impl core::fmt::Debug for rsbinder::hub::ServiceManager
 pub fn rsbinder::hub::ServiceManager::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for rsbinder::hub::ServiceManager

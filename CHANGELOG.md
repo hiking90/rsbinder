@@ -153,6 +153,14 @@ peers; peers of either release still subscribe to each other.
   30 seconds, by the count of such ends in a row. A program that registers
   nothing no longer runs once per lookup. A registration ends the hold-off;
   `systemd` starts are not held off.
+- `rsb_hub` policy: a `[[rule]]` or `[[topic]]` pattern that holds `{` or `}`
+  fails the load, at start and on `SIGHUP`, unless it is `user/{uid}/*`. In
+  0.13.0 it loaded and matched no name.
+- `rsbinder-tools`: `config::NamePattern` has the variant `UserNamespace` and
+  `config::PolicyError` the variant `UnsupportedPlaceholder`: a `match` that
+  names every variant of either needs an arm for it.
+  `config::Policy::group_could_grant` and `config::TopicPolicy::group_could_grant`
+  take the caller's uid as a third argument.
 
 ### Added
 
@@ -200,6 +208,21 @@ peers; peers of either release still subscribe to each other.
   `getService2`, `checkService2`) at `warn`, once a minute for each uid and
   name, and its dump counts them in `refused lookups:`. The caller is still
   answered as for a name that is not registered.
+- `rsbinder::bus` (Experimental): `bus::system()` and `bus::session()` give a
+  `Bus` that adds, checks, waits for, watches and lists services by name. A
+  session name `player` is the service manager's `user/<uid>/player`, the
+  uid being the caller's effective one, which `rsb_hub`'s `user/{uid}/*` rule
+  keeps to that uid. Both buses run over kernel binder and initialize
+  `ProcessState` on the default device when nothing has; a machine with no
+  binder device is `StatusCode::NameNotFound`. `Bus` is a
+  `rsbinder_topic::Resolver`, so `advertise_on` and `subscribe_named_on` take
+  a topic name of the session.
+- `hub::ServiceManager::watch`: `hub::watch` on a service manager the caller
+  holds.
+- `rsb_hub` policy: the pattern `user/{uid}/*`, in `[[rule]]` and `[[topic]]`,
+  covers every name that starts with `user/<digits>/` and grants one only to
+  the caller whose uid the digits spell, so each uid has names no other uid
+  can add or find.
 - `rsb_hub`'s dump has `uptime:`, an `age=` for each registration, and a
   `declared (N):` section: each `[[service]]` the caller may `find`, with its
   `start` kind, whether it is registered, and for one with a `start` whether
