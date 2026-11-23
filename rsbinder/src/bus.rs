@@ -37,6 +37,11 @@
 //! which a name is added and found only by the uid its digits spell. Without that rule the
 //! names are as open as the rules that cover them make them.
 //!
+//! The service manager judges a name by the caller's uid as its own user namespace maps it. A
+//! process in a user namespace that maps its uids to others, a rootless container for instance,
+//! asks for `user/<uid>/` with the uid it sees, and a service manager outside that namespace
+//! refuses the name.
+//!
 //! Every user opens the same binder device, so the policy stops another user from finding a
 //! name, not from calling a binder it was handed by other means. A service that must refuse
 //! other users checks the caller's uid ([`CallingContext`](crate::CallingContext)) in its
@@ -85,18 +90,22 @@ impl std::fmt::Debug for Bus {
 
 impl Bus {
     fn over_kernel_binder(prefix: String) -> Result<Bus> {
-        if !ProcessState::is_initialized() {
-            ProcessState::init_default().inspect_err(|err| {
-                if *err == StatusCode::NameNotFound {
-                    log::error!(
-                        "bus: this machine has no binder device ({} or {}), and the bus has no \
-                         other transport yet",
-                        crate::DEFAULT_BINDER_PATH,
-                        crate::LEGACY_BINDER_PATH
-                    );
-                }
-            })?;
-        }
+        // One call, not a check and an init: a state another thread sets meanwhile is taken as is.
+        ProcessState::init_or_existing(
+            ProcessState::default_driver_path(),
+            crate::DEFAULT_MAX_BINDER_THREADS,
+            ProcessState::default_mmap_size(),
+        )
+        .inspect_err(|err| {
+            if *err == StatusCode::NameNotFound {
+                log::error!(
+                    "bus: this machine has no binder device ({} or {}), and the bus has no \
+                     other transport yet",
+                    crate::DEFAULT_BINDER_PATH,
+                    crate::LEGACY_BINDER_PATH
+                );
+            }
+        })?;
         Ok(Bus {
             names: hub::default()?,
             prefix,

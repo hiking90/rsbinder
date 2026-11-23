@@ -153,6 +153,14 @@ peers; peers of either release still subscribe to each other.
   30 seconds, by the count of such ends in a row. A program that registers
   nothing no longer runs once per lookup. A registration ends the hold-off;
   `systemd` starts are not held off.
+- `rsb_hub` policy: a `[[rule]]` or `[[topic]]` pattern that holds `{` or `}`
+  fails the load, at start and on `SIGHUP`, unless it is `user/{uid}/*`. In
+  0.13.0 it loaded and matched no name.
+- `rsbinder-tools`: `config::NamePattern` has the variant `UserNamespace` and
+  `config::PolicyError` the variant `UnsupportedPlaceholder`: a `match` that
+  names every variant of either needs an arm for it.
+  `config::Policy::group_could_grant` and `config::TopicPolicy::group_could_grant`
+  take the caller's uid as a third argument.
 
 ### Added
 
@@ -214,10 +222,7 @@ peers; peers of either release still subscribe to each other.
 - `rsb_hub` policy: the pattern `user/{uid}/*`, in `[[rule]]` and `[[topic]]`,
   covers every name that starts with `user/<digits>/` and grants one only to
   the caller whose uid the digits spell, so each uid has names no other uid
-  can add or find. `{` and `}` in any other pattern fail the load; such a
-  pattern loaded before and matched no name.
-  `rsbinder_tools::config::NamePattern` has the variant `UserNamespace` and
-  `PolicyError` the variant `UnsupportedPlaceholder`.
+  can add or find.
 - `rsb_hub`'s dump has `uptime:`, an `age=` for each registration, and a
   `declared (N):` section: each `[[service]]` the caller may `find`, with its
   `start` kind, whether it is registered, and for one with a `start` whether

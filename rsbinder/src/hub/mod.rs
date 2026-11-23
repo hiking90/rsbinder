@@ -1894,7 +1894,7 @@ impl<S: Borrow<ServiceManager>> Drop for WatchGuard<S> {
     }
 }
 
-/// A registration callback on the default service manager, from [`watch`].
+/// A registration callback on a service manager, from [`watch`] or [`ServiceManager::watch`].
 ///
 /// Dropping it unregisters the callback (`unregisterForNotifications`) on
 /// the service manager it was registered with. A failed unregister is not

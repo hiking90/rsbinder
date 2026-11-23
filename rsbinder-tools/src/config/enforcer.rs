@@ -138,7 +138,7 @@ impl Enforcer {
         self.judge(
             uid,
             |gids| policy.check_parts(permission, name, uid, gids),
-            || policy.group_could_grant(permission, name),
+            || policy.group_could_grant(permission, name, uid),
         )
     }
 
@@ -157,7 +157,7 @@ impl Enforcer {
         self.judge(
             uid,
             |gids| topics.check_parts(permission, name, uid, gids),
-            || topics.group_could_grant(permission, name),
+            || topics.group_could_grant(permission, name, uid),
         )
     }
 
@@ -415,6 +415,29 @@ mod tests {
             assert!(!enforcer.check_uid(Permission::Find, "svc", 2));
         }
         assert_eq!(calls(&counter), 1);
+    }
+
+    /// No group makes another uid's name the caller's: that deny costs no lookup, its own does.
+    #[test]
+    fn another_uids_name_never_revalidates() {
+        let (groups, counter) = GroupCache::scripted(vec![gids(&[]), gids(&[50])]);
+        let policy = Policy {
+            list: Subjects::None,
+            rules: vec![Rule {
+                pattern: NamePattern::UserNamespace,
+                add: Subjects::set([], [50]),
+                find: Subjects::None,
+            }],
+        };
+        let enforcer = Enforcer::from_policy_with(policy, groups);
+        assert!(!enforcer.check_uid(Permission::Add, "user/8/svc", 7));
+        enforcer.groups.age_entries(GroupCache::MIN_REVALIDATE);
+        for _ in 0..3 {
+            assert!(!enforcer.check_uid(Permission::Add, "user/8/svc", 7));
+        }
+        assert_eq!(calls(&counter), 1);
+        assert!(enforcer.check_uid(Permission::Add, "user/7/svc", 7));
+        assert_eq!(calls(&counter), 2);
     }
 
     /// An allow never re-reads, however old the entry.

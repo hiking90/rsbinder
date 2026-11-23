@@ -58,6 +58,20 @@ The additions and fixes themselves are listed in
   ended in 10 seconds now prints what arrived and exits 2; `--timeout SECS`
   changes the 10. An argument `--timeout` meant for the service goes after
   `--`.
+- A `[[rule]]` or `[[topic]]` whose `name` holds `{` or `}` fails the load, so
+  `rsb_hub` does not start with it and a `SIGHUP` keeps the configuration it
+  had. The one such pattern there is, `user/{uid}/*`, loads. In 0.13.0 a
+  pattern with a brace loaded and matched no name, as no name holds one:
+  remove the rule. `rsb_hub --check-config` reports it without starting the
+  hub. See [Access control](./service-manager.md#access-control).
+- `rsbinder_tools::config::NamePattern` has the variant `UserNamespace` and
+  `config::PolicyError` the variant `UnsupportedPlaceholder`. Neither enum is
+  `#[non_exhaustive]`, so a `match` that names every variant needs an arm for
+  the new one, or a `_` arm.
+- `config::Policy::group_could_grant` and
+  `config::TopicPolicy::group_could_grant` take the caller's uid as a third
+  argument: under `user/{uid}/*` no group lifts the deny of another uid's
+  name, and the answer says so. Pass the uid the deny was judged for.
 
 The sections below are about `rsbinder-topic`.
 

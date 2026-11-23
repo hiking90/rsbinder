@@ -312,20 +312,21 @@ impl Policy {
     }
 
     /// Could a larger group set change the answer to
-    /// [`check(permission, name, _)`](Self::check)?
+    /// [`check(permission, name, _)`](Self::check) for a caller of `uid`?
     ///
     /// True only when the governing subject set (the global `list` gate, or
     /// the first rule covering `name`) grants to at least one group. An
     /// `any` set has already allowed, and `none` or a uid-only set answers
-    /// the same whatever the groups are. `Enforcer` uses this to decide
-    /// whether a deny is worth a fresh name-service read.
-    pub fn group_could_grant(&self, permission: Permission, name: &str) -> bool {
+    /// the same whatever the groups are. Nor does a group lift the deny of a
+    /// name that is not `uid`'s ([`NamePattern::is_callers`]). `Enforcer` uses
+    /// this to decide whether a deny is worth a fresh name-service read.
+    pub fn group_could_grant(&self, permission: Permission, name: &str, uid: u32) -> bool {
         let subjects = if permission == Permission::List {
             &self.list
         } else {
             match self.rules.iter().find(|rule| rule.pattern.matches(name)) {
-                Some(rule) => rule.subjects_for(permission),
-                None => return false,
+                Some(rule) if rule.pattern.is_callers(name, uid) => rule.subjects_for(permission),
+                _ => return false,
             }
         };
         matches!(subjects, Subjects::Set { gids, .. } if !gids.is_empty())
@@ -407,11 +408,7 @@ impl TopicPolicy {
         uid: u32,
         gids: &BTreeSet<u32>,
     ) -> bool {
-        let callers = permission == TopicPermission::List
-            || self
-                .rule_of(name)
-                .is_some_and(|rule| rule.pattern.is_callers(name, uid));
-        callers
+        self.is_callers(permission, name, uid)
             && self
                 .subjects_for(permission, name)
                 .is_some_and(|subjects| subjects.allows_parts(uid, gids))
@@ -422,12 +419,22 @@ impl TopicPolicy {
         self.rules.iter().find(|rule| rule.pattern.matches(name))
     }
 
-    /// Could a larger group set change the answer? See [`Policy::group_could_grant`].
-    pub fn group_could_grant(&self, permission: TopicPermission, name: &str) -> bool {
-        matches!(
-            self.subjects_for(permission, name),
-            Some(Subjects::Set { gids, .. }) if !gids.is_empty()
-        )
+    /// Is `name` one its rule may grant to `uid`? `List` has no name, so always.
+    fn is_callers(&self, permission: TopicPermission, name: &str, uid: u32) -> bool {
+        permission == TopicPermission::List
+            || self
+                .rule_of(name)
+                .is_some_and(|rule| rule.pattern.is_callers(name, uid))
+    }
+
+    /// Could a larger group set change the answer for a caller of `uid`? See
+    /// [`Policy::group_could_grant`].
+    pub fn group_could_grant(&self, permission: TopicPermission, name: &str, uid: u32) -> bool {
+        self.is_callers(permission, name, uid)
+            && matches!(
+                self.subjects_for(permission, name),
+                Some(Subjects::Set { gids, .. }) if !gids.is_empty()
+            )
     }
 
     /// The set that governs `permission` on `name`; `None` when no rule covers it.
@@ -669,13 +676,13 @@ mod tests {
             ],
         };
         // The first rule covers it and grants to no group; the catch-all's group is irrelevant.
-        assert!(!policy.group_could_grant(Permission::Find, "com.a.x"));
-        assert!(policy.group_could_grant(Permission::Find, "other"));
-        assert!(!policy.group_could_grant(Permission::Add, "other"));
-        assert!(!policy.group_could_grant(Permission::List, "other"));
+        assert!(!policy.group_could_grant(Permission::Find, "com.a.x", 2));
+        assert!(policy.group_could_grant(Permission::Find, "other", 2));
+        assert!(!policy.group_could_grant(Permission::Add, "other", 2));
+        assert!(!policy.group_could_grant(Permission::List, "other", 2));
         policy.list = Subjects::set([], [50]);
-        assert!(policy.group_could_grant(Permission::List, "other"));
-        assert!(!Policy::deny_all().group_could_grant(Permission::Find, "other"));
+        assert!(policy.group_could_grant(Permission::List, "other", 2));
+        assert!(!Policy::deny_all().group_could_grant(Permission::Find, "other", 2));
     }
 
     fn topic_policy() -> TopicPolicy {
@@ -710,9 +717,9 @@ mod tests {
 
         assert!(policy.check(TopicPermission::List, "", &subject(3000, &[50])));
         assert!(!policy.check(TopicPermission::List, "", &reader));
-        assert!(policy.group_could_grant(TopicPermission::Subscribe, "sensors.imu"));
-        assert!(!policy.group_could_grant(TopicPermission::Advertise, "sensors.imu"));
-        assert!(policy.group_could_grant(TopicPermission::List, "ignored"));
+        assert!(policy.group_could_grant(TopicPermission::Subscribe, "sensors.imu", 2000));
+        assert!(!policy.group_could_grant(TopicPermission::Advertise, "sensors.imu", 2000));
+        assert!(policy.group_could_grant(TopicPermission::List, "ignored", 2000));
     }
 
     /// An empty topic policy, what a configuration without `[[topic]]` loads, denies root too.
@@ -728,7 +735,7 @@ mod tests {
                 !TopicPolicy::default().check(permission, "x", &root),
                 "{permission}"
             );
-            assert!(!TopicPolicy::default().group_could_grant(permission, "x"));
+            assert!(!TopicPolicy::default().group_could_grant(permission, "x", 0));
         }
         let unmatched = TopicPolicy {
             list: Subjects::None,
@@ -834,7 +841,21 @@ mod tests {
         assert!(policy.check(Permission::Add, "user/1000/svc", &subject(1000, &[50])));
         assert!(!policy.check(Permission::Add, "user/1000/svc", &subject(1000, &[])));
         assert!(!policy.check(Permission::Add, "user/1000/svc", &subject(2000, &[50])));
-        assert!(policy.group_could_grant(Permission::Add, "user/1000/svc"));
+        assert!(policy.group_could_grant(Permission::Add, "user/1000/svc", 1000));
+        // No group makes the name another uid's, so that deny is not worth a re-read.
+        assert!(!policy.group_could_grant(Permission::Add, "user/1000/svc", 2000));
+
+        let topics = TopicPolicy {
+            list: Subjects::set([], [50]),
+            rules: vec![TopicRule {
+                pattern: NamePattern::UserNamespace,
+                advertise: Subjects::set([], [50]),
+                subscribe: Subjects::Any,
+            }],
+        };
+        assert!(topics.group_could_grant(TopicPermission::Advertise, "user/1000/t", 1000));
+        assert!(!topics.group_could_grant(TopicPermission::Advertise, "user/1000/t", 2000));
+        assert!(topics.group_could_grant(TopicPermission::List, "user/1000/t", 2000));
     }
 
     #[test]
