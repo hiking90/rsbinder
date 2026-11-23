@@ -458,8 +458,10 @@ tier_kernel() {
     # Two uids on a binder device of its own: the kernel keeps a device to its first manager's euid.
     if docker info >/dev/null 2>&1; then
         run "hub on a device another uid managed (container)" tests/container/ac_hub_uid.sh
+        run "session bus between two uids (container)" tests/container/ac_session_uid.sh
     else
         skip "hub on a device another uid managed (container)" "needs a running docker"
+        skip "session bus between two uids (container)" "needs a running docker"
     fi
     run "run_d8b_register" bash example-hello/cpp/run_d8b_register.sh
     # Starts and kills its own rsb_hub, so it too runs with the shared one stopped.
