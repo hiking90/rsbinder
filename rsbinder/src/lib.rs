@@ -326,6 +326,9 @@ pub mod rpc;
 /// Service hub and manager implementations
 pub mod hub;
 
+// The system and session buses; plain comment, same reason as `cancel` below.
+pub mod bus;
+
 /// Client stub for Android's `PermissionManagerService`
 /// (`android.os.IPermissionController`). See module doc for the
 /// AOSP-faithful surface and fail-closed `check_permission` helper.

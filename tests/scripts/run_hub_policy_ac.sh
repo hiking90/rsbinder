@@ -536,6 +536,56 @@ run_svc wait ac61.allowed.live --timeout 0.5
 want_rc 2 "wait with no hub to ask exits 2"
 
 ######################################################################
+# Plan 20 E1a: the names a uid has to itself, and the session bus over them.
+# The catch-all behind the namespace rule grants everything, so another uid's
+# name refused below was refused by the namespace rule and not for want of one.
+note "20 E1a  user/{uid}/* and the session bus"
+USERPOL="$POLDIR.user"
+OTHER_UID=$((MY_UID + 1))
+rm -rf "$USERPOL"; mkdir -p "$USERPOL"
+cat > "$USERPOL/10-rules.toml" <<'EOF'
+[global]
+list = "any"
+
+[[rule]]
+name = "user/{uid}/*"
+add  = "any"
+find = "any"
+
+[[rule]]
+name = "*"
+add  = "any"
+find = "any"
+EOF
+if ! start_hub --config "$USERPOL"; then bad "hub did not start with a user/{uid}/* rule"; cat "$LOG"; exit 1; fi
+run_probe "add:user/$MY_UID/ac20.own" "add:user/$OTHER_UID/ac20.other" "add:user/0$MY_UID/ac20.padded" \
+          add:user/abc/ac20.plain "notify:user/$OTHER_UID/ac20.other" \
+          sadd:ac20.session "find:user/$MY_UID/ac20.session" sfind:ac20.session sfind:ac20.own \
+          sfind:ac20.none swatch:ac20.session slist
+want_result add    "user/$MY_UID/ac20.own"      OK       "a uid adds a name of its own"
+want_result add    "user/$OTHER_UID/ac20.other" SECURITY "another uid's name is refused, a catch-all behind the rule or not"
+want_result add    "user/0$MY_UID/ac20.padded"  SECURITY "digits that are not the uid's decimal are nobody's"
+want_result add    user/abc/ac20.plain          OK       "a name outside user/<digits>/ goes on to the next rule"
+want_result notify "user/$OTHER_UID/ac20.other" SECURITY "another uid's name cannot be watched"
+want_result sadd   ac20.session                 OK       "the session bus adds a name"
+want_result find   "user/$MY_UID/ac20.session"  OK       "which the hub holds as user/<uid>/NAME"
+want_result sfind  ac20.session                 OK       "the session bus finds it"
+want_result sfind  ac20.own                     OK       "and a name added as user/<uid>/NAME"
+want_result sfind  ac20.none                    NOTFOUND "a session name nobody added is not found"
+want_result swatch ac20.session                 OK       "a session watch is called for a name that is registered"
+want_result slist  ""                           OK       "the session bus lists"
+want_line   "SLIST ac20.session"                         "its list has the session's names without user/<uid>/"
+want_line   "SLIST ac20.own"                             "all of them"
+reject_line "SLIST manager"                              "and none of the system bus's"
+reject_line "SLIST user/abc/ac20.plain"                  "whatever their spelling"
+echo 'name = "app/{uid}/*"' | sed 's/^/[[rule]]\n/' > "$USERPOL/20-bad.toml"
+$HUB --check-config --config "$USERPOL" >"$OUT" 2>&1 && bad "a placeholder outside user/{uid}/* loaded" \
+    || ok "a placeholder outside user/{uid}/* fails the load"
+want_out "unsupported placeholder" "and the message says which"
+stop_hub
+rm -rf "$USERPOL"
+
+######################################################################
 # Plan 6-4: running under a service supervisor. Readiness has to be
 # reported at the instant handle 0 becomes reachable -- earlier and every
 # unit ordered After= the hub races the registry -- and a deliberate stop
