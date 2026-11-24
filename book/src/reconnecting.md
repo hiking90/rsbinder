@@ -98,5 +98,7 @@ handle there keeps the helper, its session and the callback alive in a
 cycle.
 
 The helper does not register services. A service that outlives a restarted
-service manager must add itself again; on Android, `init` restarts the
-services that depend on `servicemanager`.
+service manager has no name with the new one: the init system restarts the
+services that depend on it, as `init` does for `servicemanager` on Android
+and as a unit's `Requires=` does for `rsb_hub`
+([When the hub restarts](./service-manager.md#when-the-hub-restarts)).

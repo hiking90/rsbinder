@@ -28,6 +28,7 @@
 - [Storing Values (Data Serialization)](./data-serialization.md)
 - [RPC Transport (binder-over-socket)](./rpc-transport.md)
 - [Cross-Transport Services](./cross-transport-services.md)
+- [Replacing D-Bus](./replacing-dbus.md)
 - [Security & Authorization](./security.md)
 - [Stability Tiers](./stability-tiers.md)
 - [Migrating from 0.13 to 0.14](./migrating-0.14.md)

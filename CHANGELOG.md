@@ -223,7 +223,10 @@ peers; peers of either release still subscribe to each other.
   `ProcessState` on the default device when nothing has; a machine with no
   binder device is `StatusCode::NameNotFound`. `Bus` is a
   `rsbinder_topic::Resolver`, so `advertise_on` and `subscribe_named_on` take
-  a topic name of the session.
+  a topic name of the session. The book's
+  [Replacing D-Bus](https://hiking90.github.io/rsbinder/replacing-dbus.html)
+  maps D-Bus's methods, names, signals and properties onto binder calls,
+  `rsb_hub` and topics, with the example `topic_service`.
 - `hub::ServiceManager::watch`: `hub::watch` on a service manager the caller
   holds.
 - `rsb_hub` policy: the pattern `user/{uid}/*`, in `[[rule]]` and `[[topic]]`,
