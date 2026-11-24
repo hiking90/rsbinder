@@ -344,8 +344,36 @@ fn exec_command(root: At<'_>, argv: &[String], our_uid: u32) -> Result<Command, 
     }
     let mut c = child_command(program);
     c.args(&argv[1..]);
+    end_with_hub(&mut c);
     Ok(c)
 }
+
+/// Has the kernel send `SIGTERM` to the program when the thread that spawns it ends, which the
+/// hub's exit, abort and `SIGKILL` all do: the start thread waits on the program until then.
+///
+/// A program left behind has no name with the next hub, whose first lookup of it would start a
+/// second one. Not covered: a process the program forks, a program that ignores `SIGTERM`, and
+/// a set-user-ID, set-group-ID or file-capability program, for which `execve` clears the setting.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn end_with_hub(command: &mut Command) {
+    let hub = rustix::process::getpid().as_raw_nonzero().get();
+    // SAFETY: the closure allocates nothing and calls only async-signal-safe functions.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The hub ended before the `prctl`: no signal will come, so do not start.
+            if libc::getppid() != hub {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        })
+    };
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn end_with_hub(_command: &mut Command) {}
 
 /// `program` without the hub's `$NOTIFY_SOCKET`, which `Notifier::from_environment` leaves set,
 /// and without its signal mask: `Command` keeps a mask, and `rsb_hub` blocks what `sigwait` takes.
@@ -401,6 +429,24 @@ mod tests {
         let line = String::from_utf8(out.stdout).expect("utf-8");
         let mask = line.split_whitespace().nth(1).expect("a SigBlk line");
         assert_eq!(u64::from_str_radix(mask, 16), Ok(0), "{line}");
+    }
+
+    /// The signal is the spawning thread's end, so a thread stands in for the hub here.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_exec_child_is_terminated_when_its_spawning_thread_ends() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut child = std::thread::spawn(|| {
+            let mut command = child_command("/bin/sleep");
+            command.arg("60");
+            end_with_hub(&mut command);
+            command.spawn().expect("spawn")
+        })
+        .join()
+        .expect("thread");
+        let status = child.wait().expect("wait");
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
     }
 
     struct Recorder {

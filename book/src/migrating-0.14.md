@@ -52,6 +52,10 @@ The additions and fixes themselves are listed in
   registered, now runs it at most once per hold-off; a service that registers
   is unaffected. See
   [Declaring services](./service-manager.md#declaring-services).
+- An `exec` program gets `SIGTERM` when `rsb_hub` ends, on Linux and Android.
+  In 0.13.0 it went on running with no name, and the next hub's lookup started
+  a second one. A service that must go on serving the binders its clients hold
+  while the hub restarts is declared with a `systemd` start.
 - `rsb_service dump NAME` hands the service a pipe and prints what it read
   once the service closes it. In 0.13.0 the service wrote to the command's
   stdout itself, so output appeared as it was written. A dump that has not

@@ -947,6 +947,15 @@ attempt. An `exec` start stays
 outstanding for the process's lifetime. `exec` takes an argv list, never a
 shell string.
 
+An `exec` program ends with the hub. On Linux and Android the kernel sends it
+`SIGTERM` when `rsb_hub` exits, aborts or is killed (`PR_SET_PDEATHSIG`): its
+name went with the hub, and a program left running would be started a second
+time by the next hub's first lookup. A client's calls on a binder it holds
+therefore end too; a service that must outlive the hub is a `systemd` start.
+The signal does not reach a process the program forks and leaves behind, a
+program that ignores `SIGTERM`, or a set-user-ID, set-group-ID or
+file-capability program, for which the kernel clears the setting.
+
 An `exec` program that ends before any name it starts was registered holds
 its next start off: 1, 2, 4, 8, 16, then 30 seconds, by the count of such
 ends in a row. The hub judges the registration, not the exit code: a program

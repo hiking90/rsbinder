@@ -153,6 +153,13 @@ peers; peers of either release still subscribe to each other.
   30 seconds, by the count of such ends in a row. A program that registers
   nothing no longer runs once per lookup. A registration ends the hold-off;
   `systemd` starts are not held off.
+- `rsb_hub`: an `exec` program gets `SIGTERM` when the hub exits, aborts or is
+  killed (`PR_SET_PDEATHSIG`; Linux and Android). In 0.13.0 it went on running
+  with no name, and the next hub's first lookup started a second one. A
+  service that must go on serving the binders its clients hold while the hub
+  restarts is declared with a `systemd` start. A set-user-ID, set-group-ID or
+  file-capability program, a program that ignores `SIGTERM`, and a process the
+  program forks and leaves behind are not ended.
 - `rsb_hub` policy: a `[[rule]]` or `[[topic]]` pattern that holds `{` or `}`
   fails the load, at start and on `SIGHUP`, unless it is `user/{uid}/*`. In
   0.13.0 it loaded and matched no name.
