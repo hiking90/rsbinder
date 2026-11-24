@@ -681,6 +681,54 @@ fi
 stop_hub
 
 ######################################################################
+# Plan 6-7 E2: a program the hub started ends with the hub, however the hub ends.
+# One left behind has no name with the next hub, whose lookup would start a second.
+note "6-7 E2  an exec child ends with the hub"
+EXECPOL="$POLDIR.exec"
+rm -rf "$EXECPOL"; mkdir -p "$EXECPOL"
+cat > "$EXECPOL/10-rules.toml" <<EOF
+[[rule]]
+name = "ac67.*"
+add  = { uid = [$MY_UID] }
+find = { uid = [$MY_UID] }
+
+[[service]]
+name = "ac67.ISleep/default"
+start = { exec = ["/usr/bin/sleep", "67.25"] }
+EOF
+exec_children() { pgrep -xf '/usr/bin/sleep 67.25'; }
+wait_exec_child() {
+    for _ in $(seq 1 20); do exec_children >/dev/null && return 0; sleep 0.25; done
+    return 1
+}
+for sig in TERM KILL; do
+    if ! start_hub --config "$EXECPOL"; then bad "hub did not start for the SIG$sig half"; cat "$LOG"; continue; fi
+    run_probe get:ac67.ISleep/default
+    if ! wait_exec_child; then bad "SIG$sig: the exec child did not start"; stop_hub; continue; fi
+    CHILD=$(exec_children | head -1)
+    # By pid: the point is which signal the hub got, and `stop_hub` matches by command line.
+    kill "-$sig" "$HUB_PID"
+    for _ in $(seq 1 20); do kill -0 "$CHILD" 2>/dev/null || break; sleep 0.25; done
+    # A child that outlived the hub is left for the count below, which it makes two.
+    kill -0 "$CHILD" 2>/dev/null && bad "SIG$sig: the exec child outlived the hub" \
+        || ok "SIG$sig: the exec child ended with the hub"
+    for _ in $(seq 1 20); do kill -0 "$HUB_PID" 2>/dev/null || break; sleep 0.25; done
+    if start_hub --config "$EXECPOL"; then
+        run_probe get:ac67.ISleep/default
+        wait_exec_child
+        count=$(exec_children | wc -l)
+        [ "$count" -eq 1 ] && ok "SIG$sig: the next hub's lookup leaves one child" \
+            || bad "SIG$sig: $count children after the next hub's lookup"
+    else
+        bad "SIG$sig: the next hub did not start"; cat "$LOG"
+    fi
+    stop_hub
+    for _ in $(seq 1 20); do exec_children >/dev/null || break; sleep 0.25; done
+    exec_children >/dev/null && { bad "SIG$sig: a child is left after the gate"; kill -KILL $(exec_children); }
+done
+rm -rf "$EXECPOL"
+
+######################################################################
 note "AC-6.1.10  a caller the hub's user namespace does not map is refused"
 # The driver gives such a caller uid 4294967295; a hub in a user namespace with no
 # uid_map leaves even this user unmapped. Killed by pid: `pkill -f` matches the shell.
