@@ -108,12 +108,10 @@
 //!   read under `SO_RCVTIMEO`. While a read deadline is armed, each read
 //!   costs one `ioctl` to tell the two apart.
 //!
-//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG`, a hub's
-//!   notice) is judged by the same rule apart from the send: the session's
-//!   reaper waits on the slot in `__wait_for_room`, a `SendWait` of its own, and
-//!   ends the session when the deadline passes, and what such a send left of a
-//!   frame goes out through a send that waits (`session` module doc "Deferred
-//!   `DEC_STRONG`").
+//! - **A frame that does not wait** (`__send_no_wait`, a `DEC_STRONG`) has no
+//!   deadline of its own: what such a send left of a frame, or could not send,
+//!   goes out through a send that waits, which the deadline judges (`session`
+//!   module doc "Deferred `DEC_STRONG`").
 //!
 //! The `ioctl` runs only while a deadline is armed: a send or read without
 //! one has no verdict for it to change. A socket that refuses it once
@@ -627,13 +625,6 @@ pub trait RpcTransport: Send + Sync {
     #[doc(hidden)]
     fn __whole_small_frame_now(&self) -> bool {
         false
-    }
-
-    /// Not part of the API: wait as a send that found no room waits. `Ok(true)` is room, or an
-    /// error a send will report; `Ok(false)` is the send deadline passed with no peer progress.
-    #[doc(hidden)]
-    fn __wait_for_room(&self) -> RpcResult<bool> {
-        Ok(true)
     }
 
     /// [`send_raw_with_fds`](Self::send_raw_with_fds) for a transaction,

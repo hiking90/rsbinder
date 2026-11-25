@@ -25,10 +25,6 @@ fn main() {
         "aidl/rsbinder/topic/TopicInfo.aidl",
         "aidl/rsbinder/topic/ITopicWatcher.aidl",
         "aidl/rsbinder/topic/ITopicRegistry.aidl",
-        "aidl/rsbinder/topic/TopicAddress.aidl",
-        "aidl/rsbinder/topic/TopicAllocation.aidl",
-        "aidl/rsbinder/topic/ITopicAddressWatcher.aidl",
-        "aidl/rsbinder/topic/ITopicUdsRegistry.aidl",
     ];
     let builder = sources.iter().fold(
         rsbinder_aidl::Builder::new().set_async_support(true),

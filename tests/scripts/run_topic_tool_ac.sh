@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # `rsb_service topic` against a real hub and a publisher of another process
 # (plans/15-pubsub-gaps.md §5.3): `stat`, `hz`, `echo` and `record` through the
-# hub's topic registry, `stat` of a stopped publisher, and the `--topic-socket`
-# path. Needs a Linux host with a writable /dev/binderfs/binder and no rsb_hub
-# running: the script starts its own.
+# hub's topic registry, and `stat` of a stopped publisher. Needs a Linux host
+# with a writable /dev/binderfs/binder and no rsb_hub running: the script
+# starts its own.
 #
 #   ./tests/scripts/run_topic_tool_ac.sh
 #
-# It builds `rsb_hub` and `rsb_service` with the `topic` and `rpc` features,
+# It builds `rsb_hub` and `rsb_service` with the `topic` feature,
 # copied to target/debug/rsb_hub_tool and rsb_service_tool, then both again
-# without them, so target/debug/rsb_hub stays the hub every other script runs;
+# without it, so target/debug/rsb_hub stays the hub every other script runs;
 # and `topic_probe`, whose `publish:NAME:VALUE` publishes VALUE every 50 ms.
 # The copies go when it ends.
 set -u
@@ -37,7 +37,7 @@ PRE_HUB=$(built rsb_hub); PRE_SVC=$(built rsb_service)
 trap '[ "$PLAIN" -eq 1 ] || { [ "$(built rsb_hub)" = "$PRE_HUB" ] || rm -f target/debug/rsb_hub
       [ "$(built rsb_service)" = "$PRE_SVC" ] || rm -f target/debug/rsb_service; }
       rm -f "$HUB_TOOL" "$SVC_TOOL"' EXIT
-cargo build -q -p rsbinder-tools --features topic,rpc --bin rsb_hub --bin rsb_service || exit 1
+cargo build -q -p rsbinder-tools --features topic --bin rsb_hub --bin rsb_service || exit 1
 cp -f target/debug/rsb_hub "$HUB_TOOL" && cp -f target/debug/rsb_service "$SVC_TOOL" || exit 1
 cargo build -q -p rsbinder-tools --bin rsb_hub --bin rsb_service || exit 1
 PLAIN=1
@@ -181,20 +181,6 @@ else
     bad "hub did not start: $(tail -3 "$LOG")"
 fi
 stop_probes; stop_hub
-
-######################################################################
-note "--topic-socket: the hub's registry over a Unix socket"
-SOCK=$WORK/topic.sock
-if start_hub --config "$CFG" --topic-socket "$SOCK"; then
-    tool "$WORK/sock" topic stat tool.none --topic-socket "$SOCK"
-    [ "$RC" -eq 1 ] && ok "a name with no topic on the socket: exit 1" \
-        || bad "socket exit $RC: $(cat "$WORK/sock.err")"
-    tool "$WORK/sock-list" topic list --topic-socket "$SOCK"
-    [ "$RC" -eq 0 ] && ok "topic list over the socket" || bad "socket list exit $RC"
-else
-    bad "hub did not start: $(tail -3 "$LOG")"
-fi
-stop_hub
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::unix::{send_no_wait_no_fds, send_raw_no_fds, wait_for_room, Carry};
+use super::unix::{send_no_wait_no_fds, send_raw_no_fds, Carry};
 use super::{OutQueue, PeerIdentity, ReadDeadline, RpcTransport};
 use crate::rpc::RpcResult;
 
@@ -212,10 +212,6 @@ impl RpcTransport for TcpDebugTransport {
 
     fn __whole_small_frame_now(&self) -> bool {
         super::unix::tcp_whole_small_frame_now(self.stream.as_fd())
-    }
-
-    fn __wait_for_room(&self) -> RpcResult<bool> {
-        wait_for_room(self.stream.as_fd(), &self.queue)
     }
 
     /// Raw, unframed write for the android-13+ profile (the real android

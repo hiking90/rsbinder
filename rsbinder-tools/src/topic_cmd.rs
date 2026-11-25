@@ -4,10 +4,10 @@
 //! `rsb_service topic`: a topic as a process outside its publisher sees it — its status, the rate
 //! of its records, the records themselves, and a file of them.
 //!
-//! Each command finds the topic by its name once, through one of three sources: `rsb_hub`'s topic
-//! registry (the default), the service manager (`--service`), or the registry a hub serves on a
-//! Unix socket (`--topic-socket`). It never guesses: a name the chosen source has nothing for is
-//! exit 1; a binder under the name that is not a topic refuses the call, which is exit 2.
+//! Each command finds the topic by its name once, through one of two sources: `rsb_hub`'s topic
+//! registry (the default) or the service manager (`--service`). It never guesses: a name the
+//! chosen source has nothing for is exit 1; a binder under the name that is not a topic refuses
+//! the call, which is exit 2.
 //!
 //! `hz`, `echo` and `record` subscribe once as a subscriber of any type
 //! (`rsbinder_topic::AnyType`) that the publisher does not wait for
@@ -55,8 +55,6 @@ pub enum Source {
     Registry,
     /// The service manager: a topic registered as a service.
     Service,
-    /// The registry a hub serves on this Unix socket (`rsb_hub --topic-socket`).
-    Socket(PathBuf),
 }
 
 /// What a watching command does with the records.
@@ -70,15 +68,8 @@ pub enum Watch {
     Record(PathBuf),
 }
 
-/// The topic a name has, as its source answers.
-enum Found {
-    Binder(SIBinder),
-    #[cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
-    Socket(rsbinder_topic::registry::uds::UdsResolver),
-}
-
-/// `Err` with the exit code once the reason is printed.
-fn find(name: &str, source: &Source) -> Result<Found, u8> {
+/// The topic a name has, as its source answers; `Err` with the exit code once the reason is printed.
+fn find(name: &str, source: &Source) -> Result<SIBinder, u8> {
     let found = match source {
         Source::Registry => {
             let resolver = RegistryResolver::find().map_err(|status| {
@@ -94,39 +85,11 @@ fn find(name: &str, source: &Source) -> Result<Found, u8> {
             }
         }
         Source::Service => hub::check_service(name),
-        Source::Socket(path) => return on_socket(path),
     };
-    found.map(Found::Binder).ok_or_else(|| {
+    found.ok_or_else(|| {
         eprintln!("rsb_service: {name}: no topic (or not one this caller may reach)");
         NO
     })
-}
-
-#[cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
-fn on_socket(path: &std::path::Path) -> Result<Found, u8> {
-    use rsbinder_topic::registry::uds::{ResolverOptions, UdsResolver};
-    use rsbinder_topic::uds::Endpoint;
-    let endpoint = Endpoint::Path(path.to_owned());
-    match UdsResolver::connect(endpoint, &ResolverOptions::default()) {
-        Ok(resolver) => Ok(Found::Socket(resolver)),
-        Err(status) => {
-            eprintln!(
-                "rsb_service: no topic registry on {}: {status}",
-                path.display()
-            );
-            Err(ERR)
-        }
-    }
-}
-
-#[cfg(not(all(feature = "rpc", any(target_os = "linux", target_os = "android"))))]
-fn on_socket(path: &std::path::Path) -> Result<Found, u8> {
-    eprintln!(
-        "rsb_service: {} takes the features `topic` and `rpc`, on Linux or Android; this build \
-         is not that",
-        path.display()
-    );
-    Err(ERR)
 }
 
 /// The reason a call failed, with where to look for a refusal; exit 1 for a name with no topic.
@@ -156,12 +119,11 @@ pub fn stat(name: &str, source: &Source, timeout: Duration) -> u8 {
         Err(code) => return code,
     };
     let (sent, answered) = mpsc::channel();
-    let asked = name.to_owned();
     // A kernel binder call has no deadline: one to a stopped publisher waits for ever.
     let asking = std::thread::Builder::new()
         .name("rsb_service-stat".into())
         .spawn(move || {
-            let _ = sent.send(ask_status(&asked, found));
+            let _ = sent.send(ask_status(found));
         });
     if asking.is_err() {
         eprintln!("rsb_service: cannot start the thread that asks");
@@ -183,16 +145,9 @@ pub fn stat(name: &str, source: &Source, timeout: Duration) -> u8 {
     }
 }
 
-fn ask_status(name: &str, found: Found) -> BinderResult<TopicStatus> {
-    match found {
-        Found::Binder(binder) => {
-            let _ = name;
-            let topic: Strong<dyn ITopic> = binder.into_interface()?;
-            topic.r#status()
-        }
-        #[cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
-        Found::Socket(resolver) => resolver.status(name),
-    }
+fn ask_status(binder: SIBinder) -> BinderResult<TopicStatus> {
+    let topic: Strong<dyn ITopic> = binder.into_interface()?;
+    topic.r#status()
 }
 
 /// `topic hz`, `echo` and `record`: subscribe once, then receive `count` records or until the
@@ -204,7 +159,7 @@ pub fn watch(name: &str, source: &Source, watch: &Watch, count: Option<u64>) -> 
     };
     let builder = Subscriber::<AnyType>::builder().unwaited().start_at(start);
     let subscribed = match find(name, source) {
-        Ok(found) => subscribe(name, found, builder),
+        Ok(found) => subscribe(&found, builder),
         Err(code) => return code,
     };
     let subscriber = match subscribed {
@@ -226,20 +181,12 @@ pub fn watch(name: &str, source: &Source, watch: &Watch, count: Option<u64>) -> 
 }
 
 fn subscribe(
-    name: &str,
-    found: Found,
+    binder: &SIBinder,
     builder: SubscriberBuilder<AnyType>,
 ) -> BinderResult<Subscriber<AnyType>> {
-    match found {
-        Found::Binder(binder) => {
-            // The publisher's death and the end of its records reach a pool thread.
-            rsbinder::ProcessState::start_thread_pool();
-            let _ = name;
-            builder.subscribe(&binder)
-        }
-        #[cfg(all(feature = "rpc", any(target_os = "linux", target_os = "android")))]
-        Found::Socket(resolver) => resolver.subscribe(name, builder),
-    }
+    // The publisher's death and the end of its records reach a pool thread.
+    rsbinder::ProcessState::start_thread_pool();
+    builder.subscribe(binder)
 }
 
 /// What a watching command does with each thing a receive returns.

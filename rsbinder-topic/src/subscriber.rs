@@ -164,8 +164,7 @@ impl Settings {
 }
 
 /// The receiving end of a topic of `T`, made by a [`builder`](Self::builder):
-/// [`subscribe`](crate::SubscriberBuilder::subscribe) for a topic's binder, `connect` for a
-/// publisher's socket (feature `uds`).
+/// [`subscribe`](crate::SubscriberBuilder::subscribe) for a topic's binder.
 ///
 /// It maps the topic's memory read-only and reads records at its own pace; nothing it does
 /// reaches the publisher or another subscriber. Dropping it ends the subscription and tells the
@@ -288,9 +287,8 @@ impl Drop for Closing {
 
 impl<T: Payload> Subscriber<T> {
     /// A builder of a subscriber of `T`, which subscribes in its last call: one topic's binder
-    /// ([`subscribe`](crate::SubscriberBuilder::subscribe)), a name
-    /// ([`subscribe_named`](crate::SubscriberBuilder::subscribe_named)), or a publisher's socket
-    /// (`connect`, feature `uds`).
+    /// ([`subscribe`](crate::SubscriberBuilder::subscribe)) or a name
+    /// ([`subscribe_named`](crate::SubscriberBuilder::subscribe_named)).
     pub fn builder() -> crate::SubscriberBuilder<T> {
         crate::SubscriberBuilder::new()
     }
@@ -459,12 +457,6 @@ impl<T: Payload> Subscriber<T> {
     pub(crate) fn with_session(mut self, session: Arc<dyn Any + Send + Sync>) -> Self {
         self.session = Some(session);
         self
-    }
-
-    /// What [`with_session`](Self::with_session) gave it, for a test.
-    #[cfg(all(test, feature = "uds", any(target_os = "linux", target_os = "android")))]
-    pub(crate) fn session_guard<G: Any + Send + Sync>(&self) -> Option<&G> {
-        self.session.as_ref()?.downcast_ref()
     }
 }
 

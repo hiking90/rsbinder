@@ -5,10 +5,9 @@
 [![GitHub](https://img.shields.io/badge/github-hiking90%2Frsbinder-8da0cb?logo=github)](https://github.com/hiking90/rsbinder/tree/master/rsbinder-topic)
 
 **Experimental.** One publisher and many subscribers over kernel binder, on
-Linux and Android, or with the feature `uds` over a Unix domain socket on Linux,
-where there is no binder device. A binder call sets each subscription up; after
-it the records travel through shared memory, and no binder transaction is made
-for them.
+Linux and Android. A binder call sets each subscription up; after it the
+records travel through shared memory, and no binder transaction is made for
+them.
 
 - The publisher allocates a ring of records in a sealed memfd, and every
   subscriber maps it read-only: one copy into the ring serves all of them.
@@ -23,8 +22,7 @@ for them.
 - A topic is found through the service manager, by its binder or by a name
   that the subscriber watches and reconnects to, or by a name in the registry
   of topic names `rsb_hub` serves with its `topic` feature, under a policy of
-  its own. Without a binder device, at a socket path or through the same
-  registry on a socket (`rsb_hub --topic-socket`).
+  its own.
 - A publisher can wait for its subscribers to come and go, and answers a status
   call and a binder dump (`dumpsys`) for the callers it lets look;
   `rsb_service topic` prints a topic's status, rate and records from outside,
@@ -32,8 +30,7 @@ for them.
 
 ```toml
 [dependencies]
-rsbinder-topic = "0.1"                                      # over kernel binder
-# rsbinder-topic = { version = "0.1", features = ["uds"] }  # and over a Unix socket
+rsbinder-topic = "0.1"
 ```
 
 A receiver that must see every value however slow it is uses

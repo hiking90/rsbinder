@@ -12,11 +12,10 @@ This crate provides essential CLI tools for using Binder IPC on Linux systems. W
 $ cargo install rsbinder-tools
 ```
 
-Two features are off by default. `topic` adds `rsb_hub`'s registry of topic
-names and `rsb_service topics`; `topic` with `rpc` adds `--topic-socket`, the
-same registry on a Unix socket with no binder device:
+The feature `topic`, off by default, adds `rsb_hub`'s registry of topic names
+and `rsb_service topics`:
 ```bash
-$ cargo install rsbinder-tools --features topic,rpc
+$ cargo install rsbinder-tools --features topic
 ```
 
 ### From source
@@ -156,7 +155,7 @@ to run an independent one.
 - **Access Control**: per-name `add` / `find` policy plus a global `list` gate (`[global] list`), keyed on caller uid and group, default-deny, reloadable with `SIGHUP`
 - **Service Declarations**: `[[service]]` entries answer `isDeclared` / `getDeclaredInstances` / `getConnectionInfo`, the Linux stand-in for VINTF manifests; an `accessor` key hands clients of the instance the `IAccessor` registered under that name, as VINTF `<accessor>` does
 - **On-Demand Start**: a `getService` that misses a declared service starts it (`checkService`, and so `rsb_service check`, never does), via systemd or a configured command; an `exec` command's program (`argv[0]`) runs with `rsb_hub`'s privileges, so it must be an absolute path and pass the configuration's own ownership and mode check when the configuration is loaded and again right before each start
-- **Topic names** (feature `topic`): a registry of topic names under `[[topic]]` rules. With the feature `rpc` too, `rsb_hub --topic-socket PATH` serves it alone on a Unix socket, with no binder device
+- **Topic names** (feature `topic`): a registry of topic names under `[[topic]]` rules
 - **Notification System**: callbacks for service availability changes
 - **Dump Priorities**: `listServices` filters by the AOSP `DUMP_FLAG_PRIORITY_*` flags — a listing filter, not an access-control mechanism
 
@@ -193,7 +192,6 @@ $ rsb_service connection com.example.IFoo/default   # declared ip:port, if any
 $ rsb_service dump manager                          # rsb_hub's own registry
 $ rsb_service dump manager com.example              # ... narrowed by substring
 $ rsb_service topics                                # topic names (feature topic)
-$ rsb_service topics --topic-socket PATH            # ... of a hub on a socket
 ```
 
 Every command takes `-d, --device <NAME>` (default `binder`) to ask the

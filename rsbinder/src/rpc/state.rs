@@ -248,8 +248,6 @@ pub struct RpcState {
     remote_books: HashMap<RpcAddress, RemoteBook>,
     /// Sends of a peer address the peer has not paid back yet; present only while one is unpaid.
     remote_sends: HashMap<RpcAddress, RemoteSends>,
-    /// How many addresses may have an unpaid send when a no-wait oneway adds one; `None`: any.
-    unpaid_address_limit: Option<usize>,
     /// Monotonic address allocator (per-session).
     addr_counter: u64,
     /// This endpoint's address subspace (initiator vs acceptor): the two peers never collide.
@@ -273,7 +271,6 @@ impl RpcState {
             remote_proxies: HashMap::new(),
             remote_books: HashMap::new(),
             remote_sends: HashMap::new(),
-            unpaid_address_limit: None,
             addr_counter: 0,
             space,
             #[cfg(test)]
@@ -491,18 +488,6 @@ impl RpcState {
     /// transaction's target on the android-13+ wire. Module doc "Ref-count model".
     pub fn on_proxy_leaving(&mut self, addr: RpcAddress) {
         self.remote_sends.entry(addr).or_default().unpaid += 1;
-    }
-
-    /// Set the limit [`past_unpaid_limit`](Self::past_unpaid_limit) reads.
-    pub(crate) fn limit_unpaid_addresses(&mut self, limit: usize) {
-        self.unpaid_address_limit = Some(limit);
-    }
-
-    /// Whether a send of `addr` would take the addresses with an unpaid send past the limit.
-    pub(crate) fn past_unpaid_limit(&self, addr: &RpcAddress) -> bool {
-        self.unpaid_address_limit.is_some_and(|limit| {
-            self.remote_sends.len() >= limit && !self.remote_sends.contains_key(addr)
-        })
     }
 
     /// A proxy of `addr` dropped (`RpcProxy::drop`). Returns the `DEC_STRONG` amount to send

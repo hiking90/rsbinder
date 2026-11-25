@@ -69,5 +69,5 @@ pub use policy::{
     TopicPolicy, TopicRule,
 };
 #[cfg(feature = "topic")]
-pub use topic_mode::{registry_out_of_reach, unused_on_a_topic_socket};
+pub use topic_mode::registry_out_of_reach;
 pub use trust::{trust_problem, TrustProblem, Untrusted};

@@ -80,12 +80,31 @@ peers; peers of either release still subscribe to each other.
   it returns `Ok` and `is_read_only()` is `true`, where it returned the error
   of a writable `mmap` unless the fd was also write-protected. A receiver that
   writes then gets `PermissionDenied` from `write_at`.
+- `RpcProxy::__try_oneway`, `RpcServer::__limit_unpaid_addresses` and
+  `RpcTransport::__wait_for_room`, hidden and not part of the API, are gone:
+  their one caller was the topic registry on a socket, below. A type that
+  implements `RpcTransport` and defined `__wait_for_room` drops it.
 
+- **`rsbinder-topic` (breaking): topics over a Unix domain socket are gone.**
+  The feature `uds`, the modules `uds` and `registry::uds` (`UdsResolver`,
+  `UdsRegistry`, `SocketDir`, `ResolverOptions`), `SubscriberBuilder::connect`
+  and `connect_with`, the example `topic_uds`, and the AIDL types
+  `ITopicUdsRegistry`, `ITopicAddressWatcher`, `TopicAddress` and
+  `TopicAllocation` are removed, and `RegistryStats::pending` with them.
+  `rsb_hub --topic-socket` and `--topic-socket` of `rsb_service topics` and
+  `rsb_service topic` are removed too: `rsbinder-tools`' feature `rpc` no
+  longer adds a mode to the hub. A topic's names are those of a binder
+  device. Names on a socket could be made to look like kernel binder's but
+  not to behave as they do (a binder cannot leave the RPC session it arrived
+  on, and a caller is known per connection, not per call), so they are not
+  kept as a second kind of bus. `SubscriberBuilder::subscribe` still takes an
+  `ITopic` binder of an RPC session of your own that passes fds and has an
+  incoming connection. The removed code is at the tag `archive/topic-uds`.
 - **`rsbinder-topic` (breaking): both ends are made by a builder.**
   `PublisherPolicy`, `PoolPolicy`, `Backpressure`, `Authorize`,
   `SubscriberPolicy`, `Publisher::new`, `advertise`, `advertise_with`,
-  `Subscriber::request`, `NamedSubscriber::subscribe`/`subscribe_with` and
-  `uds::subscribe`/`subscribe_with` are gone, with no alias.
+  `Subscriber::request` and `NamedSubscriber::subscribe`/`subscribe_with` are
+  gone, with no alias.
   `Publisher::<T>::events()` returns a `PublisherBuilder<T, EventTopic>`
   that sizes the ring from `max_value_bytes` and `keep`
   (`(keep + 1) × (max_value_bytes rounded up to 8, plus 8)`, at least 4 KiB,
@@ -98,13 +117,11 @@ peers; peers of either release still subscribe to each other.
   setting without `lend` is refused with `EX_ILLEGAL_ARGUMENT`.
   `Subscriber::<T>::builder()` takes `start_at`, `wake`, `max_ring_bytes` and
   `max_pool_bytes`, and subscribes in its last call: `subscribe(&binder)`,
-  `subscribe_named(name)`, `subscribe_named_on(name, &resolver)`, and with
-  `uds` `connect(endpoint)` and `connect_with(endpoint, &options)`.
+  `subscribe_named(name)` and `subscribe_named_on(name, &resolver)`.
   `Start::Latest` and `Start::Last` are now `Start::Next` and
   `Start::Newest`; `Start::Oldest` is unchanged. The default start is the new
   `Start::Auto`, which on an event topic is `Start::Next`, the 0.1.0 default.
-  `UdsResolver::subscribe` takes a `SubscriberBuilder` in place of the
-  policy. A name is given with `advertise_on` after `build`. **The default
+  A name is given with `advertise_on` after `build`. **The default
   ring is 4 KiB, not 64 KiB**: a topic made with none of `max_value_bytes`,
   `keep` and `ring_bytes` carries values of up to 2040 bytes, where
   `PublisherPolicy::default()` carried 32760, and a larger value fails with
@@ -316,8 +333,7 @@ peers; peers of either release still subscribe to each other.
   dump of a topic at a time, so a caller that does not read its pipe holds
   no binder thread of the publisher; `Acceptor::dump` writes the same text
   to a writer on the calling thread. `RegistryResolver::lookup`
-  gives the `ITopic` binder of a registry name; `uds::status` and
-  `UdsResolver::status` ask for the status over a socket; `TopicStatus`
+  gives the `ITopic` binder of a registry name; `TopicStatus`
   implements `Display`, the text of the dump.
 - `Blob::read_into`: a blob's payload copied into a `Vec` the caller keeps.
   A reader of many large blobs that hands the same `Vec` back copies into

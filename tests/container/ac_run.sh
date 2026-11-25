@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# What tests/container/run.sh promises (plan 6-7 X1, plan 15-pubsub-uds §4.9).
+# What tests/container/run.sh promises (plan 6-7 X1).
 #
 #   tests/container/ac_run.sh
 #

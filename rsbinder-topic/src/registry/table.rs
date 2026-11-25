@@ -11,8 +11,7 @@ use rsbinder::{BinderResult, Caller};
 
 use crate::named::{FIRST_RETRY, LAST_RETRY};
 
-/// Names with a topic, and apart from them names with a watch: the hub's bound on each map. A
-/// registry over a socket keeps a descriptor for each, so a host needs at least this many.
+/// Names with a topic, and apart from them names with a watch: the hub's bound on each map.
 pub const MAX_NAMES: usize = 10_000;
 /// Watches of one name, the hub's bound on the callbacks of one service name.
 pub(crate) const MAX_WATCHERS: usize = 256;
@@ -21,8 +20,7 @@ pub(crate) const MAX_OWED: usize = MAX_WATCHERS;
 
 /// A binder as the table knows it: equality, and the handle its death link is counted by.
 ///
-/// A process has one proxy per handle, so a handle says which binder a key is of. Keys of one
-/// handle differ only by what they add to it, as the allocation of a socket.
+/// A process has one proxy per handle, so a handle says which binder a key is of.
 pub(crate) trait Key: Clone + PartialEq {
     /// What tells this binder from another while the key lives; `None` for one that is not linked.
     fn handle(&self) -> Option<u64>;
@@ -49,12 +47,6 @@ pub(crate) enum Refused {
     Full,
     /// The death link failed; nothing changed.
     Link(rsbinder::Status),
-    /// `commit` of an allocation that was replaced, withdrawn or never made.
-    #[cfg_attr(
-        not(all(feature = "uds", any(target_os = "linux", target_os = "android"))),
-        expect(dead_code, reason = "only a registry on a socket allocates")
-    )]
-    NoAllocation,
 }
 
 /// A notice of a change to one watcher of the changed name: the shell judges the caller and sends.
@@ -108,33 +100,17 @@ struct Owed<W> {
     due: Instant,
 }
 
-/// An allocation of a name that is not committed yet: nothing finds it.
-#[cfg_attr(
-    not(all(feature = "uds", any(target_os = "linux", target_os = "android"))),
-    expect(dead_code, reason = "only a registry on a socket allocates")
-)]
-struct Pending<T> {
-    key: T,
-    uid: u32,
-}
-
-/// The names a handle is used under, as a topic, as a watcher and as a pending allocation.
+/// The names a handle is used under, as a topic and as a watcher.
 #[derive(Default)]
 struct Uses {
     topics: BTreeSet<String>,
     watches: BTreeSet<String>,
-    pending: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy)]
 enum Use {
     Topic,
     Watch,
-    #[cfg_attr(
-        not(all(feature = "uds", any(target_os = "linux", target_os = "android"))),
-        expect(dead_code, reason = "only a registry on a socket allocates")
-    )]
-    Pending,
 }
 
 impl Uses {
@@ -142,12 +118,11 @@ impl Uses {
         match kind {
             Use::Topic => &mut self.topics,
             Use::Watch => &mut self.watches,
-            Use::Pending => &mut self.pending,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.topics.is_empty() && self.watches.is_empty() && self.pending.is_empty()
+        self.topics.is_empty() && self.watches.is_empty()
     }
 }
 
@@ -158,7 +133,6 @@ pub(crate) struct Counts {
     pub watched: usize,
     pub watchers: usize,
     pub owed: usize,
-    pub pending: usize,
     pub sent: u64,
     pub failed: u64,
     pub retried: u64,
@@ -174,8 +148,6 @@ pub(crate) struct Table<T, W> {
     links: BTreeMap<u64, Uses>,
     /// Owed watches, apart from `watchers` for a round: each a watch's, at most [`MAX_OWED`].
     owed: BTreeMap<String, Vec<Owed<W>>>,
-    /// Allocations not committed yet, at most one per name and handle; they count to [`MAX_NAMES`].
-    pending: BTreeMap<String, Vec<Pending<T>>>,
     counts: Counts,
 }
 
@@ -193,7 +165,6 @@ impl<T: Key, W: Key> Table<T, W> {
             generation: 0,
             links: BTreeMap::new(),
             owed: BTreeMap::new(),
-            pending: BTreeMap::new(),
             counts: Counts::default(),
         }
     }
@@ -212,7 +183,7 @@ impl<T: Key, W: Key> Table<T, W> {
             Some(held) if held.key == topic => return Ok(Vec::new()),
             Some(held) if held.uid != uid && !cross_uid => return Err(Refused::Taken),
             Some(_) => {}
-            None if self.held() >= MAX_NAMES => return Err(Refused::Limit),
+            None if self.topics.len() >= MAX_NAMES => return Err(Refused::Limit),
             None => {}
         }
         // A new key of the handle that holds the name: the one use of the name stays.
@@ -268,111 +239,6 @@ impl<T: Key, W: Key> Table<T, W> {
         true
     }
 
-    /// Names with a topic and allocations not committed: each holds a resource of the host's.
-    fn held(&self) -> usize {
-        self.topics.len() + self.pending_count()
-    }
-
-    fn pending_count(&self) -> usize {
-        self.pending.values().map(Vec::len).sum()
-    }
-}
-
-/// What only a registry on a socket does: a name given in two steps (plan 15-pubsub-uds §4.5).
-#[cfg(all(feature = "uds", any(target_os = "linux", target_os = "android")))]
-impl<T: Key, W: Key> Table<T, W> {
-    /// Make `key` the pending allocation of `name` for its handle, in place of one it had.
-    /// `Taken` as for a change of the name, which is judged again at the commit.
-    pub(crate) fn allocate(
-        &mut self,
-        uid: u32,
-        name: &str,
-        key: T,
-        cross_uid: bool,
-        links: &mut dyn Links<T, W>,
-    ) -> Result<(), Refused> {
-        if self
-            .topics
-            .get(name)
-            .is_some_and(|held| held.uid != uid && !cross_uid)
-        {
-            return Err(Refused::Taken);
-        }
-        let handle = key.handle();
-        let same = |pending: &Pending<T>| pending.key.handle() == handle;
-        let held = self.pending.get_mut(name);
-        if let Some(pending) = held.and_then(|list| list.iter_mut().find(|p| same(p))) {
-            *pending = Pending { key, uid };
-            return Ok(());
-        }
-        if self.held() >= MAX_NAMES {
-            return Err(Refused::Limit);
-        }
-        self.retain(handle, name, Use::Pending, |handle| {
-            links.link_topic(handle, &key)
-        })
-        .map_err(Refused::Link)?;
-        let list = self.pending.entry(name.to_owned()).or_default();
-        list.push(Pending { key, uid });
-        Ok(())
-    }
-
-    /// Take the pending allocation equal to `key`, if any, with its use of the handle kept.
-    fn take_pending(&mut self, name: &str, key: &T) -> Option<Pending<T>> {
-        let list = self.pending.get_mut(name)?;
-        let at = list.iter().position(|pending| pending.key == *key)?;
-        let pending = list.swap_remove(at);
-        if list.is_empty() {
-            self.pending.remove(name);
-        }
-        Some(pending)
-    }
-
-    /// Give `name` to the pending allocation equal to `key`: the notices and the generation of
-    /// the change. A refusal ends the allocation too, so a caller allocates again to try again.
-    pub(crate) fn commit(
-        &mut self,
-        (uid, pid): (u32, i32),
-        name: &str,
-        key: &T,
-        cross_uid: bool,
-        now: Instant,
-        links: &mut dyn Links<T, W>,
-    ) -> Result<(Vec<Notice<W>>, u64), Refused> {
-        let Some(pending) = self.take_pending(name, key) else {
-            return Err(Refused::NoAllocation);
-        };
-        let handle = pending.key.handle();
-        let change = self.advertise((uid, pid), name, pending.key, cross_uid, now, links);
-        // After the change: its use of the handle, if it made one, keeps the link in place.
-        self.release(handle, name, Use::Pending, links);
-        change.map(|notices| (notices, self.generation))
-    }
-
-    /// Withdraw the pending allocation equal to `key` if `uid` made it; whether it did.
-    pub(crate) fn withdraw_pending(
-        &mut self,
-        uid: u32,
-        name: &str,
-        key: &T,
-        links: &mut dyn Links<T, W>,
-    ) -> bool {
-        let held = self.pending.get(name);
-        let mine = held.is_some_and(|list| {
-            list.iter()
-                .any(|pending| pending.key == *key && pending.uid == uid)
-        });
-        if !mine {
-            return false;
-        }
-        if let Some(pending) = self.take_pending(name, key) {
-            self.release(pending.key.handle(), name, Use::Pending, links);
-        }
-        true
-    }
-}
-
-impl<T: Key, W: Key> Table<T, W> {
     /// The topic `name` has and the generation of the change that gave it; with none, now's.
     pub(crate) fn lookup(&self, name: &str) -> (Option<T>, u64) {
         match self.topics.get(name) {
@@ -468,14 +334,6 @@ impl<T: Key, W: Key> Table<T, W> {
             self.topics.remove(&name);
             self.generation += 1;
             self.clear_owed(&name);
-        }
-        for name in uses.pending {
-            if let Some(list) = self.pending.get_mut(&name) {
-                list.retain(|pending| pending.key.handle() != Some(handle));
-                if list.is_empty() {
-                    self.pending.remove(&name);
-                }
-            }
         }
         let other = |key: &W| key.handle() != Some(handle);
         for name in uses.watches {
@@ -620,7 +478,6 @@ impl<T: Key, W: Key> Table<T, W> {
             watched: self.watchers.len(),
             watchers: self.watchers.values().map(Vec::len).sum(),
             owed: self.owed(),
-            pending: self.pending_count(),
             ..self.counts
         }
     }
@@ -673,7 +530,7 @@ impl<T: Key, W: Key> Table<T, W> {
     pub(crate) fn linked(&self) -> BTreeMap<u64, usize> {
         let uses = self.links.iter();
         let counted = uses.map(|(handle, uses)| {
-            let count = uses.topics.len() + uses.watches.len() + uses.pending.len();
+            let count = uses.topics.len() + uses.watches.len();
             (*handle, count)
         });
         counted.collect()
@@ -706,8 +563,9 @@ impl<T: Key, W: Key> Table<T, W> {
             }
         }
         assert!(self.owed() <= MAX_OWED, "{} owed", self.owed());
-        assert!(self.held() <= MAX_NAMES, "{} held", self.held());
-        type Names<'a> = (BTreeSet<&'a str>, BTreeSet<&'a str>, BTreeSet<&'a str>);
+        let held = self.topics.len();
+        assert!(held <= MAX_NAMES, "{held} held");
+        type Names<'a> = (BTreeSet<&'a str>, BTreeSet<&'a str>);
         let mut uses: BTreeMap<u64, Names<'_>> = BTreeMap::new();
         for (name, held) in &self.topics {
             if let Some(handle) = held.key.handle() {
@@ -719,26 +577,13 @@ impl<T: Key, W: Key> Table<T, W> {
                 uses.entry(handle).or_default().1.insert(name);
             }
         }
-        for (name, list) in &self.pending {
-            assert!(!list.is_empty(), "{name:?}: an empty pending list");
-            for handle in list.iter().filter_map(|pending| pending.key.handle()) {
-                uses.entry(handle).or_default().2.insert(name);
-            }
-        }
         fn names(set: &BTreeSet<String>) -> BTreeSet<&str> {
             set.iter().map(String::as_str).collect()
         }
         let indexed: BTreeMap<u64, Names<'_>> = self
             .links
             .iter()
-            .map(|(handle, held)| {
-                let names = (
-                    names(&held.topics),
-                    names(&held.watches),
-                    names(&held.pending),
-                );
-                (*handle, names)
-            })
+            .map(|(handle, held)| (*handle, (names(&held.topics), names(&held.watches))))
             .collect();
         assert_eq!(indexed, uses, "the names of each handle");
     }

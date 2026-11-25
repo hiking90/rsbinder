@@ -24,9 +24,6 @@
 //! A [`RegistryResolver`] is the client side: [`Publisher::advertise_on`] and
 //! [`SubscriberBuilder::subscribe_named_on`] take it in place of the service manager.
 //!
-//! The module `uds` (feature `uds`, Linux and Android) is the same registry on a Unix socket, for
-//! a host with no binder device: `rsb_hub --topic-socket`.
-//!
 //! [`ITopicRegistry::SERVICE_NAME`]: crate::aidl::ITopicRegistry::SERVICE_NAME
 //! [`Publisher::advertise_on`]: crate::Publisher::advertise_on
 //! [`SubscriberBuilder::subscribe_named_on`]: crate::SubscriberBuilder::subscribe_named_on
@@ -35,16 +32,6 @@ mod resolver;
 mod table;
 #[cfg(test)]
 mod tests;
-#[cfg(all(feature = "uds", any(target_os = "linux", target_os = "android")))]
-pub mod uds;
-#[cfg(all(
-    test,
-    feature = "uds",
-    not(loom),
-    not(miri),
-    any(target_os = "linux", target_os = "android")
-))]
-mod uds_tests;
 
 pub use resolver::RegistryResolver;
 pub use table::MAX_NAMES;
@@ -83,8 +70,7 @@ pub trait RegistryAccess: Send + Sync {
     /// A panic in it ends the call that asked, and the registry goes on: a change keeps its new
     /// state, and the notice being judged is not sent. On a [`Registry`] those of a change not
     /// sent by then are not sent either; a notice the retry thread was judging stays owed, and
-    /// the next send starts another thread for it. On a registry on a socket a notice's judgement
-    /// ends no call: the change's other notices go on, and it no longer owes the one judged.
+    /// the next send starts another thread for it.
     ///
     /// One registry call can ask several times, each time a call of its own: a list asks about
     /// [`Action::List`] once and then about [`Action::Subscribe`] for each name. The registry
@@ -135,8 +121,6 @@ pub struct RegistryStats {
     pub notices_retried: u64,
     /// Failed notices not kept to send again, as 256 were owed already.
     pub owed_dropped: u64,
-    /// Allocations of a registry over a socket not committed yet.
-    pub pending: usize,
 }
 
 /// One name with a topic, as [`RegistryResolver::list`] returns it.
@@ -237,7 +221,6 @@ impl Registry {
             owed: counts.owed,
             notices_retried: counts.retried,
             owed_dropped: counts.dropped,
-            pending: counts.pending,
         }
     }
 }
@@ -418,14 +401,7 @@ fn refused(refused: Refused) -> Status {
             refuse(ERROR_LIMIT, "the registry holds as many as it takes")
         }
         Refused::Link(status) => link_failed(&status),
-        Refused::NoAllocation => no_allocation(),
     }
-}
-
-/// A commit of an allocation that is gone: a name is given again from a new one.
-fn no_allocation() -> Status {
-    let why = "the allocation was replaced or withdrawn";
-    Status::from((ExceptionCode::IllegalState, why))
 }
 
 /// A binder whose death cannot be linked; `DeadObject` would read as the registry's own death.

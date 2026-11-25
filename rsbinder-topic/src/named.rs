@@ -68,8 +68,7 @@ pub enum NamedState {
     Waiting,
     /// The publisher the name has, or the resolver's check of it, refused this subscriber with
     /// this status, one a retry cannot change ([`Disconnected::Rejected`] lists them). Nothing is
-    /// asked again until the name is given to another binder. Over a socket the connection is
-    /// closed, and nothing connects to that publisher again until the name has a new generation.
+    /// asked again until the name is given to another binder.
     Refused(Status),
     /// The last connection ended at a check of the publisher's memory that failed
     /// ([`Closed::Corrupted`]), and the name still has that publisher. Nothing is asked again
@@ -140,7 +139,7 @@ pub enum NamedState {
 /// whose fd the subscriber's epoll instance refuses ([`Disconnected::Rejected`]) does not.
 ///
 /// The subscriber remembers a publisher it was connected to by its topic's memory, which stays
-/// the same however it is reached: a publisher a registry on a socket gave a new socket is still
+/// the same however it is reached: a publisher a resolver gave a new binder is still
 /// the publisher it read. It forgets one on what a connection to it saw: the connection read the
 /// end record of its topic (what [`Closed::End`] and [`Closed::Status`] report), after which the
 /// publisher refuses every later subscription, or the notice of its binder's death arrived while
@@ -151,7 +150,7 @@ pub enum NamedState {
 /// [`Disconnected::Replaced`] included, and the death notice that arrives while it is held; an
 /// end it read no record of, or a notice that arrives once it is over, goes to none.
 ///
-/// Over a socket that notice is the end of the session, which a publisher can outlive. A
+/// Over an RPC session that notice is the end of the session, which a publisher can outlive. A
 /// subscriber of a [`TopicKind::State`] topic, or one that starts at [`Start::Newest`], remembers
 /// the publisher through it and connects to it again by the rules above. Any other subscriber
 /// of a [`TopicKind::Event`] topic forgets it: connected to it again, it starts at the oldest
@@ -579,23 +578,6 @@ impl<T: Payload + 'static> NamedSubscriber<T> {
             _watch: watch,
             _host: host,
         })
-    }
-
-    /// What keeps the session of the connection taken open, for a test that ends it.
-    #[cfg(all(
-        test,
-        feature = "uds",
-        not(loom),
-        not(miri),
-        any(target_os = "linux", target_os = "android"),
-        any(
-            target_pointer_width = "64",
-            all(target_arch = "x86", target_feature = "sse2"),
-            all(target_arch = "arm", target_has_atomic = "64")
-        )
-    ))]
-    pub(crate) fn connection_session<G: Any + Send + Sync>(&self) -> Option<&G> {
-        self.current.as_ref()?.subscriber.session_guard()
     }
 }
 
@@ -1592,7 +1574,7 @@ impl<T: Payload + 'static> Named<T> {
                             let session = (tell && !in_use).then(|| state.session.take()).flatten();
                             state.connecting = false;
                             drop(state);
-                            close_refused(session);
+                            drop(session);
                             self.signal();
                             return;
                         }
@@ -1736,15 +1718,6 @@ impl<T: Payload> Drop for Connecting<'_, T> {
         drop(state);
         self.0.signal();
     }
-}
-
-/// End the session of a publisher that refused this subscriber, which holds one of its connections.
-fn close_refused(session: Option<Arc<dyn Any + Send + Sync>>) {
-    #[cfg(feature = "uds")]
-    if let Some(session) = &session {
-        crate::uds::close_refused(&**session);
-    }
-    drop(session);
 }
 
 /// Whether a connection thread may subscribe to `binder`: neither `ended` nor refused.

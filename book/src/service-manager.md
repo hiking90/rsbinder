@@ -677,8 +677,8 @@ rsb_hub: /etc/rsbinder/hub.d loads: 3 rule(s), 1 service declaration(s)
 ```
 
 `--check-config` loads the configuration as a start or a reload would and
-exits 0 if it loads, 1 with the error if not. It opens no binder device and
-no socket, so it runs beside a serving hub. Run it as the hub's user: whether
+exits 0 if it loads, 1 with the error if not. It opens no binder device,
+so it runs beside a serving hub. Run it as the hub's user: whether
 a file is trusted depends on who reads it. A file can still change between
 the check and the signal, so the hub also keeps the outcome of its last
 reload: `rsb_service dump manager` prints `last reload: ok, N s ago` or
@@ -805,88 +805,9 @@ holds it and how many topic rules are in force, and its counters as
 `key=value` (`notices_failed` counts the sends of a notice that failed, for
 want of room or otherwise, those sent again included).
 
-### A hub on a Unix socket
-
-Built with the features `topic` and `rpc`
-(`cargo build -p rsbinder-tools --features topic,rpc`), `rsb_hub --topic-socket
-PATH` serves the registry of topic names on a Unix socket, where no binder device
-can be had (see [Topics](./topics.md#names-on-a-socket)). It opens no binder
-device and is no service manager, so it takes no `--device`. The hub on a device
-and the hub on a socket are two runs of one binary, each with names of its own:
-one process does not serve both, as a name would mean two things.
-
-| Run as | Socket | Its directory |
-|---|---|---|
-| a system service | `/run/rsbinder/topic.sock` | `/run/rsbinder/topic.d/` |
-| a systemd unit | as above, with `RuntimeDirectory=rsbinder` | as above |
-| a user | `$XDG_RUNTIME_DIR/rsbinder/topic.sock` | `$XDG_RUNTIME_DIR/rsbinder/topic.d/` |
-
-The directory is the socket's path with `.sock` replaced by `.d`, or with `.d`
-added to any other name. It has to be the hub's own: a socket file lives there
-only between its bind and its unlink. The hub makes it with mode 0700, and as it
-starts removes the socket files with a number for a name that a crash left. It
-refuses to start on a directory that is a symlink, that a uid other than root or
-its own owns, whose mode is not 0700, that another hub holds, or that holds
-anything else, and removes nothing then, so `--topic-socket /etc/rsbinder/hub.sock`
-cannot empty `/etc/rsbinder/hub.d`. The hub makes the socket's parent if it has to,
-with mode 0755 whatever the umask, and leaves one that exists as it is.
-
-Clients need only see the socket: between containers, bind mount the directory
-above it read-only. A connect works through a read-only mount, and whoever can write
-to the directory can put a socket of their own at the path for others to reach. A
-hub that restarts binds a new socket file, which a bind mount of the file alone does
-not show, and a unit needs `RuntimeDirectoryPreserve=yes` for a bind mount of its
-`RuntimeDirectory=` to outlive a restart.
-
-The socket's mode is 0666, whatever the umask, so that any local process can
-connect and be judged: as with `rsb_device --mode 0666` on a binder device, who may
-do what is the policy's to say, by `SO_PEERCRED` of the connection. To keep others
-from connecting at all, use the mode of a directory above it
-(`RuntimeDirectoryMode=` of a unit). The hub refuses to start if, when it sets the
-mode of the socket, the path names a symlink, another kind of file or a file of
-another uid. Across user namespaces a uid with no mapping reads 65534, and that is
-the uid the policy judges.
-
-Of the configuration this hub uses only `[[topic]]` and `[global] topics`.
-`[[rule]]`, `[[service]]` and `[global] list` have nothing to apply to, and it logs
-a warning naming each as it loads and reloads, as one directory of files can
-configure both a device hub and a socket hub. A `[[service]]`'s `start` is not run.
-
-`rsb_hub` raises its soft `RLIMIT_NOFILE` to the hard limit as it starts: it holds
-a descriptor per name and up to five per session (the connection it serves, two more
-in a call on it, and the two callback connections a client may attach), where a
-systemd service's soft limit is 1024. What a client sends with a call the kernel
-closes: no call takes a descriptor. It runs 1024 serve workers at once, one to a
-session; a callback connection takes a worker only while it attaches, so a session
-being set up needs one more free, and a connection past that waits in the socket's
-backlog. It logs a warning when the limit is short of those sessions and the
-registry's 10 000 names, under 15 152, and runs fewer workers once half the
-descriptors do not hold them, under 10 240; raise it with `LimitNOFILE=`. So sessions
-cannot take the descriptors of names: half of them are out of their reach. Names have
-no such bound below 15 152. Any uid can connect, so one can still hold every worker
-for as long as it likes, and keep others from connecting; a uid the policy has refused
-takes up a worker all the same. Keep such uids from connecting with the mode of a
-directory above the socket.
-
-A descriptor in a message a client has not read costs the hub no descriptor of its
-own, but the kernel counts it against the hub's uid, and refuses to send more once
-the count passes `RLIMIT_NOFILE`, unless the hub has `CAP_SYS_RESOURCE` or
-`CAP_SYS_ADMIN`. Each socket a client does not read holds a few hundred at the default
-socket size, so a uid the policy lets `subscribe` can reach any limit with enough
-stopped sessions; the hub's other limits do not bound this. Past the count nothing
-waits and no other session ends: a notice is owed and sent again, and a `lookup`,
-`watch` or `allocate` whose reply has a descriptor fails with `FAILED_TRANSACTION`
-for that call. An `allocate` refused that way leaves its name pending until the
-session ends or allocates that name again. To take the count away, give the hub the
-capability (`AmbientCapabilities=CAP_SYS_RESOURCE`; root has it only outside a
-container that dropped it), or keep such uids out of the policy.
-
-`rsb_service topics --topic-socket PATH [PREFIX]` lists the names, with no binder
-device. `rsb_service dump manager` does not apply: there is no manager to ask.
-
 ### What a caller can hold the hub up with
 
-On a binder device, `rsb_hub` serves every caller on one binder thread, as Android's
+`rsb_hub` serves every caller on one binder thread, as Android's
 `servicemanager` does, so a call it waited in would hold up every other,
 lookups included. It makes no call that waits for an answer. It runs under
 `CallRestriction::FatalIfNotOneway`, as `servicemanager` does: a two-way
@@ -935,9 +856,6 @@ caller is one the policy allows `list`, and every other call is answered.
 On macOS the writer sets `F_SETNOSIGPIPE` on the fd, so a write the caller
 makes through its own copy of it after the reader is gone fails with
 `EPIPE` instead of raising `SIGPIPE`.
-
-A hub on a socket has a serve thread and a reaper thread per session and no call
-restriction; what holds it up is in [Topics](./topics.md#what-differs-from-kernel-binder).
 
 ## Declaring services
 

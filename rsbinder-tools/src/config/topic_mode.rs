@@ -1,19 +1,17 @@
 // Copyright 2026 Jeff Kim <hiking90@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! What a hub warns of about a configuration, by how it serves topics.
+//! What a hub warns of about a configuration's topic rules.
 //!
-//! A hub on kernel binder finds its registry through the service manager, so `[[topic]]` rules
-//! alone leave it unreachable. A hub on a Unix socket (`rsb_hub --topic-socket`) has no service
-//! manager at all, so what governs services is left with nothing to govern. Neither is refused:
-//! one directory of configuration can serve a hub of each kind.
+//! A caller finds the hub's registry through the service manager, so `[[topic]]` rules alone
+//! leave it unreachable.
 
 use rsbinder_topic::aidl::ITopicRegistry::SERVICE_NAME;
 
 use super::policy::Subjects;
 use super::Config;
 
-/// A hub on kernel binder: why the registry the `[[topic]]` rules govern cannot be found, if so.
+/// Why the registry the `[[topic]]` rules govern cannot be found, if so.
 pub fn registry_out_of_reach(config: &Config) -> Option<String> {
     if config.topics.rules.is_empty() {
         return None;
@@ -32,32 +30,6 @@ pub fn registry_out_of_reach(config: &Config) -> Option<String> {
              caller find it, so RegistryResolver::find answers NameNotFound"
         )
     })
-}
-
-/// A hub on a Unix socket: what the configuration sets that it does not use, if anything.
-pub fn unused_on_a_topic_socket(config: &Config) -> Option<String> {
-    let rules = config.policy.rules.len();
-    let services = config.declarations.len();
-    let list = config.policy.list != Subjects::None;
-    if rules == 0 && services == 0 && !list {
-        return None;
-    }
-    let mut unused = Vec::new();
-    if rules > 0 {
-        unused.push(format!("{rules} [[rule]]"));
-    }
-    if services > 0 {
-        unused.push(format!(
-            "{services} [[service]], whose `start` is not run: this mode starts no service"
-        ));
-    }
-    if list {
-        unused.push("[global] list".to_owned());
-    }
-    Some(format!(
-        "this hub serves topics on a socket and no service manager, so it does not use: {}",
-        unused.join(", ")
-    ))
 }
 
 #[cfg(test)]
@@ -84,7 +56,7 @@ mod tests {
     }
 
     #[test]
-    fn no_topic_rule_warns_of_nothing_on_kernel_binder() {
+    fn no_topic_rule_warns_of_nothing() {
         assert_eq!(registry_out_of_reach(&Config::default()), None);
     }
 
@@ -126,29 +98,5 @@ mod tests {
             rule(SERVICE_NAME, Subjects::Any),
         ];
         assert!(registry_out_of_reach(&config).is_some());
-    }
-
-    #[test]
-    fn topic_rules_alone_are_all_a_socket_hub_uses() {
-        assert_eq!(unused_on_a_topic_socket(&with_topic_rule()), None);
-    }
-
-    #[test]
-    fn what_a_socket_hub_does_not_use_is_named() {
-        let mut config = with_topic_rule();
-        config.policy.rules = vec![rule("*", Subjects::Any), rule("a", Subjects::Any)];
-        config.policy.list = Subjects::Any;
-        let warning = unused_on_a_topic_socket(&config).unwrap();
-        assert!(warning.contains("2 [[rule]]"), "{warning}");
-        assert!(warning.contains("[global] list"), "{warning}");
-        assert!(!warning.contains("[[service]]"), "{warning}");
-    }
-
-    /// A kernel hub's service manager rules are no reason to warn a socket hub of the registry.
-    #[test]
-    fn the_two_warnings_are_of_the_two_modes() {
-        let config = with_topic_rule();
-        assert!(registry_out_of_reach(&config).is_some());
-        assert_eq!(unused_on_a_topic_socket(&config), None);
     }
 }

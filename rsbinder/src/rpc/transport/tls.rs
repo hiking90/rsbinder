@@ -1053,13 +1053,6 @@ impl RpcTransport for TlsTransport {
         self.stream.socket().is_some_and(whole_small_frame_now)
     }
 
-    fn __wait_for_room(&self) -> RpcResult<bool> {
-        match self.stream.socket() {
-            Some(sock) => super::unix::wait_for_room(sock, &self.queue),
-            None => Ok(true),
-        }
-    }
-
     /// Single-reader: one thread drives `recv_*` per connection (the RPC
     /// serve loop / the in-flight transact's reply wait). Concurrent
     /// multi-reader would interleave `pump_incoming` socket reads and
