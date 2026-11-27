@@ -218,9 +218,6 @@ impl RpcTransport for HoldsOnPins {
     ) -> std::result::Result<(), RpcError> {
         self.0.__flush_carried(drain)
     }
-    fn __wait_for_room(&self) -> std::result::Result<bool, RpcError> {
-        self.0.__wait_for_room()
-    }
     fn peer_identity(&self) -> PeerIdentity {
         self.0.peer_identity()
     }

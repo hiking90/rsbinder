@@ -78,9 +78,11 @@ process chooses another transport for one of them: every process then asks
 the same service manager, and a binder taken from one bus can be passed to a
 service of the other.
 
-- A machine with no binder device has no bus yet: `bus::system()` and
-  `bus::session()` return `StatusCode::NameNotFound`. Topics alone work there,
-  [over a Unix socket](./topics.md#topics-without-a-binder-device).
+- A machine with no binder device has no bus: `bus::system()` and
+  `bus::session()` return `StatusCode::NameNotFound`, and no name of a service
+  or of a topic is found there. What kernel binder does between the processes
+  of a call, an RPC session does only between its two ends, so a bus on
+  sockets could not behave as this one does.
 - A device that exists and cannot be opened is that open's error. The process
   takes no part in the bus until the device's mode or group lets it in
   (`rsb_device --mode`, `--group`); it is not moved to another transport,
@@ -211,4 +213,4 @@ with.
 | `busctl monitor` of method calls | A binder call goes from the caller to the service, with no broker between them to watch. The kernel's binder tracepoints show transactions |
 | Match rules in the bus | Subscribers filter |
 | Name request queues, `ALLOW_REPLACEMENT` | See name ownership above |
-| A bus on a machine with no binder device | Not yet; see [One transport for the machine](#one-transport-for-the-machine) |
+| A bus on a machine with no binder device | No; see [One transport for the machine](#one-transport-for-the-machine) |

@@ -15,8 +15,7 @@ use rsbinder::{BinderResult, SIBinder};
 /// [`SubscriberBuilder::subscribe_named_on`].
 ///
 /// [`ServiceManager`] is the implementation [`SubscriberBuilder::subscribe_named`] uses;
-/// [`RegistryResolver`] is a registry of topic names, apart
-/// from service names; `registry::uds::UdsResolver` (feature `uds`) is one on a Unix socket.
+/// [`RegistryResolver`] is a registry of topic names, apart from service names.
 ///
 /// [`RegistryResolver`]: crate::registry::RegistryResolver
 /// [`Publisher::advertise_on`]: crate::Publisher::advertise_on

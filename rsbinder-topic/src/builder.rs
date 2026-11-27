@@ -761,29 +761,6 @@ impl<T: Payload> SubscriberBuilder<T> {
         let start = self.settings.start;
         Subscriber::request_starting(topic, &self.settings, |_, _| (start, None))
     }
-
-    /// Subscribe to the topic of the publisher at `endpoint`, with
-    /// [`Options`](crate::uds::Options)' defaults.
-    ///
-    /// The returned [`Subscriber`] holds the session and closes it as it drops, so nothing is left
-    /// to end. Its errors are those of [`subscribe`](Self::subscribe) and of connecting: the code
-    /// of the kernel's answer (`NameNotFound` for no file, `Errno(-ECONNREFUSED)` for no listener,
-    /// `Errno(-EACCES)` for the socket file's mode) and `TimedOut` past
-    /// [`Options::timeout`](crate::uds::Options::timeout).
-    #[cfg(feature = "uds")]
-    pub fn connect(self, endpoint: crate::uds::Endpoint) -> BinderResult<Subscriber<T>> {
-        self.connect_with(endpoint, &crate::uds::Options::default())
-    }
-
-    /// [`connect`](Self::connect) with `options`.
-    #[cfg(feature = "uds")]
-    pub fn connect_with(
-        self,
-        endpoint: crate::uds::Endpoint,
-        options: &crate::uds::Options,
-    ) -> BinderResult<Subscriber<T>> {
-        crate::uds::connect_with(endpoint, &self.settings, options)
-    }
 }
 
 impl<T: Payload + 'static> SubscriberBuilder<T> {

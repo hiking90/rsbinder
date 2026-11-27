@@ -270,27 +270,22 @@ jobs:
         # connection). The two-process tests
         # are `#[ignore]`d and run in integration-test.yml. Its loom models
         # and its run under Miri are in `scripts/local_gate.sh`, as
-        # `rsbinder-fmq`'s are. With `uds`, the same over a Unix socket
-        # between two processes, which needs no binder device.
-        run: |
-          cargo test -p rsbinder-topic
-          cargo test -p rsbinder-topic --features uds
-      - name: Topics in a container with no binder (plan 15-pubsub-uds)
-        # Docker's default profiles and no device: it shows that the socket
-        # transport works where binder cannot, between real uids.
+        # `rsbinder-fmq`'s are.
+        run: cargo test -p rsbinder-topic
+      - name: The container runner (plan 6-7 X1)
+        # What `tests/container/run.sh` promises the scripts that use it.
         env:
           RSB_CONTAINER_REQUIRED: 1
         run: |
           cargo build -p rsbinder-tools
           tests/container/ac_run.sh
-          tests/container/topic_uds.sh
       - name: rsbinder-tools unit tests (hermetic)
         # The `rsb_hub` configuration parser, policy and enforcer, the NSS
         # and notify helpers, and the three binaries' own tests: none opens
         # the binder device, so the whole package runs here. Once more with
         # `topic`: its `[[topic]]` parse, the reserved registry name and the
         # name rule shared with `rsbinder-topic` are tested under that feature.
-        # With `rpc` too: `rsb_hub --topic-socket`'s own files and limits.
+        # With `rpc` too: the enforcer's judgement of an RPC caller.
         run: |
           cargo test -p rsbinder-tools
           cargo test -p rsbinder-tools --features topic

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a command in a container of its own: a binder device of its own, several
-# uids, or no binder at all (plan 6-7 §8, plan 15-pubsub-uds §4.9).
+# uids, or no binder at all (plan 6-7 §8).
 #
 #   tests/container/run.sh [--no-binder] [--as-root | --uid N] [--rw DIR] -- COMMAND...
 #
@@ -17,10 +17,8 @@
 #
 # --no-binder grants nothing: no SYS_ADMIN, no device rule, and Docker's default
 # seccomp and apparmor profiles, so binderfs cannot be mounted and binder-control
-# cannot be opened. This is the environment the topic transport over a Unix
-# socket is for, so a test here shows that it works where binder cannot, rather
-# than that it happens not to open binder. A path that would need more than the
-# default profile fails here instead of passing with the profile lifted.
+# cannot be opened. A path that would need more than the default profile fails
+# here instead of passing with the profile lifted.
 #
 # With a device the profiles are lifted: seccomp filters the mount binderfs needs,
 # and apparmor's docker-default denies mount where it is loaded. Nothing else of

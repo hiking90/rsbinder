@@ -12,8 +12,7 @@
 //! outside its publisher: its status, the rate of its records, the records
 //! themselves (`rsbinder_tools::topic_cmd`).
 //!
-//! Every question goes over binder, or over the hub's Unix socket for
-//! `--topic-socket`, as an ordinary client, so `rsb_hub`'s
+//! Every question goes over binder, as an ordinary client, so `rsb_hub`'s
 //! policy applies to `rsb_service` exactly as it does to anything else —
 //! running it does not grant a view a normal caller would not have. Where
 //! the policy withholds an answer, the tool says so rather than reporting
@@ -211,25 +210,6 @@ fn cmd_topics(prefix: &str) -> ExitCode {
         }
     };
     print_topics(resolver.list(prefix))
-}
-
-/// [`cmd_topics`] on the registry a hub serves on a Unix socket, with no binder device.
-#[cfg(all(
-    feature = "topic",
-    feature = "rpc",
-    any(target_os = "linux", target_os = "android")
-))]
-fn cmd_topics_on_socket(socket: &str, prefix: &str) -> ExitCode {
-    use rsbinder_topic::registry::uds::{ResolverOptions, UdsResolver};
-    use rsbinder_topic::uds::Endpoint;
-    let endpoint = Endpoint::Path(socket.into());
-    match UdsResolver::connect(endpoint, &ResolverOptions::default()) {
-        Ok(resolver) => print_topics(resolver.list(prefix)),
-        Err(status) => {
-            eprintln!("rsb_service: no topic registry on {socket}: {status}");
-            ExitCode::from(exit::ERR)
-        }
-    }
 }
 
 #[cfg(feature = "topic")]
@@ -562,30 +542,15 @@ fn cli() -> clap::Command {
         )
 }
 
-/// The `--topic-socket` option of every topic command.
-fn topic_socket() -> clap::Arg {
-    clap::Arg::new("topic-socket")
-        .long("topic-socket")
-        .value_name("PATH")
-        .hide(!cfg!(all(
-            feature = "topic",
-            feature = "rpc",
-            any(target_os = "linux", target_os = "android")
-        )))
-        .help("Ask the hub at this Unix socket (rsb_hub --topic-socket), with no binder device")
-}
-
 /// `topics` and `topic list`.
 fn list_command(name: &'static str) -> clap::Command {
-    clap::Command::new(name)
-        .arg(
-            clap::Arg::new("prefix")
-                .value_name("PREFIX")
-                .index(1)
-                .default_value("")
-                .help("Only list the names that start with this"),
-        )
-        .arg(topic_socket())
+    clap::Command::new(name).arg(
+        clap::Arg::new("prefix")
+            .value_name("PREFIX")
+            .index(1)
+            .default_value("")
+            .help("Only list the names that start with this"),
+    )
 }
 
 /// A topic command that takes a topic's name and where to look it up.
@@ -602,10 +567,8 @@ fn named_topic(name: &'static str) -> clap::Command {
             clap::Arg::new("service")
                 .long("service")
                 .action(clap::ArgAction::SetTrue)
-                .conflicts_with("topic-socket")
                 .help("NAME is a service manager name, not a topic registry one"),
         )
-        .arg(topic_socket())
 }
 
 /// A topic command that receives, up to `--count` records.
@@ -623,16 +586,14 @@ fn counted(command: clap::Command) -> clap::Command {
 #[cfg(feature = "topic")]
 fn topic_source(m: &clap::ArgMatches) -> rsbinder_tools::topic_cmd::Source {
     use rsbinder_tools::topic_cmd::Source;
-    if let Some(socket) = m.get_one::<String>("topic-socket") {
-        Source::Socket(socket.into())
-    } else if m.get_flag("service") {
+    if m.get_flag("service") {
         Source::Service
     } else {
         Source::Registry
     }
 }
 
-/// `topic stat|hz|echo|record`, once the binder device is open where one is needed.
+/// `topic stat|hz|echo|record`, once the binder device is open.
 #[cfg(feature = "topic")]
 fn cmd_topic(command: &str, m: &clap::ArgMatches) -> ExitCode {
     use rsbinder_tools::topic_cmd::{self, Watch};
@@ -686,40 +647,6 @@ fn main() -> ExitCode {
         },
         _ => (None, None),
     };
-    // Over the hub's socket, with no binder device to open.
-    #[cfg(feature = "topic")]
-    if let Some((command, m)) = topic {
-        if m.get_one::<String>("topic-socket").is_some() {
-            return cmd_topic(command, m);
-        }
-    }
-
-    if let Some(m) = listing {
-        if let Some(socket) = m.get_one::<String>("topic-socket") {
-            #[cfg(all(
-                feature = "topic",
-                feature = "rpc",
-                any(target_os = "linux", target_os = "android")
-            ))]
-            return cmd_topics_on_socket(
-                socket,
-                m.get_one::<String>("prefix")
-                    .expect("prefix has a default value"),
-            );
-            #[cfg(not(all(
-                feature = "topic",
-                feature = "rpc",
-                any(target_os = "linux", target_os = "android")
-            )))]
-            {
-                eprintln!(
-                    "rsb_service: {socket} takes the features `topic` and `rpc`, on Linux or \
-                     Android; this build is not that"
-                );
-                return ExitCode::from(exit::ERR);
-            }
-        }
-    }
 
     let device = matches
         .get_one::<String>("device")

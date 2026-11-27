@@ -316,14 +316,6 @@ pub(crate) fn check_no_wait_frame(buf: &[u8]) -> RpcResult<()> {
     Ok(())
 }
 
-/// `__wait_for_room` on a socket: `Ok(false)` is the send deadline passed with no peer progress.
-pub(crate) fn wait_for_room(
-    sock: std::os::fd::BorrowedFd<'_>,
-    queue: &OutQueue,
-) -> RpcResult<bool> {
-    Ok(SendWait::new(sock, queue).wait(false)?.is_some())
-}
-
 /// `__whole_small_frame_now` on TCP: past `POLLOUT` a small send stops short only for want of memory.
 #[cfg(any(feature = "rpc-tcp-debug", feature = "rpc-tls"))]
 pub(crate) fn tcp_whole_small_frame_now(sock: std::os::fd::BorrowedFd<'_>) -> bool {
@@ -1098,10 +1090,6 @@ impl RpcTransport for UnixTransport {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn __flush_carried(&self, drain: Option<&mut dyn FnMut() -> RpcResult<()>>) -> RpcResult<()> {
         self.carried_first(drain)
-    }
-
-    fn __wait_for_room(&self) -> RpcResult<bool> {
-        wait_for_room(self.stream.as_fd(), &self.queue)
     }
 
     /// Receive one length-prefixed frame plus any `SCM_RIGHTS` fds.

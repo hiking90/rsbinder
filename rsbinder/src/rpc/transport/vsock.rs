@@ -155,11 +155,6 @@ impl RpcTransport for VsockTransport {
         self.carry.flush(self.stream.as_fd(), &self.queue, drain)
     }
 
-    fn __wait_for_room(&self) -> RpcResult<bool> {
-        use std::os::fd::AsFd;
-        super::unix::wait_for_room(self.stream.as_fd(), &self.queue)
-    }
-
     fn peer_identity(&self) -> PeerIdentity {
         self.peer.clone()
     }

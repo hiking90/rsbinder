@@ -31,9 +31,3 @@ pub use generated::rsbinder::topic::{
 
 #[doc(hidden)]
 pub use generated::rsbinder::topic::{ISubscription, ITopicWatcher, Pool, TopicInfo, TopicRef};
-
-// The wire of `registry::uds`, which a program reaches through `UdsResolver` and `UdsRegistry`.
-#[doc(hidden)]
-pub use generated::rsbinder::topic::{
-    ITopicAddressWatcher, ITopicUdsRegistry, TopicAddress, TopicAllocation,
-};

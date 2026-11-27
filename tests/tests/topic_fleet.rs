@@ -20,10 +20,6 @@
 //! `TOPIC_NODE_BIN` replaces the node binary and `TOPIC_FLEET_DIR` the directory the run
 //! directories go in (`target/tmp/topic-fleet`), for a device the binaries were pushed to.
 //!
-//! With the feature `topic-uds` and `TOPIC_FLEET_SOCKETS` set to a directory, the fleet runs over
-//! Unix sockets and opens no binder device: `tests/container/topic_fleet_uds.sh` runs it in a
-//! container that has none. `steady_state_fleet`, `scripted_faults` and `chaos_faults` take it.
-//!
 //! On Android the platform service manager is the context manager and the nodes run as root:
 //! `su` is a permissive domain on a userdebug build, so any name can be added under enforcing
 //! SELinux. `hub_restarts` does not apply there. Android 10's service manager sends no
@@ -766,9 +762,6 @@ fn init() {
 /// subscriber can follow a name only through the registry there (`rsbinder_topic::ServiceManager`).
 fn registration_notices() -> bool {
     init();
-    if transport::sockets().is_some() {
-        return true;
-    }
     let probe = format!("rsb.fleet.probe.{}", std::process::id());
     match ServiceManager.watch(&probe, Box::new(|_| {})) {
         Ok(_) => true,
@@ -858,15 +851,6 @@ impl Topology {
             pins: String::new(),
             notices: registration_notices(),
         };
-        // Over sockets a registry stands for the service manager, which holds only topics.
-        #[cfg(feature = "topic-uds")]
-        if transport::sockets().is_some() {
-            let hub = transport::HUB;
-            topology.node(hub, &[("--registry", format!("service={hub}"))]);
-            topology
-                .registered
-                .retain(|name| *name != service && *name != registry);
-        }
         topology.node("registry", &[("--registry", format!("service={registry}"))]);
         topology.node(
             "p-status",
@@ -1122,15 +1106,8 @@ fn memfd_counts(pid: i32) -> (usize, usize, usize) {
     (memfds, maps, threads)
 }
 
-/// The open files of the fleet's socket registry node, or of this machine's `rsb_hub`, if one.
-fn hub_fds(fleet: &Fleet) -> Option<usize> {
-    #[cfg(feature = "topic-uds")]
-    if transport::sockets().is_some() {
-        let fds = format!("/proc/{}/fd", fleet.pid(transport::HUB));
-        return Some(fs::read_dir(fds).ok()?.count());
-    }
-    #[cfg(not(feature = "topic-uds"))]
-    let _ = fleet;
+/// The open files of this machine's `rsb_hub`, if one runs.
+fn hub_fds() -> Option<usize> {
     let hub = fs::read_dir("/proc")
         .ok()?
         .filter_map(Result::ok)
@@ -1305,7 +1282,6 @@ fn stop_point(
         }
     }
 
-    // Before the list: over sockets it opens a session of the hub's, whose threads end after it.
     let snapshot = Snapshot {
         processes: topology
             .nodes
@@ -1317,7 +1293,7 @@ fn stop_point(
                 )
             })
             .collect(),
-        hub_fds: hub_fds(fleet),
+        hub_fds: hub_fds(),
     };
 
     // Android 10's service manager lists a dead service's name for good, an earlier run's too.
@@ -2655,8 +2631,7 @@ impl Chaos<'_> {
             .nodes
             .iter()
             .map(|(node, _)| node.clone())
-            // The hub over sockets stands for the service manager, which no fault here hits.
-            .filter(|node| !PRODUCERS.contains(&node.as_str()) && node != "hub")
+            .filter(|node| !PRODUCERS.contains(&node.as_str()))
             .collect();
         match self.rng.below(4) {
             0 => {

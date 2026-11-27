@@ -126,7 +126,44 @@ The additions and fixes themselves are listed in
   argument: under `user/{uid}/*` no group lifts the deny of another uid's
   name, and the answer says so. Pass the uid the deny was judged for.
 
+- `rsb_hub --topic-socket` and the `--topic-socket` option of
+  `rsb_service topics` and `rsb_service topic` are gone, with
+  [topics over a Unix socket](#topics-over-a-unix-socket). The feature `rpc`
+  of `rsbinder-tools` no longer adds a mode to the hub, and
+  `config::unused_on_a_topic_socket` is removed. Run the hub on a binder
+  device.
+
 The sections below are about `rsbinder-topic`.
+
+## Topics over a Unix socket
+
+The feature `uds` and everything behind it are removed: the modules `uds` and
+`registry::uds` (`UdsResolver`, `UdsRegistry`, `SocketDir`, `ResolverOptions`,
+`uds::serve`, `uds::status`), `SubscriberBuilder::connect` and `connect_with`,
+the example `topic_uds`, the AIDL types `ITopicUdsRegistry`,
+`ITopicAddressWatcher`, `TopicAddress` and `TopicAllocation`, and
+`RegistryStats::pending`. A topic's names are those of a binder device: the
+service manager's, or a registry's found through it.
+
+There is no replacement for a name on a socket. Names on a socket could be made
+to look like kernel binder's but not to behave as they do: a binder cannot
+leave the RPC session it arrived on, and a caller is known per connection, not
+per call. A program on a machine with no binder device that used `uds` has
+these choices:
+
+- Give the machine a binder device (`rsb_device`), which a container needs
+  `CAP_SYS_ADMIN` and a device rule for, and use `rsb_hub`.
+- Open an RPC session of your own to the publisher's socket and pass its
+  `ITopic` binder to `SubscriberBuilder::subscribe`, which still takes one of a
+  session that passes fds and has an incoming connection; see
+  [A topic over an RPC session](./topics.md#a-topic-over-an-rpc-session).
+- Stay on `rsbinder-topic` 0.1.0 with rsbinder 0.13.0. The removed code is at
+  the tag `archive/topic-uds` of the repository.
+
+`RpcProxy::__try_oneway`, `RpcServer::__limit_unpaid_addresses` and
+`RpcTransport::__wait_for_room` of rsbinder, hidden and not part of its API,
+are removed with it. A type that implements `RpcTransport` and defined
+`__wait_for_room` drops that method.
 
 ## Making a publisher
 
@@ -161,8 +198,7 @@ is not set and as 16 at least with `lend`.
 ## Making a subscriber
 
 `SubscriberPolicy`, `Subscriber::request`, `NamedSubscriber::subscribe`,
-`NamedSubscriber::subscribe_with`, `uds::subscribe` and `uds::subscribe_with`
-are gone, with no alias. `Subscriber::<T>::builder()` takes `start_at`, `wake`,
+`NamedSubscriber::subscribe_with` are gone, with no alias. `Subscriber::<T>::builder()` takes `start_at`, `wake`,
 `max_ring_bytes` and `max_pool_bytes`, and subscribes in its last call:
 
 | 0.1.0 | Now |
@@ -170,10 +206,7 @@ are gone, with no alias. `Subscriber::<T>::builder()` takes `start_at`, `wake`,
 | `Subscriber::request` | `subscribe(&binder)` |
 | `NamedSubscriber::subscribe` | `subscribe_named(name)` |
 | `NamedSubscriber::subscribe_with` | `subscribe_named_on(name, &resolver)` |
-| `uds::subscribe` | `connect(endpoint)` |
-| `uds::subscribe_with` | `connect_with(endpoint, &options)` |
-
-`UdsResolver::subscribe` takes a `SubscriberBuilder` in place of the policy.
+| `uds::subscribe`, `uds::subscribe_with` | removed: [topics over a Unix socket](#topics-over-a-unix-socket) |
 
 `Start::Latest` and `Start::Last` are now `Start::Next` and `Start::Newest`;
 `Start::Oldest` keeps its name. The default start is the new `Start::Auto`,
