@@ -271,6 +271,30 @@ fn a_control_page_that_is_not_what_the_request_says_is_refused() {
     assert_eq!(publisher.subscriber_count(), 2);
 }
 
+/// With no call on the thread there is no caller for `authorize` to judge.
+#[test]
+fn a_request_no_call_of_this_thread_brings_is_not_put_to_authorize() {
+    let asked = Arc::new(Mutex::new(0));
+    let count = asked.clone();
+    let admitting = events::<Bytes>().authorize(move |_| {
+        *count.lock().unwrap() += 1;
+        true
+    });
+    let publisher = admitting.build().unwrap();
+    let acceptor = publisher.acceptor();
+    let other = request(control(b"RSTC", VERSION, 0, 0x80), token());
+    let refused = acceptor.accept(&other).err();
+    assert_eq!(
+        refused.map(|status| status.exception_code()),
+        Some(ExceptionCode::Security)
+    );
+    assert_eq!(*asked.lock().unwrap(), 0);
+    // The same request, once this thread asks with it, is put to the policy.
+    let _asking = crate::connect::Asking::new(&other);
+    assert!(acceptor.accept(&other).is_ok());
+    assert_eq!(*asked.lock().unwrap(), 1);
+}
+
 /// A request with this thread's token but not its address, as a nested call brings, is refused.
 #[test]
 fn a_copy_of_the_request_this_thread_makes_is_refused() {

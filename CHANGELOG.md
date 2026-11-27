@@ -175,6 +175,12 @@ peers; peers of either release still subscribe to each other.
   publish. A reply the subscriber refuses tells it too.
 - `rsbinder-topic`: `Payload::type_name` reserves the empty name, and
   `build()` refuses a type that has it with `EX_ILLEGAL_ARGUMENT`.
+- `rsbinder-topic`: `Acceptor::accept` refuses with `EX_SECURITY` a call made
+  on another thread than its subscription call arrived on, where it took this
+  process for the caller: `authorize` judged the publisher's own uid, and
+  `max_per_uid` counted against it. An `ITopic` of the application's own that
+  hands the request to a thread or task it started calls `accept` in the
+  handler instead.
 - **wire**: `rsbinder-topic`: `SubscribeRequest` has a new last field `flags`,
   and `TopicEndpoint` the last fields `id`, `flags` and `typeName`; `ITopic`
   has the methods above, with no change of the layout version. A 0.1.0
