@@ -25,7 +25,7 @@
 //!
 //! # Raw fd wire
 //!
-//! `write_raw_fd` / `read_raw_fd` are AOSP `Parcel::writeFileDescriptor` /
+//! `write_bare_fd` / `read_bare_fd` are AOSP `Parcel::writeFileDescriptor` /
 //! `Parcel::readFileDescriptor`: the **bare** fd object with no not-null / comm
 //! markers — `BINDER_TYPE_FD` on the kernel path, the fd-table index on an RPC
 //! `Unix` fd-mode session (preceded by `TYPE_NATIVE_FILE_DESCRIPTOR`, with its
@@ -248,8 +248,8 @@ fn rpc_fd_profile(parcel: &Parcel) -> Result<Option<RpcFdProfile>> {
 }
 
 /// AOSP `Parcel::writeFileDescriptor`: bare fd object, fd dup'd; see module doc "Raw fd wire".
-pub(crate) fn write_raw_fd(parcel: &mut Parcel, fd: BorrowedFd<'_>) -> Result<()> {
-    write_raw_owned_fd(parcel, dup_for_parcel(parcel, fd)?)
+pub(crate) fn write_bare_fd(parcel: &mut Parcel, fd: BorrowedFd<'_>) -> Result<()> {
+    write_bare_owned_fd(parcel, dup_for_parcel(parcel, fd)?)
 }
 
 /// Fd-mode gate + dup, run before writing anything so a failure leaves the parcel untouched.
@@ -263,8 +263,8 @@ pub(crate) fn dup_cloexec(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
     rustix::io::fcntl_dupfd_cloexec(fd, 0).map_err(errno_status)
 }
 
-/// [`write_raw_fd`] of an owned fd (a dup, or a caller's); a refused fd mode drops it unwritten.
-pub(crate) fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
+/// [`write_bare_fd`] of an owned fd (a dup, or a caller's); a refused fd mode drops it unwritten.
+pub(crate) fn write_bare_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()> {
     #[cfg(feature = "rpc")]
     if let Some(profile) = rpc_fd_profile(parcel)? {
         // Push only after the body is written, so a failed write leaves no ghost table entry.
@@ -288,7 +288,7 @@ pub(crate) fn write_raw_owned_fd(parcel: &mut Parcel, dup: OwnedFd) -> Result<()
 }
 
 /// AOSP `Parcel::readFileDescriptor`: RPC consumes the table entry; see module doc "Raw fd wire".
-pub(crate) fn read_raw_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
+pub(crate) fn read_bare_fd(parcel: &mut Parcel) -> Result<OwnedFd> {
     // Refuses a parcel whose fd mode forbids fds before any of it is read.
     let profile = rpc_fd_profile(parcel)?;
     #[cfg(not(feature = "rpc"))]
@@ -328,13 +328,13 @@ impl Serialize for ParcelFileDescriptor {
             if profile == RpcFdProfile::V1Plus {
                 parcel.write::<i32>(&0)?; // hasComm = 0 (no comm fd)
             }
-            return write_raw_owned_fd(parcel, dup);
+            return write_bare_owned_fd(parcel, dup);
         }
 
         // Not null
         parcel.write::<i32>(&1)?;
         parcel.write::<i32>(&0)?;
-        write_raw_owned_fd(parcel, dup)
+        write_bare_owned_fd(parcel, dup)
     }
 }
 
@@ -374,12 +374,12 @@ impl DeserializeOption for ParcelFileDescriptor {
                     return Err(StatusCode::BadValue);
                 }
             }
-            return Ok(Some(ParcelFileDescriptor::new(read_raw_fd(parcel)?)));
+            return Ok(Some(ParcelFileDescriptor::new(read_bare_fd(parcel)?)));
         }
 
         // Java PFD `writeToParcel`: `[hasComm][fd]`, plus `[commFd]` when hasComm != 0 (reliable).
         let has_comm = parcel.read::<i32>()?;
-        let fd = read_raw_fd(parcel)?;
+        let fd = read_bare_fd(parcel)?;
 
         // Reliable-PFD comm socket: consume it, send `DETACHED` (AOSP `readParcelFileDescriptor`).
         if has_comm != 0 {
@@ -475,7 +475,7 @@ fn fuzz_v1_parcel(input: &[u8]) -> Parcel {
     p
 }
 
-/// Fuzz entrypoint for the **bare** fd decode ([`read_raw_fd`], the
+/// Fuzz entrypoint for the **bare** fd decode ([`read_bare_fd`], the
 /// `android.utils.IMemoryHeap` wire) over RPC `Unix` fd-mode, **no
 /// received fds**. First byte selects the profile: even = R34/v0 bare
 /// index, odd = v1+ `[TYPE|idx]` with the next byte sizing a hostile
@@ -495,7 +495,7 @@ pub fn __fuzz_rpc_raw_fd(input: &[u8]) {
     } else {
         fuzz_v1_parcel(rest)
     };
-    let _ = read_raw_fd(&mut p);
+    let _ = read_bare_fd(&mut p);
 }
 
 #[cfg(test)]

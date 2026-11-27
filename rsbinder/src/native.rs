@@ -330,7 +330,7 @@ impl<T: Remotable> Inner<T> {
             INTERFACE_TRANSACTION => reply.write(T::descriptor()),
             DUMP_TRANSACTION => {
                 // AOSP `readFileDescriptor`, kernel or RPC; a kernel parcel closes its own fd.
-                let fd = crate::file_descriptor::read_raw_fd(_reader)?;
+                let fd = _reader.read_fd()?;
 
                 let argc = _reader.read::<i32>()?;
                 let mut argv = Vec::new();
@@ -1306,7 +1306,7 @@ mod rpc_dispatch_tests {
                 let rp = (*root).as_any().downcast_ref::<RpcProxy>().unwrap();
                 let (read_end, write_end) = rustix::pipe::pipe().unwrap();
                 let mut data = crate::binder::RemoteProxy::prepare_transact(rp, false).unwrap();
-                crate::file_descriptor::write_raw_fd(&mut data, write_end.as_fd()).unwrap();
+                data.write_fd(write_end.as_fd()).unwrap();
                 data.write(&0i32).unwrap();
                 drop(write_end);
                 rp.send(DUMP_TRANSACTION, &data, 0).unwrap();

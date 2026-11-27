@@ -78,7 +78,7 @@ impl<H: IMemoryHeap + 'static> Remotable for BnMemoryHeap<H> {
             HEAP_ID => {
                 let heap = &*self.0;
                 let fd = heap.heap_fd().ok_or(StatusCode::BadValue)?;
-                crate::file_descriptor::write_raw_fd(reply, fd)?;
+                reply.write_fd(fd)?;
                 reply.write_u64(heap.size() as u64)?;
                 reply.write_i64(heap.offset() as i64)?;
                 reply.write_u32(heap.flags())
@@ -139,7 +139,7 @@ impl BpMemoryHeap {
             return Ok(m.clone());
         }
         let mut reply = call(&self.binder, IMEMORY_HEAP_DESCRIPTOR, HEAP_ID)?;
-        let fd = crate::file_descriptor::read_raw_fd(&mut reply)?;
+        let fd = reply.read_fd()?;
         let size64 = reply.read_u64()?;
         let offset64 = reply.read_i64()?;
         let flags = reply.read_u32()?;
@@ -498,7 +498,7 @@ mod tests {
             .unwrap();
         reply.set_data_position(0);
         // Bare fd object first — no ParcelFileDescriptor markers.
-        let fd = crate::file_descriptor::read_raw_fd(&mut reply).unwrap();
+        let fd = reply.read_fd().unwrap();
         assert_eq!(reply.read_u64().unwrap(), (page() * 3) as u64);
         assert_eq!(reply.read_i64().unwrap(), 0);
         assert_eq!(reply.read_u32().unwrap(), FLAG_READ_ONLY);
@@ -552,7 +552,7 @@ mod tests {
             .on_transact(HEAP_ID, &mut Parcel::new(), &mut reply)
             .unwrap();
         reply.set_data_position(0);
-        let fd = crate::file_descriptor::read_raw_fd(&mut reply).unwrap();
+        let fd = reply.read_fd().unwrap();
         assert_eq!(
             ino(fd.as_fd()),
             ino(lying.heap.as_fd()),

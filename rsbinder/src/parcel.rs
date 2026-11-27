@@ -1303,7 +1303,7 @@ impl Parcel {
     /// `fcntl` when the duplicate cannot be made. Nothing is written in
     /// either case.
     pub fn write_fd(&mut self, fd: BorrowedFd<'_>) -> Result<()> {
-        crate::file_descriptor::write_raw_fd(self, fd)
+        crate::file_descriptor::write_bare_fd(self, fd)
     }
 
     /// Read a bare fd object, the wire of an AIDL `FileDescriptor` argument
@@ -1325,7 +1325,7 @@ impl Parcel {
     /// and [`StatusCode::BadValue`] when an RPC parcel names an fd that was
     /// not received with it.
     pub fn read_fd(&mut self) -> Result<OwnedFd> {
-        crate::file_descriptor::read_raw_fd(self)
+        crate::file_descriptor::read_bare_fd(self)
     }
 
     /// Attach the RPC hooks and enter RPC mode (AOSP `Parcel::markForRpc`/`mSession`).
