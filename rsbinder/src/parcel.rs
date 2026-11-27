@@ -1281,6 +1281,16 @@ impl Parcel {
         false
     }
 
+    /// Write a bare file descriptor (AOSP `Parcel::writeFileDescriptor` / Java AIDL `FileDescriptor`).
+    pub fn write_raw_fd(&mut self, fd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+        crate::file_descriptor::write_raw_fd(self, fd)
+    }
+
+    /// Read a bare file descriptor (AOSP `Parcel::readFileDescriptor` / Java AIDL `FileDescriptor`).
+    pub fn read_raw_fd(&mut self) -> Result<std::os::fd::OwnedFd> {
+        crate::file_descriptor::read_raw_fd(self)
+    }
+
     /// Attach the RPC hooks and enter RPC mode (AOSP `Parcel::markForRpc`/`mSession`).
     #[cfg(feature = "rpc")]
     pub(crate) fn attach_rpc_ops(&mut self, ops: std::sync::Arc<dyn RpcParcelOps>) {
