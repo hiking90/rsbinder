@@ -23,6 +23,14 @@
 # a blob, a SharedMemory kept, a MemoryDealer). `soak` is rsbinder-topic under churn, checked
 # rather than timed; SOAK_SECONDS sets each of its four runs' length (600).
 #
+# `load` is many kernel binder services called by many clients at once, timed and checked
+# (src/load.rs): the probe alone, then by number of clients, by how services are spread over
+# processes, by thread ceiling, and under heavy churn. LOAD_SECONDS sets each run's length (30).
+# Its processes are not pinned. `leak` is the same load for 8 rounds of LOAD_SECONDS (15) under
+# heavy churn, at the default thread ceiling and at 4: the `check` row's note has every
+# server's and the hub's fds, heap, binder buffers, nodes and references after each round.
+# Results go to plans/load-bench/.
+#
 # Results go to plans/15-pubsub-bench/<time>-<set>/ (plans/20-dbus-bench/ for the `dbus` sets
 # and `soak`): conditions.txt and results-<repeat>.csv.
 #
@@ -64,6 +72,7 @@ fi
 
 case "$set_name" in
     dbus*|soak|region) results=20-dbus-bench ;;
+    load|leak) results=load-bench ;;
     *) results=15-pubsub-bench ;;
 esac
 out=$root/plans/$results/$(date +%Y%m%d-%H%M%S)-$set_name
@@ -327,6 +336,35 @@ soak() {
     measure soak --duration "$seconds" --size 65536 --backpressure 1000
 }
 
+# Many services, many clients (src/load.rs). LOAD_SECONDS is each run's length.
+load() {
+    local seconds=${LOAD_SECONDS:-30} clients
+    local run=(load --duration "$seconds" --warmup 2)
+    measure "${run[@]}" --clients 0 --churn 0
+    for clients in 4 16 32; do
+        measure "${run[@]}" --servers 2 --services 2 --threads 4 --clients "$clients" --churn 2
+    done
+    # Four services in one process, sharing its pool, and one in each of four; no relay, which
+    # needs a second process.
+    local no_relay=(--ops echo,blob,post,callback,lookup --clients 16 --churn 2)
+    measure "${run[@]}" --servers 1 --services 4 --threads 4 "${no_relay[@]}"
+    measure "${run[@]}" --servers 4 --services 1 --threads 4 "${no_relay[@]}"
+    # Callers past the thread ceiling, and the default ceiling.
+    measure "${run[@]}" --servers 4 --services 4 --threads 1 --clients 32 --churn 4
+    measure "${run[@]}" --servers 4 --services 4 --threads 15 --clients 32 --churn 4
+    measure "${run[@]}" --servers 2 --services 2 --threads 4 --clients 8 --churn 16
+}
+
+# Many rounds of the same load against the same servers (src/load.rs), for what each round
+# leaves behind. LOAD_SECONDS is each round's length.
+leak() {
+    local seconds=${LOAD_SECONDS:-15} threads
+    for threads in 4 15; do
+        measure load --duration "$seconds" --warmup 1 --rounds 8 --servers 2 --services 2 \
+            --threads "$threads" --clients 16 --churn 16
+    done
+}
+
 case "$set_name" in
     dbus|dbus-calls|dbus-large|dbus-pubsub)
         address=$("$here/bus.sh" start)
@@ -366,6 +404,8 @@ for repeat in $(seq "$repeats"); do
         dbus-pubsub) dbus_pubsub ;;
         region) region ;;
         soak) soak ;;
+        load) load ;;
+        leak) leak ;;
         *) echo "run.sh: unknown set $set_name" >&2; exit 2 ;;
     esac
 done

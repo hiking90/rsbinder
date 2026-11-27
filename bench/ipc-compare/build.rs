@@ -8,6 +8,8 @@ fn main() {
         "aidl/ipccompare/Limits.aidl",
         "aidl/ipccompare/Config.aidl",
         "aidl/ipccompare/IBench.aidl",
+        "aidl/ipccompare/ILoadSink.aidl",
+        "aidl/ipccompare/ILoad.aidl",
     ];
     for source in sources {
         println!("cargo:rerun-if-changed={source}");
