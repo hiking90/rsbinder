@@ -5,6 +5,8 @@ fn main() {
         "aidl/ipccompare/BlobBytes.aidl",
         "aidl/ipccompare/StreamBytes.aidl",
         "aidl/ipccompare/IBenchSink.aidl",
+        "aidl/ipccompare/Limits.aidl",
+        "aidl/ipccompare/Config.aidl",
         "aidl/ipccompare/IBench.aidl",
     ];
     for source in sources {

@@ -1,6 +1,7 @@
 package ipccompare;
 
 import ipccompare.BlobBytes;
+import ipccompare.Config;
 import ipccompare.IBenchSink;
 import ipccompare.StreamBytes;
 import rsbinder.stream.StreamEndpoint;
@@ -32,4 +33,27 @@ interface IBench {
     int failures();
 
     BlobBytes echo(in BlobBytes data);
+
+    // B1 with the payload in the transaction itself, whatever its size.
+    byte[] echoBytes(in byte[] data);
+
+    // B8: a call with a parcelable of several kinds of field, returned as it came.
+    Config describe(in Config config);
+
+    // B10: a value read with a call, and the same value as a state topic.
+    long value();
+    IBinder stateTopic();
+
+    // B11: maps `len` bytes of `fd`, and returns the sequence number stamped in them plus the
+    // last byte.
+    long touch(in ParcelFileDescriptor fd, long len);
+
+    // B12: a region the client shares once; echoShared() copies `len` bytes of it out and
+    // writes them back.
+    void shareRegion(in ParcelFileDescriptor fd);
+    void echoShared(long len);
+
+    // B12: an IMemory of the client's dealer in, its bytes in an IMemory of the server's
+    // dealer back.
+    IBinder echoMemory(IBinder memory);
 }

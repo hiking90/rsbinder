@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -28,6 +29,13 @@ pub fn pin(cpu: usize) {
     if let Err(e) = rustix::thread::sched_setaffinity(None, &set) {
         eprintln!("ipc-compare: pinning to cpu {cpu}: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Pins a server to `--cpu`, or with `--pin no` leaves its threads to the scheduler.
+pub fn pin_server(a: &Args) {
+    if a.str("pin", "yes") != "no" {
+        pin(a.num("cpu", 1) as usize);
     }
 }
 
@@ -186,6 +194,137 @@ pub fn merge(records: &[Record]) -> (Histogram<u64>, f64, u64) {
     (hist, slowest, received)
 }
 
+/// Merges the records of callers that ran at once: one histogram, and the sum of their rates.
+pub fn merge_sum(records: &[Record]) -> (Histogram<u64>, f64, u64) {
+    let mut hist = histogram();
+    let mut total = 0.0;
+    let mut received = 0;
+    for r in records {
+        hist.add(&r.hist).expect("same bounds");
+        let span = r.last_ns.saturating_sub(r.first_ns) as f64 / 1e9;
+        if span > 0.0 {
+            total += r.hist.len() as f64 / span;
+        }
+        received += r.received;
+    }
+    (hist, total, received)
+}
+
+/// A caller of B7 connects, says `CONNECTED` and starts at `--start-at` (ns of `now_ns`), so
+/// that the callers measure the same span; without the flag it starts at once.
+pub fn wait_for_start(a: &Args) {
+    if a.has("start-at") {
+        println!("CONNECTED");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        sleep_until(a.num("start-at", 0));
+    }
+}
+
+/// `--count` calls of `call` (given the call's number), each timed, the first `--warmup` left
+/// out of the histogram. Stops at the first call that fails.
+pub fn time_calls<E>(a: &Args, mut call: impl FnMut(u64) -> Result<(), E>) -> Result<Record, E> {
+    let count = a.num("count", 0);
+    let warmup = a.num("warmup", 0);
+    wait_for_start(a);
+    let mut record = Record::new(0);
+    for seq in 0..count {
+        let start = now_ns();
+        call(seq)?;
+        let end = now_ns();
+        record.received += 1;
+        if seq >= warmup {
+            if record.first_ns == 0 {
+                record.first_ns = start;
+            }
+            record.hist.saturating_record((end - start).max(1));
+            record.last_ns = end;
+        }
+    }
+    Ok(record)
+}
+
+/// B8's values, the same in every implementation.
+pub const CONFIG_NAME: &str = "bench-config-entry";
+pub const CONFIG_TAGS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
+pub const CONFIG_SAMPLES: usize = 16;
+
+/// B11's payload: a memfd of `len` bytes, mapped for writing by the client that made it.
+pub struct SharedBytes {
+    pub fd: OwnedFd,
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl SharedBytes {
+    pub fn new(len: usize) -> std::io::Result<Self> {
+        let len = len.max(STAMP_BYTES + 1);
+        let fd = rustix::fs::memfd_create("ipc-compare", rustix::fs::MemfdFlags::CLOEXEC)?;
+        rustix::fs::ftruncate(&fd, len as u64)?;
+        // SAFETY: a new shared mapping of a memfd this process just sized to `len`.
+        let ptr = unsafe {
+            rustix::mm::mmap(
+                std::ptr::null_mut(),
+                len,
+                rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+                rustix::mm::MapFlags::SHARED,
+                &fd,
+                0,
+            )?
+        };
+        // Every page is written once, so no call pays for the first touch of one.
+        // SAFETY: `ptr` is the mapping of `len` writable bytes made above.
+        unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0x5a, len) };
+        Ok(SharedBytes { fd, ptr: ptr.cast(), len })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Stamps the head and writes `seq`'s low byte at the end; returns what `touch` answers.
+    pub fn stamp(&mut self, seq: u64) -> u64 {
+        // SAFETY: the mapping is `len` bytes, held by `self` alone in this process.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) };
+        stamp(bytes, seq);
+        bytes[self.len - 1] = seq as u8;
+        seq + u64::from(seq as u8)
+    }
+}
+
+impl Drop for SharedBytes {
+    fn drop(&mut self) {
+        // SAFETY: the mapping made in `new`, unmapped once.
+        let _ = unsafe { rustix::mm::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// B11's server: maps `len` bytes of `fd`, reads the stamp and the last byte, unmaps.
+pub fn touch(fd: impl AsFd, len: usize) -> std::io::Result<u64> {
+    if len <= STAMP_BYTES {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    // SAFETY: a new read-only shared mapping; the kernel refuses a length the file lacks at
+    // the first read past its end, which this harness's client never sends.
+    let ptr = unsafe {
+        rustix::mm::mmap(
+            std::ptr::null_mut(),
+            len,
+            rustix::mm::ProtFlags::READ,
+            rustix::mm::MapFlags::SHARED,
+            &fd,
+            0,
+        )?
+    };
+    // SAFETY: `ptr` is `len` readable bytes until the unmap below.
+    let answer = unsafe {
+        let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len);
+        read_stamp(bytes).1 + u64::from(bytes[len - 1])
+    };
+    // SAFETY: the mapping made above, unmapped once.
+    unsafe { rustix::mm::munmap(ptr, len)? };
+    Ok(answer)
+}
+
 /// `--key value` arguments.
 pub struct Args(HashMap<String, String>);
 
@@ -264,6 +403,8 @@ impl Peer {
             let left = end.checked_duration_since(Instant::now())?;
             match self.lines.recv_timeout(left) {
                 Ok(line) if line.starts_with(prefix) => return Some(line),
+                // A progress word the caller did not wait for.
+                Ok(line) if matches!(line.as_str(), "READY" | "SUBSCRIBED" | "CONNECTED") => {}
                 Ok(line) => eprintln!("child: {line}"),
                 Err(_) => return None,
             }
@@ -272,6 +413,10 @@ impl Peer {
 }
 
 impl Peer {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Waits up to `timeout` for the child to exit by itself, then kills it.
     pub fn finish(self, timeout: Duration) {
         let mut peer = self;
