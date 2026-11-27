@@ -51,7 +51,6 @@ use std::os::fd::OwnedFd;
 use std::sync::{Arc, OnceLock};
 
 use crate::error::{Result, StatusCode};
-use crate::file_descriptor;
 use crate::parcel::Parcel;
 use crate::shared_memory::heap::{check_extent, read_memfd, seals_forbid_writing};
 use crate::shared_memory::{MappedHeap, MemoryHeapBase, FLAG_READ_ONLY, SEAL_SHRINK};
@@ -382,7 +381,7 @@ impl Parcel {
             BLOB_ASHMEM_IMMUTABLE
         })?;
         // Bare fd as AOSP `writeFileDescriptor`: no `ParcelFileDescriptor` not-null marker.
-        file_descriptor::write_raw_fd(self, std::os::fd::AsFd::as_fd(fd.as_ref()))
+        self.write_fd(std::os::fd::AsFd::as_fd(fd.as_ref()))
     }
 
     /// Read a blob written by [`write_blob`](Parcel::write_blob) or Java
@@ -471,7 +470,7 @@ impl Parcel {
             return Err(StatusCode::BadValue);
         }
         let mutable = tag == BLOB_ASHMEM_MUTABLE;
-        let fd = file_descriptor::read_raw_fd(self)?;
+        let fd = self.read_fd()?;
         // Stricter than AOSP `ashmem_valid`: a peer-truncatable file would SIGBUS on first touch.
         let seals = crate::shared_memory::heap::fd_seals(&fd);
         let shrink_sealed = seals.is_some_and(|s| s & SEAL_SHRINK != 0);
@@ -778,7 +777,8 @@ mod tests {
             let mut parcel = Parcel::new();
             parcel.write::<i32>(&(len as i32)).expect("len");
             parcel.write::<i32>(&tag).expect("tag");
-            file_descriptor::write_raw_fd(&mut parcel, std::os::fd::AsFd::as_fd(fd.as_ref()))
+            parcel
+                .write_fd(std::os::fd::AsFd::as_fd(fd.as_ref()))
                 .expect("fd");
             parcel.set_data_position(0);
             let status = parcel.read_blob().err();
@@ -802,7 +802,7 @@ mod tests {
             let mut parcel = Parcel::new();
             parcel.write::<i32>(&(len as i32)).expect("len");
             parcel.write::<i32>(&tag).expect("tag");
-            file_descriptor::write_raw_fd(&mut parcel, fd.as_fd()).expect("fd");
+            parcel.write_fd(fd.as_fd()).expect("fd");
             parcel.set_data_position(0);
             let status = parcel.read_blob().map(|blob| blob.mapped().map(|_| ()));
             let want = if refused {
@@ -828,7 +828,7 @@ mod tests {
         let mut parcel = Parcel::new();
         parcel.write::<i32>(&(len as i32)).expect("len");
         parcel.write::<i32>(&BLOB_ASHMEM_IMMUTABLE).expect("tag");
-        file_descriptor::write_raw_fd(&mut parcel, fd.as_fd()).expect("fd");
+        parcel.write_fd(fd.as_fd()).expect("fd");
         parcel.set_data_position(0);
 
         // A shrink-sealed memfd of `len` bytes has a blob's shape, whatever its open mode.

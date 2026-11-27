@@ -1281,14 +1281,51 @@ impl Parcel {
         false
     }
 
-    /// Write a bare file descriptor (AOSP `Parcel::writeFileDescriptor` / Java AIDL `FileDescriptor`).
-    pub fn write_raw_fd(&mut self, fd: std::os::fd::BorrowedFd<'_>) -> Result<()> {
-        crate::file_descriptor::write_raw_fd(self, fd)
+    /// Write a file descriptor as a bare fd object, the wire of an AIDL
+    /// `FileDescriptor` argument (AOSP `Parcel::writeDupFileDescriptor`,
+    /// Java `Parcel.writeRawFileDescriptor`).
+    ///
+    /// The parcel takes a duplicate of `fd` (`F_DUPFD_CLOEXEC`) and closes
+    /// it when the parcel is dropped. `fd` itself stays with its owner, which
+    /// may close it as soon as this returns.
+    ///
+    /// This is not the wire of [`ParcelFileDescriptor`](crate::ParcelFileDescriptor),
+    /// which writes two `i32` markers before the object and has a null form.
+    /// A bare fd has neither, so the two do not read each other. Use this
+    /// only for an interface whose AIDL says `FileDescriptor`, such as
+    /// `android.os.IVoldMountCallback`; the AIDL compiler's NDK and Rust
+    /// backends refuse that type, and `rsbinder-aidl` does too.
+    ///
+    /// # Errors
+    ///
+    /// [`StatusCode::FdsNotAllowed`] when this parcel cannot carry an fd
+    /// (see [`allow_fds`](Self::allow_fds)), and the status of the failed
+    /// `fcntl` when the duplicate cannot be made. Nothing is written in
+    /// either case.
+    pub fn write_fd(&mut self, fd: BorrowedFd<'_>) -> Result<()> {
+        crate::file_descriptor::write_bare_fd(self, fd)
     }
 
-    /// Read a bare file descriptor (AOSP `Parcel::readFileDescriptor` / Java AIDL `FileDescriptor`).
-    pub fn read_raw_fd(&mut self) -> Result<std::os::fd::OwnedFd> {
-        crate::file_descriptor::read_raw_fd(self)
+    /// Read a bare fd object, the wire of an AIDL `FileDescriptor` argument
+    /// (AOSP `Parcel::readUniqueFileDescriptor`, Java
+    /// `Parcel.readRawFileDescriptor`). See [`write_fd`](Self::write_fd) for
+    /// how this differs from [`ParcelFileDescriptor`](crate::ParcelFileDescriptor).
+    ///
+    /// The returned fd belongs to the caller: it closes when dropped and
+    /// does not depend on the parcel staying alive. On kernel binder it is a
+    /// duplicate (`F_DUPFD_CLOEXEC`) of the fd the parcel holds, so reading
+    /// the same position again returns another duplicate. On an RPC session
+    /// it is the received fd itself, taken out of the parcel, and a second
+    /// read of the same position is [`StatusCode::BadValue`].
+    ///
+    /// # Errors
+    ///
+    /// [`StatusCode::FdsNotAllowed`] when this parcel cannot carry an fd,
+    /// [`StatusCode::BadType`] when the object at the cursor is not an fd,
+    /// and [`StatusCode::BadValue`] when an RPC parcel names an fd that was
+    /// not received with it.
+    pub fn read_fd(&mut self) -> Result<OwnedFd> {
+        crate::file_descriptor::read_bare_fd(self)
     }
 
     /// Attach the RPC hooks and enter RPC mode (AOSP `Parcel::markForRpc`/`mSession`).
@@ -3821,6 +3858,39 @@ mod tests {
         assert!(!writers_gone(&r), "the read dup keeps the pipe open");
         drop(read);
         assert!(writers_gone(&r));
+    }
+
+    #[test]
+    fn write_fd_dups_and_read_fd_returns_an_fd_the_caller_owns() {
+        use std::os::fd::AsFd;
+        let (r, w) = pipe_probe();
+        let mut p = Parcel::new();
+        p.write_fd(w.as_fd()).unwrap();
+        drop(w);
+        assert!(!writers_gone(&r), "the parcel holds a dup of its own");
+        p.set_data_position(0);
+        let read = p.read_fd().unwrap();
+        drop(p);
+        assert!(!writers_gone(&r), "the read fd outlives the parcel");
+        drop(read);
+        assert!(writers_gone(&r));
+    }
+
+    #[test]
+    fn write_fd_is_the_fd_object_alone() {
+        use std::os::fd::AsFd;
+        let (_r, w) = pipe_probe();
+        let mut bare = Parcel::new();
+        bare.write_fd(w.as_fd()).unwrap();
+        assert_eq!(bare.objects.as_slice(), &[0]);
+        assert_eq!(bare.data_size(), FlatBinderObject::SIZE);
+        // `ParcelFileDescriptor` puts `[1][hasComm]` first, so neither reads the other.
+        bare.set_data_position(0);
+        assert!(bare.read::<ParcelFileDescriptor>().is_err());
+        let mut pfd = Parcel::new();
+        pfd.write(&ParcelFileDescriptor::new(w)).unwrap();
+        pfd.set_data_position(0);
+        assert_eq!(pfd.read_fd().err(), Some(StatusCode::BadType));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Fuzz target: arbitrary bytes → the **bare** RPC fd decode
-//! (`read_raw_fd`, the handwritten `android.utils.IMemoryHeap` wire) in
+//! (`Parcel::read_fd`, the handwritten `android.utils.IMemoryHeap` wire) in
 //! both the R34/v0 bare-index and the v1+ `[TYPE|idx]` + hostile
 //! object-position-table profiles, with no received fds. Property: no
 //! panic / UB / fd leak; every forged input is a clean `Err`.

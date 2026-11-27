@@ -679,7 +679,7 @@ pub trait RemoteProxy {
     /// writing.
     fn dump(&self, fd: std::os::fd::OwnedFd, args: &[String]) -> Result<()> {
         let mut send = self.prepare_transact(false)?;
-        crate::file_descriptor::write_raw_owned_fd(&mut send, fd)?;
+        crate::file_descriptor::write_bare_owned_fd(&mut send, fd)?;
         send.write::<i32>(&(args.len() as i32))?;
         for arg in args {
             send.write(arg)?;

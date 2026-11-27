@@ -4745,6 +4745,7 @@ pub fn rsbinder::Parcel::read<D: rsbinder::Deserialize>(&mut self) -> rsbinder::
 pub fn rsbinder::Parcel::read_bool(&mut self) -> rsbinder::Result<bool>
 pub fn rsbinder::Parcel::read_f32(&mut self) -> rsbinder::Result<f32>
 pub fn rsbinder::Parcel::read_f64(&mut self) -> rsbinder::Result<f64>
+pub fn rsbinder::Parcel::read_fd(&mut self) -> rsbinder::Result<std::os::fd::owned::OwnedFd>
 pub fn rsbinder::Parcel::read_i32(&mut self) -> rsbinder::Result<i32>
 pub fn rsbinder::Parcel::read_i64(&mut self) -> rsbinder::Result<i64>
 pub fn rsbinder::Parcel::read_i8(&mut self) -> rsbinder::Result<i8>
@@ -4762,6 +4763,7 @@ pub fn rsbinder::Parcel::write<S: rsbinder::Serialize + ?core::marker::Sized>(&m
 pub fn rsbinder::Parcel::write_bool(&mut self, bool) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_f32(&mut self, f32) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_f64(&mut self, f64) -> rsbinder::Result<()>
+pub fn rsbinder::Parcel::write_fd(&mut self, std::os::fd::owned::BorrowedFd<'_>) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_i32(&mut self, i32) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_i64(&mut self, i64) -> rsbinder::Result<()>
 pub fn rsbinder::Parcel::write_i8(&mut self, i8) -> rsbinder::Result<()>
