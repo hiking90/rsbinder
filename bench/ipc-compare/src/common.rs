@@ -376,9 +376,18 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn spawn(args: &[String]) -> Self {
+    /// This binary with `args`, run by the command `wrap` when it is not empty.
+    pub fn spawn_under(wrap: &[String], args: &[String]) -> Self {
         let exe = std::env::current_exe().expect("current_exe");
-        let mut child = Command::new(exe)
+        let mut command = match wrap.split_first() {
+            Some((program, rest)) => {
+                let mut command = Command::new(program);
+                command.args(rest).arg(exe);
+                command
+            }
+            None => Command::new(exe),
+        };
+        let mut child = command
             .args(args)
             .stdout(Stdio::piped())
             .spawn()

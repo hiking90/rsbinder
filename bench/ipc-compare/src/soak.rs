@@ -256,7 +256,7 @@ fn parse(line: &str) -> HashMap<String, u64> {
 }
 
 /// The publisher's fds, memfd mappings and threads.
-fn resources(pid: u32) -> Option<(usize, usize, usize)> {
+pub fn resources(pid: u32) -> Option<(usize, usize, usize)> {
     let entries = |dir: &str| Some(std::fs::read_dir(format!("/proc/{pid}/{dir}")).ok()?.count());
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
     Some((entries("fd")?, maps.lines().filter(|l| l.contains("memfd:")).count(), entries("task")?))

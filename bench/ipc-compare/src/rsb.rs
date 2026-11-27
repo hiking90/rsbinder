@@ -24,7 +24,7 @@ use rsbinder_topic::{
 use crate::common::*;
 
 #[allow(clippy::all, non_snake_case, non_camel_case_types, dead_code)]
-mod generated {
+pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/bench.rs"));
 }
 use generated::ipccompare::Config::Config;

@@ -15,6 +15,7 @@
 //! ipc-compare b11 --impl rsb|dbus --size B              (a memfd handed over and mapped)
 //! ipc-compare b12 --impl rsb-shm|rsb-dealer --size B    (round trips through a region kept)
 //! ipc-compare soak ...                                  (src/soak.rs)
+//! ipc-compare load ...                                  (src/load.rs: many services, many clients)
 //! ipc-compare b2 --impl rsb-stream|ix [--wait block|poll] --size B --rate HZ
 //! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|rsb-topic-loan|ix|dbus [--wait block|poll] --n N --size B --rate HZ
 //!   (rsb-topic and rsb-topic-loan also take --wait fd; rsb-topic-loan lends a pool slot per item
@@ -37,7 +38,9 @@
 
 mod common;
 mod dbus;
+mod heap;
 mod ix;
+mod load;
 mod queue;
 mod rsb;
 mod soak;
@@ -46,6 +49,11 @@ mod topic_cost;
 use std::time::Duration;
 
 use common::*;
+
+// Every process of this binary counts its live allocations (src/heap.rs), two uncontended
+// relaxed atomic adds per allocation; the `load` set's servers report the counts.
+#[global_allocator]
+static ALLOCATOR: heap::Counting = heap::Counting;
 
 const START: Duration = Duration::from_secs(20);
 
@@ -82,6 +90,7 @@ fn main() {
             calls("b12", &a, &ops, a.num("size", 1 << 20) as usize)
         }
         "soak" => soak::run(&a),
+        "load" => load::run(&a),
         "b5" => topic_cost::b5(&a),
         "b6" => topic_cost::b6(&a),
         _ => {
@@ -104,6 +113,8 @@ fn child(words: &[String]) {
         "rsb-call" => rsb::call_client(&a).err().map(|e| format!("{e:?}")),
         "rsb-soak-pub" => soak::publisher(&a).err().map(|e| format!("{e:?}")),
         "rsb-soak-sub" => soak::subscriber(&a).err().map(|e| format!("{e:?}")),
+        "rsb-load-server" => load::server(&a).err().map(|e| format!("{e:?}")),
+        "rsb-load-client" => load::client(&a).err().map(|e| format!("{e:?}")),
         "ix-call" => ix::call_client(&a).err().map(|e| e.to_string()),
         "dbus-call" => dbus::call_client(&a).err().map(|e| e.to_string()),
         "ix-producer" => ix::producer(&a).err().map(|e| e.to_string()),
@@ -132,9 +143,14 @@ fn arg_list(pairs: &[(&str, String)]) -> Vec<String> {
 }
 
 fn spawn(role: &str, pairs: &[(&str, String)]) -> Peer {
+    spawn_under(&[], role, pairs)
+}
+
+/// `spawn`, with the child run under the command `wrap` (empty: none), as `heaptrack` runs one.
+fn spawn_under(wrap: &[String], role: &str, pairs: &[(&str, String)]) -> Peer {
     let mut args = vec!["child".to_string(), role.to_string()];
     args.extend(arg_list(pairs));
-    Peer::spawn(&args)
+    Peer::spawn_under(wrap, &args)
 }
 
 /// Reads one RESULT from each consumer; a consumer that gives none is named in `note`.
