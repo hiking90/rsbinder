@@ -42,6 +42,55 @@ The additions and fixes themselves are listed in
 - `hub::ServiceManager` is `#[non_exhaustive]`. A `match` on the value
   `hub::default()` returns needs a `_` arm; one that names every variant of
   your build no longer compiles. An `if let` on one variant is unchanged.
+- `blob::Blob` is a struct. In 0.13.0 it was an enum, `Inline(Vec<u8>)` or
+  `Shared { heap, len, mutable }`. Replace a `match` on it with its methods:
+  `inline()` is `Some` for the inline form, and `len()`, `is_mutable()` and
+  `mapped()` give what the `Shared` fields held. Code that took the inline
+  `Vec` or the `Arc<MappedHeap>` by value copies instead: `to_vec()` or
+  `read_into()` for the payload, `mapped()?.cloned()` for the mapping. A
+  `Blob` can no longer be built by hand; `Parcel::read_blob` makes it.
+- `Blob::mapped` returns `Result<Option<&Arc<MappedHeap>>>`: add a `?` in
+  front of the `Option` you handled. `Parcel::read_blob` no longer maps a
+  shared blob's region. The first `mapped` does and the blob keeps the
+  mapping. A reader that calls `to_vec` or `read_into` makes no mapping of a
+  memfd. `read_blob` checks the blob's shape: the tag, the kind of
+  descriptor, that the region cannot shrink, that it holds the payload. It
+  does not check that the region can be read. A region the kernel will not
+  let your process read or map, such as a descriptor not open for reading or
+  a mapping SELinux denies, is the error of the first `to_vec`, `read_into`
+  or `mapped`. In 0.13.0 it was the error of `read_blob`, as it is of AOSP
+  `Parcel::readBlob`. Code that treated a blob `read_blob` returned as
+  readable handles the error of those three calls instead.
+  `read_blob` does return `BadValue` for a `BLOB_ASHMEM_MUTABLE` blob whose fd
+  reports that it takes no writable mapping: an fd not open `O_RDWR` (on macOS,
+  one open `O_RDONLY`), a memfd sealed `F_SEAL_WRITE` or `F_SEAL_FUTURE_WRITE`,
+  an ashmem region whose protection mask lacks `PROT_WRITE`. In 0.13.0 that was
+  the error of the `mmap`; a writer that sends one sends
+  `BLOB_ASHMEM_IMMUTABLE` instead.
+- `Parcel::write_blob` can return an error it did not in 0.13.0. On Linux and
+  Android it fills the region of a payload past `BLOB_INPLACE_LIMIT` with
+  `pwrite(2)`, and a page the kernel does not give the region is that call's error:
+  `NoMemory` for `ENOMEM`, the errno's status otherwise. In 0.13.0 the process
+  ended with `SIGBUS`. Handle the error as any other from `write_blob`; the
+  parcel holds nothing of the blob. A memory cgroup at its limit is not that
+  case: there the kernel's OOM killer ends a process with `SIGKILL`, in 0.13.0
+  and now.
+- A blob of half a huge page or more (1 MiB where a huge page is 2 MiB) takes
+  a region of whole huge pages where
+  `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is neither `never` nor
+  `deny`. The region is up to twice the blob, and that is the size a reader's
+  `fstat` on the fd reports; `Blob::len` is still the payload's. There is no
+  switch for it in rsbinder. A region the kernel cannot back on this path ends
+  the process with `SIGBUS`, as every shared blob did in 0.13.0. Budget a
+  memory cgroup for the region, not the payload.
+- `SharedMemory::from_fd`, on Linux and Android, adopts an fd open `O_RDONLY`
+  with a read-only mapping: it returns `Ok`, and `is_read_only()` is `true`.
+  In 0.13.0 it asked for a writable mapping and returned the error of that
+  `mmap`, unless the fd was also write-protected (a write seal, an ashmem
+  protection mask without `PROT_WRITE`). Reading a `SharedMemory` from a
+  parcel goes through the same function. A receiver that writes to the region
+  checks `is_read_only()` after adopting it; without the check, the failure it
+  got at adoption is now `PermissionDenied` from `write_at`.
 
 ## `rsb_hub`
 
