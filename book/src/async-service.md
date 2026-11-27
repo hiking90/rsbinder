@@ -476,6 +476,63 @@ To get real concurrency, leave the transaction context with `tokio::spawn` and c
 there. That task's calls are no longer nested, so they also lose the deadlock avoidance —
 do not call back into a service that is currently blocked waiting on you.
 
+### What a spawned task leaves behind
+
+The handler's future is polled on the thread the transaction arrived on, and three things
+belong to that thread rather than to the future. A task started with `tokio::spawn` or
+`spawn_blocking` has none of them:
+
+| On the handler's thread | In a spawned task |
+|---|---|
+| `get_calling_uid()` / `CallingContext::current()` name the caller | They name **this process**; `calling_caller()` is `None` |
+| An outbound call is nested in the inbound one | It is a new call: a callback to the original client goes to that client's thread pool, not to its waiting thread |
+| On an Android kernel the thread runs at the caller's priority | The task runs at the runtime thread's own |
+
+The first is the one that fails silently: a uid check moved into a spawned task compares
+the service's own uid, so a service that runs as `root` or `system` admits every caller.
+Authorize before spawning, or read the caller in the handler and move the value in:
+
+```rust
+async fn r#export(&self, path: &str) -> rsbinder::BinderResult<()> {
+    let caller = rsbinder::calling_caller();          // read here, on the handler's thread
+    let path = path.to_owned();
+    tokio::spawn(async move {
+        // `calling_caller()` is `None` in here; `caller` still names who asked.
+        audit(&caller, &path).await;
+    });
+    Ok(())
+}
+```
+
+Code that may run on either side should decide with `calling_caller()`, which tells "no
+caller to read" (`None`) from a caller, where `get_calling_uid()` answers with a uid both
+times. See [Security](./security.md).
+
+### A lock held across a call can meet itself
+
+A callback that the callee makes while the handler waits for it is delivered to **the same
+thread**, and runs there to completion before the outer call returns. The outer handler is
+not suspended at an `.await` while that happens — it is further down the same stack — so a
+guard it holds cannot be released:
+
+```rust
+async fn r#refresh(&self) -> rsbinder::BinderResult<()> {
+    let mut state = self.state.lock().await;     // tokio::sync::Mutex
+    // `peer` calls back into `on_changed` below, on this thread, before `fetch` returns.
+    state.value = self.peer.r#fetch().await?;
+    Ok(())
+}
+
+async fn r#on_changed(&self) -> rsbinder::BinderResult<()> {
+    let _state = self.state.lock().await;        // never acquired: `refresh` holds it
+    Ok(())
+}
+```
+
+A `std::sync::Mutex` fails the same way. Take what the call needs out of the lock, drop the
+guard, then call — the rule for a sync service, which an async one inherits because its
+handler runs on the binder thread.
+
 ## Creating Nested Async Binders
 
 An async service can create and return new async binders, for instance when implementing a
