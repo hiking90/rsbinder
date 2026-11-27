@@ -1,10 +1,22 @@
-//! Plan 15 §8: rsbinder's paths next to iceoryx2's, one process per participant, each pinned to
-//! a core. Every measurement prints one CSV row (`ipc-compare header` prints the header).
+//! Plan 15 §8 and plan 20: rsbinder's paths next to iceoryx2's and D-Bus's, one process per
+//! participant, each pinned to a core. Every measurement prints one CSV row (`ipc-compare
+//! header` prints the header). The D-Bus rows are `zbus`'s blocking API on the bus
+//! `DBUS_SESSION_BUS_ADDRESS` names.
 //!
 //! ```text
-//! ipc-compare b1 --impl rsb|ix [--wait block|poll] --size B
+//! ipc-compare b1 --impl rsb|rsb-reuse|rsb-bytes|ix|dbus [--wait block|poll] --size B
+//!   (rsb sends a blob, a memfd past 16 KiB; rsb-reuse the same, each side reading it into a
+//!   Vec it keeps; rsb-bytes a byte[] in the transaction)
+//! ipc-compare b7 --impl rsb|ix|dbus --n N --size B [--server-pin no]
+//!   (N callers of one server at once; --server-pin no leaves the server's threads unpinned)
+//! ipc-compare b8 --impl rsb|ix|dbus                     (a call with a struct of 8 fields)
+//! ipc-compare b9 --impl rsb|ix|dbus                     (a name looked up, to a proxy)
+//! ipc-compare b10 --impl rsb|rsb-state|ix|dbus|dbus-cached   (a value read)
+//! ipc-compare b11 --impl rsb|dbus --size B              (a memfd handed over and mapped)
+//! ipc-compare b12 --impl rsb-shm|rsb-dealer --size B    (round trips through a region kept)
+//! ipc-compare soak ...                                  (src/soak.rs)
 //! ipc-compare b2 --impl rsb-stream|ix [--wait block|poll] --size B --rate HZ
-//! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|rsb-topic-loan|ix [--wait block|poll] --n N --size B --rate HZ
+//! ipc-compare b3 --impl rsb-stream|rsb-oneway|rsb-topic|rsb-topic-loan|ix|dbus [--wait block|poll] --n N --size B --rate HZ
 //!   (rsb-topic and rsb-topic-loan also take --wait fd; rsb-topic-loan lends a pool slot per item
 //!   and its subscriber reads it in place, or copies it out with --touch yes; with --trust yes
 //!   the subscriber vouches for the publisher and copies with a plain memory copy; with
@@ -24,9 +36,11 @@
 //! round trip (B1); B4 reports round trip / 2 as a mean only, as iceoryx2's queue benchmark.
 
 mod common;
+mod dbus;
 mod ix;
 mod queue;
 mod rsb;
+mod soak;
 mod topic_cost;
 
 use std::time::Duration;
@@ -54,6 +68,20 @@ fn main() {
         "b1" => b1(&a),
         "b2" | "b3" => fanout(what, &a),
         "b4" => b4(&a),
+        "b7" => b7(&a),
+        "b8" => calls("b8", &a, &[("rsb", "struct"), ("ix", "struct"), ("dbus", "struct")], 0),
+        "b9" => calls("b9", &a, &[("rsb", "lookup"), ("ix", "lookup"), ("dbus", "lookup")], 0),
+        "b10" => {
+            let ops =
+                [("rsb", "value"), ("rsb-state", "state"), ("ix", "value"), ("dbus", "value"), ("dbus-cached", "cached")];
+            calls("b10", &a, &ops, 8)
+        }
+        "b11" => calls("b11", &a, &[("rsb", "fd"), ("dbus", "fd")], a.num("size", 1 << 20) as usize),
+        "b12" => {
+            let ops = [("rsb-shm", "shm"), ("rsb-dealer", "dealer")];
+            calls("b12", &a, &ops, a.num("size", 1 << 20) as usize)
+        }
+        "soak" => soak::run(&a),
         "b5" => topic_cost::b5(&a),
         "b6" => topic_cost::b6(&a),
         _ => {
@@ -73,11 +101,19 @@ fn child(words: &[String]) {
         "rsb-topic" => rsb::topic_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-topic-loan" => rsb::topic_loan_consumer(&a).err().map(|e| format!("{e:?}")),
         "rsb-echo" => rsb::echo_client(&a).err().map(|e| format!("{e:?}")),
+        "rsb-call" => rsb::call_client(&a).err().map(|e| format!("{e:?}")),
+        "rsb-soak-pub" => soak::publisher(&a).err().map(|e| format!("{e:?}")),
+        "rsb-soak-sub" => soak::subscriber(&a).err().map(|e| format!("{e:?}")),
+        "ix-call" => ix::call_client(&a).err().map(|e| e.to_string()),
+        "dbus-call" => dbus::call_client(&a).err().map(|e| e.to_string()),
         "ix-producer" => ix::producer(&a).err().map(|e| e.to_string()),
         "ix-consumer" => ix::consumer(&a).err().map(|e| e.to_string()),
         "ix-server" => ix::server(&a).err().map(|e| e.to_string()),
         "ix-client" => ix::client(&a).err().map(|e| e.to_string()),
         "ix-cleanup" => ix::cleanup().err().map(|e| e.to_string()),
+        "dbus-producer" => dbus::producer(&a).err().map(|e| e.to_string()),
+        "dbus-consumer" => dbus::consumer(&a).err().map(|e| e.to_string()),
+        "dbus-echo" => dbus::echo_client(&a).err().map(|e| e.to_string()),
         _ => Some(format!("unknown role {role}")),
     };
     if let Some(e) = failed {
@@ -250,6 +286,11 @@ fn fanout(bench: &str, a: &Args) {
             let extra = if touch { vec![("touch", "yes".to_string())] } else { Vec::new() };
             (producer, "ix-consumer".to_string(), extra)
         }
+        "dbus" => {
+            note.push("signal through dbus-broker; no flow control".to_string());
+            let producer = spawn("dbus-producer", &[("name", name.clone()), ("cpu", producer_cpu)]);
+            (producer, "dbus-consumer".to_string(), Vec::new())
+        }
         other => {
             eprintln!("ipc-compare: unknown --impl {other}");
             std::process::exit(2);
@@ -278,10 +319,21 @@ fn fanout(bench: &str, a: &Args) {
             return row(None, 0.0, 0, vec![format!("start: {e:?}")]);
         }
     }
+    if imp == "dbus" {
+        if let Err(e) = dbus::start(&name, count, size, rate) {
+            return row(None, 0.0, 0, vec![format!("start: {e}")]);
+        }
+    }
     let records = collect(&consumers, warmup, rsb::expected(count, rate), &mut note);
     if imp.starts_with("rsb") {
         failures = rsb::failures(&name).map(|f| f as u64).unwrap_or_else(|e| {
             note.push(format!("failures(): {e:?}"));
+            0
+        });
+    }
+    if imp == "dbus" {
+        failures = dbus::failures(&name).map(|f| f as u64).unwrap_or_else(|e| {
+            note.push(format!("failures(): {e}"));
             0
         });
     }
@@ -301,11 +353,11 @@ fn fanout(bench: &str, a: &Args) {
 fn b1(a: &Args) {
     let imp = a.str("impl", "rsb");
     let size = a.num("size", 8) as usize;
-    let wait = if imp == "rsb" { "block".to_string() } else { a.str("wait", "block") };
+    let wait = if imp == "ix" { a.str("wait", "block") } else { "block".to_string() };
     let (count, warmup) = match a.has("count") {
         true => (a.num("count", 0), a.num("warmup", 0)),
         false => {
-            let count = (1_000_000_000 / size.max(1) as u64).clamp(2_000, 100_000);
+            let count = (1_000_000_000 / size.max(1) as u64).clamp(200, 100_000);
             (count, count / 10)
         }
     };
@@ -331,15 +383,29 @@ fn b1(a: &Args) {
         .print()
     };
     let (server_role, client_role) = match imp.as_str() {
-        "rsb" => ("rsb-producer", "rsb-echo"),
+        // `rsb-bytes`: the payload as an AIDL `byte[]`, in the transaction whatever its size.
+        // `rsb-reuse`: a blob each side reads into a `Vec` it keeps (`Blob::read_into`).
+        "rsb" | "rsb-bytes" | "rsb-reuse" => ("rsb-producer", "rsb-echo"),
         "ix" => ("ix-server", "ix-client"),
+        "dbus" => ("dbus-producer", "dbus-echo"),
         other => {
             eprintln!("ipc-compare: unknown --impl {other}");
             std::process::exit(2);
         }
     };
+    let payload = match imp.as_str() {
+        "rsb-bytes" => "bytes",
+        "rsb-reuse" => "blob-reuse",
+        _ => "blob",
+    };
     let common = |cpu: String| {
-        vec![("name", name.clone()), ("cpu", cpu), ("size", size.to_string()), ("wait", wait.clone())]
+        vec![
+            ("name", name.clone()),
+            ("cpu", cpu),
+            ("size", size.to_string()),
+            ("wait", wait.clone()),
+            ("payload", payload.to_string()),
+        ]
     };
     let server = spawn(server_role, &common(producer_cpu));
     if server.wait_for("READY", START).is_none() {
@@ -350,8 +416,11 @@ fn b1(a: &Args) {
     pairs.push(("warmup", warmup.to_string()));
     let client = spawn(client_role, &pairs);
     let mut note = Vec::new();
-    if imp == "rsb" && size > rsbinder::blob::BLOB_INPLACE_LIMIT {
+    if matches!(imp.as_str(), "rsb" | "rsb-reuse") && size > rsbinder::blob::BLOB_INPLACE_LIMIT {
         note.push("blob through a memfd".to_string());
+    }
+    if imp == "rsb-reuse" {
+        note.push("each side reads into a Vec it keeps".to_string());
     }
     let records = collect(std::slice::from_ref(&client), 0, rsb::expected(count, 0), &mut note);
     let (hist, calls_per_s, received) = merge(&records);
@@ -360,6 +429,188 @@ fn b1(a: &Args) {
     }
     client.finish(Duration::from_secs(10));
     let linger = if imp == "ix" { Duration::from_secs(30) } else { Duration::ZERO };
+    server.finish(linger);
+    row(Some(hist), calls_per_s, note.join("; "));
+}
+
+/// B7: `--n` callers of one server at once, each making `--count` round trips of `--size`
+/// bytes. The row's rate is the sum of the callers', and its histogram all their round trips.
+fn b7(a: &Args) {
+    let imp = a.str("impl", "rsb");
+    let n = a.num("n", 4) as usize;
+    let size = a.num("size", 64) as usize;
+    let wait = if imp == "ix" { a.str("wait", "block") } else { "block".to_string() };
+    let count = a.num("count", 20_000);
+    let warmup = a.num("warmup", count / 10);
+    let server_cpu = a.num("producer-cpu", 1).to_string();
+    let client_cpus = a.cpus("consumer-cpus", "2,3,4,5,6,7,0,8");
+    let name = unique_name();
+    let row = |hist, calls_per_s, note: String| {
+        Row {
+            bench: "b7",
+            imp: &imp,
+            wait: &wait,
+            n,
+            size,
+            rate: 0,
+            count,
+            warmup,
+            hist,
+            mean_ns: None,
+            msgs_per_s: calls_per_s,
+            failures: 0,
+            note,
+        }
+        .print()
+    };
+    let (server_role, client_role) = match imp.as_str() {
+        "rsb" => ("rsb-producer", "rsb-echo"),
+        "ix" => ("ix-server", "ix-client"),
+        "dbus" => ("dbus-producer", "dbus-echo"),
+        other => {
+            eprintln!("ipc-compare: unknown --impl {other}");
+            std::process::exit(2);
+        }
+    };
+    let common = |cpu: String| {
+        vec![
+            ("name", name.clone()),
+            ("cpu", cpu),
+            ("size", size.to_string()),
+            ("wait", wait.clone()),
+            ("n", n.to_string()),
+        ]
+    };
+    // `--server-pin no`: the server's threads go where the scheduler puts them.
+    let server_free = a.str("server-pin", "yes") == "no";
+    let mut server_pairs = common(server_cpu);
+    if server_free {
+        server_pairs.push(("pin", "no".to_string()));
+    }
+    let server = spawn(server_role, &server_pairs);
+    if server.wait_for("READY", START).is_none() {
+        return row(None, 0.0, "server did not start".into());
+    }
+    // Long enough for every caller to connect before the first call.
+    let start_at = now_ns() + 2_000_000_000 + n as u64 * 100_000_000;
+    let mut clients = Vec::new();
+    for i in 0..n {
+        let mut pairs = common(client_cpus[i % client_cpus.len()].to_string());
+        pairs.push(("count", count.to_string()));
+        pairs.push(("warmup", warmup.to_string()));
+        pairs.push(("start-at", start_at.to_string()));
+        let client = spawn(client_role, &pairs);
+        if client.wait_for("CONNECTED", START).is_none() {
+            return row(None, 0.0, format!("caller {i} did not connect"));
+        }
+        clients.push(client);
+    }
+    let server_where = if server_free { "server not pinned" } else { "server on one cpu" };
+    let mut note = vec![format!("{server_where}; {n} callers on {} cpus", client_cpus.len().min(n))];
+    if now_ns() > start_at {
+        note.push("callers connected after the start time".to_string());
+    }
+    let records = collect(&clients, 0, rsb::expected(count, 0), &mut note);
+    let (hist, calls_per_s, received) = merge_sum(&records);
+    if received < count * n as u64 {
+        note.push(format!("{received} of {} calls", count * n as u64));
+    }
+    for client in clients {
+        client.finish(Duration::from_secs(10));
+    }
+    let linger = if imp == "ix" { Duration::from_secs(30) } else { Duration::ZERO };
+    server.finish(linger);
+    row(Some(hist), calls_per_s, note.join("; "));
+}
+
+/// B8 to B11: one server and one client that makes `--count` calls of one kind. `ops` maps each
+/// `--impl` the measurement has to the `--op` its client runs; the family before a `-` picks
+/// the processes.
+fn calls(bench: &str, a: &Args, ops: &[(&str, &str)], size: usize) {
+    let imp = a.str("impl", "rsb");
+    let Some((_, op)) = ops.iter().find(|(known, _)| *known == imp) else {
+        eprintln!("ipc-compare: {bench} has no --impl {imp}");
+        std::process::exit(2);
+    };
+    let family = imp.split('-').next().unwrap_or_default();
+    let wait = if family == "ix" { a.str("wait", "block") } else { "block".to_string() };
+    let count = match *op {
+        "lookup" => 5_000,
+        // B12 copies its payload four times a call, as B1 does: B1's count, by size.
+        "shm" | "dealer" => (1_000_000_000 / size.max(1) as u64).clamp(200, 50_000),
+        _ => 50_000,
+    };
+    let count = a.num("count", count);
+    let warmup = a.num("warmup", count / 10);
+    let name = unique_name();
+    let row = |hist, calls_per_s, note: String| {
+        Row {
+            bench,
+            imp: &imp,
+            wait: &wait,
+            n: 1,
+            size,
+            rate: 0,
+            count,
+            warmup,
+            hist,
+            mean_ns: None,
+            msgs_per_s: calls_per_s,
+            failures: 0,
+            note,
+        }
+        .print()
+    };
+    let common = |cpu: String| {
+        vec![
+            ("name", name.clone()),
+            ("cpu", cpu),
+            ("size", size.to_string()),
+            ("wait", wait.clone()),
+            ("op", op.to_string()),
+            // B9's iceoryx2 client holds one port open and opens another per call.
+            ("n", "2".to_string()),
+        ]
+    };
+    let (server_role, client_role) = match family {
+        "rsb" => ("rsb-producer", "rsb-call"),
+        "ix" => ("ix-server", "ix-call"),
+        _ => ("dbus-producer", "dbus-call"),
+    };
+    let server = spawn(server_role, &common(a.num("producer-cpu", 1).to_string()));
+    if server.wait_for("READY", START).is_none() {
+        return row(None, 0.0, "server did not start".into());
+    }
+    let mut pairs = common(a.cpus("consumer-cpus", "2")[0].to_string());
+    pairs.push(("count", count.to_string()));
+    pairs.push(("warmup", warmup.to_string()));
+    let client = spawn(client_role, &pairs);
+    let what = match (*op, family) {
+        ("struct", "ix") => "a repr(C) struct of fixed arrays; no encoding",
+        ("struct", "rsb") => "a parcelable of 8 fields: string; string[4]; int[16]; nested",
+        ("struct", _) => "(ixdbsasai(iid))",
+        ("lookup", "rsb") => "service manager lookup to a proxy",
+        ("lookup", "ix") => "service opened by name and a client port made",
+        ("lookup", _) => "GetNameOwner and a proxy",
+        ("value", "rsb") => "a call",
+        ("value", "ix") => "blackboard entry read",
+        ("value", _) => "Properties.Get",
+        ("state", _) => "state topic: try_latest; the value held when none is newer",
+        ("cached", _) => "the proxy's property cache",
+        ("fd", "rsb") => "memfd as a ParcelFileDescriptor; the server maps and unmaps it",
+        ("fd", _) => "memfd as an h; the server maps and unmaps it",
+        ("shm", _) => "one SharedMemory shared before; each side copies in and out",
+        ("dealer", _) => "an IMemory of a MemoryDealer each way, heaps kept mapped; each side copies in and out",
+        _ => "",
+    };
+    let mut note = vec![what.to_string()];
+    let records = collect(std::slice::from_ref(&client), 0, rsb::expected(count, 0), &mut note);
+    let (hist, calls_per_s, received) = merge(&records);
+    if received < count {
+        note.push(format!("{received} of {count} calls"));
+    }
+    client.finish(Duration::from_secs(10));
+    let linger = if family == "ix" { Duration::from_secs(30) } else { Duration::ZERO };
     server.finish(linger);
     row(Some(hist), calls_per_s, note.join("; "));
 }

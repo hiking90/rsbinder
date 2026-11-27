@@ -156,20 +156,29 @@ pub fn consumer(a: &Args) -> Result<(), Error> {
 
 /// Child role `ix-server`: B1's server, answers each request with a copy of it.
 pub fn server(a: &Args) -> Result<(), Error> {
-    pin(a.num("cpu", 1) as usize);
+    pin_server(a);
+    match a.str("op", "").as_str() {
+        "struct" => return struct_server(a),
+        "value" => return value_server(a),
+        _ => {}
+    }
     let base = a.str("name", "");
     let size = a.num("size", 8) as usize;
     let block = a.str("wait", "block") == "block";
+    // B7's callers at once; B1 has one.
+    let clients = a.num("n", 1) as usize;
     let node = node()?;
     let service = node
         .service_builder(&name(&base, "")?)
         .request_response::<[u8], [u8]>()
-        .max_clients(1)
+        .max_clients(clients)
         .max_servers(1)
         .create()?;
     let server = service.server_builder().initial_max_slice_len(size).create()?;
-    let requests = node.service_builder(&name(&base, "/req")?).event().create()?;
-    let responses = node.service_builder(&name(&base, "/resp")?).event().create()?;
+    let requests =
+        node.service_builder(&name(&base, "/req")?).event().max_notifiers(clients).create()?;
+    let responses =
+        node.service_builder(&name(&base, "/resp")?).event().max_listeners(clients).create()?;
     let listener = requests.listener_builder().create()?;
     let notifier = responses.notifier_builder().create()?;
     ready("READY");
@@ -197,11 +206,192 @@ pub fn server(a: &Args) -> Result<(), Error> {
                 }
             }
         }
-        // Exits with its node once the client has, as the producer does.
+        // Exits with its node once the client has, as the producer does. B9's client makes no
+        // request: having been there counts.
+        let clients = service.dynamic_config().number_of_clients();
+        served |= clients > 0;
+        if served && clients == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// B8's argument: what iceoryx2 sends is the struct's bytes, so its strings and arrays have a
+/// fixed size.
+#[derive(Debug, Clone, Copy, ZeroCopySend)]
+#[repr(C)]
+pub struct Entry {
+    id: i32,
+    timestamp: i64,
+    gain: f64,
+    enabled: bool,
+    name: [u8; 32],
+    tags: [[u8; 16]; 4],
+    samples: [i32; CONFIG_SAMPLES],
+    low: i32,
+    high: i32,
+    scale: f64,
+}
+
+fn fixed<const N: usize>(text: &str) -> [u8; N] {
+    let mut bytes = [0u8; N];
+    bytes[..text.len()].copy_from_slice(text.as_bytes());
+    bytes
+}
+
+fn config() -> Entry {
+    let mut samples = [0i32; CONFIG_SAMPLES];
+    for (i, sample) in samples.iter_mut().enumerate() {
+        *sample = i as i32;
+    }
+    Entry {
+        id: 7,
+        timestamp: now_ns() as i64,
+        gain: 1.5,
+        enabled: true,
+        name: fixed(CONFIG_NAME),
+        tags: CONFIG_TAGS.map(fixed),
+        samples,
+        low: -100,
+        high: 100,
+        scale: 0.25,
+    }
+}
+
+/// `ix-server --op struct`: B8's server, answers each `Entry` with a copy of it.
+fn struct_server(a: &Args) -> Result<(), Error> {
+    let base = a.str("name", "");
+    let block = a.str("wait", "block") == "block";
+    let node = node()?;
+    let service = node
+        .service_builder(&name(&base, "")?)
+        .request_response::<Entry, Entry>()
+        .max_clients(1)
+        .max_servers(1)
+        .create()?;
+    let server = service.server_builder().create()?;
+    let requests = node.service_builder(&name(&base, "/req")?).event().create()?;
+    let responses = node.service_builder(&name(&base, "/resp")?).event().create()?;
+    let listener = requests.listener_builder().create()?;
+    let notifier = responses.notifier_builder().create()?;
+    ready("READY");
+    let mut served = false;
+    let mut idle = 0u32;
+    loop {
+        match server.receive()? {
+            Some(request) => {
+                request.send_copy(*request.payload())?;
+                if block {
+                    notifier.notify()?;
+                }
+                served = true;
+                continue;
+            }
+            None if block => {
+                listener.timed_wait(|_| {}, Duration::from_millis(10))?;
+            }
+            None => {
+                idle = idle.wrapping_add(1);
+                if idle % 65536 != 0 {
+                    continue;
+                }
+            }
+        }
         if served && service.dynamic_config().number_of_clients() == 0 {
             return Ok(());
         }
     }
+}
+
+/// `ix-server --op value`: B10's value on a blackboard, until its reader has come and gone.
+fn value_server(a: &Args) -> Result<(), Error> {
+    let node = node()?;
+    let service = node
+        .service_builder(&name(&a.str("name", ""), "")?)
+        .blackboard_creator::<u64>()
+        .add::<u64>(0, crate::rsb::VALUE)
+        .create()?;
+    let _writer = service.writer_builder().create()?;
+    ready("READY");
+    let mut read = false;
+    loop {
+        std::thread::sleep(Duration::from_millis(10));
+        let readers = service.dynamic_config().number_of_readers();
+        read |= readers > 0;
+        if read && readers == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Child role `ix-call`: `--count` calls of `--op`: `struct` (B8), `lookup` (B9: the service
+/// opened by name and a client port made, both dropped again), `value` (B10: a blackboard
+/// entry read).
+pub fn call_client(a: &Args) -> Result<(), Error> {
+    pin(a.num("cpu", 2) as usize);
+    let base = a.str("name", "");
+    let block = a.str("wait", "block") == "block";
+    let node = node()?;
+    let record = match a.str("op", "").as_str() {
+        "struct" => {
+            let service =
+                node.service_builder(&name(&base, "")?).request_response::<Entry, Entry>().open()?;
+            let client = service.client_builder().create()?;
+            let requests = node.service_builder(&name(&base, "/req")?).event().open()?;
+            let responses = node.service_builder(&name(&base, "/resp")?).event().open()?;
+            let notifier = requests.notifier_builder().create()?;
+            let listener = responses.listener_builder().create()?;
+            let config = config();
+            time_calls(a, |_| -> Result<(), Error> {
+                let pending = client.send_copy(config)?;
+                if block {
+                    notifier.notify()?;
+                }
+                loop {
+                    if let Some(response) = pending.receive()? {
+                        if response.payload().high != 100 {
+                            return Err("another config came back".into());
+                        }
+                        return Ok(());
+                    }
+                    if block {
+                        listener.blocking_wait(|_| {})?;
+                    }
+                }
+            })?
+        }
+        "lookup" => {
+            let open = || -> Result<_, Error> {
+                let service = node
+                    .service_builder(&name(&base, "")?)
+                    .request_response::<[u8], [u8]>()
+                    .open()?;
+                let client = service.client_builder().create()?;
+                Ok((service, client))
+            };
+            // Held for the whole run: the server leaves once it has no client.
+            let _held = open()?;
+            time_calls(a, |_| open().map(drop))?
+        }
+        "value" => {
+            let service =
+                node.service_builder(&name(&base, "")?).blackboard_opener::<u64>().open()?;
+            let reader = service.reader_builder().create()?;
+            let entry = reader.entry::<u64>(&0)?;
+            let record = time_calls(a, |_| -> Result<(), Error> {
+                if *std::hint::black_box(entry.get()) != crate::rsb::VALUE {
+                    return Err("another value came back".into());
+                }
+                Ok(())
+            })?;
+            // The server looks for its reader every 10 ms, and leaves once it has seen one go.
+            std::thread::sleep(Duration::from_millis(50));
+            record
+        }
+        other => return Err(format!("unknown --op {other}").into()),
+    };
+    println!("{}", record.line());
+    Ok(())
 }
 
 /// Child role `ix-client`: B1's client.
@@ -220,6 +410,7 @@ pub fn client(a: &Args) -> Result<(), Error> {
     let notifier = requests.notifier_builder().create()?;
     let listener = responses.listener_builder().create()?;
     let mut buf = vec![0u8; size];
+    wait_for_start(a);
     let mut record = Record::new(0);
     for seq in 0..count {
         stamp(&mut buf, seq);
