@@ -75,6 +75,12 @@ Two properties make it the right default for "a big lump of bytes":
   so nothing the reader writes comes back; for a buffer both sides share, use
   a region of your own (below).
 
+The 16 KB boundary is AOSP's `BLOB_INPLACE_LIMIT`. A writer that wants
+another one passes it: `parcel.write_blob_with_limit(&payload, false, limit)`.
+The reader does not change, because the tag on the wire says which form the
+blob took. [What each form costs](#what-each-form-costs) has the sizes at
+which one overtakes the other, and what bounds an inline payload.
+
 Reach for the sections below when you need the region itself: a window into a
 larger heap, a lifetime longer than one call, or many buffers out of one
 allocation.
@@ -201,6 +207,7 @@ consumer is done with it.
 use rsbinder::shared_memory::{BpMemory, HeapCache};
 
 let cache = HeapCache::new();        // one per session
+let mut kept = None;                 // the heap, held between frames
 for seq in 0..6 {
     let binder = shm.nextFrame(seq)?;
     let frame = BpMemory::new_with_cache(binder, cache.clone());
@@ -208,12 +215,72 @@ for seq in 0..6 {
     let mut buf = [0u8; 40];
     frame.read_at(0, &mut buf)?;     // offset is relative to the window
     assert_eq!(cache.len(), 1);      // one mapped heap behind every frame
+    kept = Some(heap);
 }
 ```
 
 Without the cache each `BpMemory` maps the heap on its own (still
 correct, just more VMAs); with it, frames from the same dealer resolve to
 bare offsets.
+
+**Hold the heap between frames.** The cache keeps a heap weakly, as AOSP's
+`HeapCache` does: the mapping lives while a `BpMemory` or the
+`Arc<BpMemoryHeap>` that `resolve` returned is alive. A receiver that drops
+each frame before it takes the next, and keeps nothing else, drops the
+mapping with it, and the next frame asks for the heap and maps it again.
+Keeping the last `resolve` result, as `kept` does above, leaves one mapping
+for the whole run. On the machine of the table below a 64 KiB round trip was
+95.5 µs without it and 53.9 µs with it.
+
+## What each form costs
+
+One call that carries a payload to a service and gets it back, four ways, by
+payload size. Every row copies the payload the same number of times (the
+caller writes it and reads the reply, the service reads it and writes the
+reply), so the differences are what each form adds around the copies.
+
+| payload | in the transaction (`byte[]`) | blob (`write_blob`) | `SharedMemory` kept | `MemoryDealer` frame |
+|---|---|---|---|---|
+| 16 KiB | 13.8 µs | 13.9 µs | 11.2 µs | 43.2 µs |
+| 32 KiB | 17.5 µs | 48.3 µs | 12.8 µs | 46.9 µs |
+| 64 KiB | 40.4 µs | 69.1 µs | 15.9 µs | 53.9 µs |
+| 128 KiB | 99.9 µs | 104 µs | 23.0 µs | 64.2 µs |
+| 256 KiB | 219 µs | 279 µs | 36.9 µs | 73.5 µs |
+| 512 KiB | 477 µs | 551 µs | 65.7 µs | 99.3 µs |
+| 1 MiB | does not fit | 879 µs | 123 µs | 156 µs |
+| 4 MiB | does not fit | 2.40 ms | 0.455 ms | 1.23 ms |
+| 16 MiB | does not fit | 14.5 ms | 6.21 ms | 6.47 ms |
+
+Median round trip over kernel binder, three runs, on one x86_64 laptop CPU
+(Ryzen 7 8845HS, Linux 7.2, 2 MiB huge pages for shared memory, `performance`
+governor, caller and service each on a core of its own). The numbers are one
+machine's; the order of the columns is what carries over. The benchmark is
+`bench/ipc-compare` (`run.sh region`).
+
+- **In the transaction** is the cheapest form for a payload that is sent once
+  and is small: no region, no fd. Its cost grows fastest with size, and it
+  ends at the binder buffer: 1 MiB less two pages for the whole receiving
+  process, shared by every transaction it is handling, half of that for
+  oneway calls. A call that does not fit fails with `FailedTransaction`.
+- **A blob** past its inline limit makes a region for every call, so it pays
+  for an fd and for the region's pages each time. Just past 16 KiB that is
+  more than the bytes cost in the transaction, which is the case for
+  `write_blob_with_limit` with a higher limit: at 32 KiB the inline form took
+  17.5 µs and the region 48.3 µs, and the two met near 128 KiB. Choose a limit
+  against the buffer above, counting the calls a service may be handling at
+  once. Past the buffer a blob is the form that needs no setup. A reader of
+  many large blobs uses `read_into` with a `Vec` it keeps.
+- **A `SharedMemory` kept** across calls pays for its pages once. The call
+  carries a length and each side copies in and out of the mapping. It is the
+  cheapest form at every size here, and it asks for a protocol of your own:
+  who writes when, and when the other side is done reading.
+- **A `MemoryDealer` frame** costs two binder objects a call (the frame's
+  `IMemory` each way) on top of the copies, about 40 µs here, and then grows
+  like the kept region. It gives many buffers out of one heap, each with a
+  lifetime of its own.
+
+For a stream of values to many readers, a region per call is the wrong shape
+whatever its size: that is what [Topics](./topics.md) are for.
 
 Because the transactions are the handwritten AOSP layout, the same
 binders work against a C++ `interface_cast<IMemory>` client or a C++

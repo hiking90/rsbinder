@@ -310,12 +310,53 @@ impl Parcel {
     ///
     /// The reader follows the tag, so it needs to know none of this.
     pub fn write_blob(&mut self, data: &[u8], mutable_copy: bool) -> Result<()> {
+        self.write_blob_with_limit(data, mutable_copy, BLOB_INPLACE_LIMIT)
+    }
+
+    /// [`write_blob`](Parcel::write_blob) with the writer's own length
+    /// past which a payload leaves the parcel for a shared region:
+    /// `inline_limit` in place of [`BLOB_INPLACE_LIMIT`]. Everything
+    /// else is `write_blob`'s, the other conditions of the shared form
+    /// included.
+    ///
+    /// The wire is the same. The tag says which form a blob took and
+    /// the limit is not on it, so [`read_blob`](Parcel::read_blob), AOSP
+    /// `Parcel::readBlob` and Java `Parcel.readBlob` read a blob written
+    /// with any limit: they take an inline payload of whatever length
+    /// the parcel holds.
+    ///
+    /// What the limit trades. An inline payload is copied into the
+    /// parcel and by the kernel into the receiver's transaction buffer;
+    /// a shared one costs a region — an fd, its pages, the receiver's
+    /// read of them — whatever its size, and stays out of that buffer.
+    /// Which is larger at a given size depends on the machine; the
+    /// book's shared-memory chapter has one machine's round trips of
+    /// both forms by size, where the region is the larger cost from
+    /// `BLOB_INPLACE_LIMIT` up to about 128 KiB.
+    ///
+    /// What bounds it. A kernel binder transaction has to fit in the
+    /// receiving process's buffer: 1 MiB less two pages as
+    /// `ProcessState` maps it, shared by every transaction that process
+    /// is handling, with half of it the ceiling for oneway calls. A
+    /// parcel that does not fit fails the call with
+    /// [`StatusCode::FailedTransaction`] — at `transact`, not here — so
+    /// a limit is chosen against the largest payload the receiver may be
+    /// holding at once, not against one call. An RPC session has no such
+    /// buffer.
+    ///
+    /// `inline_limit` of `0` sends every non-empty payload through a
+    /// region.
+    pub fn write_blob_with_limit(
+        &mut self,
+        data: &[u8],
+        mutable_copy: bool,
+        inline_limit: usize,
+    ) -> Result<()> {
         // AOSP rejects a non-int32 length first; the wire carries it as one.
         let len = i32::try_from(data.len()).map_err(|_| StatusCode::BadValue)?;
 
-        let shared = data.len() > BLOB_INPLACE_LIMIT
-            && self.allow_fds()
-            && crate::shared_memory::is_supported();
+        let shared =
+            data.len() > inline_limit && self.allow_fds() && crate::shared_memory::is_supported();
         // Fill the region before writing, so a failure leaves the parcel unchanged.
         let heap = if shared {
             let flags = if mutable_copy { 0 } else { FLAG_READ_ONLY };
@@ -495,6 +536,37 @@ mod tests {
                 .ok()
                 .and_then(|h| h.seals())
                 .is_some_and(seals_forbid_writing)
+    }
+
+    /// The writer's limit moves the boundary and nothing on the wire: one reader takes every form.
+    #[test]
+    fn the_writers_limit_decides_the_form() {
+        let len = BLOB_INPLACE_LIMIT + 4096;
+        let data = pattern(len);
+        for (limit, want_inline) in [
+            (0usize, false),
+            (len - 1, false),
+            (len, true),
+            (usize::MAX, true),
+        ] {
+            let mut parcel = Parcel::new();
+            parcel
+                .write_blob_with_limit(&data, false, limit)
+                .expect("write_blob_with_limit");
+            parcel.set_data_position(0);
+            let blob = parcel.read_blob().expect("read_blob");
+            let want_inline = want_inline || !shared_form_available(false);
+            assert_eq!(blob.inline().is_some(), want_inline, "limit {limit}");
+            assert_eq!(blob.to_vec().expect("to_vec"), data, "limit {limit}");
+        }
+        // An empty payload has no region to take, whatever the limit.
+        let mut parcel = Parcel::new();
+        parcel.write_blob_with_limit(&[], false, 0).expect("empty");
+        parcel.set_data_position(0);
+        assert_eq!(
+            parcel.read_blob().expect("read_blob").inline(),
+            Some(&[][..])
+        );
     }
 
     /// Plan 10-2 AC-2.1: the boundary is the whole decision; pin one byte either side of it.

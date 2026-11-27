@@ -32,6 +32,7 @@ fn talk(client: &rsbinder::Client) -> rsbinder::Result<()> {
 
     // ---- 2. Frames: many IMemory windows, one heap mapping ---------------
     let cache = HeapCache::new(); // keep one per session
+    let mut kept = None; // the cache holds a heap weakly; this keeps it mapped between frames
     for seq in 0..6 {
         let binder = shm.nextFrame(seq)?;
         let frame = BpMemory::new_with_cache(binder, cache.clone());
@@ -47,7 +48,9 @@ fn talk(client: &rsbinder::Client) -> rsbinder::Result<()> {
             heap.size(),
             cache.len()
         );
+        kept = Some(heap);
     }
+    drop(kept);
     Ok(())
 }
 

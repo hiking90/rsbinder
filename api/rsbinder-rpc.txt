@@ -4772,6 +4772,7 @@ pub fn rsbinder::Parcel::write_u8(&mut self, u8) -> rsbinder::Result<()>
 impl rsbinder::Parcel
 pub fn rsbinder::Parcel::read_blob(&mut self) -> rsbinder::Result<rsbinder::blob::Blob>
 pub fn rsbinder::Parcel::write_blob(&mut self, &[u8], bool) -> rsbinder::Result<()>
+pub fn rsbinder::Parcel::write_blob_with_limit(&mut self, &[u8], bool, usize) -> rsbinder::Result<()>
 impl core::default::Default for rsbinder::Parcel
 pub fn rsbinder::Parcel::default() -> Self
 impl core::fmt::Debug for rsbinder::Parcel
