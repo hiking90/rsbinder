@@ -230,26 +230,26 @@ each frame before it takes the next, and keeps nothing else, drops the
 mapping with it, and the next frame asks for the heap and maps it again.
 Keeping the last `resolve` result, as `kept` does above, leaves one mapping
 for the whole run. On the machine of the table below a 64 KiB round trip was
-95.5 µs without it and 53.9 µs with it.
+95.5 µs without it and 54.0 µs with it.
 
 ## What each form costs
 
-One call that carries a payload to a service and gets it back, four ways, by
+One call that carries a payload to a service and gets it back, five ways, by
 payload size. Every row copies the payload the same number of times (the
 caller writes it and reads the reply, the service reads it and writes the
 reply), so the differences are what each form adds around the copies.
 
-| payload | in the transaction (`byte[]`) | blob (`write_blob`) | `SharedMemory` kept | `MemoryDealer` frame |
-|---|---|---|---|---|
-| 16 KiB | 13.8 µs | 13.9 µs | 11.2 µs | 43.2 µs |
-| 32 KiB | 17.5 µs | 48.3 µs | 12.8 µs | 46.9 µs |
-| 64 KiB | 40.4 µs | 69.1 µs | 15.9 µs | 53.9 µs |
-| 128 KiB | 99.9 µs | 104 µs | 23.0 µs | 64.2 µs |
-| 256 KiB | 219 µs | 279 µs | 36.9 µs | 73.5 µs |
-| 512 KiB | 477 µs | 551 µs | 65.7 µs | 99.3 µs |
-| 1 MiB | does not fit | 879 µs | 123 µs | 156 µs |
-| 4 MiB | does not fit | 2.40 ms | 0.455 ms | 1.23 ms |
-| 16 MiB | does not fit | 14.5 ms | 6.21 ms | 6.47 ms |
+| payload | in the transaction (`byte[]`) | blob, `to_vec` | blob, `read_into` | `SharedMemory` kept | `MemoryDealer` frame |
+|---|---|---|---|---|---|
+| 16 KiB | 13.8 µs | 14.0 µs | 14.0 µs | 11.2 µs | 43.4 µs |
+| 32 KiB | 17.7 µs | 48.5 µs | 47.8 µs | 12.8 µs | 47.2 µs |
+| 64 KiB | 40.7 µs | 70.3 µs | 68.4 µs | 16.0 µs | 54.0 µs |
+| 128 KiB | 99.2 µs | 107 µs | 105 µs | 23.2 µs | 64.8 µs |
+| 256 KiB | 220 µs | 281 µs | 176 µs | 37.6 µs | 73.4 µs |
+| 512 KiB | 467 µs | 558 µs | 323 µs | 66.7 µs | 100 µs |
+| 1 MiB | does not fit | 881 µs | 375 µs | 123 µs | 159 µs |
+| 4 MiB | does not fit | 2.45 ms | 1.31 ms | 0.465 ms | 1.24 ms |
+| 16 MiB | does not fit | 14.7 ms | 9.65 ms | 6.27 ms | 6.51 ms |
 
 Median round trip over kernel binder, three runs, on one x86_64 laptop CPU
 (Ryzen 7 8845HS, Linux 7.2, 2 MiB huge pages for shared memory, `performance`
@@ -266,10 +266,15 @@ machine's; the order of the columns is what carries over. The benchmark is
   for an fd and for the region's pages each time. Just past 16 KiB that is
   more than the bytes cost in the transaction, which is the case for
   `write_blob_with_limit` with a higher limit: at 32 KiB the inline form took
-  17.5 µs and the region 48.3 µs, and the two met near 128 KiB. Choose a limit
+  17.7 µs and the region 48.5 µs, and the two met near 128 KiB. Choose a limit
   against the buffer above, counting the calls a service may be handling at
-  once. Past the buffer a blob is the form that needs no setup. A reader of
-  many large blobs uses `read_into` with a `Vec` it keeps.
+  once. Past the buffer a blob is the form that needs no setup.
+- **`read_into`** is the same blob with each side reading it into a `Vec` it
+  keeps, where `to_vec` allocates one per blob. From 256 KiB up, with glibc's
+  allocator, the new `Vec` is memory mapped for it and given back afterwards,
+  a page fault for each page of every blob, and keeping the `Vec` took the
+  1 MiB round trip from 881 µs to 375 µs. Below that the allocator reuses its
+  own memory and the two columns agree.
 - **A `SharedMemory` kept** across calls pays for its pages once. The call
   carries a length and each side copies in and out of the mapping. It is the
   cheapest form at every size here, and it asks for a protocol of your own:
