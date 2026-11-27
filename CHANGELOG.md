@@ -198,6 +198,15 @@ peers; peers of either release still subscribe to each other.
 
 ### Added
 
+- `Parcel::write_blob_with_limit(data, mutable_copy, inline_limit)`:
+  `write_blob` with the writer's own length past which a payload leaves the
+  parcel for a shared region, in place of `BLOB_INPLACE_LIMIT` (16 KiB). The
+  wire is the same, since the tag says which form a blob took: `read_blob`,
+  AOSP `Parcel::readBlob` and Java `Parcel.readBlob` read a blob written with
+  any limit. An inline payload has to fit in the receiver's binder buffer with
+  everything else it is handling, and a parcel that does not fails the call
+  with `FailedTransaction`. The book's shared-memory chapter has round trips
+  of both forms by size.
 - `wait_for_service_timeout` and `wait_for_interface_timeout`, on
   `hub::ServiceManager` and as `hub::` functions: the synchronous wait with a
   bound. It is the same wait as `wait_for_service` and returns
