@@ -215,6 +215,14 @@ peers; peers of either release still subscribe to each other.
 
 ### Added
 
+- `Parcel::write_fd` and `Parcel::read_fd`: a file descriptor as a bare fd
+  object, the wire of an AIDL `FileDescriptor` argument (AOSP
+  `Parcel::writeDupFileDescriptor` / `readUniqueFileDescriptor`, Java
+  `writeRawFileDescriptor` / `readRawFileDescriptor`). It is for calling or
+  implementing by hand a platform interface that declares that type, such as
+  `android.os.IVoldMountCallback`; `ParcelFileDescriptor` writes two markers
+  before the object and the two do not read each other. `write_fd` takes a
+  `BorrowedFd` and duplicates it, `read_fd` returns an `OwnedFd`.
 - `Parcel::write_blob_with_limit(data, mutable_copy, inline_limit)`:
   `write_blob` with the writer's own length past which a payload leaves the
   parcel for a shared region, in place of `BLOB_INPLACE_LIMIT` (16 KiB). The
