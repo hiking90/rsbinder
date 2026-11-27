@@ -50,13 +50,14 @@ fn page_size() -> usize {
     rustix::param::page_size()
 }
 
-/// The region for `size` bytes of data, and whether huge pages fill it: whole huge pages from
-/// half of one on, which bounds the region at twice the data; `size` itself below that.
+/// Region for `size` data bytes and whether huge pages fill it: whole huge pages from half of one.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn contents_region(size: usize, huge_page: Option<usize>) -> (usize, bool) {
     let whole = huge_page
         .filter(|huge| *huge > 0 && size >= huge / 2)
-        .and_then(|huge| size.checked_next_multiple_of(huge));
+        .and_then(|huge| size.checked_next_multiple_of(huge))
+        // AOSP `readBlob` takes the region's size as an `int` and refuses one past it.
+        .filter(|region| i32::try_from(*region).is_ok());
     whole.map_or((size, false), |region| (region, true))
 }
 
@@ -85,8 +86,7 @@ impl Mapping {
         })
     }
 
-    /// A writable mapping of the first `len` bytes, every page of it backed, by huge pages
-    /// where the kernel grants them: for a region that holds nothing yet.
+    /// Writable mapping of an empty region's first `len` bytes, every page backed, huge if granted.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn map_huge(fd: &OwnedFd, len: usize) -> Result<Self> {
         let mapping = shm::Mapping::map(fd.as_fd(), 0, len as u64)?;
@@ -213,8 +213,7 @@ mod backend {
         Ok(())
     }
 
-    /// The size of a huge page of shared memory, `None` where the system gives it none: read
-    /// once from `/sys/kernel/mm/transparent_hugepage`, and `None` too where that is unreadable.
+    /// Size of a shared-memory huge page, read once from sysfs; `None` if not granted or unread.
     pub(super) fn huge_page_size() -> Option<usize> {
         static SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         *SIZE.get_or_init(|| {
@@ -225,8 +224,7 @@ mod backend {
         })
     }
 
-    /// Whether `shmem_enabled`'s text, its choice in brackets, gives a mapping advised
-    /// `MADV_HUGEPAGE` huge pages: every choice but `never` and `deny`.
+    /// Whether `shmem_enabled`'s bracketed choice grants `MADV_HUGEPAGE`: all but `never`, `deny`.
     pub(super) fn huge_pages_granted(shmem_enabled: &str) -> bool {
         let chosen = shmem_enabled
             .split_whitespace()
@@ -234,8 +232,7 @@ mod backend {
         matches!(chosen, Some(choice) if choice != "never" && choice != "deny")
     }
 
-    /// `pwrite(2)` of all of `data` from offset 0, the fd's position left where a peer expects
-    /// it; a write seal refuses the call, so it runs before the seals.
+    /// `pwrite(2)` of all of `data` from offset 0, the fd position unmoved; runs before the seals.
     pub(super) fn write_all(fd: &OwnedFd, mut data: &[u8]) -> Result<()> {
         use rustix::io::Errno;
         let mut offset = 0u64;
@@ -522,7 +519,8 @@ impl MemoryHeapBase {
     /// mapping advised `MADV_HUGEPAGE` instead ([`contents_region`]): `pwrite(2)` gets small
     /// pages whatever the advice, and a huge page is one allocation, one fault and one release
     /// where its small pages are 512 of each. That mapping takes the `SIGBUS`, and the region
-    /// is up to twice the data.
+    /// is up to twice the data. Whole huge pages that pass `i32::MAX` bytes are not used: AOSP
+    /// `readBlob` takes the region's size as an `int`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn with_contents(data: &[u8], flags: u32, name: &str) -> Result<Self> {
         if data.is_empty() {
@@ -1018,6 +1016,12 @@ mod tests {
         // A region no `usize` holds stays the size asked, for the kernel to refuse.
         let past = usize::MAX - 4095;
         assert_eq!(contents_region(past, Some(HUGE)), (past, false));
+        // So does one whose whole huge pages pass `i32::MAX`, the size an AOSP reader takes.
+        let int_max = i32::MAX as usize + 1;
+        let fits = int_max - 2 * HUGE + 4096;
+        assert_eq!(contents_region(fits, Some(HUGE)), (int_max - HUGE, true));
+        let over = int_max - HUGE + 4096;
+        assert_eq!(contents_region(over, Some(HUGE)), (over, false));
         assert_eq!(contents_region(HUGE, Some(0)), (HUGE, false));
     }
 
@@ -1026,6 +1030,10 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn with_contents_holds_a_region_past_a_huge_page() {
         let system = backend::huge_page_size();
+        // The lengths below scale with the huge page: 512 MiB on arm64 with 64 KiB pages.
+        if system.is_some_and(|huge| huge > 4 << 20) {
+            return;
+        }
         let huge = system.unwrap_or(2 << 20);
         for len in [
             huge / 2 - 1,

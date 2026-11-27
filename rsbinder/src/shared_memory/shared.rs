@@ -51,8 +51,8 @@ impl SharedMemory {
     /// `F_SEAL_FUTURE_WRITE` on Linux/Android — how `ASharedMemory_setProt`
     /// enforces read-only on memfd —, a legacy `/dev/ashmem` fd whose
     /// `ASHMEM_GET_PROT_MASK` lacks `PROT_WRITE` — how it enforces
-    /// read-only on ashmem, where the kernel refuses a writable mapping —
-    /// or an `O_RDONLY` fd on macOS).
+    /// read-only on ashmem, where the kernel refuses a writable mapping —,
+    /// or an fd open `O_RDONLY` on Linux/Android or macOS).
     ///
     /// The fd is not required to be shrink-sealed, so a sender that
     /// `ftruncate`s it after this call makes the next
@@ -202,8 +202,14 @@ pub(crate) fn is_ashmem_fd(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     rsbinder_fmq::shm::is_ashmem_fd(fd)
 }
 
+/// Whether the kernel refuses `fd` a writable mapping, by what the fd itself reports.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn write_sealed<F: AsFd>(fd: F) -> bool {
+pub(crate) fn write_sealed<F: AsFd>(fd: F) -> bool {
+    use rustix::fs::OFlags;
+    // `mmap` gives `PROT_WRITE` `MAP_SHARED` only to an fd open `O_RDWR`, whatever its seals.
+    if rustix::fs::fcntl_getfl(fd.as_fd()).is_ok_and(|fl| fl & OFlags::ACCMODE != OFlags::RDWR) {
+        return true;
+    }
     // ashmem answers `F_GET_SEALS` with `EINVAL`; its read-only state is the prot mask.
     if is_ashmem_fd(fd.as_fd()) {
         // `false` when the ioctl fails: the region is then offered as writable.
@@ -214,13 +220,15 @@ fn write_sealed<F: AsFd>(fd: F) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the kernel refuses `fd` a writable mapping, by what the fd itself reports.
 #[cfg(target_os = "macos")]
-fn write_sealed<F: AsFd>(fd: F) -> bool {
+pub(crate) fn write_sealed<F: AsFd>(fd: F) -> bool {
     super::heap::is_read_only_fd(fd)
 }
 
+/// Whether the kernel refuses `fd` a writable mapping; nothing reports it on this target.
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn write_sealed<F: AsFd>(_fd: F) -> bool {
+pub(crate) fn write_sealed<F: AsFd>(_fd: F) -> bool {
     false
 }
 
@@ -292,6 +300,27 @@ mod tests {
             rx.write_at(0, b"xx").unwrap_err(),
             StatusCode::PermissionDenied
         );
+        let mut b = [0u8; 2];
+        rx.read_at(0, &mut b).unwrap();
+        assert_eq!(&b, b"ok");
+    }
+
+    /// An unsealed memfd reopened `O_RDONLY` takes no writable mapping: it is adopted read-only.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_fd_reopened_read_only_is_adopted_read_only() {
+        use std::os::fd::AsRawFd;
+        let owner = SharedMemory::create(page()).unwrap();
+        owner.write_at(0, b"ok").unwrap();
+        let path = format!("/proc/self/fd/{}", owner.as_fd().as_raw_fd());
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            // An enforcing SELinux domain has no `open` on its own memfd.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("reopen O_RDONLY: {e}"),
+        };
+        let rx = SharedMemory::from_fd(OwnedFd::from(file)).unwrap();
+        assert!(rx.is_read_only());
         let mut b = [0u8; 2];
         rx.read_at(0, &mut b).unwrap();
         assert_eq!(&b, b"ok");
