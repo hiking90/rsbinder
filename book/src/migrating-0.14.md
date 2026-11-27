@@ -42,6 +42,17 @@ The additions and fixes themselves are listed in
 - `hub::ServiceManager` is `#[non_exhaustive]`. A `match` on the value
   `hub::default()` returns needs a `_` arm; one that names every variant of
   your build no longer compiles. An `if let` on one variant is unchanged.
+- `blob::Blob` is a struct. In 0.13.0 it was an enum, `Inline(Vec<u8>)` or
+  `Shared { heap, len, mutable }`. Replace a `match` on it with its methods:
+  `inline()` is `Some` for the inline form, and `len()`, `is_mutable()` and
+  `mapped()` give what the `Shared` fields held. A `Blob` can no longer be
+  built by hand; `Parcel::read_blob` makes it.
+- `Blob::mapped` returns `Result<Option<&Arc<MappedHeap>>>`: add a `?` in
+  front of the `Option` you handled. `Parcel::read_blob` no longer maps a
+  shared blob's region. The first `mapped` does and the blob keeps the
+  mapping, so a failed `mmap` is that call's error. `read_blob` still checks
+  the descriptor: its kind, that it cannot shrink, that it holds the payload.
+  A reader that calls `to_vec` or `read_into` makes no mapping of a memfd.
 
 ## `rsb_hub`
 

@@ -47,13 +47,14 @@
 //! false. Nothing to configure, and the reader does not care: it follows
 //! the tag.
 
-use std::sync::Arc;
+use std::os::fd::OwnedFd;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::{Result, StatusCode};
 use crate::file_descriptor;
 use crate::parcel::Parcel;
-use crate::shared_memory::heap::seals_forbid_writing;
-use crate::shared_memory::{IMemoryHeap, MappedHeap, MemoryHeapBase, FLAG_READ_ONLY, SEAL_SHRINK};
+use crate::shared_memory::heap::{check_extent, read_memfd, seals_forbid_writing};
+use crate::shared_memory::{MappedHeap, MemoryHeapBase, FLAG_READ_ONLY, SEAL_SHRINK};
 
 /// Payloads this long or shorter always go inline; a longer one goes to
 /// shared memory when [`Parcel::write_blob`] can use it (see there).
@@ -74,40 +75,69 @@ pub const BLOB_ASHMEM_MUTABLE: i32 = 2;
 /// Shared region name, recognizable in `/proc/<pid>/fd`; AOSP uses the same string.
 const BLOB_REGION_NAME: &str = "Parcel Blob";
 
-/// A blob read out of a parcel: the bytes, or the mapping they live in.
+/// A blob read out of a parcel: the bytes, or the shared region they
+/// live in.
 ///
-/// [`to_vec`](Self::to_vec) gets the payload whichever form it took.
-/// There is deliberately **no** `as_bytes()` spanning both: a shared
-/// region is memory another process can still write — always for a
-/// mutable blob, and even for an immutable one, whose seal stops new
-/// writable mappings but not the writer's existing one — so a `&[u8]`
-/// over it would be a promise this module cannot keep. Reach for
-/// [`mapped`](Self::mapped) to work in place with that in view.
+/// [`to_vec`](Self::to_vec) and [`read_into`](Self::read_into) get the
+/// payload whichever form it took. There is deliberately **no**
+/// `as_bytes()` spanning both: a shared region is memory another process
+/// can still write — always for a mutable blob, and even for an
+/// immutable one, whose seal stops new writable mappings but not the
+/// writer's existing one — so a `&[u8]` over it would be a promise this
+/// module cannot keep. Reach for [`mapped`](Self::mapped) to work in
+/// place with that in view.
+///
+/// A shared blob holds the region's file descriptor and maps it only
+/// when [`mapped`](Self::mapped) is first called: a reader that copies
+/// the payload out pays for no mapping.
 #[derive(Debug)]
-pub enum Blob {
+pub struct Blob(Form);
+
+#[derive(Debug)]
+enum Form {
     /// Carried in the parcel itself (`BLOB_INPLACE`).
     Inline(Vec<u8>),
     /// Carried as a shared-memory region.
-    Shared {
-        /// The mapping, `len` bytes at offset 0.
-        heap: Arc<MappedHeap>,
-        /// Payload length. For a blob [`Parcel::read_blob`] produced it
-        /// equals `heap.size()`, which records the length that was asked
-        /// for; the page rounding happens inside the kernel mapping and
-        /// is not visible here.
-        len: usize,
-        /// `true` for `BLOB_ASHMEM_MUTABLE` — the writer offered a
-        /// region it expects to see changes in.
-        mutable: bool,
-    },
+    Shared(Region),
+}
+
+/// A shared blob: an fd [`Parcel::read_blob`] has checked holds `len` bytes that cannot shrink.
+#[derive(Debug)]
+struct Region {
+    fd: OwnedFd,
+    len: usize,
+    /// `BLOB_ASHMEM_MUTABLE`: the writer offered a region it expects to see changes in.
+    mutable: bool,
+    /// `len` bytes at offset 0, made by the first `mapped`.
+    heap: OnceLock<Arc<MappedHeap>>,
+}
+
+impl Region {
+    fn mapped(&self) -> Result<&Arc<MappedHeap>> {
+        if let Some(heap) = self.heap.get() {
+            return Ok(heap);
+        }
+        let flags = if self.mutable { 0 } else { FLAG_READ_ONLY };
+        let heap = MappedHeap::from_fd(self.fd.try_clone()?, self.len, 0, flags)?;
+        // Two first callers each map; one mapping is kept and the other unmapped.
+        Ok(self.heap.get_or_init(|| Arc::new(heap)))
+    }
+
+    /// The first `out.len()` bytes: by `pread(2)` where the fd takes it, else the mapping.
+    fn copy_out(&self, out: &mut [u8]) -> Result<()> {
+        if read_memfd(&self.fd, out)? {
+            return Ok(());
+        }
+        self.mapped()?.read_at(0, out)
+    }
 }
 
 impl Blob {
     /// Payload length in bytes.
     pub fn len(&self) -> usize {
-        match self {
-            Blob::Inline(bytes) => bytes.len(),
-            Blob::Shared { len, .. } => *len,
+        match &self.0 {
+            Form::Inline(bytes) => bytes.len(),
+            Form::Shared(region) => region.len,
         }
     }
 
@@ -120,7 +150,7 @@ impl Blob {
     /// (`BLOB_ASHMEM_MUTABLE`). An inline blob is never mutable — there
     /// is nothing shared to write.
     pub fn is_mutable(&self) -> bool {
-        matches!(self, Blob::Shared { mutable: true, .. })
+        matches!(&self.0, Form::Shared(region) if region.mutable)
     }
 
     /// The payload, copied out.
@@ -129,37 +159,81 @@ impl Blob {
     /// peer is still writing has no single value, and this returns
     /// whatever is there at the moment of the call.
     pub fn to_vec(&self) -> Result<Vec<u8>> {
-        match self {
-            Blob::Inline(bytes) => Ok(bytes.clone()),
-            Blob::Shared { heap, len, .. } => {
-                // Hand-built `Blob::Shared` with `len` past the map: BadValue, not an OOM abort.
-                if *len > heap.size() {
-                    return Err(StatusCode::BadValue);
-                }
-                let mut out = vec![0u8; *len];
-                heap.read_at(0, &mut out)?;
+        match &self.0 {
+            Form::Inline(bytes) => Ok(bytes.clone()),
+            Form::Shared(region) => {
+                let mut out = vec![0u8; region.len];
+                region.copy_out(&mut out)?;
                 Ok(out)
             }
         }
+    }
+
+    /// The payload copied into `out`, which ends up holding exactly the
+    /// payload: [`to_vec`](Self::to_vec) into an allocation the caller
+    /// keeps.
+    ///
+    /// A new `Vec` of a large payload is memory the allocator takes from
+    /// the kernel, a page fault for each of its pages when the copy
+    /// reaches it. A reader of many large blobs — one per call of a
+    /// service, say — that hands the same `Vec` back each time copies
+    /// into pages it already has.
+    ///
+    /// On an error `out` holds no payload: its length and contents are
+    /// unspecified.
+    pub fn read_into(&self, out: &mut Vec<u8>) -> Result<()> {
+        match &self.0 {
+            Form::Inline(bytes) => {
+                out.clear();
+                out.extend_from_slice(bytes);
+            }
+            Form::Shared(region) => {
+                // Not cleared first: only the bytes `out` grows by are zeroed.
+                out.resize(region.len, 0);
+                region.copy_out(out)?;
+            }
+        }
+        Ok(())
     }
 
     /// The bytes without copying — `Some` only for an inline blob, where
     /// they are this process's own. See the type docs for why a shared
     /// region does not answer here.
     pub fn inline(&self) -> Option<&[u8]> {
-        match self {
-            Blob::Inline(bytes) => Some(bytes),
-            Blob::Shared { .. } => None,
+        match &self.0 {
+            Form::Inline(bytes) => Some(bytes),
+            Form::Shared(_) => None,
         }
     }
 
-    /// The mapping a shared blob arrived in, for reading it in place or
-    /// (when [`is_mutable`](Self::is_mutable)) writing back to the
-    /// sender. `None` for an inline blob.
-    pub fn mapped(&self) -> Option<&Arc<MappedHeap>> {
-        match self {
-            Blob::Inline(_) => None,
-            Blob::Shared { heap, .. } => Some(heap),
+    /// A shared blob's region mapped, [`len`](Self::len) bytes at offset
+    /// 0, for reading it in place or (when
+    /// [`is_mutable`](Self::is_mutable)) writing back to the sender.
+    /// `Ok(None)` for an inline blob.
+    ///
+    /// The first call makes the mapping and the blob keeps it: later
+    /// calls return the same one, and a clone of the `Arc` outlives the
+    /// blob. An immutable blob's mapping is read-only.
+    ///
+    /// [`Parcel::read_blob`] has already checked the descriptor — its
+    /// kind, that it cannot shrink, that it holds the payload — so an
+    /// error here is the mapping itself failing: the address space or
+    /// the descriptor table is full.
+    pub fn mapped(&self) -> Result<Option<&Arc<MappedHeap>>> {
+        match &self.0 {
+            Form::Inline(_) => Ok(None),
+            Form::Shared(region) => region.mapped().map(Some),
+        }
+    }
+
+    /// A shared blob's file descriptor, to hand the region on without
+    /// mapping it; `None` for an inline blob. The payload is the
+    /// region's first [`len`](Self::len) bytes, so take the length
+    /// before this consumes the blob.
+    pub fn into_fd(self) -> Option<OwnedFd> {
+        match self.0 {
+            Form::Inline(_) => None,
+            Form::Shared(region) => Some(region.fd),
         }
     }
 }
@@ -180,8 +254,9 @@ impl Parcel {
     /// `seal_future_write`.
     ///
     /// `mutable_copy` is meaningful only to the reader. This function
-    /// keeps no handle on the region: the mapping is dropped and the
-    /// owner fd closed before it returns, only a dup travels in the
+    /// keeps no handle on the region: the owner fd, and on macOS the
+    /// mapping the region was filled through, are closed before it
+    /// returns, only a dup travels in the
     /// parcel, and the return type carries nothing back — so the writer
     /// cannot observe what the reader writes. A sender-side handle would
     /// take a variant returning the heap, the way AOSP's
@@ -213,7 +288,7 @@ impl Parcel {
         // Fill the region before writing, so a failure leaves the parcel unchanged.
         let heap = if shared {
             let flags = if mutable_copy { 0 } else { FLAG_READ_ONLY };
-            let heap = MemoryHeapBase::new_named(data.len(), flags, BLOB_REGION_NAME)?;
+            let heap = MemoryHeapBase::with_contents(data, flags, BLOB_REGION_NAME)?;
             // Pre-5.1 kernels lack the write seal; never tag a writable region immutable.
             let write_sealed = heap.seals().is_some_and(seals_forbid_writing);
             (mutable_copy || write_sealed).then_some(heap)
@@ -226,7 +301,6 @@ impl Parcel {
             // `writeInplace`: raw bytes, no own length, padded to 4 bytes.
             return self.write_aligned_data(data);
         };
-        heap.write_at(0, data)?;
         let fd = heap.to_parcel_fd()?;
 
         self.write::<i32>(&len)?;
@@ -279,7 +353,7 @@ impl Parcel {
         let tag = self.read::<i32>()?;
 
         if tag == BLOB_INPLACE {
-            return Ok(Blob::Inline(self.read_aligned_data(len)?.to_vec()));
+            return Ok(Blob(Form::Inline(self.read_aligned_data(len)?.to_vec())));
         }
         if tag != BLOB_ASHMEM_IMMUTABLE && tag != BLOB_ASHMEM_MUTABLE {
             log::error!("read_blob: unknown blob tag {tag}");
@@ -301,14 +375,14 @@ impl Parcel {
             log::error!("read_blob: a shared blob of zero length has no region to map");
             return Err(StatusCode::BadValue);
         }
-        // `from_fd` checks region >= payload (as AOSP) and refuses a 0-length non-ashmem fd.
-        let flags = if mutable { 0 } else { FLAG_READ_ONLY };
-        let heap = MappedHeap::from_fd(fd, len, 0, flags)?;
-        Ok(Blob::Shared {
-            heap: Arc::new(heap),
+        // Region >= payload (as AOSP), and no 0-length fd but ashmem: what a mapping would need.
+        check_extent(&fd, len, 0)?;
+        Ok(Blob(Form::Shared(Region {
+            fd,
             len,
             mutable,
-        })
+            heap: OnceLock::new(),
+        })))
     }
 }
 
@@ -362,6 +436,75 @@ mod tests {
         }
     }
 
+    /// Lengths that end inside a page and span many: the shared form carries each exactly.
+    #[test]
+    fn a_shared_blob_round_trips_at_any_length() {
+        for len in [
+            BLOB_INPLACE_LIMIT + 1,
+            BLOB_INPLACE_LIMIT + 4095,
+            1 << 20,
+            (3 << 20) + 5,
+        ] {
+            let data = pattern(len);
+            for mutable_copy in [false, true] {
+                let mut parcel = Parcel::new();
+                parcel.write_blob(&data, mutable_copy).expect("write_blob");
+                parcel.set_data_position(0);
+                let blob = parcel.read_blob().expect("read_blob");
+                assert_eq!(blob.len(), len);
+                assert_eq!(blob.to_vec().expect("to_vec"), data, "len {len}");
+                // `read_into` leaves exactly the payload, whatever `out` held: longer, shorter.
+                for held in [len + 9, len / 2, 0] {
+                    let mut out = vec![0xa5u8; held];
+                    blob.read_into(&mut out).expect("read_into");
+                    assert_eq!(out, data, "len {len} into a Vec of {held}");
+                }
+                // The mapping a reader may take instead reads the same bytes.
+                if let Some(heap) = blob.mapped().expect("mapped") {
+                    let mut mapped = vec![0u8; len];
+                    heap.read_at(0, &mut mapped).expect("read_at");
+                    assert_eq!(mapped, data, "len {len} through the mapping");
+                }
+            }
+        }
+    }
+
+    /// The blob maps once and keeps the mapping; its fd carries the region on without one.
+    #[test]
+    fn a_shared_blob_maps_once_and_gives_up_its_fd() {
+        let data = pattern(BLOB_INPLACE_LIMIT + 4096);
+        if !shared_form_available(false) {
+            return;
+        }
+        let mut parcel = Parcel::new();
+        parcel.write_blob(&data, false).expect("write_blob");
+        parcel.set_data_position(0);
+        let blob = parcel.read_blob().expect("read_blob");
+
+        let first = blob.mapped().expect("mapped").expect("shared").clone();
+        let again = blob.mapped().expect("mapped").expect("shared");
+        assert!(Arc::ptr_eq(&first, again));
+        assert_eq!(crate::shared_memory::IMemoryHeap::size(&*first), data.len());
+
+        // The mapping outlives the blob, and the fd holds the payload for whoever gets it.
+        let fd = blob.into_fd().expect("a shared blob has an fd");
+        let mut kept = vec![0u8; data.len()];
+        first.read_at(0, &mut kept).expect("read_at");
+        assert_eq!(kept, data);
+        let passed_on = MappedHeap::from_fd_strict(fd, data.len(), 0, FLAG_READ_ONLY)
+            .expect("the fd is a write-sealed region of the payload's length");
+        let mut got = vec![0u8; data.len()];
+        passed_on.read_at(0, &mut got).expect("read_at");
+        assert_eq!(got, data);
+
+        let mut parcel = Parcel::new();
+        parcel.write_blob(b"small", false).expect("write_blob");
+        parcel.set_data_position(0);
+        let blob = parcel.read_blob().expect("read_blob");
+        assert!(blob.mapped().expect("mapped").is_none());
+        assert!(blob.into_fd().is_none());
+    }
+
     /// The tag says which form the reader gets; only a mutable region is reader-writable.
     #[test]
     fn a_mutable_blob_is_writable_and_an_immutable_one_is_not() {
@@ -375,7 +518,11 @@ mod tests {
         parcel.set_data_position(0);
         let blob = parcel.read_blob().expect("read_blob");
         assert!(blob.is_mutable());
-        let heap = blob.mapped().expect("a large blob is shared").clone();
+        let heap = blob
+            .mapped()
+            .expect("mapped")
+            .expect("a large blob is shared")
+            .clone();
         heap.write_at(0, b"edit")
             .expect("a mutable region takes a write");
         // The edit is visible through the same mapping the blob reads.
@@ -392,7 +539,10 @@ mod tests {
         let blob = parcel.read_blob().expect("read_blob");
         assert!(!blob.is_mutable());
         // Plan 10-2 AC-2.3: the region is mapped read-only.
-        let heap = blob.mapped().expect("a large blob is shared");
+        let heap = blob
+            .mapped()
+            .expect("mapped")
+            .expect("a large blob is shared");
         assert!(
             heap.write_at(0, b"edit").is_err(),
             "an immutable blob must not accept a write"
@@ -418,6 +568,17 @@ mod tests {
         let blob = parcel.read_blob().expect("read_blob");
         assert!(blob.is_empty());
         assert_eq!(blob.to_vec().expect("to_vec"), Vec::<u8>::new());
+        let mut out = vec![1u8; 8];
+        blob.read_into(&mut out).expect("read_into");
+        assert!(out.is_empty());
+
+        // An inline blob replaces what `out` held as a shared one does.
+        let mut parcel = Parcel::new();
+        parcel.write_blob(b"inline", false).expect("write_blob");
+        parcel.set_data_position(0);
+        let blob = parcel.read_blob().expect("read_blob");
+        blob.read_into(&mut out).expect("read_into");
+        assert_eq!(out, b"inline");
     }
 
     /// Plan 10-2 AC-2.5: an fd-less parcel (AOSP `!mAllowFds`, `to_bytes`) inlines any size.

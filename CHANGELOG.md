@@ -53,6 +53,12 @@ peers; peers of either release still subscribe to each other.
   rsbinder needs a wildcard arm. A later `IServiceManager` generation, such as
   the one that appends `checkServiceAccess` (`android-16.0.0_r3`), is then a
   new variant without a breaking release.
+- `blob::Blob` is a struct, where it was an enum with the variants `Inline`
+  and `Shared { heap, len, mutable }`, and `Blob::mapped` returns
+  `Result<Option<&Arc<MappedHeap>>>`, where it returned the `Option`.
+  `Parcel::read_blob` no longer maps a shared blob's region: the first
+  `mapped` does, so a failed `mmap` is that call's error, and a reader that
+  only copies the payload out makes no mapping.
 
 - **`rsbinder-topic` (breaking): both ends are made by a builder.**
   `PublisherPolicy`, `PoolPolicy`, `Backpressure`, `Authorize`,
@@ -283,6 +289,12 @@ peers; peers of either release still subscribe to each other.
   gives the `ITopic` binder of a registry name; `uds::status` and
   `UdsResolver::status` ask for the status over a socket; `TopicStatus`
   implements `Display`, the text of the dump.
+- `Blob::read_into`: a blob's payload copied into a `Vec` the caller keeps.
+  A reader of many large blobs that hands the same `Vec` back copies into
+  pages it already has, where each `Blob::to_vec` takes a page fault for
+  every page of a new allocation.
+- `Blob::into_fd`: a shared blob's file descriptor, to hand its region on
+  without mapping it.
 - `rsbinder-topic`: the `tracing` feature, events of each subscription's life
   under the target `rsbinder_topic`, none per record.
 - `rsbinder-tools`: `rsb_service topic list|stat|hz|echo|record` (feature
@@ -292,6 +304,22 @@ peers; peers of either release still subscribe to each other.
 
 ### Changed
 
+- A blob past `BLOB_INPLACE_LIMIT` costs fewer page faults on Linux and
+  Android. `Parcel::write_blob` fills its region with `pwrite(2)` and makes
+  no mapping of it, and `Blob::to_vec` copies a memfd out with `pread(2)`; an
+  ashmem fd is still read through a mapping. The bytes on the wire, the fd's
+  seals and its file position are the same. A region the kernel cannot back
+  now fails `write_blob` with the error of the `pwrite`, where the copy
+  through a mapping ended the process with `SIGBUS`.
+- A blob of half a huge page or more (1 MiB where a huge page is 2 MiB:
+  x86_64, and aarch64 with 4 KiB pages) is written to huge pages where the
+  system gives shared memory any:
+  `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is neither `never` nor
+  `deny`, read once per process. `Parcel::write_blob` then makes the region a
+  whole number of huge pages, so up to twice the blob, and fills it through a
+  mapping advised `MADV_HUGEPAGE`; a region the kernel cannot back is a
+  `SIGBUS` there. The reader still gets the blob's length, and the bytes of
+  the region past it read zero.
 - Stream `*_async` waits — a futex wait on the ring, for an item or for
   room, and on calls a credit or item wait that is bounded or may ping —
   run on rsbinder's own threads instead of the runtime's blocking pool.

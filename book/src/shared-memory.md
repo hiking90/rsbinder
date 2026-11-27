@@ -52,6 +52,13 @@ let blob = parcel.read_blob()?;
 let bytes = blob.to_vec()?;               // whichever form it took
 ```
 
+A reader that takes a large blob on every call keeps one `Vec` and passes it
+to `blob.read_into(&mut buf)`. A new `Vec` of that size is memory the
+allocator takes from the kernel, a page fault for each page as the copy
+reaches it; the `Vec` handed back has its pages already. To read a shared blob
+where it lies, `blob.mapped()?` maps the region on its first call and returns
+`None` for an inline one.
+
 Two properties make it the right default for "a big lump of bytes":
 
 - **The transport decides, not your code.** Where fds cannot travel — vsock,

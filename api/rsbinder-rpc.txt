@@ -2,22 +2,19 @@ pub mod rsbinder
 pub mod rsbinder::binderfs
 pub fn rsbinder::binderfs::add_device(&std::path::Path, &str) -> std::io::error::Result<(u32, u32)>
 pub mod rsbinder::blob
-pub enum rsbinder::blob::Blob
-pub rsbinder::blob::Blob::Inline(alloc::vec::Vec<u8>)
-pub rsbinder::blob::Blob::Shared
-pub rsbinder::blob::Blob::Shared::heap: alloc::sync::Arc<rsbinder::shared_memory::MappedHeap>
-pub rsbinder::blob::Blob::Shared::len: usize
-pub rsbinder::blob::Blob::Shared::mutable: bool
+pub struct rsbinder::blob::Blob(_)
 impl rsbinder::blob::Blob
 pub fn rsbinder::blob::Blob::inline(&self) -> core::option::Option<&[u8]>
+pub fn rsbinder::blob::Blob::into_fd(self) -> core::option::Option<std::os::fd::owned::OwnedFd>
 pub fn rsbinder::blob::Blob::is_empty(&self) -> bool
 pub fn rsbinder::blob::Blob::is_mutable(&self) -> bool
 pub fn rsbinder::blob::Blob::len(&self) -> usize
-pub fn rsbinder::blob::Blob::mapped(&self) -> core::option::Option<&alloc::sync::Arc<rsbinder::shared_memory::MappedHeap>>
+pub fn rsbinder::blob::Blob::mapped(&self) -> rsbinder::Result<core::option::Option<&alloc::sync::Arc<rsbinder::shared_memory::MappedHeap>>>
+pub fn rsbinder::blob::Blob::read_into(&self, &mut alloc::vec::Vec<u8>) -> rsbinder::Result<()>
 pub fn rsbinder::blob::Blob::to_vec(&self) -> rsbinder::Result<alloc::vec::Vec<u8>>
 impl core::fmt::Debug for rsbinder::blob::Blob
 pub fn rsbinder::blob::Blob::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for rsbinder::blob::Blob
+impl !core::marker::Freeze for rsbinder::blob::Blob
 impl core::marker::Send for rsbinder::blob::Blob
 impl core::marker::Sync for rsbinder::blob::Blob
 impl core::marker::Unpin for rsbinder::blob::Blob

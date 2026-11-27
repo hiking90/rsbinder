@@ -50,6 +50,16 @@ fn page_size() -> usize {
     rustix::param::page_size()
 }
 
+/// The region for `size` bytes of data, and whether huge pages fill it: whole huge pages from
+/// half of one on, which bounds the region at twice the data; `size` itself below that.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn contents_region(size: usize, huge_page: Option<usize>) -> (usize, bool) {
+    let whole = huge_page
+        .filter(|huge| *huge > 0 && size >= huge / 2)
+        .and_then(|huge| size.checked_next_multiple_of(huge));
+    whole.map_or((size, false), |region| (region, true))
+}
+
 fn round_up_to_page(size: usize) -> Option<usize> {
     let ps = page_size();
     size.checked_add(ps - 1).map(|s| s & !(ps - 1))
@@ -73,6 +83,15 @@ impl Mapping {
         } else {
             Self::Ro(shm::RoMapping::map(fd, at, extent)?.carve().bytes(0, len)?)
         })
+    }
+
+    /// A writable mapping of the first `len` bytes, every page of it backed, by huge pages
+    /// where the kernel grants them: for a region that holds nothing yet.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn map_huge(fd: &OwnedFd, len: usize) -> Result<Self> {
+        let mapping = shm::Mapping::map(fd.as_fd(), 0, len as u64)?;
+        mapping.populate_huge_pages();
+        Ok(Self::Rw(mapping.carve().bytes(0, len)?))
     }
 
     fn view(&self) -> SharedBytes<'_> {
@@ -191,6 +210,63 @@ mod backend {
 
     pub(super) fn seal_future_write(fd: &OwnedFd, _ro: Option<&OwnedFd>) -> Result<()> {
         shm::add_seals(fd.as_fd(), Seals::FUTURE_WRITE)?;
+        Ok(())
+    }
+
+    /// The size of a huge page of shared memory, `None` where the system gives it none: read
+    /// once from `/sys/kernel/mm/transparent_hugepage`, and `None` too where that is unreadable.
+    pub(super) fn huge_page_size() -> Option<usize> {
+        static SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        *SIZE.get_or_init(|| {
+            const DIR: &str = "/sys/kernel/mm/transparent_hugepage";
+            let enabled = std::fs::read_to_string(format!("{DIR}/shmem_enabled")).ok()?;
+            let size = std::fs::read_to_string(format!("{DIR}/hpage_pmd_size")).ok()?;
+            huge_pages_granted(&enabled).then(|| size.trim().parse().ok())?
+        })
+    }
+
+    /// Whether `shmem_enabled`'s text, its choice in brackets, gives a mapping advised
+    /// `MADV_HUGEPAGE` huge pages: every choice but `never` and `deny`.
+    pub(super) fn huge_pages_granted(shmem_enabled: &str) -> bool {
+        let chosen = shmem_enabled
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('[')?.strip_suffix(']'));
+        matches!(chosen, Some(choice) if choice != "never" && choice != "deny")
+    }
+
+    /// `pwrite(2)` of all of `data` from offset 0, the fd's position left where a peer expects
+    /// it; a write seal refuses the call, so it runs before the seals.
+    pub(super) fn write_all(fd: &OwnedFd, mut data: &[u8]) -> Result<()> {
+        use rustix::io::Errno;
+        let mut offset = 0u64;
+        while !data.is_empty() {
+            match rustix::io::pwrite(fd, data, offset) {
+                Ok(0) => return Err(crate::error::errno_status(Errno::IO)),
+                Ok(n) => {
+                    data = data.get(n..).unwrap_or_default();
+                    offset += n as u64;
+                }
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(crate::error::errno_status(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// `pread(2)` of all of `dst` from `offset`; a region that ends first is `BadValue`.
+    pub(super) fn read_exact_at(fd: &OwnedFd, mut offset: u64, mut dst: &mut [u8]) -> Result<()> {
+        use rustix::io::Errno;
+        while !dst.is_empty() {
+            match rustix::io::pread(fd, &mut *dst, offset) {
+                Ok(0) => return Err(StatusCode::BadValue),
+                Ok(n) => {
+                    dst = dst.get_mut(n..).unwrap_or_default();
+                    offset += n as u64;
+                }
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(crate::error::errno_status(e)),
+            }
+        }
         Ok(())
     }
 
@@ -322,6 +398,44 @@ pub(super) fn is_read_only_fd<F: AsFd>(fd: F) -> bool {
     backend::is_read_only_fd(fd)
 }
 
+/// What [`MappedHeap::from_fd`] requires of a received fd before it maps `size` bytes at `offset`.
+pub(crate) fn check_extent(fd: &OwnedFd, size: usize, offset: usize) -> Result<()> {
+    if size == 0 || offset % page_size() != 0 {
+        return Err(StatusCode::BadValue);
+    }
+    let end = offset.checked_add(size).ok_or(StatusCode::BadValue)?;
+    let st_size = rustix::fs::fstat(fd)
+        .map_err(crate::error::errno_status)?
+        .st_size;
+    if st_size <= 0 {
+        if !super::shared::is_ashmem_fd(fd.as_fd()) {
+            log::error!("shared memory fd has no backing size and is not ashmem");
+            return Err(StatusCode::BadValue);
+        }
+        // ashmem `mmap` ignores the offset; a range past the region SIGBUSes on first touch.
+        if end > super::shared::region_size(fd.as_fd())? {
+            return Err(StatusCode::BadValue);
+        }
+    } else if (end as u64) > st_size as u64 {
+        return Err(StatusCode::BadValue);
+    }
+    Ok(())
+}
+
+/// Copies a memfd's first `dst.len()` bytes out with `pread(2)`, which takes none of the page
+/// faults a copy through a mapping does. `Ok(false)`, with `dst` as it was, where that is not
+/// available: an fd that is not a memfd (ashmem), and every target but Linux and Android.
+pub(crate) fn read_memfd(fd: &OwnedFd, dst: &mut [u8]) -> Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if backend::get_seals(fd).is_some() {
+        backend::read_exact_at(fd, 0, dst)?;
+        return Ok(true);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = (fd, dst);
+    Ok(false)
+}
+
 /// `SEAL_*` protections of a bare fd before any mapping (fd form of [`MappedHeap::seals`]).
 pub(crate) fn fd_seals(fd: &OwnedFd) -> Option<u32> {
     backend::get_seals(fd)
@@ -394,6 +508,62 @@ impl MemoryHeapBase {
             flags,
             writable: true,
         }))
+    }
+
+    /// A region that holds `data`, sealed per `flags`: what `Parcel::write_blob` sends.
+    ///
+    /// Linux and Android fill it with `pwrite(2)` before the seals and leave it unmapped
+    /// ([`FLAG_DONT_MAP_LOCALLY`]): a copy through a new mapping takes a page fault for every
+    /// page of the region, and a region the kernel cannot back kills the process with `SIGBUS`
+    /// where `pwrite(2)` returns the error.
+    ///
+    /// Data of half a huge page or more, where the system gives shared memory huge pages
+    /// (`backend::huge_page_size`), goes to a region of whole huge pages filled through a
+    /// mapping advised `MADV_HUGEPAGE` instead ([`contents_region`]): `pwrite(2)` gets small
+    /// pages whatever the advice, and a huge page is one allocation, one fault and one release
+    /// where its small pages are 512 of each. That mapping takes the `SIGBUS`, and the region
+    /// is up to twice the data.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn with_contents(data: &[u8], flags: u32, name: &str) -> Result<Self> {
+        if data.is_empty() {
+            return Err(StatusCode::BadValue);
+        }
+        let size = round_up_to_page(data.len()).ok_or(StatusCode::BadValue)?;
+        let (size, huge) = contents_region(size, backend::huge_page_size());
+        let Created { fd, ro_fd } = backend::create(name, size)?;
+        let map = if huge {
+            let map = Mapping::map_huge(&fd, size)?;
+            if let Mapping::Rw(bytes) = &map {
+                bytes.store(0, data);
+            }
+            Some(map)
+        } else {
+            backend::write_all(&fd, data)?;
+            None
+        };
+        backend::seal(&fd, flags)?;
+        Ok(Self(HeapInner {
+            fd,
+            ro_fd,
+            export_ro: AtomicBool::new(flags & FLAG_READ_ONLY != 0),
+            map,
+            size,
+            offset: 0,
+            flags: if huge {
+                flags
+            } else {
+                flags | FLAG_DONT_MAP_LOCALLY
+            },
+            writable: true,
+        }))
+    }
+
+    /// A region that holds `data`, sealed per `flags`: what `Parcel::write_blob` sends.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn with_contents(data: &[u8], flags: u32, name: &str) -> Result<Self> {
+        let heap = Self::new_named(data.len(), flags, name)?;
+        heap.write_at(0, data)?;
+        Ok(heap)
     }
 
     /// Raw base pointer of the local mapping (`None` with
@@ -534,25 +704,7 @@ impl MappedHeap {
     /// `InvalidOperation` because the fd's seals cannot be read, while
     /// this call still maps.
     pub fn from_fd(fd: OwnedFd, size: usize, offset: usize, flags: u32) -> Result<Self> {
-        if size == 0 || offset % page_size() != 0 {
-            return Err(StatusCode::BadValue);
-        }
-        let end = offset.checked_add(size).ok_or(StatusCode::BadValue)?;
-        let st_size = rustix::fs::fstat(&fd)
-            .map_err(crate::error::errno_status)?
-            .st_size;
-        if st_size <= 0 {
-            if !super::shared::is_ashmem_fd(fd.as_fd()) {
-                log::error!("shared memory fd has no backing size and is not ashmem");
-                return Err(StatusCode::BadValue);
-            }
-            // ashmem `mmap` ignores the offset; a range past the region SIGBUSes on first touch.
-            if end > super::shared::region_size(fd.as_fd())? {
-                return Err(StatusCode::BadValue);
-            }
-        } else if (end as u64) > st_size as u64 {
-            return Err(StatusCode::BadValue);
-        }
+        check_extent(&fd, size, offset)?;
         let writable = flags & FLAG_READ_ONLY == 0;
         let map = Mapping::map(&fd, size, offset, writable)?;
         Ok(Self(HeapInner {
@@ -794,6 +946,138 @@ mod tests {
         let mut back = [0u8; 4];
         owner.read_at(0, &mut back).unwrap();
         assert_eq!(&back, b"back");
+    }
+
+    /// A length that ends inside a page: the bytes arrive, and the rest of the page reads zero.
+    #[test]
+    fn with_contents_holds_the_data_under_the_seals_asked_for() {
+        let ps = page_size();
+        let data: Vec<u8> = (0..ps * 3 + 7).map(|i| (i % 251) as u8).collect();
+        for flags in [0, FLAG_READ_ONLY] {
+            let owner = MemoryHeapBase::with_contents(&data, flags, "test").unwrap();
+            assert_eq!(owner.size(), ps * 4);
+            let seals = owner.seals().unwrap();
+            assert_ne!(seals & SEAL_SHRINK, 0);
+            let rx_flags = flags & FLAG_READ_ONLY;
+            let rx = MappedHeap::from_fd_strict(
+                OwnedFd::from(owner.to_parcel_fd().unwrap()),
+                owner.size(),
+                0,
+                rx_flags,
+            )
+            .unwrap();
+            let mut got = vec![0xffu8; owner.size()];
+            rx.read_at(0, &mut got).unwrap();
+            assert_eq!(&got[..data.len()], &data[..]);
+            assert!(got[data.len()..].iter().all(|b| *b == 0));
+            // A read-only region refuses a writable mapping; a writable one takes it.
+            let writable =
+                MappedHeap::from_fd(OwnedFd::from(owner.to_parcel_fd().unwrap()), ps, 0, 0);
+            assert_eq!(writable.is_ok(), flags == 0);
+        }
+        assert_eq!(
+            MemoryHeapBase::with_contents(&[], 0, "test").err(),
+            Some(StatusCode::BadValue)
+        );
+    }
+
+    /// The bracketed word is the system's choice; only `never` and `deny` give no huge pages.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn shmem_enabled_grants_huge_pages_unless_never_or_deny() {
+        for (text, granted) in [
+            ("always within_size [advise] never deny force\n", true),
+            ("[always] within_size advise never deny force\n", true),
+            ("always [within_size] advise never deny force\n", true),
+            ("always within_size advise never deny [force]\n", true),
+            ("always within_size advise [never] deny force\n", false),
+            ("always within_size advise never [deny] force\n", false),
+            ("always within_size advise never deny force\n", false),
+            ("", false),
+        ] {
+            assert_eq!(backend::huge_pages_granted(text), granted, "{text:?}");
+        }
+    }
+
+    /// Whole huge pages from half of one on, the size asked below that or with no huge page.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn contents_region_is_whole_huge_pages_from_half_of_one() {
+        const HUGE: usize = 2 << 20;
+        for (size, region, huge) in [
+            (4096, 4096, false),
+            (HUGE / 2 - 4096, HUGE / 2 - 4096, false),
+            (HUGE / 2, HUGE, true),
+            (HUGE, HUGE, true),
+            (HUGE + 4096, 2 * HUGE, true),
+            (3 * HUGE, 3 * HUGE, true),
+        ] {
+            assert_eq!(contents_region(size, Some(HUGE)), (region, huge), "{size}");
+            assert_eq!(contents_region(size, None), (size, false), "{size}");
+        }
+        // A region no `usize` holds stays the size asked, for the kernel to refuse.
+        let past = usize::MAX - 4095;
+        assert_eq!(contents_region(past, Some(HUGE)), (past, false));
+        assert_eq!(contents_region(HUGE, Some(0)), (HUGE, false));
+    }
+
+    /// Data from half a huge page on holds whichever way this system fills its region.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn with_contents_holds_a_region_past_a_huge_page() {
+        let system = backend::huge_page_size();
+        let huge = system.unwrap_or(2 << 20);
+        for len in [
+            huge / 2 - 1,
+            huge / 2,
+            huge,
+            huge + 1,
+            huge * 2 + page_size() + 7,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+            let owner = MemoryHeapBase::with_contents(&data, FLAG_READ_ONLY, "test").unwrap();
+            let (region, _) = contents_region(round_up_to_page(len).unwrap(), system);
+            assert_eq!(owner.size(), region);
+            let fd = OwnedFd::from(owner.to_parcel_fd().unwrap());
+            // Every page is backed when the fd leaves: the peer's first read allocates nothing.
+            let backed = rustix::fs::fstat(&fd).unwrap().st_blocks as usize * 512;
+            assert!(backed >= owner.size(), "len {len}: {backed} backed");
+            assert_eq!(rustix::fs::tell(&fd).unwrap(), 0);
+            let mut got = vec![0u8; len];
+            assert!(read_memfd(&fd, &mut got).unwrap());
+            assert!(got == data, "len {len}");
+            assert!(MappedHeap::from_fd(fd, len, 0, 0).is_err());
+        }
+    }
+
+    /// `read_memfd` reads what a mapping reads, a later write included, and no fd but a memfd.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_memfd_reads_the_region_and_only_a_memfd() {
+        let ps = page_size();
+        let data: Vec<u8> = (0..ps * 3).map(|i| (i % 249) as u8).collect();
+        let owner = MemoryHeapBase::with_contents(&data, 0, "test").unwrap();
+        let fd = OwnedFd::from(owner.to_parcel_fd().unwrap());
+
+        let mut got = vec![0u8; data.len() - 3];
+        assert!(read_memfd(&fd, &mut got).unwrap());
+        assert_eq!(&got[..], &data[..data.len() - 3]);
+        // The fd's position, which the sender shares, is moved by neither the fill nor the read.
+        assert_eq!(rustix::fs::tell(&fd).unwrap(), 0);
+
+        let mapped = MappedHeap::from_fd(fd.try_clone().unwrap(), ps, 0, 0).unwrap();
+        mapped.write_at(0, b"edit").unwrap();
+        assert!(read_memfd(&fd, &mut got).unwrap());
+        assert_eq!(&got[..4], b"edit");
+
+        // Past the region's end there is nothing to read.
+        let mut past = vec![0u8; ps * 3 + 1];
+        assert_eq!(read_memfd(&fd, &mut past).err(), Some(StatusCode::BadValue));
+
+        let (pipe, _write_end) = rustix::pipe::pipe().unwrap();
+        let mut untouched = [9u8; 4];
+        assert!(!read_memfd(&pipe, &mut untouched).unwrap());
+        assert_eq!(untouched, [9u8; 4]);
     }
 
     #[test]
