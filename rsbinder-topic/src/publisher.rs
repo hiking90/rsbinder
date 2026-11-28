@@ -662,6 +662,12 @@ impl Acceptor {
     /// remote `ITopic` makes while this thread waits for it runs on this thread too; its request
     /// is a copy, so a token of this process in it is refused.
     ///
+    /// On another thread — one the handler spawned, a task of a runtime — there is no caller
+    /// to read ([`rsbinder::calling_caller`] is `None`), and this process would stand in for
+    /// it before `authorize` and `max_per_uid`. Such a call is refused with `EX_SECURITY`:
+    /// where `authorize` is set before anything else, otherwise once the request is found
+    /// well formed.
+    ///
     /// [`ITopic::ERROR_VERSION`]: crate::aidl::ITopic::ERROR_VERSION
     /// [`ITopic::ERROR_FULL`]: crate::aidl::ITopic::ERROR_FULL
     /// [`ITopic::ERROR_CLOSED`]: crate::aidl::ITopic::ERROR_CLOSED
@@ -692,7 +698,8 @@ impl Acceptor {
     /// [`ITopic::ERROR_CLOSED`] once the publisher is dropped. A closed publisher still answers.
     ///
     /// Call it from the handler of the call, on the thread the call arrived on: the caller it
-    /// checks is that call's. For an admitted caller it takes the topic's lock, which a publish on
+    /// checks is that call's, and on any other thread it is this process, which the default
+    /// rule admits. For an admitted caller it takes the topic's lock, which a publish on
     /// a [`lossless`](crate::PublisherBuilder::lossless) topic holds while it waits for room, so
     /// the answer can wait up to that timeout; a refused caller is answered without it.
     ///
@@ -843,7 +850,12 @@ impl<T: Payload + 'static> Accept for Shared<T> {
     }
 
     fn take(self: Arc<Self>, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        // Off the thread of the call there is no caller to read: this process would stand in.
+        let known = asked_here(request) || rsbinder::calling_caller().is_some();
         if let Some(authorize) = &self.authorize {
+            if !known {
+                return Err(no_caller());
+            }
             if !authorize.admits(&CallingContext::current()) {
                 return Err(Status::from((
                     ExceptionCode::Security,
@@ -902,6 +914,9 @@ impl<T: Payload + 'static> Accept for Shared<T> {
             }),
             None => None,
         };
+        if !known {
+            return Err(no_caller());
+        }
         let caller = CallingContext::current();
         let uid = caller.uid;
         let list = Arc::downgrade(&self) as Weak<dyn Forget>;
@@ -961,6 +976,14 @@ impl<T: Payload> Forget for Shared<T> {
         let gone = state.links.remove(dead);
         self.writer.unlock(state, gone.into_iter().collect());
     }
+}
+
+/// The refusal of a subscription call made where its caller cannot be read.
+fn no_caller() -> Status {
+    Status::from((
+        ExceptionCode::Security,
+        "the subscription call is not one this thread handles or makes",
+    ))
 }
 
 /// The event of a subscription call to a topic of `payload`, taken or refused.

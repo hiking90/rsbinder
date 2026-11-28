@@ -550,6 +550,13 @@ pub enum Caller {
 /// runs; [`is_handling_transaction`](crate::is_handling_transaction) stays
 /// `false` there.
 ///
+/// `None` covers every thread that has no call to answer for: a thread or
+/// task the handler started, and a method of a local service called
+/// directly through its `Strong<dyn IFoo>`, which is a plain method call
+/// with no dispatch. [`get_calling_uid`] answers this process's uid in both,
+/// so a check that may run off the handler's thread should decide here,
+/// where "no caller" is told from a caller.
+///
 /// This is the transport-aware basis for handler-side authorization: a
 /// service `match`es on the [`Caller`] arm and applies the right check
 /// (Android permission vs uid ACL vs TLS-cert allowlist). For a single
@@ -2463,6 +2470,10 @@ impl CallingContext {
     ///
     /// Take it inside the handler: a value stored and read later still
     /// names the caller of the call that made it.
+    ///
+    /// On a thread or task the handler started it is this process too, which
+    /// an authorization check cannot tell from a caller of the same uid:
+    /// [`calling_caller`] is `None` there.
     pub fn current() -> CallingContext {
         // An in-flight RPC transaction wins (pure-RPC safe); RPC carries no SELinux `sid`.
         if let Some((uid, pid)) = rpc_calling() {

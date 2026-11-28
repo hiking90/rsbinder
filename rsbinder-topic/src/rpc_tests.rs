@@ -10,12 +10,16 @@ use std::time::{Duration, Instant};
 
 use rsbinder::rpc::transport::TcpDebugTransport;
 use rsbinder::rpc::{FileDescriptorTransportMode, RpcClientConfig, RpcServer, RpcSession};
-use rsbinder::{ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode, Strong};
+use rsbinder::{
+    BinderResult, ExceptionCode, Interface, ParcelFileDescriptor, SIBinder, StatusCode, Strong,
+};
 
 use crate::aidl::ITopic::{BnTopic, ITopic, WAKE_FUTEX};
 use crate::aidl::ITopicRegistry::ITopicRegistry;
 use crate::aidl::ITopicWatcher::BnTopicWatcher;
 use crate::aidl::SubscribeRequest::SubscribeRequest;
+use crate::aidl::TopicEndpoint::TopicEndpoint;
+use crate::aidl::TopicStatus::TopicStatus;
 use crate::connect::Token;
 use crate::layout::{ControlPage, VERSION};
 use crate::link::{link_death, Dead};
@@ -245,6 +249,43 @@ fn a_publisher_that_predates_the_notice_keeps_the_session_it_comes_over() {
     assert_eq!(publisher.subscriber_count(), 1);
     publisher.publish(&Bytes(vec![2])).unwrap();
     assert_eq!(again.recv_timeout(WAIT), Ok(Bytes(vec![2])));
+    session.close_session();
+    server.terminate();
+}
+
+/// An `ITopic` that answers its subscription call on another thread than the call arrived on.
+struct OffThread(crate::Acceptor);
+
+impl Interface for OffThread {}
+
+impl ITopic for OffThread {
+    fn r#subscribe(&self, request: &SubscribeRequest) -> BinderResult<TopicEndpoint> {
+        std::thread::scope(|scope| scope.spawn(|| self.0.accept(request)).join().unwrap())
+    }
+
+    fn r#unsubscribed(&self) -> BinderResult<()> {
+        self.0.unsubscribed();
+        Ok(())
+    }
+
+    fn r#status(&self) -> BinderResult<TopicStatus> {
+        self.0.status()
+    }
+}
+
+/// The token is the caller's and the request well formed: only the thread is not the call's.
+#[test]
+fn a_subscription_call_answered_off_its_thread_is_refused() {
+    let publisher = publisher();
+    let (name, server) = serve(BnTopic::new_binder(OffThread(publisher.acceptor())).as_binder());
+    let session = connect(&name, 1);
+    let topic = session.get_root().unwrap();
+    let refused = Subscriber::<Bytes>::builder().subscribe(&topic).err();
+    assert_eq!(
+        refused.map(|status| status.exception_code()),
+        Some(ExceptionCode::Security)
+    );
+    assert_eq!(publisher.subscriber_count(), 0);
     session.close_session();
     server.terminate();
 }

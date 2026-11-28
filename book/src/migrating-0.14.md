@@ -283,6 +283,13 @@ impl ITopic for Guarded {
 A type that implements `ITopic` only to check the caller needs none of this:
 `PublisherBuilder::authorize` runs that check in the publisher's own binder.
 
+`Acceptor::accept` is called in the handler of the subscription call, on the
+thread the call arrived on. On a thread or task the handler started there is no
+caller to read, and 0.1.0 took this process for it — `authorize` judged the
+publisher's own uid. Such a call is refused with `EX_SECURITY` now; an
+implementation that handed the request over calls `accept` first and hands over
+what it returns.
+
 `SubscriberInfo` has the fields `id` and `unwaited`; it is `#[non_exhaustive]`,
 so only a pattern that names every field breaks. `Payload::type_name` reserves
 the empty name, which `AnyType` sends, and a publisher of a type with it is
